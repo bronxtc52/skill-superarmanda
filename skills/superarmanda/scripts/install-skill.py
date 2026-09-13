@@ -67,6 +67,16 @@ def is_descendant(path, ancestor):
     return len(path_parts) > len(ancestor_parts) and path_parts[: len(ancestor_parts)] == ancestor_parts
 
 
+def reject_source_containment(destinations):
+    source = SKILL.resolve()
+    lexical_source = Path(os.path.abspath(SKILL))
+    for destination in destinations:
+        if is_descendant(intended_destination(destination), source) or is_descendant(
+            Path(os.path.abspath(destination)), lexical_source
+        ):
+            fail(f"refusing destination inside skill source: {destination}")
+
+
 def reject_nested_destinations(destinations):
     identities = [intended_destination(destination) for destination in destinations]
     lexical = [Path(os.path.abspath(destination)) for destination in destinations]
@@ -107,6 +117,7 @@ def install(args):
         Path(args.target_home).expanduser() if args.target_home is not None else None
     )
     targets = destinations(args.client, target_home)
+    reject_source_containment([destination for _, destination in targets])
     # Check every target before making a directory or link. This keeps `both`
     # atomic with respect to known conflicts.
     states = [

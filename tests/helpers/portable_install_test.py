@@ -317,6 +317,53 @@ class PortableInstallTest(unittest.TestCase):
                 (home / "skills" / "superarmanda").resolve(), self.skill.resolve()
             )
 
+    def test_source_contained_destinations_are_refused_without_source_changes(self):
+        external_home = self.root / "external home"
+        alias = self.root / "source alias"
+        alias.symlink_to(self.skill, target_is_directory=True)
+        case_variant = self.skill.parent / self.skill.name.upper()
+        for client, source_home in (
+            ("claude", self.skill),
+            ("codex", self.skill),
+            ("claude", alias),
+            ("codex", alias),
+            ("claude", case_variant),
+            ("codex", case_variant),
+        ):
+            with self.subTest(client=client, source_home=source_home):
+                installer = self.installer_module()
+                before = {
+                    path.relative_to(self.skill): path.read_bytes()
+                    for path in self.skill.rglob("*")
+                    if path.is_file()
+                }
+                homes = {"claude": external_home, "codex": external_home}
+                homes[client] = source_home
+                try:
+                    with mock.patch.object(installer, "client_home", side_effect=lambda name, _: homes[name]):
+                        with self.assertRaises(ValueError):
+                            installer.install(SimpleNamespace(client="both", target_home=None))
+                    after = {
+                        path.relative_to(self.skill): path.read_bytes()
+                        for path in self.skill.rglob("*")
+                        if path.is_file()
+                    }
+                    self.assertEqual(after, before)
+                finally:
+                    nested = self.skill / "skills"
+                    if nested.exists():
+                        shutil.rmtree(nested)
+
+    def test_external_identical_link_remains_idempotent(self):
+        installer = self.installer_module()
+        home = self.root / "outside source"
+        with mock.patch.object(installer, "client_home", return_value=home):
+            installer.install(SimpleNamespace(client="both", target_home=None))
+            installer.install(SimpleNamespace(client="both", target_home=None))
+        self.assertEqual(
+            (home / "skills" / "superarmanda").resolve(), self.skill.resolve()
+        )
+
     def test_installed_path_builds_state_and_packet_for_local_git_project(self):
         self.install("codex")
         installed = self.home / ".codex" / "skills" / "superarmanda" / "scripts"
