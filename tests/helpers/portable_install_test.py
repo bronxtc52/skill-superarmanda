@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Acceptance tests for portable, non-destructive skill installation."""
 
+import importlib.util
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,6 +37,12 @@ class PortableInstallTest(unittest.TestCase):
             ["python3", str(self.installer), "install", "--client", client, "--target-home", str(self.home)],
             text=True, capture_output=True, check=check,
         )
+
+    def installer_module(self):
+        spec = importlib.util.spec_from_file_location("portable_installer", self.installer)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
 
     def test_fork_path_install_is_idempotent_and_preserves_origin(self):
         self.install("both")
@@ -150,6 +159,31 @@ class PortableInstallTest(unittest.TestCase):
                 else:
                     self.assertEqual(self.home.read_text(encoding="utf-8"), "foreign home")
                     self.home.unlink()
+
+    def test_empty_target_home_is_refused_before_home_resolution(self):
+        installer = self.installer_module()
+        with mock.patch.object(installer, "client_home", side_effect=AssertionError("home lookup")):
+            with self.assertRaises(ValueError):
+                installer.install(SimpleNamespace(client="both", target_home=""))
+
+    def test_omitted_target_home_uses_mocked_client_homes(self):
+        installer = self.installer_module()
+        fake_home = self.root / "mock client homes"
+
+        def client_home(client, target_home):
+            self.assertIsNone(target_home)
+            return fake_home / (".claude" if client == "claude" else ".codex")
+
+        with mock.patch.object(installer, "client_home", side_effect=client_home):
+            installer.install(SimpleNamespace(client="both", target_home=None))
+        self.assertEqual(
+            (fake_home / ".claude" / "skills" / "superarmanda").resolve(),
+            self.skill.resolve(),
+        )
+        self.assertEqual(
+            (fake_home / ".codex" / "skills" / "superarmanda").resolve(),
+            self.skill.resolve(),
+        )
 
     def test_installed_path_builds_state_and_packet_for_local_git_project(self):
         self.install("codex")

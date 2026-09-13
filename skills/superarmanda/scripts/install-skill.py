@@ -56,7 +56,11 @@ def preflight(destination):
 def install(args):
     if not (SKILL / "SKILL.md").is_file():
         fail(f"skill source has no SKILL.md: {SKILL}")
-    target_home = Path(args.target_home).expanduser() if args.target_home else None
+    if args.target_home == "":
+        fail("target-home must not be empty")
+    target_home = (
+        Path(args.target_home).expanduser() if args.target_home is not None else None
+    )
     targets = destinations(args.client, target_home)
     # Check every target before making a directory or link. This keeps `both`
     # atomic with respect to known conflicts.
