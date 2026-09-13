@@ -300,10 +300,22 @@ class PortableInstallTest(unittest.TestCase):
                 return "present"
             return original_preflight(destination)
 
-        with mock.patch.object(installer, "client_home", side_effect=lambda client, _: homes[client]), mock.patch.object(installer, "preflight", side_effect=case_insensitive_preflight):
+        with mock.patch.object(installer, "client_home", side_effect=lambda client, _: homes[client]), mock.patch.object(installer, "preflight", side_effect=case_insensitive_preflight), mock.patch.object(installer.os, "symlink", wraps=installer.os.symlink) as symlink:
             installer.install(SimpleNamespace(client="both", target_home=None))
         self.assertTrue((homes["claude"] / "skills" / "superarmanda").is_symlink())
-        self.assertFalse((homes["codex"] / "skills" / "superarmanda").exists())
+        self.assertEqual(symlink.call_count, 1)
+
+    def test_case_variant_equal_targets_point_to_skill_on_current_filesystem(self):
+        installer = self.installer_module()
+        root = self.root / "case variant actual"
+        homes = {"claude": root / ".claude", "codex": root / ".CLAUDE"}
+        with mock.patch.object(installer, "client_home", side_effect=lambda client, _: homes[client]):
+            installer.install(SimpleNamespace(client="both", target_home=None))
+            installer.install(SimpleNamespace(client="both", target_home=None))
+        for home in homes.values():
+            self.assertEqual(
+                (home / "skills" / "superarmanda").resolve(), self.skill.resolve()
+            )
 
     def test_installed_path_builds_state_and_packet_for_local_git_project(self):
         self.install("codex")
