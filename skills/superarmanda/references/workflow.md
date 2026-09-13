@@ -10,6 +10,9 @@
 4. После tester отдельный provider проверяет задачу по контракту. На итоговом diff этот
    review повторяется. Пакет содержит requirements, base/head SHA, diff, необходимые файлы
    и результаты тестов; его размер проверяется заранее, усечение запрещено.
+   После подтверждённого provider quota event/notice Fable coordinator может
+   сделать отдельную Opus-попытку через `codex-host-opus`, сохранив оба artifact;
+   никакой runner не переключает профиль автоматически.
 5. Findings возвращаются coder. После каждой неудачной corrective attempt, включая failure от
    fresh tester, единственный coordinator вызывает `fix-loop --outcome failed`; coder → tester →
    reviewer повторяется. Это ручная дисциплина coordinator, а не автономное доказательство
@@ -20,6 +23,9 @@
    CodeRabbit необязателен, но существенные полученные findings разбираются.
 
 Недоступный обязательный reviewer/auth/model/quota — `blocked`/`unavailable`, а не pass.
+Исключение только для подтверждённого Fable quota: сама Fable-попытка остаётся
+unavailable, но отдельная успешная закреплённая Opus-попытка на том же current
+SHA может закрыть gate; неуспешная Opus-попытка оставляет PR draft.
 Если GitHub review невозможен до ready PR, не меняй draft policy для обхода: запиши зависимость
 и запроси решение пользователя. После нового HEAD старый PR review также устарел.
 

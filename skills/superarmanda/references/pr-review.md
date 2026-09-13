@@ -35,8 +35,10 @@ a current `APPROVED` or `COMMENTED` Codex review body only after the review `com
 resolved body SHA both match the requested full SHA, with no current attached inline comment.
 CRLF is normalized. The rocket summary may have the exact legacy footer
 `<details><summary>About Codex</summary>Automated review.</details>`. The second format begins
-`Codex Review: Didn't find any major issues. Keep them coming!` or `Codex Review: Didn't find any
-major issues. Chef's kiss.` and requires the exact GitHub connector footer beginning `<details>
+`Codex Review: Didn't find any major issues. Keep them coming!`, `Codex Review: Didn't find any
+major issues. Chef's kiss.`, `Codex Review: Didn't find any major issues. Bravo.`, `Codex Review:
+Didn't find any major issues. What shall we delve into next?`, or `Codex Review: Didn't find any
+major issues. Breezy!` and requires the exact GitHub connector footer beginning `<details>
 <summary>ℹ️ About Codex in GitHub</summary>`, including its observed whitespace before
 `</details>`. A Codex comment containing
 `<!-- codex-pull-request-review-summary -->` records completion only and never proves a clean

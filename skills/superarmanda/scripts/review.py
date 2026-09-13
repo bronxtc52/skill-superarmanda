@@ -3,7 +3,8 @@
 
 ``packet`` accepts only a clean repository whose checked-out commit is ``--head``.
 It writes a canonical JSON packet outside that repository.  ``run`` accepts that
-packet and either ``codex-host`` (Claude Fable) or ``claude-host`` (Codex Astra).
+packet and either ``codex-host`` (Claude Fable), ``codex-host-opus`` (Claude
+Opus), or ``claude-host`` (Codex Astra).
 It never accepts a command,
 model, endpoint, or credential from the caller.  Results record what the CLI
 actually exposes; missing model or isolation evidence remains unverified.
@@ -711,16 +712,21 @@ def authenticated(cli, timeout, env, cwd):
 
 
 def profiles(host):
-    if host == "codex-host":
+    claude_profiles = {
+        "codex-host": "fable",
+        "codex-host-opus": "claude-opus-4-8",
+    }
+    if host in claude_profiles:
+        selector = claude_profiles[host]
         return (
             "claude",
-            "fable",
+            selector,
             [
                 "claude",
                 "--safe-mode",
                 "-p",
                 "--model",
-                "fable",
+                selector,
                 "--effort",
                 "medium",
                 "--tools",
@@ -742,7 +748,14 @@ def profiles(host):
     return "codex", "gpt-6-astra", None
 
 
-def response_from_stdout(cli, stdout):
+def expected_primary_model(profile):
+    return {
+        "codex-host": "claude-fable-5-1",
+        "codex-host-opus": "claude-opus-4-8",
+    }.get(profile)
+
+
+def response_from_stdout(cli, stdout, expected_model="claude-fable-5-1"):
     if cli == "codex":
         messages, completed = [], False
         for line in stdout.splitlines():
@@ -824,7 +837,7 @@ def response_from_stdout(cli, stdout):
         message = event.get("message")
         if (
             not isinstance(message, dict)
-            or message.get("model") != "claude-fable-5-1"
+            or message.get("model") != expected_model
             or not isinstance(message.get("content"), list)
             or not all(isinstance(block, dict) for block in message["content"])
         ):
@@ -867,14 +880,14 @@ def response_from_stdout(cli, stdout):
         for block in tool_blocks
     )
     primary_verified = (
-        init.get("model") == "claude-fable-5-1"
+        init.get("model") == expected_model
         and bool(assistant_events)
-        and isinstance(usage.get("claude-fable-5-1"), dict)
+        and isinstance(usage.get(expected_model), dict)
         and not any(
             event.get("subtype") == "model_refusal_fallback" for event in events
         )
         and all(
-            event["message"]["model"] == "claude-fable-5-1"
+            event["message"]["model"] == expected_model
             for event in assistant_events
         )
     )
@@ -1117,7 +1130,9 @@ def review(args):
                 )
                 attempts.append({"state": state, "returncode": code})
                 if state == "ok" and code == 0:
-                    response, metadata = response_from_stdout(cli, stdout)
+                    response, metadata = response_from_stdout(
+                        cli, stdout, expected_primary_model(args.profile)
+                    )
                     validate_response(response, envelope)
                     verify_packet_repo(repo, envelope)
                     result = {
@@ -1201,7 +1216,9 @@ def parser():
     run_parser.add_argument("--repo", required=True)
     run_parser.add_argument("--packet", required=True)
     run_parser.add_argument(
-        "--profile", choices=("claude-host", "codex-host"), required=True
+        "--profile",
+        choices=("claude-host", "codex-host", "codex-host-opus"),
+        required=True,
     )
     run_parser.add_argument("--output", required=True)
     run_parser.add_argument("--timeout", type=int, default=180)

@@ -193,6 +193,33 @@ class EvaluateContract(unittest.TestCase):
         self.assertEqual(result["status"], "findings")
         self.assertEqual(result["findings"][0]["original_commit_id"], OLD)
 
+    def test_three_new_observed_clean_suffixes_are_exact_and_current_only(self):
+        for header in (
+            "Bravo.",
+            "What shall we delve into next?",
+            "Breezy!",
+        ):
+            with self.subTest(header=header):
+                exact = observed_clean(header=header)
+                self.assertEqual(
+                    self.evaluate(
+                        issues=[issue(exact)], resolve=lambda ref: HEAD
+                    )["status"],
+                    "pass",
+                )
+                for body, who, resolver in (
+                    (exact + "\nA finding was appended.", actor(), lambda ref: HEAD),
+                    (exact, actor(CODEX, "User"), lambda ref: HEAD),
+                    (observed_clean(OLD, header), actor(), lambda ref: OLD),
+                    (exact.replace(header, "Unexpected prose."), actor(), lambda ref: HEAD),
+                ):
+                    self.assertNotEqual(
+                        self.evaluate(
+                            issues=[issue(body, who)], resolve=resolver
+                        )["status"],
+                        "pass",
+                    )
+
     def test_observed_clean_format_rejects_mutations_and_untrusted_or_stale_evidence(
         self,
     ):

@@ -19,7 +19,12 @@
 другую задачу или роль даже после resume. Это разделяет сессии, но не доказывает, какая модель
 фактически отвечала. Для task review используй другой провайдер, чем host coder.
 
-`scripts/review.py` реализует фиксированные подписочные adapters. Fable
+`scripts/review.py` реализует фиксированные подписочные adapters. `codex-host`
+остаётся Fable. После подтверждённого provider quota event/notice Fable (либо
+уже сохранённого для текущего run quota evidence) coordinator может запустить
+отдельную попытку через фиксированный `codex-host-opus`; он сохраняет оба
+artifact. Runner не выбирает Opus сам, не принимает модель от caller и не
+выводит право fallback из произвольного текста диагностики или ответа. Fable
 подтверждается stream metadata Claude CLI. Astra запускается через локальный
 `codex app-server --stdio`: отключения применяются к процессу до initialize,
 затем проверяется effective config и ChatGPT subscription. Сервер должен вернуть
@@ -30,8 +35,23 @@
 подтверждённых capabilities не закрывает gate. Это ограничение инструментов
 CLI, не OS sandbox для процесса CLI. Вход через существующий HOME/CODEX_HOME;
 не копировать OAuth stores, не подменять login location, не использовать API fallback.
-При auth error, лимите, таймауте, неверном JSON, неполном пакете или другом SHA
-обязательный review unavailable; состояние сохраняется, PR остаётся draft.
+Первичная Fable-попытка при quota остаётся unavailable. При подтверждённом
+quota evidence успешная отдельная Opus-попытка для того же current SHA может
+закрыть этот review gate; неуспешная Opus-попытка остаётся unavailable и PR
+остаётся draft. При auth error, лимите без такого маршрута, таймауте, неверном
+JSON, неполном пакете или другом SHA обязательный review unavailable; состояние
+сохраняется, PR остаётся draft.
+
+После этого решения coordinator вызывает фиксированный профиль с уже созданным
+packet и внешним output, например:
+
+```bash
+python3 "$SUPERARMANDA_DIR/scripts/review.py" run --repo /repo \
+  --packet /outside/opus-packet.json --profile codex-host-opus \
+  --output /outside/opus-result.json
+```
+
+Он сохраняет исходный Fable failure artifact вместе с Opus result artifact.
 С 2026-09-13 скилл раскатывается фермой на все ноды (hostname-гейт mh-central снят —
 он преемник armanda/armada). Нода без Codex CLI или подписки не «не поддерживается»:
 capability check там честно даёт review unavailable → BLOCKED, PR остаётся draft.

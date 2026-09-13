@@ -4,11 +4,11 @@ Source repository: `https://github.com/bronxtc52/agent-config` at immutable
 commit `5272047475e1dace50f31733c72d1f17dae8d264`.
 
 The Python runtime, schema, references, five Python test helpers, and five test
-runners below are byte-identical copies from that commit. The helpers retain
-their source-relative paths because the standalone repository keeps the canonical
-`skills/superarmanda` layout; no assertions or scenarios were changed. `SKILL.md`
-is the sole modified moved file: its host-integration and rule links now point to
-the published authoritative HTTPS documents.
+runners were initially extracted from that commit. The helpers retain their
+source-relative paths because the standalone repository keeps the canonical
+`skills/superarmanda` layout. This provenance describes the initial extraction
+at `f10e538485a1d43e6a604214d845aa6e5e6fb34b`; it does not claim the current
+files remain byte-identical after standalone features.
 
 | Source path | Standalone path |
 |---|---|
