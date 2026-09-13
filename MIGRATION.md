@@ -33,5 +33,15 @@ the published authoritative HTTPS documents.
 | `tests/superarmanda-pr-review.test.sh` | `tests/superarmanda-pr-review.test.sh` |
 | `tests/superarmanda-codex-review.test.sh` | `tests/superarmanda-codex-review.test.sh` |
 
-Standalone additions are `README.md`, `AGENTS.md`, CI, the test runner, and the
-layout acceptance test.
+## Standalone additions
+
+| Added path |
+|---|
+| `.github/workflows/ci.yml` |
+| `.gitignore` |
+| `AGENTS.md` |
+| `MIGRATION.md` |
+| `README.md` |
+| `scripts/run-tests.sh` |
+| `tests/helpers/standalone_layout_test.py` |
+| `tests/standalone-layout.test.sh` |
