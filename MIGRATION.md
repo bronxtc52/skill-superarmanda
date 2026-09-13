@@ -3,14 +3,16 @@
 Source repository: `https://github.com/bronxtc52/agent-config` at immutable
 commit `5272047475e1dace50f31733c72d1f17dae8d264`.
 
-The runtime content below was copied unchanged from that commit. The five Python
-test helpers retain their source-relative paths because the standalone repository
-keeps the canonical `skills/superarmanda` layout; no assertions or scenarios were
-changed.
+The Python runtime, schema, references, five Python test helpers, and five test
+runners below are byte-identical copies from that commit. The helpers retain
+their source-relative paths because the standalone repository keeps the canonical
+`skills/superarmanda` layout; no assertions or scenarios were changed. `SKILL.md`
+is the sole modified moved file: its host-integration and rule links now point to
+the published authoritative HTTPS documents.
 
 | Source path | Standalone path |
 |---|---|
-| `skills/superarmanda/SKILL.md` | `skills/superarmanda/SKILL.md` |
+| `skills/superarmanda/SKILL.md` (modified: published host-integration links) | `skills/superarmanda/SKILL.md` |
 | `skills/superarmanda/references/profiles.md` | `skills/superarmanda/references/profiles.md` |
 | `skills/superarmanda/references/workflow.md` | `skills/superarmanda/references/workflow.md` |
 | `skills/superarmanda/references/review-contract.md` | `skills/superarmanda/references/review-contract.md` |
@@ -32,6 +34,4 @@ changed.
 | `tests/superarmanda-codex-review.test.sh` | `tests/superarmanda-codex-review.test.sh` |
 
 Standalone additions are `README.md`, `AGENTS.md`, CI, the test runner, and the
-layout acceptance test. `SKILL.md` changes only its formerly repository-relative
-links into HTTPS links to the authoritative `agent-config` rules and documents
-the installed host integration boundary.
+layout acceptance test.
