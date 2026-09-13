@@ -26,6 +26,8 @@ spellings as equivalent when detecting ancestor/descendant paths. This can
 reject nested-looking names that are distinct on a case-sensitive filesystem.
 The installer also refuses every destination inside the skill source checkout,
 including aliases and case/Unicode-equivalent spellings.
+Installation paths containing a literal `..` component are rejected; use a
+path without parent traversal.
 
 The runtime remains self-contained. State and review packets work against a
 synthetic local Git repository without network access. Subscription review

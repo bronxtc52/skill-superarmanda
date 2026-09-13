@@ -112,6 +112,12 @@ def reject_source_containment(destinations):
             fail(f"refusing destination inside skill source: {destination}")
 
 
+def reject_parent_traversal(destinations):
+    for destination in destinations:
+        if ".." in destination.parts:
+            fail(f"refusing parent traversal in destination: {destination}")
+
+
 def reject_nested_destinations(destinations):
     identities = [intended_destination(destination) for destination in destinations]
     lexical = [Path(os.path.abspath(destination)) for destination in destinations]
@@ -154,6 +160,7 @@ def install(args):
         Path(args.target_home).expanduser() if args.target_home is not None else None
     )
     targets = destinations(args.client, target_home)
+    reject_parent_traversal([destination for _, destination in targets])
     reject_source_containment([destination for _, destination in targets])
     # Check every target before making a directory or link. This keeps `both`
     # atomic with respect to known conflicts.

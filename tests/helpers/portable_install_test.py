@@ -410,6 +410,42 @@ class PortableInstallTest(unittest.TestCase):
                 installer.install(SimpleNamespace(client="both", target_home=None))
         self.assertFalse((alias_root / "skills" / "superarmanda").exists())
 
+    def test_parent_traversal_destinations_are_refused_before_writes(self):
+        installer = self.installer_module()
+        target_home = self.root / "target home" / ".." / "other target home"
+        with self.assertRaises(ValueError):
+            installer.install(SimpleNamespace(client="both", target_home=str(target_home)))
+        self.assertFalse((self.root / "other target home").exists())
+
+        codex_home = self.root / "codex home" / ".." / "other codex home"
+        with mock.patch.dict(installer.os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+            with self.assertRaises(ValueError):
+                installer.install(SimpleNamespace(client="codex", target_home=None))
+        self.assertFalse((self.root / "other codex home").exists())
+
+        claude_home = self.root / "combined claude home"
+        nested_codex_home = claude_home / "skills" / "superarmanda" / ".." / "other home"
+        homes = {"claude": claude_home, "codex": nested_codex_home}
+        source_parent_write = self.fork / "skills" / "other home"
+        try:
+            with mock.patch.object(installer, "client_home", side_effect=lambda client, _: homes[client]):
+                with self.assertRaises(ValueError):
+                    installer.install(SimpleNamespace(client="both", target_home=None))
+            self.assertFalse((claude_home / "skills" / "superarmanda").exists())
+            self.assertFalse(source_parent_write.exists())
+        finally:
+            if source_parent_write.exists():
+                shutil.rmtree(source_parent_write)
+
+    def test_ordinary_paths_without_parent_traversal_still_install(self):
+        installer = self.installer_module()
+        home = self.root / "ordinary path"
+        with mock.patch.object(installer, "client_home", return_value=home):
+            installer.install(SimpleNamespace(client="both", target_home=None))
+        self.assertEqual(
+            (home / "skills" / "superarmanda").resolve(), self.skill.resolve()
+        )
+
     def test_installed_path_builds_state_and_packet_for_local_git_project(self):
         self.install("codex")
         installed = self.home / ".codex" / "skills" / "superarmanda" / "scripts"

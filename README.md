@@ -41,6 +41,8 @@ fetch, не меняет remote, глобальную Git-конфигураци
 casefold и Unicode NFD-нормализации, даже на case-sensitive filesystem.
 Нельзя устанавливать skill внутрь его собственного source checkout, включая
 alias и неоднозначные case/Unicode spelling.
+Пути установки с literal компонентом `..` не поддерживаются; укажите путь без
+parent traversal.
 
 Для изолированного теста или managed install укажите явный корень вместо
 домашней директории пользователя:
