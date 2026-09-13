@@ -5,15 +5,27 @@
 беседу координатора: для Codex указывай `fork_turns="none"`. Проверяй доступность
 и фактические CLI metadata на запуске.
 
-| Роль | Claude Code host | Codex host |
+| Роль | Claude Code host (проверенный default) | Codex host (проверенный default) |
 |---|---|---|
-| coordinator / planner | Fable | `gpt-6-astra` |
-| coder | fresh `coder@sonnet` | fresh `coder@gpt-5.6-terra` |
-| tester | fresh `tester@sonnet` | fresh `tester@gpt-5.6-terra` |
-| task reviewer | Codex CLI / `gpt-6-astra` | Claude CLI / Fable |
+| coordinator / planner | доступная явная native-модель (Fable) | доступная явная native-модель (`gpt-6-astra`) |
+| coder | fresh explicit native model (`coder@sonnet`) | fresh explicit native model (`coder@gpt-5.6-terra`) |
+| tester | fresh explicit native model (`tester@sonnet`) | fresh explicit native model (`tester@gpt-5.6-terra`) |
+| task reviewer | Codex CLI / fixed adapter | Claude CLI / fixed adapter |
 | context / drafts | `reader`/`drafter@haiku` | `reader`/`drafter@gpt-5.6-luna` |
 | required PR review | GitHub Codex | GitHub Codex |
 | optional PR review | CodeRabbit | CodeRabbit |
+
+Defaults above document tested host choices, not aliases required on every
+installation. Coordinator, coder and tester select an available explicit
+native model and record observed metadata. The subscription review adapters
+below are intentionally different: their supported profiles and model IDs are
+fixed, and unavailable review leaves the PR draft. A fork changes a reviewer
+model only with tests and verified capabilities, never by relabelling metadata.
+
+`codex-host-opus` may be explicitly selected as an initial supported profile
+during setup without Fable quota evidence. The runner never selects it, and
+the existing separate quota fallback remains limited to a confirmed failed
+Fable quota attempt.
 
 `session_id` закреплён за парой task/role на всём run и не может перейти в
 другую задачу или роль даже после resume. Это разделяет сессии, но не доказывает, какая модель
@@ -52,11 +64,9 @@ python3 "$SUPERARMANDA_DIR/scripts/review.py" run --repo /repo \
 ```
 
 Он сохраняет исходный Fable failure artifact вместе с Opus result artifact.
-С 2026-09-13 скилл раскатывается фермой на все ноды (hostname-гейт mh-central снят —
-он преемник armanda/armada). Нода без Codex CLI или подписки не «не поддерживается»:
-capability check там честно даёт review unavailable → BLOCKED, PR остаётся draft.
-Живыми пилотами подтверждён только mh-central; на других нодах первый запуск — это
-их capability check, а не доказательство.
+Нода без нужного CLI, подписки или подтверждённой capability даёт review
+unavailable → BLOCKED, PR остаётся draft. Mock-тесты не подтверждают доступ к
+внешнему аккаунту.
 
 ## Каталог установленного скилла
 

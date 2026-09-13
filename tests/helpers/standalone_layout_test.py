@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SKILL = ROOT / "skills" / "superarmanda"
 EXPECTED_FILES = {
     "SKILL.md",
+    "LICENSE",
     "references/profiles.md",
     "references/workflow.md",
     "references/review-contract.md",
@@ -19,6 +20,7 @@ EXPECTED_FILES = {
     "scripts/review.py",
     "scripts/codex_review.py",
     "scripts/pr_review.py",
+    "scripts/install-skill.py",
 }
 
 
@@ -63,6 +65,12 @@ class StandaloneLayoutTest(unittest.TestCase):
             (skill / "scripts/state.py").unlink()
             with self.assertRaises(AssertionError):
                 assert_package_layout(skill)
+
+    def test_packaged_license_matches_repository_license(self):
+        self.assertEqual(
+            (ROOT / "LICENSE").read_text(encoding="utf-8"),
+            (SKILL / "LICENSE").read_text(encoding="utf-8"),
+        )
 
 
 if __name__ == "__main__":
