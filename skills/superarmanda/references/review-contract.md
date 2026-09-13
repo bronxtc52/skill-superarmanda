@@ -66,10 +66,17 @@ limit but does not raise Astra's fixed prompt cap. A larger custom packet can be
 reviewed by Fable, while Astra returns a structured `input` failure. Size overrides
 never bypass the adapter's bounded input contract.
 
-Fable marks the primary model verified only when init metadata identifies
+For `codex-host`, Fable marks the primary model verified only when init metadata identifies
 `claude-fable-5-1`, at least one assistant event is present and every assistant
 event identifies that model, its `modelUsage` has a
 `claude-fable-5-1` entry, and no `model_refusal_fallback` event is present.
 Additional `modelUsage` entries may describe ancillary CLI calls and remain in the
 report; for example, observed `claude-haiku-4-5-20251001` does not invalidate
 verified primary Fable evidence.
+
+`codex-host-opus` is a separate fixed Claude CLI profile. It passes primary
+model verification only when init metadata, every assistant event, and a
+`modelUsage` entry all identify exactly `claude-opus-4-8`, with at least one
+assistant event and no `model_refusal_fallback`. It retains the same empty
+tools/MCP/plugins and StructuredOutput-only checks. The runner neither routes
+to this profile nor accepts a caller-supplied model.

@@ -67,6 +67,8 @@ if mode == "findings":
     response["findings"] = [{"severity": "high", "file": "x.py", "line": 1, "scenario": "bad input", "evidence": "bad", "recommendation": "fix"}]
 if mode == "wrong_head":
     response["reviewed_head"] = "0" * 40
+if mode == "wrong_hash":
+    response["packet_hash"] = "sha256:" + "0" * 64
 if mode == "invalid_schema":
     del response["missing_context"]
 if mode == "status_array":
@@ -76,6 +78,9 @@ if mode == "severity_array":
     response["findings"] = [{"severity": [], "file": "x.py", "line": 1, "scenario": "bad input", "evidence": "bad", "recommendation": "fix"}]
 if mode == "transport_failure":
     print("temporary network failure", file=sys.stderr)
+    raise SystemExit(1)
+if mode == "quota_failure":
+    print("quota exhausted", file=sys.stderr)
     raise SystemExit(1)
 if mode == "cli_reported_timeout":
     print("timed out", file=sys.stderr)
@@ -90,13 +95,17 @@ if name == "claude":
     if mode == "claude_old_single_json":
         print(json.dumps({"is_error": False, "result": json.dumps(response), "structured_output": response}))
     else:
-        init = {"type": "system", "subtype": "init", "session_id": "claude-session", "model": "claude-fable-5-1", "tools": ["StructuredOutput"], "mcp_servers": [], "plugins": []}
+        requested = argv[argv.index("--model") + 1]
+        expected = {"fable": "claude-fable-5-1", "claude-opus-4-8": "claude-opus-4-8"}[requested]
+        init = {"type": "system", "subtype": "init", "session_id": "claude-session", "model": expected, "tools": ["StructuredOutput"], "mcp_servers": [], "plugins": []}
         if mode == "claude_tools": init["tools"] = ["Read"]
         if mode == "claude_tools_nonlist": init["tools"] = "StructuredOutput"
         if mode == "claude_missing_tools": del init["tools"]
-        if mode == "claude_primary_mismatch": init["model"] = "claude-opus-5"
+        if mode in ("claude_primary_mismatch", "opus_wrong_init"): init["model"] = "claude-opus-5"
+        if mode == "opus_mcp": init["mcp_servers"] = ["unexpected"]
+        if mode == "opus_plugins": init["plugins"] = ["unexpected"]
         if mode == "claude_assistant_before_init":
-            print(json.dumps({"type": "assistant", "message": {"model": "claude-fable-5-1", "content": [{"type": "tool_use", "name": "StructuredOutput", "input": response}]}}))
+            print(json.dumps({"type": "assistant", "message": {"model": expected, "content": [{"type": "tool_use", "name": "StructuredOutput", "input": response}]}}))
         print(json.dumps(init))
         if mode == "claude_duplicate_init":
             duplicate_init = dict(init)
@@ -111,8 +120,9 @@ if name == "claude":
             print(json.dumps({"type": "assistant", "message": {"model": None, "content": None}}))
         elif mode == "claude_string_message":
             print(json.dumps({"type": "assistant", "message": "not an object"}))
-        elif mode != "claude_missing_assistant":
-            assistant_model = None if mode == "claude_null_model" else "claude-fable-5-1"
+        elif mode not in ("claude_missing_assistant", "opus_missing_assistant"):
+            assistant_model = None if mode == "claude_null_model" else expected
+            if mode == "opus_wrong_assistant": assistant_model = "claude-fable-5-1"
             block = {"type": "tool_use", "name": tool_name, "input": tool_input}
             if mode in ("claude_server_tool", "claude_unknown_block"):
                 block = {
@@ -122,14 +132,16 @@ if name == "claude":
                     "name": "Read",
                 }
             print(json.dumps({"type": "assistant", "message": {"model": assistant_model, "content": [block]}}))
-        usage = [] if mode == "claude_model_usage_array" else {"claude-fable-5-1": {"inputTokens": 1}}
-        if mode == "claude_missing_primary_usage": usage = {"claude-haiku-4-5": {"inputTokens": 1}}
+        usage = [] if mode == "claude_model_usage_array" else {expected: {"inputTokens": 1}}
+        if mode in ("claude_missing_primary_usage", "opus_wrong_usage"): usage = {"claude-haiku-4-5": {"inputTokens": 1}}
         terminal = {"type": "result", "subtype": "success", "is_error": mode == "claude_error", "result": json.dumps(response), "structured_output": response, "modelUsage": usage}
         if mode == "claude_missing_model_usage": del terminal["modelUsage"]
         if mode == "claude_missing_is_error": del terminal["is_error"]
         if mode == "claude_null_is_error": terminal["is_error"] = None
         if mode == "claude_string_is_error": terminal["is_error"] = "false"
         if mode == "claude_zero_is_error": terminal["is_error"] = 0
+        if mode == "opus_refusal":
+            print(json.dumps({"type": "system", "subtype": "model_refusal_fallback"}))
         encoded_terminal = json.dumps(terminal)
         if mode == "claude_duplicate_is_error":
             encoded_terminal = encoded_terminal.replace(
@@ -1001,6 +1013,7 @@ raise SystemExit(1)
         self.assertIsNone(auth["node_tls"])
         self.assertIsNone(review["node_tls"])
         result = self.result()
+        self.assertEqual(result["requested_model"], "fable")
         self.assertTrue(result["gate_ready"])
         self.assertEqual(
             result["capabilities"],
@@ -1014,6 +1027,67 @@ raise SystemExit(1)
             result["observed_models"], {"claude-fable-5-1": {"inputTokens": 1}}
         )
         self.assertEqual(result["session_id"], "claude-session")
+
+    def test_fixed_opus_profile_requires_exact_observed_metadata_and_keeps_fable_default(self):
+        self.assert_packet_ok()
+        proc = self.review_run("codex-host-opus", "opus_success")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        auth, review = self.logs()
+        self.assertEqual(auth["program"], "claude")
+        self.assertEqual(review["program"], "claude")
+        self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "claude-opus-4-8")
+        result = self.result()
+        self.assertEqual(result["requested_model"], "claude-opus-4-8")
+        self.assertEqual(result["observed_models"], {"claude-opus-4-8": {"inputTokens": 1}})
+        self.assertTrue(result["gate_ready"])
+
+        for mode in (
+            "opus_wrong_init",
+            "opus_wrong_assistant",
+            "opus_wrong_usage",
+            "opus_missing_assistant",
+            "opus_refusal",
+            "opus_mcp",
+            "opus_plugins",
+            "claude_execution_tool",
+            "wrong_head",
+            "wrong_hash",
+            "claude_auth_unauthorized",
+            "timeout",
+        ):
+            with self.subTest(mode=mode):
+                proc = self.review_run("codex-host-opus", mode)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertFalse(self.result()["gate_ready"])
+
+        arbitrary = subprocess.run(
+            self.command(
+                "run",
+                "--repo",
+                self.repo,
+                "--packet",
+                self.packet_path,
+                "--profile",
+                "claude-anything-else",
+                "--output",
+                self.result_path,
+            ),
+            text=True,
+            capture_output=True,
+            env=self.mock_env(),
+        )
+        self.assertNotEqual(arbitrary.returncode, 0)
+        self.assertIn("invalid choice", arbitrary.stderr)
+
+    def test_fable_quota_error_never_implicitly_switches_to_opus(self):
+        self.assert_packet_ok()
+        proc = self.review_run("codex-host", "quota_failure")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.result()["error_category"], "quota")
+        auth, review = self.logs()
+        self.assertEqual(auth["program"], "claude")
+        self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "fable")
+        self.assertEqual(len(self.logs()), 2)
 
     def test_codex_adapter_verifies_app_server_model_subscription_and_capabilities(
         self,
