@@ -219,6 +219,41 @@ class PortableInstallTest(unittest.TestCase):
                 installer.install(SimpleNamespace(client="both", target_home=None))
         self.assertEqual(target.read_text(encoding="utf-8"), "foreign")
 
+    def test_nested_client_destinations_are_rejected_before_writes(self):
+        for topology in ("direct", "alias", "present", "present-alias"):
+            for order in ("claude-first", "codex-first"):
+                with self.subTest(topology=topology, order=order):
+                    installer = self.installer_module()
+                    label = f"nested-{topology}-{order}"
+                    real_home = self.root / f"{label} real home"
+                    ancestor_home = real_home
+                    if topology in ("alias", "present-alias"):
+                        real_home.mkdir()
+                        alias_home = self.root / f"{label} alias home"
+                        alias_home.symlink_to(real_home, target_is_directory=True)
+                        nested_home = alias_home / "skills" / "superarmanda" / label
+                    else:
+                        nested_home = real_home / "skills" / "superarmanda" / label
+                    ancestor_target = real_home / "skills" / "superarmanda"
+                    if topology in ("present", "present-alias"):
+                        ancestor_target.parent.mkdir(parents=True)
+                        ancestor_target.symlink_to(self.skill, target_is_directory=True)
+                    homes = (
+                        {"claude": ancestor_home, "codex": nested_home}
+                        if order == "claude-first"
+                        else {"claude": nested_home, "codex": ancestor_home}
+                    )
+                    source_write = self.skill / label
+                    try:
+                        with mock.patch.object(installer, "client_home", side_effect=lambda client, _: homes[client]):
+                            with self.assertRaises(ValueError):
+                                installer.install(SimpleNamespace(client="both", target_home=None))
+                        self.assertEqual(ancestor_target.exists(), topology.startswith("present"))
+                        self.assertFalse(source_write.exists())
+                    finally:
+                        if source_write.exists():
+                            shutil.rmtree(source_write)
+
     def test_installed_path_builds_state_and_packet_for_local_git_project(self):
         self.install("codex")
         installed = self.home / ".codex" / "skills" / "superarmanda" / "scripts"

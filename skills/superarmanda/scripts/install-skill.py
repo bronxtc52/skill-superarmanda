@@ -53,6 +53,50 @@ def preflight(destination):
     return "new"
 
 
+def intended_destination(destination):
+    """Canonicalize the parent without following a destination link itself."""
+    return destination.parent.resolve(strict=False) / destination.name
+
+
+def is_descendant(path, ancestor):
+    try:
+        path.relative_to(ancestor)
+        return path != ancestor
+    except ValueError:
+        return False
+
+
+def reject_nested_destinations(destinations):
+    identities = [intended_destination(destination) for destination in destinations]
+    lexical = [Path(os.path.abspath(destination)) for destination in destinations]
+    for index, destination in enumerate(destinations):
+        for other_index in range(index):
+            other = destinations[other_index]
+            if any(
+                (
+                    is_descendant(left, right)
+                    or is_descendant(right, left)
+                )
+                for left, right in (
+                    (lexical[index], lexical[other_index]),
+                    (identities[index], identities[other_index]),
+                )
+            ):
+                fail(f"refusing nested destinations: {destination} and {other}")
+            # An already-installed destination resolves to the skill source,
+            # so compare existing ancestors separately to retain the intended
+            # destination boundary through aliases.
+            for target, candidate in ((destination, other), (other, destination)):
+                if not target.exists():
+                    continue
+                ancestor = candidate.parent
+                while ancestor != ancestor.parent:
+                    if ancestor.exists() and os.path.samefile(target, ancestor):
+                        fail(f"refusing nested destinations: {destination} and {other}")
+                    ancestor = ancestor.parent
+    return identities
+
+
 def install(args):
     if not (SKILL / "SKILL.md").is_file():
         fail(f"skill source has no SKILL.md: {SKILL}")
@@ -69,10 +113,11 @@ def install(args):
             name,
             destination,
             preflight(destination),
-            destination.parent.resolve(strict=False) / destination.name,
         )
         for name, destination in targets
     ]
+    identities = reject_nested_destinations([destination for _, destination, _ in states])
+    states = [(*state, identities[index]) for index, state in enumerate(states)]
     completed = set()
     for name, destination, state, physical_destination in states:
         if physical_destination in completed:
