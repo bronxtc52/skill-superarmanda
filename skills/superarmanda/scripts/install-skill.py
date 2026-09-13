@@ -59,12 +59,47 @@ def intended_destination(destination):
     return destination.parent.resolve(strict=False) / destination.name
 
 
-def is_descendant(path, ancestor):
-    path_parts = tuple(unicodedata.normalize("NFD", part).casefold() for part in path.parts)
-    ancestor_parts = tuple(
-        unicodedata.normalize("NFD", part).casefold() for part in ancestor.parts
-    )
+def normalized_parts(parts):
+    return tuple(unicodedata.normalize("NFD", part).casefold() for part in parts)
+
+
+def parts_are_descendant(path_parts, ancestor_parts):
+    path_parts = normalized_parts(path_parts)
+    ancestor_parts = normalized_parts(ancestor_parts)
     return len(path_parts) > len(ancestor_parts) and path_parts[: len(ancestor_parts)] == ancestor_parts
+
+
+def is_descendant(path, ancestor):
+    return parts_are_descendant(path.parts, ancestor.parts)
+
+
+def filesystem_identity(path):
+    status = os.stat(path)
+    return status.st_dev, status.st_ino
+
+
+def existing_ancestor_identities(path):
+    """Yield each existing ancestor identity and the path suffix below it."""
+    current = Path(os.path.abspath(path))
+    suffix = ()
+    while True:
+        if current.exists():
+            yield filesystem_identity(current), suffix
+        if current == current.parent:
+            return
+        suffix = (current.name, *suffix)
+        current = current.parent
+
+
+def identity_has_nested_suffix(left, right):
+    for left_identity, left_suffix in existing_ancestor_identities(left):
+        for right_identity, right_suffix in existing_ancestor_identities(right):
+            if left_identity == right_identity and (
+                parts_are_descendant(left_suffix, right_suffix)
+                or parts_are_descendant(right_suffix, left_suffix)
+            ):
+                return True
+    return False
 
 
 def reject_source_containment(destinations):
@@ -73,7 +108,7 @@ def reject_source_containment(destinations):
     for destination in destinations:
         if is_descendant(intended_destination(destination), source) or is_descendant(
             Path(os.path.abspath(destination)), lexical_source
-        ):
+        ) or identity_has_nested_suffix(destination, source):
             fail(f"refusing destination inside skill source: {destination}")
 
 
@@ -93,6 +128,8 @@ def reject_nested_destinations(destinations):
                     (identities[index], identities[other_index]),
                 )
             ):
+                fail(f"refusing nested destinations: {destination} and {other}")
+            if identity_has_nested_suffix(destination, other):
                 fail(f"refusing nested destinations: {destination} and {other}")
             # An already-installed destination resolves to the skill source,
             # so compare existing ancestors separately to retain the intended

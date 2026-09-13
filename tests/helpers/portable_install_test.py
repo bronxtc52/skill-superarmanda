@@ -364,6 +364,52 @@ class PortableInstallTest(unittest.TestCase):
             (home / "skills" / "superarmanda").resolve(), self.skill.resolve()
         )
 
+    def test_bind_alias_nested_destinations_are_refused_before_writes(self):
+        for order in ("claude-first", "codex-first"):
+            with self.subTest(order=order):
+                installer = self.installer_module()
+                real_root = self.root / f"bind real {order}"
+                alias_root = self.root / f"bind alias {order}"
+                real_root.mkdir()
+                alias_root.mkdir()
+                ancestor_home = real_root
+                nested_home = alias_root / "skills" / "superarmanda" / "nested"
+                homes = (
+                    {"claude": ancestor_home, "codex": nested_home}
+                    if order == "claude-first"
+                    else {"claude": nested_home, "codex": ancestor_home}
+                )
+                actual_identity = installer.filesystem_identity
+
+                def bind_identity(path):
+                    if Path(path) == alias_root:
+                        return actual_identity(real_root)
+                    return actual_identity(path)
+
+                with mock.patch.object(installer, "client_home", side_effect=lambda client, _: homes[client]), mock.patch.object(installer, "filesystem_identity", side_effect=bind_identity):
+                    with self.assertRaises(ValueError):
+                        installer.install(SimpleNamespace(client="both", target_home=None))
+                self.assertFalse((ancestor_home / "skills" / "superarmanda").exists())
+                self.assertFalse((nested_home / "skills" / "superarmanda").exists())
+
+    def test_bind_alias_source_containment_is_refused_before_writes(self):
+        installer = self.installer_module()
+        alias_root = self.root / "source bind alias"
+        alias_root.mkdir()
+        external_home = self.root / "source bind external"
+        actual_identity = installer.filesystem_identity
+
+        def bind_identity(path):
+            if Path(path) == alias_root:
+                return actual_identity(self.skill)
+            return actual_identity(path)
+
+        homes = {"claude": external_home, "codex": alias_root}
+        with mock.patch.object(installer, "client_home", side_effect=lambda client, _: homes[client]), mock.patch.object(installer, "filesystem_identity", side_effect=bind_identity):
+            with self.assertRaises(ValueError):
+                installer.install(SimpleNamespace(client="both", target_home=None))
+        self.assertFalse((alias_root / "skills" / "superarmanda").exists())
+
     def test_installed_path_builds_state_and_packet_for_local_git_project(self):
         self.install("codex")
         installed = self.home / ".codex" / "skills" / "superarmanda" / "scripts"
