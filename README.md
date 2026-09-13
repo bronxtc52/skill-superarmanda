@@ -1,12 +1,12 @@
 # Superarmanda
 
-Standalone repository for the `superarmanda` agent skill. It owns the skill
-definition, its local Python runtime, schemas, references, and regression tests.
-Fleet-wide policy does not live here: admission remains the responsibility of the
-installed `agent-config` host integration at `~/.claude/bin/cc-autonomy.py` and
-its published [allowlist](https://github.com/bronxtc52/agent-config/blob/main/rules/autonomy-allowlist.md).
-The skill invokes that installed integration before autonomous coding; it does
-not duplicate host policy or make an admission decision itself.
+Это standalone-репозиторий agent skill `superarmanda`: здесь живут определение
+skill, локальный Python runtime, схемы, references и регрессионные тесты.
+Fleet policy остаётся в `agent-config`: admission выполняет установленная
+host-интеграция `~/.claude/bin/cc-autonomy.py` по опубликованному
+[allowlist](https://github.com/bronxtc52/agent-config/blob/main/rules/autonomy-allowlist.md).
+Skill вызывает эту интеграцию перед автономной разработкой, но не дублирует
+policy и не принимает admission-решения самостоятельно.
 
 ## Установка
 
@@ -15,6 +15,7 @@ not duplicate host policy or make an admission decision itself.
 
 ```bash
 git clone https://github.com/bronxtc52/skill-superarmanda.git ~/projects/skill-superarmanda
+mkdir -p ~/.claude/skills ~/.codex/skills
 ln -s ~/projects/skill-superarmanda/skills/superarmanda ~/.claude/skills/superarmanda
 ln -s ~/projects/skill-superarmanda/skills/superarmanda ~/.codex/skills/superarmanda
 ```
@@ -25,6 +26,9 @@ ln -s ~/projects/skill-superarmanda/skills/superarmanda ~/.codex/skills/superarm
 skill (`scripts/state.py`, `scripts/review.py`, `scripts/codex_review.py` и
 `scripts/pr_review.py`) работают с локальным состоянием и review-пакетами;
 они не заменяют policy fleet, allowlist или approval-gates хоста.
+
+Для существующей fleet-установки используйте sync из `agent-config`, а не
+перезаписывайте действующие символьные ссылки этими командами.
 
 ## Обновление
 

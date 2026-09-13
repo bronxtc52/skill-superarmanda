@@ -16,7 +16,7 @@ failed=()
 for suite in "${suites[@]}"; do
   name="$(basename "$suite" .test.sh)"
   printf '▶ %s\n' "$name"
-  if bash "$suite"; then
+  if /bin/bash "$suite"; then
     printf '  ✓ %s\n' "$name"
   else
     failed+=("$name")

@@ -23,4 +23,4 @@ jobs:
         run: |
           for tool in bash python3 git; do command -v "$tool" >/dev/null; done
       - name: Run standalone test suites
-        run: bash scripts/run-tests.sh
+        run: /bin/bash scripts/run-tests.sh
