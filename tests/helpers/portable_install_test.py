@@ -119,6 +119,38 @@ class PortableInstallTest(unittest.TestCase):
             self.skill.resolve(),
         )
 
+    def test_live_directory_symlink_target_home_is_supported(self):
+        backing_home = self.root / "real target home"
+        backing_home.mkdir()
+        self.home.symlink_to(backing_home, target_is_directory=True)
+        self.install("both")
+        self.assertEqual(
+            (backing_home / ".claude" / "skills" / "superarmanda").resolve(),
+            self.skill.resolve(),
+        )
+        self.assertEqual(
+            (backing_home / ".codex" / "skills" / "superarmanda").resolve(),
+            self.skill.resolve(),
+        )
+
+    def test_dangling_or_file_target_home_is_refused_without_writes(self):
+        for kind in ("dangling", "file"):
+            with self.subTest(kind=kind):
+                if kind == "dangling":
+                    self.home.symlink_to(self.root / "missing target home")
+                else:
+                    self.home.write_text("foreign home", encoding="utf-8")
+                result = self.install("both", check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.home / ".claude").exists())
+                self.assertFalse((self.home / ".codex").exists())
+                if kind == "dangling":
+                    self.assertTrue(self.home.is_symlink())
+                    self.home.unlink()
+                else:
+                    self.assertEqual(self.home.read_text(encoding="utf-8"), "foreign home")
+                    self.home.unlink()
+
     def test_installed_path_builds_state_and_packet_for_local_git_project(self):
         self.install("codex")
         installed = self.home / ".codex" / "skills" / "superarmanda" / "scripts"

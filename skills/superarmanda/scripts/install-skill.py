@@ -31,7 +31,11 @@ def existing_parent_is_safe(destination):
     parent = destination.parent
     while not parent.exists() and not parent.is_symlink():
         parent = parent.parent
-    if parent.is_symlink() or not parent.is_dir():
+    if parent.is_symlink():
+        if not parent.exists() or not parent.resolve().is_dir():
+            fail(f"destination parent is not a directory: {parent}")
+        return
+    if not parent.is_dir():
         fail(f"destination parent is not a directory: {parent}")
 
 
