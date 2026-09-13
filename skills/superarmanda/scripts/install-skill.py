@@ -64,13 +64,27 @@ def install(args):
     targets = destinations(args.client, target_home)
     # Check every target before making a directory or link. This keeps `both`
     # atomic with respect to known conflicts.
-    states = [(name, destination, preflight(destination)) for name, destination in targets]
-    for name, destination, state in states:
+    states = [
+        (
+            name,
+            destination,
+            preflight(destination),
+            destination.parent.resolve(strict=False) / destination.name,
+        )
+        for name, destination in targets
+    ]
+    completed = set()
+    for name, destination, state, physical_destination in states:
+        if physical_destination in completed:
+            print(f"{name}: shares installed destination {destination}")
+            continue
         if state == "present":
             print(f"{name}: already installed at {destination}")
+            completed.add(physical_destination)
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(SKILL, destination, target_is_directory=True)
+        completed.add(physical_destination)
         print(f"{name}: installed at {destination}")
 
 

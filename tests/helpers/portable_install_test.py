@@ -185,6 +185,40 @@ class PortableInstallTest(unittest.TestCase):
             self.skill.resolve(),
         )
 
+    def test_colliding_client_destinations_install_once_for_same_and_alias_paths(self):
+        for kind in ("same", "alias"):
+            with self.subTest(kind=kind):
+                installer = self.installer_module()
+                real_home = self.root / f"shared {kind} home"
+                if kind == "alias":
+                    real_home.mkdir()
+                    alias_home = self.root / f"shared {kind} alias"
+                    alias_home.symlink_to(real_home, target_is_directory=True)
+                else:
+                    alias_home = real_home
+
+                def client_home(client, target_home):
+                    self.assertIsNone(target_home)
+                    return real_home if client == "claude" else alias_home
+
+                with mock.patch.object(installer, "client_home", side_effect=client_home):
+                    installer.install(SimpleNamespace(client="both", target_home=None))
+                self.assertEqual(
+                    (real_home / "skills" / "superarmanda").resolve(),
+                    self.skill.resolve(),
+                )
+
+    def test_colliding_foreign_target_is_refused_without_replacement(self):
+        installer = self.installer_module()
+        shared_home = self.root / "foreign shared home"
+        target = shared_home / "skills" / "superarmanda"
+        target.parent.mkdir(parents=True)
+        target.write_text("foreign", encoding="utf-8")
+        with mock.patch.object(installer, "client_home", return_value=shared_home):
+            with self.assertRaises(ValueError):
+                installer.install(SimpleNamespace(client="both", target_home=None))
+        self.assertEqual(target.read_text(encoding="utf-8"), "foreign")
+
     def test_installed_path_builds_state_and_packet_for_local_git_project(self):
         self.install("codex")
         installed = self.home / ".codex" / "skills" / "superarmanda" / "scripts"
