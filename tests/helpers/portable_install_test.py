@@ -254,6 +254,57 @@ class PortableInstallTest(unittest.TestCase):
                         if source_write.exists():
                             shutil.rmtree(source_write)
 
+    def test_casefold_nested_destinations_are_rejected_before_writes(self):
+        for order in ("claude-first", "codex-first"):
+            with self.subTest(order=order):
+                installer = self.installer_module()
+                root = self.root / f"casefold nested {order}"
+                label = f"casefold-{order}"
+                ancestor_home = root / ".claude"
+                nested_home = root / ".CLAUDE" / "skills" / "superarmanda" / label
+                homes = (
+                    {"claude": ancestor_home, "codex": nested_home}
+                    if order == "claude-first"
+                    else {"claude": nested_home, "codex": ancestor_home}
+                )
+                with mock.patch.object(installer, "client_home", side_effect=lambda client, _: homes[client]):
+                    with self.assertRaises(ValueError):
+                        installer.install(SimpleNamespace(client="both", target_home=None))
+                self.assertFalse((ancestor_home / "skills" / "superarmanda").exists())
+                self.assertFalse((self.skill / label).exists())
+
+    def test_unicode_equivalent_nested_destinations_are_rejected_before_writes(self):
+        installer = self.installer_module()
+        root = self.root / "unicode nested"
+        label = "unicode-nested"
+        composed_home = root / "caf\u00e9"
+        decomposed_home = root / "cafe\u0301" / "skills" / "superarmanda" / label
+        homes = {"claude": composed_home, "codex": decomposed_home}
+        with mock.patch.object(installer, "client_home", side_effect=lambda client, _: homes[client]):
+            with self.assertRaises(ValueError):
+                installer.install(SimpleNamespace(client="both", target_home=None))
+        self.assertFalse((composed_home / "skills" / "superarmanda").exists())
+        self.assertFalse((self.skill / label).exists())
+
+    def test_case_variant_equal_targets_recheck_before_second_write(self):
+        installer = self.installer_module()
+        root = self.root / "case variant equal"
+        homes = {"claude": root / ".claude", "codex": root / ".CLAUDE"}
+        original_preflight = installer.preflight
+        calls = 0
+
+        def case_insensitive_preflight(destination):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                return "present"
+            return original_preflight(destination)
+
+        with mock.patch.object(installer, "client_home", side_effect=lambda client, _: homes[client]), mock.patch.object(installer, "preflight", side_effect=case_insensitive_preflight):
+            installer.install(SimpleNamespace(client="both", target_home=None))
+        self.assertTrue((homes["claude"] / "skills" / "superarmanda").is_symlink())
+        self.assertFalse((homes["codex"] / "skills" / "superarmanda").exists())
+
     def test_installed_path_builds_state_and_packet_for_local_git_project(self):
         self.install("codex")
         installed = self.home / ".codex" / "skills" / "superarmanda" / "scripts"

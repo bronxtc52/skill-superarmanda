@@ -21,6 +21,10 @@ before directories or links are created, so a known conflict leaves neither
 client partially installed. Filesystem permission and I/O failures after that
 preflight are reported and are not claimed to be transactional.
 
+For portability, destination topology treats casefolded, Unicode NFD-normalized
+spellings as equivalent when detecting ancestor/descendant paths. This can
+reject nested-looking names that are distinct on a case-sensitive filesystem.
+
 The runtime remains self-contained. State and review packets work against a
 synthetic local Git repository without network access. Subscription review
 adapters retain their fixed model and evidence checks; unavailable required

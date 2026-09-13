@@ -4,6 +4,7 @@
 import argparse
 import os
 import sys
+import unicodedata
 from pathlib import Path
 
 
@@ -59,11 +60,11 @@ def intended_destination(destination):
 
 
 def is_descendant(path, ancestor):
-    try:
-        path.relative_to(ancestor)
-        return path != ancestor
-    except ValueError:
-        return False
+    path_parts = tuple(unicodedata.normalize("NFD", part).casefold() for part in path.parts)
+    ancestor_parts = tuple(
+        unicodedata.normalize("NFD", part).casefold() for part in ancestor.parts
+    )
+    return len(path_parts) > len(ancestor_parts) and path_parts[: len(ancestor_parts)] == ancestor_parts
 
 
 def reject_nested_destinations(destinations):
@@ -124,6 +125,10 @@ def install(args):
             print(f"{name}: shares installed destination {destination}")
             continue
         if state == "present":
+            print(f"{name}: already installed at {destination}")
+            completed.add(physical_destination)
+            continue
+        if preflight(destination) == "present":
             print(f"{name}: already installed at {destination}")
             completed.add(physical_destination)
             continue
