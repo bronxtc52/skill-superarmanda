@@ -57,7 +57,10 @@ creates one manifest atomically. Before any result after a code or working-tree 
 path, so writing local state cannot itself change the reviewed tree. `status` reports `tree_matches`
 without mutating state and never reports stale evidence as `ready_for_pr_review`.
 
-Record a role with `task-result --task <id> --role <role> --status <status> --session-id <id> --head <sha>`;
+Record a role with `task-result --task <id> --role <role> --status <status> --session-id <id> --head <sha>`.
+The only valid roles are `coder`, `tester`, `cross_provider_reviewer`,
+`github_codex_review`, and `coderabbit`; valid statuses are `pass`, `findings`,
+`incomplete`, `error`, and `unavailable`.
 Cross-provider `pass` must contain matching `--reviewed-head <sha>` and
 `--packet-hash sha256:<64 lowercase hex>`; a mismatched reviewed head is rejected. GitHub Codex
 `pass` instead requires matching `--reviewed-head` and an HTTPS evidence artifact URL, with no
