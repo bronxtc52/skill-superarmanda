@@ -1,13 +1,22 @@
 ---
 name: superarmanda
 description: "По /superarmanda и на ЛЮБОЙ нетривиальной задаче разработки, даже без имени скилла: «сделай фичу», «почини баг», «добавь endpoint», «отрефактори», «напиши миграцию». Единый конвейер (преемник /armanda и /armada): одна фича от требований до проверенного PR с независимыми coder, tester и подписочным ревью. Пачку фич — по одной."
-version: "0.4.0"
-canon-version: 1.1
+metadata:
+  version: "0.5.0"
+  canon-version: "1.1"
+license: MIT
 ---
 
 # /superarmanda
 
-Autonomous coder начинает только после `python3 "$HOME/.claude/bin/cc-autonomy.py" prepare <owner/repo>` и использует его clone/worktree; обязательно [правило admission из agent-config](https://github.com/bronxtc52/agent-config/blob/main/rules/autonomy-allowlist.md). Этот installed host integration и его policy принадлежат `agent-config`; standalone skill их не копирует и не ослабляет. Interactive user worktree не является технически admitted.
+Перед автономной работой прочитай применимые host и project instructions. Если
+они требуют admission, либо существует один из локальных сигналов managed
+integration — `~/.claude/rules/autonomy-allowlist.md` или
+`~/.claude/bin/cc-autonomy.py` — прочитай локальную policy и выполни её
+prepare-flow. Отсутствующий обязательный компонент означает BLOCKED:
+standalone skill не копирует policy и не создаёт обход. Только на unmanaged host
+без обоих сигналов создай обычный изолированный Git feature worktree.
+Установщик skill не меняет remotes и не делает fetch/login или сетевых действий.
 
 Используй для одной нетривиальной фичи. Не заменяет approval для merge, deploy,
 удаления данных или production-write. Работай в отдельном worktree; в v1 только
@@ -16,9 +25,8 @@ Autonomous coder начинает только после `python3 "$HOME/.claud
 **Это преемник `/armanda` и `/armada` (с 2026-09-13 оба выключены).** Блок из N фич
 ведётся последовательно: одна фича → этот конвейер → PR → следующая; параллельных
 волн в worktree нет — осознанное ограничение v1. `/fix-bug` тоже гонит каждый фикс
-через этот конвейер. [Спек-гейт](https://github.com/bronxtc52/agent-config/blob/main/rules/spec-gate.md) и [repro-first](https://github.com/bronxtc52/agent-config/blob/main/rules/repro-first.md)
-исполняются здесь: шаг 1 — ТЗ до кода, шаг 4 — красный
-тест до фикса.
+через этот конвейер. Спек-гейт исполняется здесь: шаг 1 — ТЗ до кода, шаг 4 —
+красный тест до фикса.
 
 Перед запуском прочитай обязательные контракты:
 
@@ -34,8 +42,9 @@ Autonomous coder начинает только после `python3 "$HOME/.claud
 1. Собери контекст и зафиксируй требования, приёмку, риск, base SHA, задачи и
    команды проверок. Существенную архитектурную или high-risk задачу отдай на
    внешний review плана до реализации.
-2. Выбери host profile из [profiles.md](references/profiles.md). Проверь, что
-   текущая основная модель соответствует профилю; не пытайся переключить её.
+2. Выбери доступную явную native-модель для роли по
+   [profiles.md](references/profiles.md). Не пытайся переключить текущую
+   основную модель или подменить metadata.
    Каждому coder и tester назначай свежую native-сессию с явной моделью. Tester
    не получает самоотчёт coder как доказательство.
 3. Инициализируй локальный manifest через `scripts/state.py`. Он привязан к
@@ -79,7 +88,7 @@ Autonomous coder начинает только после `python3 "$HOME/.claud
 в другую задачу.
 
 Это собственная реализация, вдохновлённая локальной дисциплиной armanda и
-подходом Superpowers; upstream runtime-код не переносится.
+подходом Superpowers; сторонний upstream runtime-код не переносится.
 
 В конце сообщи: что сделано, изменённые файлы, SHA проверок, результаты независимых
 ролей и ссылки на ревью, пропущенные шаги и причины, использованные подписочные

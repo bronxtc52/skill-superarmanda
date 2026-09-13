@@ -1,14 +1,14 @@
 # Provenance and moved-file map
 
-Source repository: `https://github.com/bronxtc52/agent-config` at immutable
-commit `5272047475e1dace50f31733c72d1f17dae8d264`.
-
-The Python runtime, schema, references, five Python test helpers, and five test
-runners were initially extracted from that commit. The helpers retain their
-source-relative paths because the standalone repository keeps the canonical
-`skills/superarmanda` layout. This provenance describes the initial extraction
-at `f10e538485a1d43e6a604214d845aa6e5e6fb34b`; it does not claim the current
-files remain byte-identical after standalone features.
+The original Superarmanda runtime was moved from its owner-maintained source
+repository, `https://github.com/bronxtc52/agent-config`, at immutable commit
+`5272047475e1dace50f31733c72d1f17dae8d264`. This is historical provenance,
+not a runtime dependency: no access to that repository is required. The
+standalone repository owns subsequent maintenance and imports no third-party
+upstream runtime. The helpers retain source-relative paths because the
+standalone repository keeps the canonical `skills/superarmanda` layout. This
+provenance describes the initial move at `f10e538485a1d43e6a604214d845aa6e5e6fb34b`;
+it does not claim current files remain byte-identical.
 
 | Source path | Standalone path |
 |---|---|
@@ -45,3 +45,9 @@ files remain byte-identical after standalone features.
 | `scripts/run-tests.sh` |
 | `tests/helpers/standalone_layout_test.py` |
 | `tests/standalone-layout.test.sh` |
+| `tests/portable-install.test.sh` |
+| `tests/helpers/portable_install_test.py` |
+| `PORTABILITY.md` |
+| `LICENSE` |
+| `skills/superarmanda/LICENSE` |
+| `skills/superarmanda/scripts/install-skill.py` |

@@ -1,5 +1,21 @@
 # Workflow
 
+## Host admission boundary
+
+Сначала прочитай применимые host/project instructions. Host mandate для
+admission обязателен. Также проверь локальные сигналы managed integration:
+`~/.claude/rules/autonomy-allowlist.md` и
+`~/.claude/bin/cc-autonomy.py`. Наличие любого из них означает, что нужно
+прочитать локальную policy и выполнить её prepare-flow; отсутствующий второй
+обязательный компонент или ошибка prepare означает BLOCKED. Не копируй policy
+в skill и не считай частичную установку разрешением. Только когда оба сигнала
+отсутствуют и host mandate нет, создай обычный изолированный Git feature
+worktree с собственным origin пользователя. Установка skill не меняет remotes,
+не выполняет fetch/login и не создаёт сетевые действия; обычный Git workflow
+после setup следует применимым project instructions.
+
+## Delivery workflow
+
 1. Reader даёт координатору ссылки на релевантные исходники. Координатор фиксирует
    requirements, acceptance criteria, risk, task boundaries, base/head SHA и checks.
 2. Для architectural/high-risk задачи внешний reviewer проверяет план. Coder получает
