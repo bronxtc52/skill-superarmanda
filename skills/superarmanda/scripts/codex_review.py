@@ -147,13 +147,30 @@ def _unsafe_config(config):
         features.get(name) is not False for name in DISABLED_FEATURES
     ):
         return True
+    mcp_servers = config.get("mcp_servers")
+    if not isinstance(mcp_servers, dict) or any(
+        not isinstance(server, dict) or server.get("enabled") is not False
+        for server in mcp_servers.values()
+    ):
+        return True
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict) or (
+        plugins
+        and (
+            features.get("plugins") is not False
+            or features.get("remote_plugin") is not False
+        )
+    ):
+        return True
     if config.get("chatgpt_base_url") != "https://chatgpt.com/backend-api":
         return True
     skills = config.get("skills")
     if not isinstance(skills, dict) or skills.get("include_instructions") is not False:
         return True
     hooks = config.get("hooks")
-    if not isinstance(hooks, dict) or any(value != [] for value in hooks.values()):
+    if not isinstance(hooks, dict) or any(
+        name != "state" and value != [] for name, value in hooks.items()
+    ):
         return True
     apps = config.get("apps")
     if not isinstance(apps, dict) or set(apps) - {"_default"}:
@@ -172,9 +189,7 @@ def _unsafe_config(config):
         "model_catalog_json",
         "model_instructions_file",
         "experimental_instructions_file",
-        "mcp_servers",
         "notify",
-        "plugins",
         "model_providers",
         "experimental_thread_store_endpoint",
         "external_store",
