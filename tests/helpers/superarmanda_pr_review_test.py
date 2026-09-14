@@ -95,6 +95,63 @@ def observed_clean(sha=HEAD, header="Keep them coming!"):
     )
 
 
+# Live Codex comment bodies fetched via `gh api` for PRs #441 and #451 (issue
+# #442). Embedded byte-for-byte, including the 12-space line before
+# </details>; the trailing newline GitHub returns is stripped by text()'s
+# .strip(), same as the real fetch path. NOT built through observed_clean(),
+# which composes fixtures from an accepted-header list -- these are the raw
+# evidence the property has to accept on its own.
+RAW_CODEX_COMMENT_D37B123 = (
+    "Codex Review: Didn't find any major issues. :rocket:\n"
+    "\n"
+    "**Reviewed commit:** `d37b123ebd`\n"
+    "\n"
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>\n"
+    "<br/>\n"
+    "\n"
+    "[Your team has set up Codex to review pull requests in this repo]"
+    "(https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n"
+    "- Open a pull request for review\n"
+    "- Mark a draft as ready\n"
+    "- Comment \"@codex review\".\n"
+    "\n"
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.\n"
+    "\n"
+    "\n"
+    "\n"
+    "\n"
+    "Codex can also answer questions or update the PR. Try commenting "
+    "\"@codex address that feedback\".\n"
+    "            \n"
+    "</details>\n"
+)
+
+RAW_CODEX_COMMENT_737CE2B = (
+    "Codex Review: Didn't find any major issues. You're on a roll.\n"
+    "\n"
+    "**Reviewed commit:** `737ce2b8bf`\n"
+    "\n"
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>\n"
+    "<br/>\n"
+    "\n"
+    "[Your team has set up Codex to review pull requests in this repo]"
+    "(https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n"
+    "- Open a pull request for review\n"
+    "- Mark a draft as ready\n"
+    "- Comment \"@codex review\".\n"
+    "\n"
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.\n"
+    "\n"
+    "\n"
+    "\n"
+    "\n"
+    "Codex can also answer questions or update the PR. Try commenting "
+    "\"@codex address that feedback\".\n"
+    "            \n"
+    "</details>\n"
+)
+
+
 class EvaluateContract(unittest.TestCase):
     def evaluate(
         self, current=HEAD, reviews=(), comments=(), issues=(), resolve=lambda ref: None
@@ -167,18 +224,38 @@ class EvaluateContract(unittest.TestCase):
         )
         self.assertEqual(MODULE.clean_commit(raw_fetched_body), "039f737951")
 
-    def test_exact_chefs_kiss_clean_comment_requires_the_observed_footer(self):
-        exact = observed_clean(header="Chef's kiss.")
+    def test_raw_fetched_pr441_and_pr451_clean_comments_are_accepted(self):
+        """Live bodies from PR #441 (:rocket:) and #451 (You're on a roll.)."""
+        self.assertEqual(
+            MODULE.clean_commit(MODULE.text({"body": RAW_CODEX_COMMENT_D37B123})),
+            "d37b123ebd",
+        )
+        self.assertEqual(
+            MODULE.clean_commit(MODULE.text({"body": RAW_CODEX_COMMENT_737CE2B})),
+            "737ce2b8bf",
+        )
+        for raw, short_sha in (
+            (RAW_CODEX_COMMENT_D37B123, "d37b123ebd"),
+            (RAW_CODEX_COMMENT_737CE2B, "737ce2b8bf"),
+        ):
+            with self.subTest(short_sha=short_sha):
+                result = self.evaluate(
+                    issues=[issue(raw)],
+                    resolve=lambda ref, short_sha=short_sha: (
+                        HEAD if ref == short_sha else None
+                    ),
+                )
+                self.assertEqual(result["status"], "pass")
+                self.assertEqual(result["findings"], [])
+
+    def test_short_clean_header_with_punctuation_passes_and_keeps_the_observed_footer(
+        self,
+    ):
+        """Punctuation is not part of the accepted-phrase property (#442)."""
+        exact = observed_clean(header="Chef's kiss!")
         self.assertEqual(
             self.evaluate(issues=[issue(exact)], resolve=lambda ref: HEAD)["status"],
             "pass",
-        )
-        near_miss = observed_clean(header="Chef's kiss!")
-        self.assertEqual(
-            self.evaluate(issues=[issue(near_miss)], resolve=lambda ref: HEAD)[
-                "status"
-            ],
-            "findings",
         )
         carried_finding = {
             "user": actor(),
@@ -193,11 +270,14 @@ class EvaluateContract(unittest.TestCase):
         self.assertEqual(result["status"], "findings")
         self.assertEqual(result["findings"][0]["original_commit_id"], OLD)
 
-    def test_three_new_observed_clean_suffixes_are_exact_and_current_only(self):
+    def test_short_clean_header_accepts_arbitrary_short_phrases_but_stays_current_and_trusted(
+        self,
+    ):
         for header in (
             "Bravo.",
             "What shall we delve into next?",
             "Breezy!",
+            "Nice work, team!",
         ):
             with self.subTest(header=header):
                 exact = observed_clean(header=header)
@@ -211,7 +291,11 @@ class EvaluateContract(unittest.TestCase):
                     (exact + "\nA finding was appended.", actor(), lambda ref: HEAD),
                     (exact, actor(CODEX, "User"), lambda ref: HEAD),
                     (observed_clean(OLD, header), actor(), lambda ref: OLD),
-                    (exact.replace(header, "Unexpected prose."), actor(), lambda ref: HEAD),
+                    (
+                        exact.replace(header, "<script>alert(1)</script>"),
+                        actor(),
+                        lambda ref: HEAD,
+                    ),
                 ):
                     self.assertNotEqual(
                         self.evaluate(
@@ -219,6 +303,81 @@ class EvaluateContract(unittest.TestCase):
                         )["status"],
                         "pass",
                     )
+
+    def test_short_clean_header_structural_limits_are_enforced(self):
+        """Table from the #442 plan review: one subTest per named limitation,
+        each broken by exactly one of the mutations recorded in mutations.log.
+        """
+        cases = (
+            ("newline_in_header", "Nice.\nConsider validating tenant id."),
+            ("angle_brackets_in_header", "<b>ok</b>"),
+            ("square_brackets_in_header", "[x](y)"),
+            ("backtick_in_header", "`deadbeef`"),
+            ("header_too_long_49_chars", "x" * 49),
+            # The forbidden-character class must apply to the FIRST phrase
+            # character too, not just the rest: \S alone lets a lone leading
+            # #, <, or [ through even though the same char later in the
+            # phrase is already excluded (coordinator finding, #442 diff).
+            ("header_starts_with_hash", "#123 fixed"),
+            ("header_starts_with_angle", "<script src=x"),
+            ("header_starts_with_bracket", "[see notes"),
+            # Every prior forbidden-character case puts the character in the
+            # FIRST position, so the trailing class [^\n<>\[\]`#]{0,47} was
+            # never actually exercised: a mutation that widens it to [^\n]
+            # (still blocking newlines, nothing else) left the whole suite
+            # green (coordinator finding, PR #11 diff review). These put the
+            # forbidden character in the middle of the phrase instead.
+            ("mid_angle_brackets_in_header", "ok <b>x</b>"),
+            ("mid_square_brackets_in_header", "ok [x](y)"),
+            ("mid_backtick_in_header", "ok `sha`"),
+            ("mid_hash_in_header", "ok #1"),
+        )
+        for name, header in cases:
+            with self.subTest(name=name):
+                body = (
+                    "Codex Review: Didn't find any major issues. "
+                    + header
+                    + "\n\n**Reviewed commit:** `"
+                    + HEAD[:10]
+                    + "`\n\n"
+                    + OBSERVED_FOOTER
+                )
+                self.assertEqual(
+                    self.evaluate(issues=[issue(body)], resolve=lambda ref: HEAD)[
+                        "status"
+                    ],
+                    "findings",
+                )
+        with self.subTest(name="header_blank_after_period"):
+            # Two spaces: the mandatory leading space plus a whitespace-only
+            # "phrase" candidate. \S rejects it (a space is not \S). A weakened
+            # \S->. would accept the second space as the phrase's first char
+            # without having to swallow a newline, so this fixture is what
+            # that specific mutation needs to flip to pass.
+            blank = (
+                "Codex Review: Didn't find any major issues.  \n\n"
+                "**Reviewed commit:** `" + HEAD[:10] + "`\n\n" + OBSERVED_FOOTER
+            )
+            self.assertEqual(
+                self.evaluate(issues=[issue(blank)], resolve=lambda ref: HEAD)[
+                    "status"
+                ],
+                "findings",
+            )
+        with self.subTest(name="footer_missing_space"):
+            weakened_footer = OBSERVED_FOOTER.replace(
+                "<details> <summary>", "<details><summary>", 1
+            )
+            weakened = (
+                "Codex Review: Didn't find any major issues. :rocket:\n\n"
+                "**Reviewed commit:** `" + HEAD[:10] + "`\n\n" + weakened_footer
+            )
+            self.assertEqual(
+                self.evaluate(issues=[issue(weakened)], resolve=lambda ref: HEAD)[
+                    "status"
+                ],
+                "findings",
+            )
 
     def test_observed_clean_format_rejects_mutations_and_untrusted_or_stale_evidence(
         self,
