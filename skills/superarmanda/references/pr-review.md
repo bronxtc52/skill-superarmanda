@@ -44,7 +44,9 @@ GitHub</summary>`, including its observed whitespace before `</details>`. The cl
 accepted by *property*, not by a fixed wording list (Codex's own phrasing varies run to run —
 `:rocket:`, `You're on a roll.`, `Chef's kiss!`, … have all been observed live): it is optional;
 when present it is one line, 1–48 characters, and contains none of `\n`, `<`, `>`, `[`, `]`,
-`` ` ``, `#`. A phrase that is empty-after-a-trailing-space, spans multiple lines, carries
+`` ` ``, `#` **anywhere in it, including the first character** — a bare leading `#123 fixed`,
+`<script src=x`, or `[see notes` does not qualify as a phrase either. A phrase that is
+empty-after-a-trailing-space, spans multiple lines, carries
 markdown/HTML markup, or exceeds 48 characters does not match, and the comment falls through to
 `findings` for coordinator disposition — same as a weakened connector footer (e.g. a missing
 space in `<details> <summary>`). **The phrase itself is never proof of a clean review** — proof

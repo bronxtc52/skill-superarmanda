@@ -20,7 +20,7 @@ CLEAN_LEGACY = re.compile(
 )
 CLEAN_OBSERVED = re.compile(
     r"\ACodex Review: Didn't find any major issues\."
-    r"(?: \S[^\n<>\[\]`#]{0,47})?\n\n"
+    r"(?: [^\s<>\[\]`#][^\n<>\[\]`#]{0,47})?\n\n"
     r"\*\*Reviewed commit:\*\* `([0-9a-fA-F]+)`\n\n"
     r"<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n"
     r"\[Your team has set up Codex to review pull requests in this repo\]"

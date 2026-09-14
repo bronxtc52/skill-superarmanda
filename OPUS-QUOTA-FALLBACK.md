@@ -22,5 +22,6 @@ from `chatgpt-codex-connector[bot]` with actor type `Bot`, the existing exact
 footer, and an API-resolved SHA equal to the requested full SHA. The closing
 summary phrase is accepted by property (#442), not by a fixed wording list:
 one line, 1–48 characters, containing none of `\n`, `<`, `>`, `[`, `]`,
-`` ` ``, `#`. Any prose that breaks that property, any body mutation, finding,
+`` ` ``, `#` anywhere in it, including the first character. Any prose that
+breaks that property, any body mutation, finding,
 untrusted actor, stale review, or unresolved/mismatched SHA remains non-pass.

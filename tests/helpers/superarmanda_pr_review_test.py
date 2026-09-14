@@ -314,6 +314,13 @@ class EvaluateContract(unittest.TestCase):
             ("square_brackets_in_header", "[x](y)"),
             ("backtick_in_header", "`deadbeef`"),
             ("header_too_long_49_chars", "x" * 49),
+            # The forbidden-character class must apply to the FIRST phrase
+            # character too, not just the rest: \S alone lets a lone leading
+            # #, <, or [ through even though the same char later in the
+            # phrase is already excluded (coordinator finding, #442 diff).
+            ("header_starts_with_hash", "#123 fixed"),
+            ("header_starts_with_angle", "<script src=x"),
+            ("header_starts_with_bracket", "[see notes"),
         )
         for name, header in cases:
             with self.subTest(name=name):
