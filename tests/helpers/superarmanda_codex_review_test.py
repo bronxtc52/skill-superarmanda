@@ -19,6 +19,7 @@ import json, os, sys, time
 assert not any(key in os.environ for key in ("OTEL_EXPORTER_OTLP_ENDPOINT", "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_TLS_REJECT_UNAUTHORIZED"))
 mode=os.environ.get("SA_TEST_MODE", os.environ.get("SA_MODE", "success"))
 log=os.environ.get("SA_TEST_LOG") or os.environ["SA_LOG"]
+request_log=os.environ.get("SA_TEST_REQUEST_LOG")
 open(log,"w").write(json.dumps({"program":"codex","kind":"review","argv":sys.argv[1:],"disable_telemetry":os.environ.get("DISABLE_TELEMETRY"),"otel":os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"),"node_tls":os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED")})+"\n")
 def out(x): print(json.dumps(x), flush=True)
 def response(i, result): out({"id":i,"result":result})
@@ -26,6 +27,8 @@ config={"model_provider":"openai","forced_login_method":"chatgpt","web_search":"
 config["skills"]={"include_instructions":False}
 for line in sys.stdin:
  r=json.loads(line); i=r["id"]; m=r["method"]
+ if request_log:
+  with open(request_log,"a") as f: f.write(json.dumps({"request_method":m})+"\n")
  if mode=="timeout": time.sleep(5)
  if mode=="malformed": print("{",flush=True); continue
  if mode=="duplicate": print('{"id":%d,"id":%d,"result":{}}'%(i,i),flush=True); continue
@@ -50,6 +53,24 @@ for line in sys.stdin:
   if mode=="missing_backend": config.pop("chatgpt_base_url")
   if mode=="telemetry": config["otel"]["exporter"]={"otlp-http":{"endpoint":"https://invalid.example"}}
   if mode=="hook_command": config["hooks"]={"SessionStart":[{"command":"not-executed"}]}
+  if mode=="hook_state": config["hooks"]={"state":{"source":"trusted-metadata"}}
+  if mode=="hook_command_state": config["hooks"]={"state":{"source":"trusted-metadata"},"SessionStart":[{"command":"not-executed"}]}
+  if mode=="disabled_mcp": config["mcp_servers"]={"safe":{"enabled":False}}
+  if mode=="mcp_enabled": config["mcp_servers"]={"unsafe":{"enabled":True}}
+  if mode=="mcp_missing": config["mcp_servers"]={"unsafe":{}}
+  if mode=="mcp_false_like": config["mcp_servers"]={"unsafe":{"enabled":0}}
+  if mode=="mcp_malformed": config["mcp_servers"]={"unsafe":[]}
+  if mode=="mcp_mixed": config["mcp_servers"]={"safe":{"enabled":False},"unsafe":{"enabled":True}}
+  if mode=="missing_mcp_servers": config.pop("mcp_servers")
+  if mode=="malformed_mcp_servers": config["mcp_servers"]=[]
+  if mode=="enabled_plugin_entries": config["plugins"]={"safe":{"enabled":True}}
+  if mode in ("plugin_feature_enabled","remote_plugin_feature_enabled","plugin_feature_missing","remote_plugin_feature_missing"): config["plugins"]={"installed":{"enabled":True}}
+  if mode=="plugin_feature_enabled": config["features"]["plugins"]=True
+  if mode=="remote_plugin_feature_enabled": config["features"]["remote_plugin"]=True
+  if mode=="plugin_feature_missing": config["features"].pop("plugins")
+  if mode=="remote_plugin_feature_missing": config["features"].pop("remote_plugin")
+  if mode=="missing_plugins": config.pop("plugins")
+  if mode=="malformed_plugins": config["plugins"]=[]
   response(i,{"config":config})
  elif m=="account/read":
   account={"type":"api" if mode=="auth" else "chatgpt","planType":"free" if mode=="free" else "pro"}
@@ -111,12 +132,14 @@ class Contract(unittest.TestCase):
         bindir = root / "bin"
         bindir.mkdir()
         self.log = root / "argv.json"
+        self.request_log = root / "requests.jsonl"
         codex = bindir / "codex"
         codex.write_text(MOCK)
         codex.chmod(0o755)
         self.env = {
             "PATH": str(bindir) + os.pathsep + os.environ["PATH"],
             "SA_TEST_LOG": str(self.log),
+            "SA_TEST_REQUEST_LOG": str(self.request_log),
             "OPENAI_API_KEY": "must-not-pass",
             "OTEL_EXPORTER_OTLP_ENDPOINT": "private-telemetry",
             "DISABLE_TELEMETRY": "1",
@@ -131,17 +154,25 @@ class Contract(unittest.TestCase):
         }
 
     def invoke(self, mode="success", timeout=5):
+        self.request_log.unlink(missing_ok=True)
         env = {**self.env, "SA_TEST_MODE": mode}
         return adapter.run_review(
             "review", {"type": "object"}, timeout, env, self.temp.name
         )
+
+    def request_methods(self):
+        return [
+            json.loads(line)["request_method"]
+            for line in self.request_log.read_text().splitlines()
+            if "request_method" in json.loads(line)
+        ]
 
     def test_success_uses_spawn_overrides_and_empty_environments(self):
         response, meta = self.invoke()
         self.assertEqual(response, {"ok": True})
         self.assertTrue(meta["primary_model_verified"])
         self.assertTrue(meta["no_execution_tools"])
-        record = json.loads(self.log.read_text())
+        record = json.loads(self.log.read_text().splitlines()[0])
         argv = record["argv"]
         self.assertIn("app-server", argv)
         self.assertNotIn("--ignore-user-config", argv)
@@ -203,6 +234,34 @@ class Contract(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "review CLI failed: " + category),
             ):
                 self.invoke(mode)
+
+    def test_effective_config_allows_trusted_hook_state_disabled_mcp_and_plugins(self):
+        for mode in ("hook_state", "disabled_mcp", "enabled_plugin_entries"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.invoke(mode)[0], {"ok": True})
+
+    def test_effective_config_rejects_unsafe_hooks_mcp_and_plugin_features_before_auth(self):
+        cases = (
+            "hook_command_state",
+            "mcp_enabled",
+            "mcp_missing",
+            "mcp_false_like",
+            "mcp_malformed",
+            "mcp_mixed",
+            "missing_mcp_servers",
+            "malformed_mcp_servers",
+            "plugin_feature_enabled",
+            "remote_plugin_feature_enabled",
+            "plugin_feature_missing",
+            "remote_plugin_feature_missing",
+            "missing_plugins",
+            "malformed_plugins",
+        )
+        for mode in cases:
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(ValueError, "review CLI failed: config"):
+                    self.invoke(mode)
+                self.assertEqual(self.request_methods(), ["initialize", "config/read"])
 
     def test_tool_approval_malformed_and_ids_fail_closed(self):
         cases = (
