@@ -321,6 +321,16 @@ class EvaluateContract(unittest.TestCase):
             ("header_starts_with_hash", "#123 fixed"),
             ("header_starts_with_angle", "<script src=x"),
             ("header_starts_with_bracket", "[see notes"),
+            # Every prior forbidden-character case puts the character in the
+            # FIRST position, so the trailing class [^\n<>\[\]`#]{0,47} was
+            # never actually exercised: a mutation that widens it to [^\n]
+            # (still blocking newlines, nothing else) left the whole suite
+            # green (coordinator finding, PR #11 diff review). These put the
+            # forbidden character in the middle of the phrase instead.
+            ("mid_angle_brackets_in_header", "ok <b>x</b>"),
+            ("mid_square_brackets_in_header", "ok [x](y)"),
+            ("mid_backtick_in_header", "ok `sha`"),
+            ("mid_hash_in_header", "ok #1"),
         )
         for name, header in cases:
             with self.subTest(name=name):

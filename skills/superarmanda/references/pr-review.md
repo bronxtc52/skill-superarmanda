@@ -43,9 +43,13 @@ line and the exact GitHub connector footer beginning `<details> <summary>ℹ️ 
 GitHub</summary>`, including its observed whitespace before `</details>`. The closing phrase is
 accepted by *property*, not by a fixed wording list (Codex's own phrasing varies run to run —
 `:rocket:`, `You're on a roll.`, `Chef's kiss!`, … have all been observed live): it is optional;
-when present it is one line, 1–48 characters, and contains none of `\n`, `<`, `>`, `[`, `]`,
-`` ` ``, `#` **anywhere in it, including the first character** — a bare leading `#123 fixed`,
-`<script src=x`, or `[see notes` does not qualify as a phrase either. A phrase that is
+when present it is one line, 1–48 characters. Its **first character** must be non-whitespace
+and none of `<`, `>`, `[`, `]`, `` ` ``, `#`; its **remaining characters** (spaces allowed) must
+each be neither a newline nor one of that same `<>[]\`#` set — the forbidden characters are
+rejected throughout the phrase, not only at one end of it. A bare leading `#123 fixed`,
+`<script src=x`, or `[see notes` does not qualify as a phrase (fails on the first character),
+and neither does one with a forbidden character in the middle, such as `ok <b>x</b>`,
+`ok [x](y)`, `` ok `sha` ``, or `ok #1` (fails on a later character). A phrase that is
 empty-after-a-trailing-space, spans multiple lines, carries
 markdown/HTML markup, or exceeds 48 characters does not match, and the comment falls through to
 `findings` for coordinator disposition — same as a weakened connector footer (e.g. a missing
