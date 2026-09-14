@@ -332,8 +332,13 @@ class EvaluateContract(unittest.TestCase):
                     "findings",
                 )
         with self.subTest(name="header_blank_after_period"):
+            # Two spaces: the mandatory leading space plus a whitespace-only
+            # "phrase" candidate. \S rejects it (a space is not \S). A weakened
+            # \S->. would accept the second space as the phrase's first char
+            # without having to swallow a newline, so this fixture is what
+            # that specific mutation needs to flip to pass.
             blank = (
-                "Codex Review: Didn't find any major issues. \n\n"
+                "Codex Review: Didn't find any major issues.  \n\n"
                 "**Reviewed commit:** `" + HEAD[:10] + "`\n\n" + OBSERVED_FOOTER
             )
             self.assertEqual(
