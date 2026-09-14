@@ -21,7 +21,8 @@ and all substantive trusted-bot review/comment threads, are emitted as findings 
 disposition. They are never silently erased. CodeRabbit unavailability does not block, but any
 actual CodeRabbit finding remains a finding.
 
-Three exact clean-comment formats are accepted. The legacy format is:
+Two clean-comment formats are accepted, each a structure, not a wording list. The legacy format
+(unchanged by #442) is:
 
 ```
 Codex Review: Didn't find any major issues. :rocket:
@@ -34,13 +35,21 @@ equal the requested full SHA; prefix matching is not used. The same exact summar
 a current `APPROVED` or `COMMENTED` Codex review body only after the review `commit_id` and
 resolved body SHA both match the requested full SHA, with no current attached inline comment.
 CRLF is normalized. The rocket summary may have the exact legacy footer
-`<details><summary>About Codex</summary>Automated review.</details>`. The second format begins
-`Codex Review: Didn't find any major issues. Keep them coming!`, `Codex Review: Didn't find any
-major issues. Chef's kiss.`, `Codex Review: Didn't find any major issues. Bravo.`, `Codex Review:
-Didn't find any major issues. What shall we delve into next?`, or `Codex Review: Didn't find any
-major issues. Breezy!` and requires the exact GitHub connector footer beginning `<details>
-<summary>ℹ️ About Codex in GitHub</summary>`, including its observed whitespace before
-`</details>`. A Codex comment containing
+`<details><summary>About Codex</summary>Automated review.</details>`.
+
+The second (observed-connector) format begins `Codex Review: Didn't find any major issues.`
+optionally followed by one short closing phrase, then the fixed `**Reviewed commit:** \`SHA\``
+line and the exact GitHub connector footer beginning `<details> <summary>ℹ️ About Codex in
+GitHub</summary>`, including its observed whitespace before `</details>`. The closing phrase is
+accepted by *property*, not by a fixed wording list (Codex's own phrasing varies run to run —
+`:rocket:`, `You're on a roll.`, `Chef's kiss!`, … have all been observed live): it is optional;
+when present it is one line, 1–48 characters, and contains none of `\n`, `<`, `>`, `[`, `]`,
+`` ` ``, `#`. A phrase that is empty-after-a-trailing-space, spans multiple lines, carries
+markdown/HTML markup, or exceeds 48 characters does not match, and the comment falls through to
+`findings` for coordinator disposition — same as a weakened connector footer (e.g. a missing
+space in `<details> <summary>`). **The phrase itself is never proof of a clean review** — proof
+is always the pair (`gh api`-resolved commit SHA equals the requested full HEAD) and (zero inline
+comments/findings at that HEAD), exactly as for the legacy format. A Codex comment containing
 `<!-- codex-pull-request-review-summary -->` records completion only and never proves a clean
 review. Other formats are incomplete.
 

@@ -19,7 +19,8 @@ the refusal-fallback rejection.
 
 The GitHub evidence gate accepts only a fully anchored observed clean comment
 from `chatgpt-codex-connector[bot]` with actor type `Bot`, the existing exact
-footer, and an API-resolved SHA equal to the requested full SHA. Alongside the
-existing variants, the accepted exact summaries end in `Bravo.`, `What shall we
-delve into next?`, or `Breezy!`. Any other prose, body mutation, finding,
+footer, and an API-resolved SHA equal to the requested full SHA. The closing
+summary phrase is accepted by property (#442), not by a fixed wording list:
+one line, 1–48 characters, containing none of `\n`, `<`, `>`, `[`, `]`,
+`` ` ``, `#`. Any prose that breaks that property, any body mutation, finding,
 untrusted actor, stale review, or unresolved/mismatched SHA remains non-pass.
