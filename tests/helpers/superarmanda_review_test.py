@@ -389,6 +389,38 @@ class ReviewContract(unittest.TestCase):
             & scrubbed.keys()
         )
 
+    def test_environment_scrub_keeps_sandbox_proxy_only_under_marker(self):
+        spec = importlib.util.spec_from_file_location("scrub_proxy_review", REVIEW)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        proxy = {
+            key: "http://sandbox:token@localhost:3128"
+            for key in (
+                "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+            )
+        }
+        other = {"CLOUDSDK_PROXY_ADDRESS": "bad", "GRPC_PROXY": "bad", "RSYNC_PROXY": "bad"}
+        original = dict(module.os.environ)
+
+        def scrub(extra):
+            try:
+                for key in (*proxy, *other, "SANDBOX_RUNTIME", "CLAUDE_CODE_HOST_HTTP_PROXY_PORT"):
+                    module.os.environ.pop(key, None)
+                module.os.environ.update({**proxy, **other, **extra})
+                return module.scrubbed_environment()
+            finally:
+                module.os.environ.clear()
+                module.os.environ.update(original)
+
+        for marker in ("SANDBOX_RUNTIME", "CLAUDE_CODE_HOST_HTTP_PROXY_PORT"):
+            with self.subTest(marker=marker):
+                scrubbed = scrub({marker: "1"})
+                self.assertEqual({k: scrubbed.get(k) for k in proxy}, proxy)
+                self.assertEqual(scrubbed.get(marker), "1")
+                self.assertFalse(set(other) & scrubbed.keys())
+        self.assertFalse((set(proxy) | set(other)) & scrub({}).keys())
+
     def test_packet_loader_rejects_fifo_and_reads_at_most_the_declared_bound(self):
         spec = importlib.util.spec_from_file_location("bounded_packet_reader", REVIEW)
         module = importlib.util.module_from_spec(spec)

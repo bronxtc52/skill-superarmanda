@@ -269,6 +269,33 @@ class Contract(unittest.TestCase):
             adapter.scrubbed_environment({"NODE_TLS_REJECT_UNAUTHORIZED": "0"}),
         )
 
+    def test_environment_scrub_keeps_sandbox_proxy_only_under_marker(self):
+        proxy = {
+            key: "http://sandbox:token@localhost:3128"
+            for key in (
+                "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+            )
+        }
+        other = {
+            "CLOUDSDK_PROXY_ADDRESS": "bad",
+            "DOCKER_HTTP_PROXY": "bad",
+            "GRPC_PROXY": "bad",
+            "RSYNC_PROXY": "bad",
+            "OPENAI_API_KEY": "bad",
+        }
+        for marker in ("SANDBOX_RUNTIME", "CLAUDE_CODE_HOST_HTTP_PROXY_PORT"):
+            with self.subTest(marker=marker):
+                value = adapter.scrubbed_environment(
+                    {**proxy, **other, marker: "1", "HOME": "/login"}
+                )
+                self.assertEqual({k: value.get(k) for k in proxy}, proxy)
+                self.assertEqual(value.get(marker), "1")
+                self.assertFalse(set(other) & value.keys())
+                self.assertEqual(value["HOME"], "/login")
+        without = adapter.scrubbed_environment({**proxy, **other, "HOME": "/login"})
+        self.assertFalse((set(proxy) | set(other)) & without.keys())
+
     def test_long_delta_stream_and_packet_sized_prompt_are_accepted(self):
         response, _ = self.invoke("long_stream", timeout=2)
         self.assertEqual(response, {"ok": True})

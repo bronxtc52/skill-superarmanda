@@ -629,18 +629,38 @@ def reject_duplicate_keys(pairs):
     return value
 
 
+# Sandboxed Claude Code has egress ONLY through its proxy variables; the markers
+# are what the harness sets next to them. Keeping exactly that proxy under a
+# marker is not an alternate route: without it the child has no network at all.
+SANDBOX_MARKERS = ("SANDBOX_RUNTIME", "CLAUDE_CODE_HOST_HTTP_PROXY_PORT")
+SANDBOX_PROXY_KEYS = frozenset(
+    (
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    )
+)
+
+
+def sandbox_kept_keys(source):
+    if any(marker in source for marker in SANDBOX_MARKERS):
+        return SANDBOX_PROXY_KEYS | set(SANDBOX_MARKERS)
+    return frozenset()
+
+
 def scrubbed_environment():
     """Keep OS login support but remove API keys, proxying, and alternate routes."""
     blocked = re.compile(
         r"(API[_-]?KEY|TOKEN|SECRET|PASSWORD|OPENROUTER|LITELLM|PROXY|BASE[_-]?URL|BEDROCK|VERTEX|FOUNDRY|CREDENTIAL|ROUTING|LOADER|CONFIG|PLUGIN|EXTENSION|PYTHONPATH|NODE_(OPTIONS|PATH|EXTRA_CA_CERTS|TLS_REJECT_UNAUTHORIZED)|OTEL_|TELEMETRY|EXPORTER|ENDPOINT|SSL_CERT_FILE|SSL_CERT_DIR|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|^(LD_|DYLD_|BUN_))",
         re.I,
     )
+    kept = sandbox_kept_keys(os.environ)
     return {
         key: value
         for key, value in os.environ.items()
         if not key.startswith("GIT_")
         and (
-            key == "CLAUDE_CONFIG_DIR"
+            key in kept
+            or key == "CLAUDE_CONFIG_DIR"
             or (key == "DISABLE_TELEMETRY" and value == "1")
             or not blocked.search(key)
         )
