@@ -396,11 +396,17 @@ class ReviewContract(unittest.TestCase):
         proxy = {
             key: "http://sandbox:token@localhost:3128"
             for key in (
-                "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
-                "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy",
             )
         }
-        other = {"CLOUDSDK_PROXY_ADDRESS": "bad", "GRPC_PROXY": "bad", "RSYNC_PROXY": "bad"}
+        other = {
+            "NO_PROXY": "chatgpt.com",
+            "no_proxy": "localhost",
+            "CLOUDSDK_PROXY_ADDRESS": "bad",
+            "GRPC_PROXY": "bad",
+            "RSYNC_PROXY": "bad",
+        }
         original = dict(module.os.environ)
 
         def scrub(extra):

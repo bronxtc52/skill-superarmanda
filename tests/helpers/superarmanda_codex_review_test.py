@@ -273,11 +273,15 @@ class Contract(unittest.TestCase):
         proxy = {
             key: "http://sandbox:token@localhost:3128"
             for key in (
-                "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
-                "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy",
             )
         }
         other = {
+            # NO_PROXY is a bypass list, never an admitted route: a forged
+            # NO_PROXY=chatgpt.com would send the CLI around the proxy.
+            "NO_PROXY": "chatgpt.com",
+            "no_proxy": "localhost",
             "CLOUDSDK_PROXY_ADDRESS": "bad",
             "DOCKER_HTTP_PROXY": "bad",
             "GRPC_PROXY": "bad",

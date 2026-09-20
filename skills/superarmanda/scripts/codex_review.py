@@ -79,11 +79,11 @@ def _json(raw):
 # are what the harness sets next to them. Keeping exactly that proxy under a
 # marker is not an alternate route: without it the child has no network at all.
 SANDBOX_MARKERS = ("SANDBOX_RUNTIME", "CLAUDE_CODE_HOST_HTTP_PROXY_PORT")
+# NO_PROXY / no_proxy are never admitted: they are host lists, not URLs, and a
+# caller-controlled NO_PROXY=chatgpt.com would route the CLI around the admitted
+# proxy onto the ambient network. Every variable kept here is a validated URL.
 SANDBOX_PROXY_KEYS = frozenset(
-    (
-        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
-        "http_proxy", "https_proxy", "no_proxy", "all_proxy",
-    )
+    ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 )
 
 
@@ -103,11 +103,7 @@ def sandbox_kept_keys(source):
     """Fail closed: a marker with any non-loopback proxy is not the sandbox we know."""
     if not any(marker in source for marker in SANDBOX_MARKERS):
         return frozenset()
-    urls = [
-        source[k]
-        for k in sorted(SANDBOX_PROXY_KEYS)
-        if k in source and k.lower() != "no_proxy"
-    ]
+    urls = [source[k] for k in sorted(SANDBOX_PROXY_KEYS) if k in source]
     if not urls or not all(loopback_proxy(v) for v in urls):
         return frozenset()
     return SANDBOX_PROXY_KEYS | set(SANDBOX_MARKERS)
