@@ -420,6 +420,8 @@ class ReviewContract(unittest.TestCase):
                 self.assertEqual(scrubbed.get(marker), "1")
                 self.assertFalse(set(other) & scrubbed.keys())
         self.assertFalse((set(proxy) | set(other)) & scrub({}).keys())
+        forged = scrub({"SANDBOX_RUNTIME": "1", "HTTPS_PROXY": "http://proxy.corp.example:3128"})
+        self.assertFalse(set(proxy) & forged.keys())
 
     def test_packet_loader_rejects_fifo_and_reads_at_most_the_declared_bound(self):
         spec = importlib.util.spec_from_file_location("bounded_packet_reader", REVIEW)

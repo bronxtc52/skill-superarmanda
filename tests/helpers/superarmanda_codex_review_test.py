@@ -295,6 +295,16 @@ class Contract(unittest.TestCase):
                 self.assertEqual(value["HOME"], "/login")
         without = adapter.scrubbed_environment({**proxy, **other, "HOME": "/login"})
         self.assertFalse((set(proxy) | set(other)) & without.keys())
+        # A marker beside a remote proxy is an alternate route, not the sandbox.
+        remote = dict(proxy, HTTPS_PROXY="http://proxy.corp.example:3128")
+        forged = adapter.scrubbed_environment({**remote, "SANDBOX_RUNTIME": "1"})
+        self.assertFalse(set(proxy) & forged.keys())
+        for value in ("http://user:pw@127.0.0.1:3128", "localhost:3128", "http://[::1]:3128"):
+            with self.subTest(value=value):
+                kept = adapter.scrubbed_environment(
+                    {"HTTPS_PROXY": value, "SANDBOX_RUNTIME": "1"}
+                )
+                self.assertEqual(kept.get("HTTPS_PROXY"), value)
 
     def test_long_delta_stream_and_packet_sized_prompt_are_accepted(self):
         response, _ = self.invoke("long_stream", timeout=2)

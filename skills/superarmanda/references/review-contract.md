@@ -48,7 +48,7 @@ Git to ignore them. Before such a check, initialized submodules are bounded to
 32 levels and their Git routing and filter configuration are audited.
 Status runs separately in every audited root: the ignore override is not
 inherited by Git's recursive child status processes.
-Under the Claude Code sandbox (marker `SANDBOX_RUNTIME` or `CLAUDE_CODE_HOST_HTTP_PROXY_PORT`) the scrub keeps exactly the sandbox proxy variables (`HTTP(S)_PROXY`, `NO_PROXY`, `ALL_PROXY` and lowercase twins): that proxy is the trusted egress route, not an alternate routing knob — without it the child has no network at all. Every other `*PROXY*` variable is still removed.
+Under the Claude Code sandbox (marker `SANDBOX_RUNTIME` or `CLAUDE_CODE_HOST_HTTP_PROXY_PORT`) the scrub keeps exactly the sandbox proxy variables (`HTTP(S)_PROXY`, `NO_PROXY`, `ALL_PROXY` and lowercase twins), and only when every proxy URL points at loopback (`localhost`, `127.0.0.1`, `::1`): that proxy is the trusted egress route, not an alternate routing knob — without it the child has no network at all. Every other `*PROXY*` variable is still removed.
 
 Astra uses `scripts/codex_review.py` and the installed Codex App Server stdio protocol.
 The process receives disabling overrides before startup; effective config, exact

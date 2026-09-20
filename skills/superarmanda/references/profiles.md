@@ -45,7 +45,7 @@ artifact. Runner не выбирает Opus сам, не принимает мо
 Проверен Codex CLI 0.154.0 на mh-central; неизвестный протокол не считается успехом.
 Оба адаптера должны дать `gate_ready: true` для pass; сам статус pass без
 подтверждённых capabilities не закрывает gate. Это ограничение инструментов
-CLI, не OS sandbox для процесса CLI. Под sandbox Claude Code (маркер `SANDBOX_RUNTIME`/`CLAUDE_CODE_HOST_HTTP_PROXY_PORT` в окружении) child получает ровно proxy-переменные песочницы (`HTTP(S)_PROXY`/`NO_PROXY`/`ALL_PROXY` + lowercase): это доверенный маршрут egress, а не подмена routing — без него сети нет вовсе; прочие `*PROXY*` по-прежнему вырезаются. Вход через существующий HOME/CODEX_HOME;
+CLI, не OS sandbox для процесса CLI. Под sandbox Claude Code (маркер `SANDBOX_RUNTIME`/`CLAUDE_CODE_HOST_HTTP_PROXY_PORT` в окружении) child получает ровно proxy-переменные песочницы (`HTTP(S)_PROXY`/`NO_PROXY`/`ALL_PROXY` + lowercase): и только если все они указывают на loopback (`localhost`/`127.0.0.1`/`::1`) — это доверенный маршрут egress, а не подмена routing: без него сети нет вовсе, а маркер рядом с внешним proxy вырезается как подмена; прочие `*PROXY*` по-прежнему вырезаются. Вход через существующий HOME/CODEX_HOME;
 не копировать OAuth stores, не подменять login location, не использовать API fallback.
 Первичная Fable-попытка при quota остаётся unavailable. При подтверждённом
 quota evidence успешная отдельная Opus-попытка для того же current SHA может

@@ -12,6 +12,7 @@ import re
 import selectors
 import signal
 import subprocess
+import urllib.parse
 import time
 from collections import deque
 from pathlib import Path
@@ -86,10 +87,30 @@ SANDBOX_PROXY_KEYS = frozenset(
 )
 
 
+LOOPBACK_HOSTS = frozenset(("localhost", "127.0.0.1", "::1"))
+
+
+def loopback_proxy(value):
+    """True only for a proxy URL whose host is this machine — the sandbox proxy is one."""
+    target = value if "://" in value else "http://" + value
+    try:
+        return urllib.parse.urlsplit(target).hostname in LOOPBACK_HOSTS
+    except ValueError:
+        return False
+
+
 def sandbox_kept_keys(source):
-    if any(marker in source for marker in SANDBOX_MARKERS):
-        return SANDBOX_PROXY_KEYS | set(SANDBOX_MARKERS)
-    return frozenset()
+    """Fail closed: a marker with any non-loopback proxy is not the sandbox we know."""
+    if not any(marker in source for marker in SANDBOX_MARKERS):
+        return frozenset()
+    urls = [
+        source[k]
+        for k in sorted(SANDBOX_PROXY_KEYS)
+        if k in source and k.lower() != "no_proxy"
+    ]
+    if not urls or not all(loopback_proxy(v) for v in urls):
+        return frozenset()
+    return SANDBOX_PROXY_KEYS | set(SANDBOX_MARKERS)
 
 
 def scrubbed_environment(source=None):
