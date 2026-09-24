@@ -984,7 +984,15 @@ class StateContract(unittest.TestCase):
         manifest.write_text(json.dumps(legacy, sort_keys=True), encoding="utf-8")
         for command in (
             ("status",),
-            ("fix-loop", "--task", "implement", "--outcome", "failed"),
+            (
+                "fix-loop",
+                "--task",
+                "implement",
+                "--outcome",
+                "failed",
+                "--source",
+                "tester",
+            ),
         ):
             with self.subTest(command=command[0]):
                 manifest.write_text(
@@ -1131,8 +1139,19 @@ class StateContract(unittest.TestCase):
         self.assertNotIn("complete", entry["status"])
 
     def test_three_failed_fix_cycles_stay_blocked_across_resume(self):
-        for _ in range(3):
-            self.cli("fix-loop", "--task", "implement", "--outcome", "failed")
+        # Three distinct sources keep every per-source counter below the
+        # needs_decision threshold, so this exercises the unchanged global
+        # cap in isolation from the new per-source gate.
+        for source in ("tester", "github_codex_review", "coderabbit"):
+            self.cli(
+                "fix-loop",
+                "--task",
+                "implement",
+                "--outcome",
+                "failed",
+                "--source",
+                source,
+            )
         entry = self.manifest_data()["tasks"]["implement"]
         self.assertEqual((entry["status"], entry["fix_cycles"]), ("blocked", 3))
         self.resume()
@@ -1142,6 +1161,413 @@ class StateContract(unittest.TestCase):
             "fix-loop", "--task", "implement", "--outcome", "pass", check=False
         )
         self.assertNotEqual(retry.returncode, 0)
+
+    def test_fix_loop_failed_requires_a_known_source(self):
+        missing = self.cli(
+            "fix-loop", "--task", "implement", "--outcome", "failed", check=False
+        )
+        self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+
+        unknown = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "coder",
+            check=False,
+        )
+        self.assertNotEqual(unknown.returncode, 0, unknown.stdout + unknown.stderr)
+
+    def test_fix_loop_pass_rejects_source(self):
+        rejected = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "pass",
+            "--source",
+            "tester",
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+
+    def test_second_failed_from_same_source_needs_decision_and_blocks_progress(self):
+        self.record("coder", session="coder-before-decision")
+
+        first = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        self.assertEqual(json.loads(first.stdout)["status"], "needs_fix")
+
+        second = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        entry = json.loads(second.stdout)
+        self.assertEqual(entry["status"], "needs_decision")
+        self.assertEqual(entry["decision_required_for"], "tester")
+        self.assertEqual(entry["fix_sources"]["tester"], 2)
+
+        # In needs_decision, task-result and both fix-loop outcomes are all
+        # rejected regardless of role or outcome direction.
+        blocked_result = self.record("tester", check=False)
+        self.assertNotEqual(
+            blocked_result.returncode, 0, blocked_result.stdout + blocked_result.stderr
+        )
+        blocked_pass = self.cli(
+            "fix-loop", "--task", "implement", "--outcome", "pass", check=False
+        )
+        self.assertNotEqual(
+            blocked_pass.returncode, 0, blocked_pass.stdout + blocked_pass.stderr
+        )
+        blocked_failed = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+            check=False,
+        )
+        self.assertNotEqual(
+            blocked_failed.returncode, 0, blocked_failed.stdout + blocked_failed.stderr
+        )
+
+        # resume() must not clear needs_decision even though it invalidates
+        # the now-stale coder result for the changed tree.
+        (self.repo / "tracked.txt").write_text("resume mutation\n", encoding="utf-8")
+        self.resume()
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "needs_decision")
+        self.assertEqual(entry["decision_required_for"], "tester")
+        self.assertEqual(entry["fix_sources"]["tester"], 2)
+        self.assertEqual(entry["results"], {})
+
+    def test_decision_requires_needs_decision_state_and_a_valid_note(self):
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        too_early = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--decision",
+            "invariant",
+            "--note",
+            "ok",
+            check=False,
+        )
+        self.assertNotEqual(too_early.returncode, 0, too_early.stdout + too_early.stderr)
+
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "needs_decision")
+
+        empty_note = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--decision",
+            "invariant",
+            "--note",
+            "   ",
+            check=False,
+        )
+        self.assertNotEqual(
+            empty_note.returncode, 0, empty_note.stdout + empty_note.stderr
+        )
+
+        long_note = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--decision",
+            "invariant",
+            "--note",
+            "x" * 501,
+            check=False,
+        )
+        self.assertNotEqual(long_note.returncode, 0, long_note.stdout + long_note.stderr)
+
+        multiline_note = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--decision",
+            "invariant",
+            "--note",
+            "line one\nline two",
+            check=False,
+        )
+        self.assertNotEqual(
+            multiline_note.returncode, 0, multiline_note.stdout + multiline_note.stderr
+        )
+
+        both_flags = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--decision",
+            "invariant",
+            "--note",
+            "ok",
+            check=False,
+        )
+        self.assertNotEqual(
+            both_flags.returncode, 0, both_flags.stdout + both_flags.stderr
+        )
+
+        accepted = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--decision",
+            "invariant",
+            "--note",
+            "keep the retry budget, this is the same nil-check edge",
+        )
+        entry = json.loads(accepted.stdout)
+        self.assertEqual(entry["status"], "needs_fix")
+        self.assertIsNone(entry["decision_required_for"])
+        self.assertEqual(len(entry["decisions"]), 1)
+        self.assertEqual(entry["decisions"][0]["source"], "tester")
+        self.assertEqual(entry["decisions"][0]["decision"], "invariant")
+
+    def test_decision_source_must_match_decision_required_for(self):
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "needs_decision")
+        self.assertEqual(entry["decision_required_for"], "tester")
+
+        mismatched = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--decision",
+            "invariant",
+            "--note",
+            "wrong source guess",
+            "--source",
+            "coderabbit",
+            check=False,
+        )
+        self.assertNotEqual(
+            mismatched.returncode, 0, mismatched.stdout + mismatched.stderr
+        )
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "needs_decision")
+        self.assertEqual(entry["decision_required_for"], "tester")
+        self.assertEqual(entry["decisions"], [])
+
+        matched = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--decision",
+            "invariant",
+            "--note",
+            "matches the pending source",
+            "--source",
+            "tester",
+        )
+        entry = json.loads(matched.stdout)
+        self.assertEqual(entry["status"], "needs_fix")
+        self.assertIsNone(entry["decision_required_for"])
+        self.assertEqual(entry["decisions"][0]["source"], "tester")
+
+    def test_status_preserves_needs_decision_and_decision_required_for_on_changed_tree(
+        self,
+    ):
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "needs_decision")
+
+        before = self.manifest.read_bytes()
+        (self.repo / "tracked.txt").write_text(
+            "status changed tree\n", encoding="utf-8"
+        )
+        self.git("add", "tracked.txt")
+        self.git("commit", "-qm", "change tree without resume")
+
+        report = json.loads(self.cli("status").stdout)
+        self.assertFalse(report["tree_matches"])
+        reported = report["tasks"]["implement"]
+        self.assertEqual(reported["status"], "needs_decision")
+        self.assertEqual(reported["decision_required_for"], "tester")
+
+        # status is read-only: the manifest on disk must be byte-identical.
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_third_failed_call_from_the_same_source_hits_the_global_cap_after_a_decision(
+        self,
+    ):
+        # One decision buys exactly one more round; the very next failed call
+        # is also the third GLOBAL fix cycle, so the unchanged 3-cycle cap
+        # wins over a second needs_decision for the same source.
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--decision",
+            "cut_surface",
+            "--note",
+            "trim the surface tester keeps re-flagging",
+        )
+        third = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        entry = json.loads(third.stdout)
+        self.assertEqual((entry["status"], entry["fix_cycles"]), ("blocked", 3))
+        self.assertEqual(entry["fix_sources"]["tester"], 3)
+
+    def test_third_failed_call_from_a_different_source_still_hits_the_global_cap(self):
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "github_codex_review",
+        )
+        third = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        entry = json.loads(third.stdout)
+        # tester's own per-source count reaches 2 on this very call, which
+        # would normally require a decision, but it is also the third global
+        # cycle, and the cap takes priority.
+        self.assertEqual((entry["status"], entry["fix_cycles"]), ("blocked", 3))
+        self.assertEqual(entry["fix_sources"]["tester"], 2)
+
+    def test_legacy_manifest_without_fix_sources_accepts_failed_with_source(self):
+        data = self.manifest_data()
+        data["tasks"] = {
+            "implement": {
+                "status": "pending",
+                "fix_cycles": 0,
+                "results": {},
+                "session_roles": {},
+            }
+        }
+        self.manifest.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        result = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        entry = json.loads(result.stdout)
+        self.assertEqual(entry["status"], "needs_fix")
+        self.assertEqual(entry["fix_sources"], {"tester": 1})
+        self.assertEqual(entry["decisions"], [])
+        self.assertIsNone(entry["decision_required_for"])
 
     def test_manifest_binds_one_run_to_its_repo_base_and_head(self):
         data = self.manifest_data()
@@ -1207,7 +1633,18 @@ class StateContract(unittest.TestCase):
                     "evidence",
                 ),
             ),
-            ("fix-loop", ("fix-loop", "--task", "implement", "--outcome", "failed")),
+            (
+                "fix-loop",
+                (
+                    "fix-loop",
+                    "--task",
+                    "implement",
+                    "--outcome",
+                    "failed",
+                    "--source",
+                    "tester",
+                ),
+            ),
         ):
             with self.subTest(operation=label):
                 if lock.exists() or lock.is_symlink():
