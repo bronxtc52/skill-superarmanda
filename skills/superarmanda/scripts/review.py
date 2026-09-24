@@ -714,7 +714,7 @@ def authenticated(cli, timeout, env, cwd):
 def profiles(host):
     claude_profiles = {
         "codex-host": "fable",
-        "codex-host-opus": "claude-opus-4-8",
+        "codex-host-opus": "claude-opus-5-5",
     }
     if host in claude_profiles:
         selector = claude_profiles[host]
@@ -751,7 +751,7 @@ def profiles(host):
 def expected_primary_model(profile):
     return {
         "codex-host": "claude-fable-5-1",
-        "codex-host-opus": "claude-opus-4-8",
+        "codex-host-opus": "claude-opus-5-5",
     }.get(profile)
 
 
