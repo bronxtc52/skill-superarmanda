@@ -66,7 +66,10 @@ never reset by `resume`, even when it also invalidates stale role results for th
 coordinator является единственным writer manifest; POSIX lock также защищает
 короткие read-modify-write операции. Store a manifest outside the repository or at a gitignored
 path, so writing local state cannot itself change the reviewed tree. `status` reports `tree_matches`
-without mutating state and never reports stale evidence as `ready_for_pr_review`.
+without mutating state and never reports stale evidence as `ready_for_pr_review`; on a mismatched
+tree it downgrades every displayed task status to `pending` for the printed report only, except
+`blocked` and `needs_decision` (with its `decision_required_for`), which are shown as recorded,
+mirroring what `resume` itself preserves.
 
 Record a role with `task-result --task <id> --role <role> --status <status> --session-id <id> --head <sha>`.
 The only valid roles are `coder`, `tester`, `cross_provider_reviewer`,
@@ -94,7 +97,9 @@ becomes `needs_decision` with `decision_required_for` set to that source. While 
 `task-result` (any role) and both `fix-loop --outcome pass` and `fix-loop --outcome failed` are
 rejected with a message naming the source and the required `--decision` call. Only
 `fix-loop --decision <invariant|cut_surface|accept_limitation> --note <text>` is accepted in that
-state; `--note` is required, non-empty, at most 500 characters and must not contain a line break. It
+state; `--note` is required, non-empty, at most 500 characters and must not contain a line break.
+`--decision` also accepts an optional `--source`, but only as a confirmation: when given it must
+equal the pending `decision_required_for`, or the call is rejected. It
 appends `{source, decision, note, recorded_at}` to `decisions`, clears `decision_required_for` and
 returns status to `needs_fix`; one decision buys exactly one more round for that source; the next
 failed round from the same source can raise `needs_decision` again only if the unchanged 3-cycle

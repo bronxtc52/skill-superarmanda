@@ -675,7 +675,7 @@ def status(args):
     )
     if not data["tree_matches"]:
         for entry in data["tasks"].values():
-            if entry.get("status") != "blocked":
+            if entry.get("status") not in ("blocked", "needs_decision"):
                 entry["status"] = "pending"
     print(json.dumps(data, sort_keys=True))
 
@@ -776,6 +776,12 @@ def record_decision(args, entry):
     """A recorded decision buys exactly one more round for its source."""
     if entry["status"] != "needs_decision":
         fail("--decision is only allowed while the task is needs_decision")
+    if args.source is not None and args.source != entry["decision_required_for"]:
+        fail(
+            "--source "
+            f"{args.source} does not match the pending decision_required_for "
+            f"{entry['decision_required_for']}"
+        )
     note = args.note
     if note is None or not note.strip():
         fail("--decision requires a non-empty --note")

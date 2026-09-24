@@ -1363,6 +1363,105 @@ class StateContract(unittest.TestCase):
         self.assertEqual(entry["decisions"][0]["source"], "tester")
         self.assertEqual(entry["decisions"][0]["decision"], "invariant")
 
+    def test_decision_source_must_match_decision_required_for(self):
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "needs_decision")
+        self.assertEqual(entry["decision_required_for"], "tester")
+
+        mismatched = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--decision",
+            "invariant",
+            "--note",
+            "wrong source guess",
+            "--source",
+            "coderabbit",
+            check=False,
+        )
+        self.assertNotEqual(
+            mismatched.returncode, 0, mismatched.stdout + mismatched.stderr
+        )
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "needs_decision")
+        self.assertEqual(entry["decision_required_for"], "tester")
+        self.assertEqual(entry["decisions"], [])
+
+        matched = self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--decision",
+            "invariant",
+            "--note",
+            "matches the pending source",
+            "--source",
+            "tester",
+        )
+        entry = json.loads(matched.stdout)
+        self.assertEqual(entry["status"], "needs_fix")
+        self.assertIsNone(entry["decision_required_for"])
+        self.assertEqual(entry["decisions"][0]["source"], "tester")
+
+    def test_status_preserves_needs_decision_and_decision_required_for_on_changed_tree(
+        self,
+    ):
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        self.cli(
+            "fix-loop",
+            "--task",
+            "implement",
+            "--outcome",
+            "failed",
+            "--source",
+            "tester",
+        )
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "needs_decision")
+
+        before = self.manifest.read_bytes()
+        (self.repo / "tracked.txt").write_text(
+            "status changed tree\n", encoding="utf-8"
+        )
+        self.git("add", "tracked.txt")
+        self.git("commit", "-qm", "change tree without resume")
+
+        report = json.loads(self.cli("status").stdout)
+        self.assertFalse(report["tree_matches"])
+        reported = report["tasks"]["implement"]
+        self.assertEqual(reported["status"], "needs_decision")
+        self.assertEqual(reported["decision_required_for"], "tester")
+
+        # status is read-only: the manifest on disk must be byte-identical.
+        self.assertEqual(self.manifest.read_bytes(), before)
+
     def test_third_failed_call_from_the_same_source_hits_the_global_cap_after_a_decision(
         self,
     ):
