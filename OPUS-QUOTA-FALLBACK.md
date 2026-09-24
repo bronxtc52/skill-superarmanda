@@ -12,7 +12,7 @@ assistant text, or retry a failed Fable review with Opus.
 `codex-host` remains pinned to requested and observed
 `claude-fable-5-1` evidence through the Claude CLI's `fable` selector.
 `codex-host-opus` is pinned to the Claude CLI selector and observed metadata
-`claude-opus-4-8`. Both profiles retain first-party `claude.ai` subscription
+`claude-opus-5-5`. Both profiles retain first-party `claude.ai` subscription
 authentication, the current safe-mode command, empty tools/MCP/plugins,
 StructuredOutput-only validation, exact packet head and hash validation, and
 the refusal-fallback rejection.

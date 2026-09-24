@@ -96,7 +96,8 @@ if name == "claude":
         print(json.dumps({"is_error": False, "result": json.dumps(response), "structured_output": response}))
     else:
         requested = argv[argv.index("--model") + 1]
-        expected = {"fable": "claude-fable-5-1", "claude-opus-4-8": "claude-opus-4-8"}[requested]
+        expected = {"fable": "claude-fable-5-1", "claude-opus-5-5": "claude-opus-5-5"}[requested]
+        if mode == "opus_stale_pin": expected = "claude-opus-4-8"
         init = {"type": "system", "subtype": "init", "session_id": "claude-session", "model": expected, "tools": ["StructuredOutput"], "mcp_servers": [], "plugins": []}
         if mode == "claude_tools": init["tools"] = ["Read"]
         if mode == "claude_tools_nonlist": init["tools"] = "StructuredOutput"
@@ -1035,10 +1036,10 @@ raise SystemExit(1)
         auth, review = self.logs()
         self.assertEqual(auth["program"], "claude")
         self.assertEqual(review["program"], "claude")
-        self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "claude-opus-4-8")
+        self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "claude-opus-5-5")
         result = self.result()
-        self.assertEqual(result["requested_model"], "claude-opus-4-8")
-        self.assertEqual(result["observed_models"], {"claude-opus-4-8": {"inputTokens": 1}})
+        self.assertEqual(result["requested_model"], "claude-opus-5-5")
+        self.assertEqual(result["observed_models"], {"claude-opus-5-5": {"inputTokens": 1}})
         self.assertTrue(result["gate_ready"])
 
         for mode in (
@@ -1049,6 +1050,7 @@ raise SystemExit(1)
             "opus_refusal",
             "opus_mcp",
             "opus_plugins",
+            "opus_stale_pin",
             "claude_execution_tool",
             "wrong_head",
             "wrong_hash",

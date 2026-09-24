@@ -76,7 +76,7 @@ verified primary Fable evidence.
 
 `codex-host-opus` is a separate fixed Claude CLI profile. It passes primary
 model verification only when init metadata, every assistant event, and a
-`modelUsage` entry all identify exactly `claude-opus-4-8`, with at least one
+`modelUsage` entry all identify exactly `claude-opus-5-5`, with at least one
 assistant event and no `model_refusal_fallback`. It retains the same empty
 tools/MCP/plugins and StructuredOutput-only checks. The runner neither routes
 to this profile nor accepts a caller-supplied model.
