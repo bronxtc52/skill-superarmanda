@@ -21,6 +21,9 @@ ROLES = {
     "coderabbit",
 }
 STATUSES = {"pass", "findings", "incomplete", "error", "unavailable"}
+FIX_SOURCES = {"cross_provider_reviewer", "github_codex_review", "coderabbit", "tester"}
+DECISIONS = {"invariant", "cut_surface", "accept_limitation"}
+MAX_DECISION_NOTE_LENGTH = 500
 
 
 def fail(message):
@@ -572,6 +575,9 @@ def task(data, name):
         name, {"status": "pending", "fix_cycles": 0, "results": {}, "session_roles": {}}
     )
     entry.setdefault("session_roles", {})
+    entry.setdefault("fix_sources", {})
+    entry.setdefault("decisions", [])
+    entry.setdefault("decision_required_for", None)
     for role, result in entry.get("results", {}).items():
         entry["session_roles"].setdefault(result["session_id"], role)
     return entry
@@ -628,7 +634,7 @@ def invalidate(data, head, tree):
         ]
         for role in stale:
             del entry["results"][role]
-        if stale and entry["status"] != "blocked":
+        if stale and entry["status"] not in ("blocked", "needs_decision"):
             entry["status"] = "pending"
             invalidated.append(name)
     data["head"] = head
@@ -705,6 +711,11 @@ def result(args):
     entry = task(data, args.task)
     if entry["status"] == "blocked":
         fail("task is blocked after three fix cycles; explicit human reset is required")
+    if entry["status"] == "needs_decision":
+        fail(
+            "decision required for source "
+            f"{entry['decision_required_for']}: run fix-loop --decision ..."
+        )
     owner = session_owners(data).get(args.session_id)
     if owner is not None and owner != (args.task, args.role):
         fail("session_id is already used by another task or role for this run")
@@ -752,7 +763,47 @@ def fix_loop(args):
     entry = task(data, args.task)
     if entry["status"] == "blocked":
         fail("task is blocked after three fix cycles; explicit human reset is required")
+    if args.decision is not None:
+        record_decision(args, entry)
+    else:
+        record_fix_outcome(args, entry, data, location)
+    data["updated_at"] = now()
+    write(path, data)
+    print(json.dumps(entry, sort_keys=True))
+
+
+def record_decision(args, entry):
+    """A recorded decision buys exactly one more round for its source."""
+    if entry["status"] != "needs_decision":
+        fail("--decision is only allowed while the task is needs_decision")
+    note = args.note
+    if note is None or not note.strip():
+        fail("--decision requires a non-empty --note")
+    if len(note) > MAX_DECISION_NOTE_LENGTH:
+        fail(f"--note must be at most {MAX_DECISION_NOTE_LENGTH} characters")
+    if "\n" in note or "\r" in note:
+        fail("--note must not contain line breaks")
+    entry["decisions"].append(
+        {
+            "source": entry["decision_required_for"],
+            "decision": args.decision,
+            "note": note,
+            "recorded_at": now(),
+        }
+    )
+    entry["decision_required_for"] = None
+    entry["status"] = "needs_fix"
+
+
+def record_fix_outcome(args, entry, data, location):
+    if entry["status"] == "needs_decision":
+        fail(
+            "decision required for source "
+            f"{entry['decision_required_for']}: run fix-loop --decision ..."
+        )
     if args.outcome == "pass":
+        if args.source is not None:
+            fail("--source is only allowed with --outcome failed")
         if (
             data["repo"] != location
             or commit(location, "HEAD") != data["head"]
@@ -762,14 +813,20 @@ def fix_loop(args):
         update_task_status(entry)
         if entry["status"] != "ready_for_pr_review":
             entry["status"] = "needs_verification"
-    else:
-        entry["fix_cycles"] += 1
-        entry["status"] = "blocked" if entry["fix_cycles"] >= 3 else "needs_fix"
-        if entry["status"] == "blocked":
-            entry["blocked_reason"] = "three unsuccessful fix cycles"
-    data["updated_at"] = now()
-    write(path, data)
-    print(json.dumps(entry, sort_keys=True))
+        return
+    if args.source is None:
+        fail("--source is required with --outcome failed")
+    entry["fix_cycles"] += 1
+    sources = entry["fix_sources"]
+    sources[args.source] = sources.get(args.source, 0) + 1
+    entry["status"] = "blocked" if entry["fix_cycles"] >= 3 else "needs_fix"
+    if entry["status"] == "blocked":
+        entry["blocked_reason"] = "three unsuccessful fix cycles"
+        return
+    decided = sum(1 for d in entry["decisions"] if d["source"] == args.source)
+    if sources[args.source] - decided >= 2:
+        entry["status"] = "needs_decision"
+        entry["decision_required_for"] = args.source
 
 
 def parser():
@@ -802,7 +859,11 @@ def parser():
     q.set_defaults(func=result)
     q = sub.add_parser("fix-loop", parents=[common])
     q.add_argument("--task", required=True)
-    q.add_argument("--outcome", choices=["pass", "failed"], required=True)
+    outcome_or_decision = q.add_mutually_exclusive_group(required=True)
+    outcome_or_decision.add_argument("--outcome", choices=["pass", "failed"])
+    outcome_or_decision.add_argument("--decision", choices=sorted(DECISIONS))
+    q.add_argument("--source", choices=sorted(FIX_SOURCES))
+    q.add_argument("--note")
     q.set_defaults(func=fix_loop)
     return p
 

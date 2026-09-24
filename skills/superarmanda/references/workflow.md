@@ -30,10 +30,19 @@ worktree с собственным origin пользователя. Устано
    сделать отдельную Opus-попытку через `codex-host-opus`, сохранив оба artifact;
    никакой runner не переключает профиль автоматически.
 5. Findings возвращаются coder. После каждой неудачной corrective attempt, включая failure от
-   fresh tester, единственный coordinator вызывает `fix-loop --outcome failed`; coder → tester →
-   reviewer повторяется. Это ручная дисциплина coordinator, а не автономное доказательство
-   durable enforcement. Третья неудача блокирует задачу. Изменение head инвалидирует результаты
-   старого SHA.
+   fresh tester, единственный coordinator вызывает `fix-loop --outcome failed --source <источник>`,
+   где источник — `cross_provider_reviewer` (единственный решающий task reviewer),
+   `github_codex_review` (PR-гейт), `coderabbit` (advisory: его находки разбираются, но его два
+   круга тоже ведут к решению) или `tester`; coder → tester → reviewer повторяется. Это ручная
+   дисциплина coordinator, а не автономное доказательство durable enforcement. Третья неудача
+   блокирует задачу. Правило двух кругов на источник: вторая подряд неудача от одного источника
+   (за вычетом уже принятых по нему решений) переводит задачу в `needs_decision`, и она не
+   принимает ни `task-result`, ни следующий `fix-loop`, пока coordinator не запишет
+   `fix-loop --decision <invariant|cut_surface|accept_limitation> --note "..."` — после этого
+   задача возвращается в `needs_fix`, и решение покупает ровно один дополнительный круг для
+   этого источника. Общий кап в три неудачных цикла не меняется и имеет приоритет: если он
+   достигнут в том же вызове, задача блокируется, а не уходит в повторный `needs_decision`.
+   Изменение head инвалидирует результаты старого SHA, но не сбрасывает `needs_decision`.
 6. После всех task reviews создаётся draft PR. GitHub Codex должен завершить review именно
    текущего HEAD. Повторные запросы на тот же head идемпотентны и не опрашиваются бесконечно.
    CodeRabbit необязателен, но существенные полученные findings разбираются.
@@ -52,7 +61,9 @@ SHA может закрыть gate; неуспешная Opus-попытка о�
 `python3 "$SUPERARMANDA_DIR/scripts/state.py" init --manifest <path> --repo <repo> --base <sha> --head <sha>`
 creates one manifest atomically. Before any result after a code or working-tree change, run
 `resume` with the same `--repo --base` and current `--head`; it removes stale results but keeps
-`fix_cycles`. Один coordinator является единственным writer manifest; POSIX lock также защищает
+`fix_cycles`, `fix_sources`, `decisions` and `decision_required_for`. A `needs_decision` status is
+never reset by `resume`, even when it also invalidates stale role results for that task. Один
+coordinator является единственным writer manifest; POSIX lock также защищает
 короткие read-modify-write операции. Store a manifest outside the repository or at a gitignored
 path, so writing local state cannot itself change the reviewed tree. `status` reports `tree_matches`
 without mutating state and never reports stale evidence as `ready_for_pr_review`.
@@ -71,11 +82,27 @@ assert its continued existence; coordinator validates the artifact and adapter r
 The script rejects a session ID used by another task or role anywhere in the run and rejects a changed worktree
 until `resume`. A task becomes `ready_for_pr_review` only when current coder, tester and
 cross-provider reviewer results all pass. GitHub Codex review remains a separate PR gate;
-CodeRabbit cannot satisfy either gate. `fix-loop --outcome failed` persists each failed round;
-the third makes the task permanently `blocked` in v1. `fix-loop --outcome pass` never substitutes
-for required role results. Task IDs are coordinator-approved identifiers: renaming a blocked task
-is not a reset. v1 supplies no reset command; any human decision to resume work requires a new,
-explicitly documented run rather than editing the manifest.
+CodeRabbit cannot satisfy either gate. `fix-loop --outcome failed --source <source>` persists each
+failed round and increments both the task-wide `fix_cycles` and the per-source `fix_sources[source]`
+counter; `--source` is required with `--outcome failed`, rejected with `--outcome pass`, and must be
+one of `cross_provider_reviewer` (the only decisive task reviewer), `github_codex_review` (the PR
+gate), `coderabbit` (advisory: its findings are triaged, but two rounds from it also force a
+decision) or `tester`. The third failed round still makes the task permanently `blocked` in v1,
+unchanged from before. Two-round-per-source limit: when, after the increment, a source's own count
+minus the decisions already recorded for it reaches 2 and the task is not already `blocked`, status
+becomes `needs_decision` with `decision_required_for` set to that source. While `needs_decision`,
+`task-result` (any role) and both `fix-loop --outcome pass` and `fix-loop --outcome failed` are
+rejected with a message naming the source and the required `--decision` call. Only
+`fix-loop --decision <invariant|cut_surface|accept_limitation> --note <text>` is accepted in that
+state; `--note` is required, non-empty, at most 500 characters and must not contain a line break. It
+appends `{source, decision, note, recorded_at}` to `decisions`, clears `decision_required_for` and
+returns status to `needs_fix`; one decision buys exactly one more round for that source; the next
+failed round from the same source can raise `needs_decision` again only if the unchanged 3-cycle
+global cap has not already fired first. `fix-loop --outcome pass` never substitutes for required
+role results. Legacy manifests without `fix_sources`/`decisions`/`decision_required_for` get them
+defaulted via `setdefault` on first touch. Task IDs are coordinator-approved identifiers: renaming a
+blocked task is not a reset. v1 supplies no reset command; any human decision to resume work
+requires a new, explicitly documented run rather than editing the manifest.
 
 Every `--repo` is canonicalized to the Git top-level. Relative packet `--context`
 paths are resolved from that top-level even when `--repo` names a subdirectory.
