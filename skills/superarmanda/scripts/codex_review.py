@@ -490,7 +490,7 @@ def _thread_settings(params):
     collaboration = settings.get("collaborationMode")
     if collaboration is not None:
         nested = collaboration.get("settings") if isinstance(collaboration, dict) else None
-        if not isinstance(nested, dict):
+        if not isinstance(nested, dict) or nested.get("model") != MODEL:
             _fail("identity")
         _optional_identity(nested)
 
