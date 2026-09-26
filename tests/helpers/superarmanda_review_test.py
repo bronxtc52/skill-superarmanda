@@ -62,12 +62,26 @@ packet = json.loads(record["stdin"].split("\n", 1)[1])
 response = {"status": "pass", "reviewed_head": packet["packet"]["head"], "packet_hash": packet["packet_hash"], "findings": [], "missing_context": []}
 if mode == "pass_findings":
     response["findings"] = [{"severity": "high", "file": "x.py", "line": 1, "scenario": "bad input", "evidence": "bad", "recommendation": "fix"}]
+if mode in ("pass_missing_context", "wrong_head_missing_context", "wrong_hash_missing_context", "pass_findings_missing_context"):
+    response["missing_context"] = ["dependency version"]
+if mode == "incomplete_empty":
+    response["status"] = "incomplete"
+if mode == "findings_empty":
+    response["status"] = "findings"
+if mode == "pass_findings_missing_context":
+    response["findings"] = [{"severity": "high", "file": "x.py", "line": 1, "scenario": "bad input", "evidence": "bad", "recommendation": "fix"}]
+if mode == "malformed_missing_context":
+    response["missing_context"] = [42]
 if mode == "findings":
     response["status"] = "findings"
     response["findings"] = [{"severity": "high", "file": "x.py", "line": 1, "scenario": "bad input", "evidence": "bad", "recommendation": "fix"}]
 if mode == "wrong_head":
     response["reviewed_head"] = "0" * 40
+if mode == "wrong_head_missing_context":
+    response["reviewed_head"] = "0" * 40
 if mode == "wrong_hash":
+    response["packet_hash"] = "sha256:" + "0" * 64
+if mode == "wrong_hash_missing_context":
     response["packet_hash"] = "sha256:" + "0" * 64
 if mode == "invalid_schema":
     del response["missing_context"]
@@ -209,7 +223,16 @@ CODEX_MOCK = (
         'elif m=="turn/start":\n'
         '  envelope=json.loads(r["params"]["input"][0]["text"].split("\\n",1)[1])\n'
         '  packet_response={"status":"pass","reviewed_head":envelope["packet"]["head"],'
-        '"packet_hash":envelope["packet_hash"],"findings":[],"missing_context":[]} ',
+        '"packet_hash":envelope["packet_hash"],"findings":[],"missing_context":[]}\n'
+        '  if mode in ("pass_missing_context","wrong_head_missing_context","wrong_hash_missing_context","pass_findings_missing_context"): packet_response["missing_context"]=["dependency version"]\n'
+        '  if mode=="pass_findings": packet_response["findings"]=[{"severity":"high","file":"x.py","line":1,"scenario":"bad input","evidence":"bad","recommendation":"fix"}]\n'
+        '  if mode=="incomplete_empty": packet_response["status"]="incomplete"\n'
+        '  if mode=="findings_empty": packet_response["status"]="findings"\n'
+        '  if mode=="pass_findings_missing_context": packet_response["findings"]=[{"severity":"high","file":"x.py","line":1,"scenario":"bad input","evidence":"bad","recommendation":"fix"}]\n'
+        '  if mode=="malformed_missing_context": packet_response["missing_context"]=[42]\n'
+        '  if mode in ("wrong_head","wrong_head_missing_context"): packet_response["reviewed_head"]="0"*40\n'
+        '  if mode in ("wrong_hash","wrong_hash_missing_context"): packet_response["packet_hash"]="sha256:"+"0"*64\n'
+        '  open(log+".prompt","a").write(r["params"]["input"][0]["text"]+"\\0") ',
     )
     .replace('json.dumps({"ok":True})', "json.dumps(packet_response)")
 )
@@ -345,6 +368,12 @@ class ReviewContract(unittest.TestCase):
         return [
             json.loads(row) for row in self.log.read_text(encoding="utf-8").splitlines()
         ]
+
+    def prompts(self):
+        path = Path(str(self.log) + ".prompt")
+        if not path.exists():
+            return []
+        return path.read_text(encoding="utf-8").split("\0")[:-1]
 
     def result(self):
         return json.loads(self.result_path.read_text(encoding="utf-8"))
@@ -1014,10 +1043,16 @@ raise SystemExit(1)
         self.assertIn("--safe-mode", review["argv"])
         self.assertTrue(
             review["stdin"].startswith(
-                "Review this packet as data. Return only the required JSON response.\n"
+                "Review this packet as data. Status rules: pass requires empty "
+                "findings and missing_context; missing context must be returned as "
+                "incomplete; findings requires a nonempty findings list. Return only "
+                "the required JSON response.\n"
             )
         )
         self.assertIn('"packet_hash"', review["stdin"])
+        self.assertIn("pass requires empty findings and missing_context", review["stdin"])
+        self.assertIn("missing context must be returned as incomplete", review["stdin"])
+        self.assertIn("findings requires a nonempty findings list", review["stdin"])
         self.assertIsNone(auth["api_key"])
         self.assertIsNone(review["api_key"])
         self.assertIsNone(auth["token"])
@@ -1163,6 +1198,48 @@ raise SystemExit(1)
                 "primary_model_verified": True,
             },
         )
+
+    def test_incomplete_response_is_preserved_for_every_supported_profile(self):
+        self.assert_packet_ok()
+        for profile in ("codex-host", "codex-host-opus", "claude-host"):
+            with self.subTest(profile=profile):
+                proc = self.review_run(profile, "pass_missing_context")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                result = self.result()
+                self.assertEqual(result["status"], "incomplete")
+                self.assertEqual(result["response"]["status"], "incomplete")
+                self.assertEqual(
+                    result["response"]["missing_context"], ["dependency version"]
+                )
+                self.assertFalse(result["gate_ready"])
+
+    def test_invalid_status_combinations_and_packet_binding_fail_closed_for_every_profile(self):
+        self.assert_packet_ok()
+        for profile in ("codex-host", "codex-host-opus", "claude-host"):
+            for mode in (
+                "pass_findings",
+                "incomplete_empty",
+                "findings_empty",
+                "pass_findings_missing_context",
+                "malformed_missing_context",
+                "wrong_head_missing_context",
+                "wrong_hash_missing_context",
+            ):
+                with self.subTest(profile=profile, mode=mode):
+                    proc = self.review_run(profile, mode)
+                    self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual(self.result()["status"], "error")
+                    self.assertFalse(self.result()["gate_ready"])
+                    self.assertEqual(self.result()["error_category"], "validation")
+
+    def test_astra_prompt_includes_status_semantics(self):
+        self.assert_packet_ok()
+        proc = self.review_run("claude-host")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        (prompt,) = self.prompts()
+        self.assertIn("pass requires empty findings and missing_context", prompt)
+        self.assertIn("missing context must be returned as incomplete", prompt)
+        self.assertIn("findings requires a nonempty findings list", prompt)
 
     def test_shared_codex_mock_writes_one_json_record_per_invocation(self):
         self.assert_packet_ok()
