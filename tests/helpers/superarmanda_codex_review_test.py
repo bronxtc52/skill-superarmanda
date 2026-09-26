@@ -97,6 +97,20 @@ for line in sys.stdin:
     out({"method":"thread/started","params":started})
    response(i,{"model":"gpt-6-astra","modelProvider":"openai","approvalPolicy":"never" if mode=="approval_policy" else "on-request","sandbox":{"type":"readOnly","networkAccess":False},"thread":{"id":"t","model":"other" if mode=="nested_thread_model" else "gpt-6-astra","modelProvider":"openai"}})
  elif m=="turn/start":
+  if mode.startswith("settings"):
+   ts={"disabledPluginIds":[],"approvalPolicy":"on-request","approvalsReviewer":"user","sandboxPolicy":{"type":"readOnly","networkAccess":False},"activePermissionProfile":None,"model":"gpt-6-astra","modelProvider":"openai","effort":"medium","collaborationMode":{"mode":"default","settings":{"model":"gpt-6-astra"}},"multiAgentMode":"explicitRequestOnly"}
+   tid="t"
+   if mode=="settings_write": ts["sandboxPolicy"]={"type":"workspaceWrite","networkAccess":False}
+   if mode=="settings_network": ts["sandboxPolicy"]["networkAccess"]=True
+   if mode=="settings_approval": ts["approvalPolicy"]="never"
+   if mode=="settings_model": ts["model"]="other"
+   if mode=="settings_provider": ts["modelProvider"]="other"
+   if mode=="settings_no_model": ts.pop("model")
+   if mode=="settings_collab_model": ts["collaborationMode"]["settings"]["model"]="other"
+   if mode=="settings_profile": ts["activePermissionProfile"]={"name":"full"}
+   if mode=="settings_thread": tid="other"
+   if mode=="settings_missing": ts=None
+   out({"method":"thread/settings/updated","params":{"threadId":tid,"threadSettings":ts}})
   if mode=="early_wrongid": out({"method":"item/completed","params":{"threadId":"wrong","turnId":"u","item":{"type":"agentMessage","text":"{}"}}})
   if mode=="server_request": out({"id":99,"method":"tool/request","params":{}})
   if mode=="main_server_request": response(i,{"turn":{"id":"u"}}); out({"id":99,"method":"tool/request","params":{}}); continue
@@ -308,6 +322,27 @@ class Contract(unittest.TestCase):
             self.assertFalse(reached & {"account/read", "thread/start", "turn/start"}, mode)
             for suffix in (".spawns", ".methods"):
                 Path(str(self.log) + suffix).unlink(missing_ok=True)
+
+    def test_thread_settings_update_is_accepted_only_when_it_repeats_the_contract(self):
+        self.assertEqual(self.invoke("settings")[0], {"ok": True})
+        cases = (
+            ("settings_write", "identity"),
+            ("settings_network", "identity"),
+            ("settings_approval", "identity"),
+            ("settings_model", "identity"),
+            ("settings_provider", "identity"),
+            ("settings_no_model", "identity"),
+            ("settings_collab_model", "identity"),
+            ("settings_profile", "identity"),
+            ("settings_thread", "protocol"),
+            ("settings_missing", "protocol"),
+        )
+        for mode, category in cases:
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "review CLI failed: " + category),
+            ):
+                self.invoke(mode)
 
     def test_tool_approval_malformed_and_ids_fail_closed(self):
         cases = (

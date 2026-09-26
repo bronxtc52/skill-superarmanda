@@ -394,6 +394,7 @@ def _reject_event(message, thread_id=None, turn_id=None):
         "turn/started",
         "turn/completed",
         "thread/started",
+        "thread/settings/updated",
         "thread/status/changed",
         "thread/tokenUsage/updated",
         "account/updated",
@@ -427,6 +428,8 @@ def _reject_event(message, thread_id=None, turn_id=None):
                 isinstance(turn, dict) and turn.get("id") not in (None, turn_id)
             ):
                 _fail("protocol")
+    if method == "thread/settings/updated":
+        _thread_settings(params)
     if method.startswith("thread/"):
         _optional_identity(params)
         thread = params.get("thread")
@@ -452,6 +455,29 @@ def _reject_event(message, thread_id=None, turn_id=None):
             "reasoning",
         }:
             _fail("execution")
+
+
+def _thread_settings(params):
+    """Accept a settings echo only when it repeats the verified thread contract."""
+    settings = params.get("threadSettings")
+    if not isinstance(params.get("threadId"), str) or not isinstance(settings, dict):
+        _fail("protocol")
+    sandbox = settings.get("sandboxPolicy")
+    if (
+        not isinstance(sandbox, dict)
+        or sandbox.get("type") != "readOnly"
+        or sandbox.get("networkAccess") is not False
+        or settings.get("approvalPolicy") != "on-request"
+        or settings.get("activePermissionProfile") is not None
+    ):
+        _fail("identity")
+    _identity(settings)
+    collaboration = settings.get("collaborationMode")
+    if collaboration is not None:
+        nested = collaboration.get("settings") if isinstance(collaboration, dict) else None
+        if not isinstance(nested, dict):
+            _fail("identity")
+        _optional_identity(nested)
 
 
 def _identity(result):
