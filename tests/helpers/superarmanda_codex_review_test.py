@@ -20,12 +20,22 @@ assert not any(key in os.environ for key in ("OTEL_EXPORTER_OTLP_ENDPOINT", "CLA
 mode=os.environ.get("SA_TEST_MODE", os.environ.get("SA_MODE", "success"))
 log=os.environ.get("SA_TEST_LOG") or os.environ["SA_LOG"]
 open(log,"w").write(json.dumps({"program":"codex","kind":"review","argv":sys.argv[1:],"disable_telemetry":os.environ.get("DISABLE_TELEMETRY"),"otel":os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"),"node_tls":os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED")})+"\n")
+spawns=log+".spawns"
+open(spawns,"a").write(json.dumps({"argv":sys.argv[1:]})+"\n")
+spawn=sum(1 for _ in open(spawns))
+methods=log+".methods"
+# Codex merges table overrides with the user's config; only dotted
+# `<table>.<name>.enabled=false` overrides reach existing entries.
+disabled=set()
+for a, b in zip(sys.argv[1:], sys.argv[2:]):
+ if a=="-c" and b.endswith(".enabled=false") and b.count(".")==2: disabled.add(tuple(b[:-len(".enabled=false")].split(".")))
 def out(x): print(json.dumps(x), flush=True)
 def response(i, result): out({"id":i,"result":result})
 config={"model_provider":"openai","forced_login_method":"chatgpt","web_search":"disabled","project_doc_max_bytes":0,"orchestrator":{"mcp":{"enabled":False},"skills":{"enabled":False}},"chatgpt_base_url":"https://chatgpt.com/backend-api","features":{"hooks":False,"goals":False,"memories":False,"skill_search":False,"skill_mcp_dependency_install":False,"tool_suggest":False,"sleep_tool":False,"apps":False,"browser_use":False,"browser_use_external":False,"computer_use":False,"image_generation":False,"multi_agent":False,"plugins":False,"remote_plugin":False,"shell_tool":False,"unified_exec":False,"view_image":False,"code_mode":False,"code_mode_host":False},"mcp_servers":{},"notify":[],"hooks":{},"plugins":{},"apps":{},"otel":{"exporter":"none","trace_exporter":"none","metrics_exporter":"none","log_user_prompt":False},"model_providers":{},"model_catalog_json":None,"model_instructions_file":None,"experimental_instructions_file":None,"experimental_thread_store_endpoint":None}
 config["skills"]={"include_instructions":False}
 for line in sys.stdin:
  r=json.loads(line); i=r["id"]; m=r["method"]
+ open(methods,"a").write(json.dumps({"spawn":spawn,"method":m})+"\n")
  if mode=="timeout": time.sleep(5)
  if mode=="malformed": print("{",flush=True); continue
  if mode=="duplicate": print('{"id":%d,"id":%d,"result":{}}'%(i,i),flush=True); continue
@@ -35,6 +45,19 @@ for line in sys.stdin:
   out({"method":"configWarning","params":{"message":"synthetic warning"}})
   response(i,{})
  elif m=="config/read":
+  user={}
+  if mode in ("user_tables","user_mcp","ignore_disable","mcp_running","mcp_tools","mcp_status_cursor","mcp_status_empty_entry","mcp_status_no_tools","mcp_status_null_tools","mcp_status_omits_server","mcp_status_unknown_server","mcp_status_duplicate","mcp_status_error","mcp_status_missing","late_entry","non_bool_enabled","status_notification"): user["mcp_servers"]={"node_repl":{"command":"x","enabled":True},"reporting_db":{"command":"y"}}
+  if mode in ("user_tables","user_plugins","late_entry","ignore_plugin_disable"): user["plugins"]={"github@openai-curated":{"enabled":True},"browser@openai-bundled":{"enabled":True}}
+  if mode=="late_entry" and spawn>1: user["mcp_servers"]["added_later"]={"command":"z","enabled":True}
+  if mode=="bad_name": user["mcp_servers"]={"a.b":{"command":"x","enabled":True}}
+  if mode=="quoted_name": user["plugins"]={'x"y':{"enabled":True}}
+  if mode=="too_many": user["mcp_servers"]={"s%d"%n:{"command":"x"} for n in range(300)}
+  if mode=="bad_table": user["mcp_servers"]=["not-a-table"]
+  for table, entries in user.items():
+   if isinstance(entries, dict):
+    for name, entry in entries.items():
+     if (table, name) in disabled and not (mode=="ignore_disable" and name=="node_repl") and not (mode=="ignore_plugin_disable" and table=="plugins"): entry["enabled"]="false" if mode=="non_bool_enabled" else False
+   config[table]=entries
   if mode=="contamination": config["mcp_servers"]={"evil":{}}
   if mode=="experimental_instructions": config["experimental_instructions_file"]="/unsafe"
   if mode=="missing_skills": config.pop("skills")
@@ -51,6 +74,21 @@ for line in sys.stdin:
   if mode=="telemetry": config["otel"]["exporter"]={"otlp-http":{"endpoint":"https://invalid.example"}}
   if mode=="hook_command": config["hooks"]={"SessionStart":[{"command":"not-executed"}]}
   response(i,{"config":config})
+ elif m=="mcpServerStatus/list":
+  if mode=="mcp_status_error": out({"id":i,"error":{"code":-32601}}); continue
+  if mode=="mcp_status_missing": out({"id":i,"result":{}}); continue
+  if mode=="status_notification": out({"method":"mcpServer/startupStatus/updated","params":{"name":"node_repl"}})
+  data=[]
+  for name, entry in (config.get("mcp_servers") or {}).items():
+   running=entry.get("enabled") is not False or (mode=="mcp_running" and name=="node_repl")
+   data.append({"name":name,"runtimeStatus":None,"pluginId":None,"httpOrigin":None,"serverInfo":{"name":name} if running else None,"serverCapabilities":{} if running else None,"tools":{"t":{}} if running or (mode=="mcp_tools" and name=="node_repl") else {},"toolsError":None,"resources":[],"resourceTemplates":[],"authStatus":"unsupported"})
+  if mode=="mcp_status_empty_entry": data[0]={}
+  if mode=="mcp_status_no_tools": data[0].pop("tools")
+  if mode=="mcp_status_null_tools": data[0]["tools"]=None
+  if mode=="mcp_status_omits_server": data.pop()
+  if mode=="mcp_status_unknown_server": data.append(dict(data[0],name="unlisted"))
+  if mode=="mcp_status_duplicate": data.append(dict(data[0]))
+  response(i,{"data":data,"nextCursor":"more" if mode=="mcp_status_cursor" else None})
  elif m=="account/read":
   account={"type":"api" if mode=="auth" else "chatgpt","planType":"free" if mode=="free" else "pro"}
   response(i,account if mode=="bare_auth" else {"requiresOpenaiAuth":mode!="auth_not_required","account":account})
@@ -65,6 +103,24 @@ for line in sys.stdin:
     out({"method":"thread/started","params":started})
    response(i,{"model":"gpt-6-astra","modelProvider":"openai","approvalPolicy":"never" if mode=="approval_policy" else "on-request","sandbox":{"type":"readOnly","networkAccess":False},"thread":{"id":"t","model":"other" if mode=="nested_thread_model" else "gpt-6-astra","modelProvider":"openai"}})
  elif m=="turn/start":
+  if mode.startswith("settings"):
+   ts={"disabledPluginIds":[],"approvalPolicy":"on-request","approvalsReviewer":"user","sandboxPolicy":{"type":"readOnly","networkAccess":False},"activePermissionProfile":None,"model":"gpt-6-astra","modelProvider":"openai","effort":"medium","collaborationMode":{"mode":"default","settings":{"model":"gpt-6-astra"}},"multiAgentMode":"explicitRequestOnly"}
+   tid="t"
+   if mode=="settings_write": ts["sandboxPolicy"]={"type":"workspaceWrite","networkAccess":False}
+   if mode=="settings_network": ts["sandboxPolicy"]["networkAccess"]=True
+   if mode=="settings_approval": ts["approvalPolicy"]="never"
+   if mode=="settings_model": ts["model"]="other"
+   if mode=="settings_provider": ts["modelProvider"]="other"
+   if mode=="settings_no_model": ts.pop("model")
+   if mode=="settings_collab_model": ts["collaborationMode"]["settings"]["model"]="other"
+   if mode=="settings_profile": ts["activePermissionProfile"]={"name":"full"}
+   if mode=="settings_auto_reviewer": ts["approvalsReviewer"]="auto_review"
+   if mode=="settings_no_reviewer": ts.pop("approvalsReviewer")
+   if mode=="settings_null_reviewer": ts["approvalsReviewer"]=None
+   if mode=="settings_collab_type": ts["collaborationMode"]="default"
+   if mode=="settings_thread": tid="other"
+   if mode=="settings_missing": ts=None
+   out({"method":"thread/settings/updated","params":{"threadId":tid,"threadSettings":ts}})
   if mode=="early_wrongid": out({"method":"item/completed","params":{"threadId":"wrong","turnId":"u","item":{"type":"agentMessage","text":"{}"}}})
   if mode=="server_request": out({"id":99,"method":"tool/request","params":{}})
   if mode=="main_server_request": response(i,{"turn":{"id":"u"}}); out({"id":99,"method":"tool/request","params":{}}); continue
@@ -197,6 +253,116 @@ class Contract(unittest.TestCase):
             ("conflicting_start_provider", "identity"),
             ("missing_ids", "protocol"),
         ]
+        for mode, category in cases:
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "review CLI failed: " + category),
+            ):
+                self.invoke(mode)
+
+
+    def spawns(self):
+        path = Path(str(self.log) + ".spawns")
+        return [json.loads(line)["argv"] for line in path.read_text().splitlines()]
+
+    def methods(self):
+        path = Path(str(self.log) + ".methods")
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def test_user_mcp_and_plugins_are_disabled_per_process_and_proven_inert(self):
+        for mode in ("user_tables", "user_mcp", "user_plugins"):
+            with self.subTest(mode=mode):
+                for suffix in (".spawns", ".methods"):
+                    Path(str(self.log) + suffix).unlink(missing_ok=True)
+                response, meta = self.invoke(mode)
+                self.assertEqual(response, {"ok": True})
+                self.assertTrue(meta["no_execution_tools"])
+                spawns = self.spawns()
+                self.assertEqual(len(spawns), 2)
+                probe, review = spawns
+                self.assertEqual(review[: len(probe)], probe)
+                extra = review[len(probe):]
+                expected = []
+                if mode != "user_plugins":
+                    expected += ["mcp_servers.node_repl.enabled=false", "mcp_servers.reporting_db.enabled=false"]
+                if mode != "user_mcp":
+                    expected += ["plugins.browser@openai-bundled.enabled=false", "plugins.github@openai-curated.enabled=false"]
+                self.assertEqual(extra[0::2], ["-c"] * len(expected))
+                self.assertEqual(sorted(extra[1::2]), sorted(expected))
+                calls = self.methods()
+                self.assertEqual(
+                    [c["method"] for c in calls if c["spawn"] == 1],
+                    ["initialize", "config/read"],
+                )
+                second = [c["method"] for c in calls if c["spawn"] == 2]
+                self.assertEqual(
+                    second[:4],
+                    ["initialize", "config/read", "mcpServerStatus/list", "account/read"],
+                )
+
+    def test_empty_user_tables_use_one_process_and_still_prove_mcp_inert(self):
+        self.invoke()
+        self.assertEqual(len(self.spawns()), 1)
+        self.assertIn("mcpServerStatus/list", [c["method"] for c in self.methods()])
+
+    def test_disable_isolation_fails_closed(self):
+        cases = (
+            ("ignore_disable", "config"),
+            ("ignore_plugin_disable", "config"),
+            ("non_bool_enabled", "config"),
+            ("late_entry", "config"),
+            ("mcp_running", "config"),
+            ("mcp_tools", "config"),
+            ("mcp_status_cursor", "config"),
+            ("mcp_status_missing", "config"),
+            ("mcp_status_empty_entry", "config"),
+            ("mcp_status_no_tools", "config"),
+            ("mcp_status_null_tools", "config"),
+            ("mcp_status_omits_server", "config"),
+            ("mcp_status_unknown_server", "config"),
+            ("mcp_status_duplicate", "config"),
+            ("bad_name", "config"),
+            ("quoted_name", "config"),
+            ("too_many", "config"),
+            ("bad_table", "config"),
+            ("mcp_status_error", "protocol"),
+            ("status_notification", "protocol"),
+        )
+        for mode, category in cases:
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "review CLI failed: " + category),
+            ):
+                self.invoke(mode)
+            reached = {c["method"] for c in self.methods()}
+            forbidden = {"account/read", "thread/start", "turn/start"}
+            if not mode.startswith(("mcp_", "status_")):
+                # Listing MCP status may start enabled servers, so it must
+                # never happen before the effective config is proven safe.
+                forbidden.add("mcpServerStatus/list")
+            with self.subTest(mode=mode, check="stops_before_forbidden_methods"):
+                self.assertFalse(reached & forbidden, mode)
+            for suffix in (".spawns", ".methods"):
+                Path(str(self.log) + suffix).unlink(missing_ok=True)
+
+    def test_thread_settings_update_is_accepted_only_when_it_repeats_the_contract(self):
+        self.assertEqual(self.invoke("settings")[0], {"ok": True})
+        cases = (
+            ("settings_write", "identity"),
+            ("settings_network", "identity"),
+            ("settings_approval", "identity"),
+            ("settings_model", "identity"),
+            ("settings_provider", "identity"),
+            ("settings_no_model", "identity"),
+            ("settings_collab_model", "identity"),
+            ("settings_profile", "identity"),
+            ("settings_auto_reviewer", "identity"),
+            ("settings_no_reviewer", "identity"),
+            ("settings_null_reviewer", "identity"),
+            ("settings_collab_type", "identity"),
+            ("settings_thread", "protocol"),
+            ("settings_missing", "protocol"),
+        )
         for mode, category in cases:
             with (
                 self.subTest(mode=mode),

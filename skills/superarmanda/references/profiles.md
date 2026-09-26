@@ -42,7 +42,29 @@ artifact. Runner не выбирает Opus сам, не принимает мо
 затем проверяется effective config и ChatGPT subscription. Сервер должен вернуть
 точные model/provider, read-only sandbox; thread и turn получают `environments: []`.
 Любой tool/approval event, model reroute или неверные IDs отклоняют ревью.
-Проверен Codex CLI 0.154.0 на mh-central; неизвестный протокол не считается успехом.
+`thread/settings/updated` допускается только как эхо того же контракта: read-only
+sandbox без сети, `on-request`, точные model/provider, без permission profile,
+тот же thread.
+
+Codex сливает табличные overrides `mcp_servers={}` / `plugins={}` с
+`~/.codex/config.toml`, а не замещает их. Поэтому первый процесс App Server
+выполняет только `initialize` и `config/read` и узнаёт имена пользовательских
+MCP-серверов и плагинов. Затем адаптер перезапускает процесс, добавив на
+каждую запись `-c <table>.<name>.enabled=false`, и требует, чтобы в effective
+config каждая запись была строго `enabled = false`. После этого
+`mcpServerStatus/list` должен показать, что ни один сервер не запущен и не
+отдаёт tools/resources. Имя, которое нельзя адресовать голым сегментом пути
+(`[A-Za-z0-9_@-]`, без точек и кавычек), или более 256 записей → `config`.
+Глобальный конфиг, `CODEX_HOME` и хранилища авторизации не меняются; ни один
+MCP-сервер или плагин, в том числе встроенный, не разрешается включённым.
+Известная граница: первый процесс стартует с пользовательскими записями как
+есть (так же, как прежний одиночный процесс) и делает только `initialize` и
+`config/read`; если версия Codex поднимет MCP уже на `initialize`, это
+произойдёт до отключения. `mcpServerStatus/list` вызывается только после
+проверки конфига. Пагинация статуса (`nextCursor`) — отказ, а не догрузка.
+`thread/settings/updated` также требует `approvalsReviewer` = `user`.
+Проверен Codex CLI 0.154.0 на mh-central и 0.157.1 на Mac с пользовательскими
+MCP и плагинами; неизвестный протокол не считается успехом.
 Оба адаптера должны дать `gate_ready: true` для pass; сам статус pass без
 подтверждённых capabilities не закрывает gate. Это ограничение инструментов
 CLI, не OS sandbox для процесса CLI. Вход через существующий HOME/CODEX_HOME;
