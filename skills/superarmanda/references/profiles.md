@@ -63,6 +63,13 @@ MCP-сервер или плагин, в том числе встроенный,
 произойдёт до отключения. `mcpServerStatus/list` вызывается только после
 проверки конфига. Пагинация статуса (`nextCursor`) — отказ, а не догрузка.
 `thread/settings/updated` также требует `approvalsReviewer` = `user`.
+Claude CLI 2.1.283 даже под `--safe-mode` загружает встроенные плагины
+`agents-md@builtin` и `telemetry@builtin`. Оба Claude-профиля передают только
+дочернему процессу `--settings '{"enabledPlugins":{…:false}}'`; пользовательские
+настройки не меняются. `init.plugins` по-прежнему обязан быть пустым: новый или
+не выключенный плагин оставляет `gate_ready: false`. В отчёте
+`capabilities.isolation_checks` содержит только булевы `known_tools`,
+`mcp_empty`, `plugins_empty`, `structured_only`, без имён и сырых данных.
 Проверен Codex CLI 0.154.0 на mh-central и 0.157.1 на Mac с пользовательскими
 MCP и плагинами; неизвестный протокол не считается успехом.
 Оба адаптера должны дать `gate_ready: true` для pass; сам статус pass без
