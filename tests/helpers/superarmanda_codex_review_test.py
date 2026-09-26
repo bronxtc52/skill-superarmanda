@@ -46,7 +46,7 @@ for line in sys.stdin:
   response(i,{})
  elif m=="config/read":
   user={}
-  if mode in ("user_tables","user_mcp","ignore_disable","mcp_running","mcp_tools","mcp_status_cursor","mcp_status_error","mcp_status_missing","late_entry","non_bool_enabled","status_notification"): user["mcp_servers"]={"node_repl":{"command":"x","enabled":True},"reporting_db":{"command":"y"}}
+  if mode in ("user_tables","user_mcp","ignore_disable","mcp_running","mcp_tools","mcp_status_cursor","mcp_status_empty_entry","mcp_status_no_tools","mcp_status_null_tools","mcp_status_omits_server","mcp_status_unknown_server","mcp_status_duplicate","mcp_status_error","mcp_status_missing","late_entry","non_bool_enabled","status_notification"): user["mcp_servers"]={"node_repl":{"command":"x","enabled":True},"reporting_db":{"command":"y"}}
   if mode in ("user_tables","user_plugins","late_entry","ignore_plugin_disable"): user["plugins"]={"github@openai-curated":{"enabled":True},"browser@openai-bundled":{"enabled":True}}
   if mode=="late_entry" and spawn>1: user["mcp_servers"]["added_later"]={"command":"z","enabled":True}
   if mode=="bad_name": user["mcp_servers"]={"a.b":{"command":"x","enabled":True}}
@@ -82,6 +82,12 @@ for line in sys.stdin:
   for name, entry in (config.get("mcp_servers") or {}).items():
    running=entry.get("enabled") is not False or (mode=="mcp_running" and name=="node_repl")
    data.append({"name":name,"runtimeStatus":None,"pluginId":None,"httpOrigin":None,"serverInfo":{"name":name} if running else None,"serverCapabilities":{} if running else None,"tools":{"t":{}} if running or (mode=="mcp_tools" and name=="node_repl") else {},"toolsError":None,"resources":[],"resourceTemplates":[],"authStatus":"unsupported"})
+  if mode=="mcp_status_empty_entry": data[0]={}
+  if mode=="mcp_status_no_tools": data[0].pop("tools")
+  if mode=="mcp_status_null_tools": data[0]["tools"]=None
+  if mode=="mcp_status_omits_server": data.pop()
+  if mode=="mcp_status_unknown_server": data.append(dict(data[0],name="unlisted"))
+  if mode=="mcp_status_duplicate": data.append(dict(data[0]))
   response(i,{"data":data,"nextCursor":"more" if mode=="mcp_status_cursor" else None})
  elif m=="account/read":
   account={"type":"api" if mode=="auth" else "chatgpt","planType":"free" if mode=="free" else "pro"}
@@ -309,6 +315,12 @@ class Contract(unittest.TestCase):
             ("mcp_tools", "config"),
             ("mcp_status_cursor", "config"),
             ("mcp_status_missing", "config"),
+            ("mcp_status_empty_entry", "config"),
+            ("mcp_status_no_tools", "config"),
+            ("mcp_status_null_tools", "config"),
+            ("mcp_status_omits_server", "config"),
+            ("mcp_status_unknown_server", "config"),
+            ("mcp_status_duplicate", "config"),
             ("bad_name", "config"),
             ("quoted_name", "config"),
             ("too_many", "config"),
@@ -328,7 +340,8 @@ class Contract(unittest.TestCase):
                 # Listing MCP status may start enabled servers, so it must
                 # never happen before the effective config is proven safe.
                 forbidden.add("mcpServerStatus/list")
-            self.assertFalse(reached & forbidden, mode)
+            with self.subTest(mode=mode, check="stops_before_forbidden_methods"):
+                self.assertFalse(reached & forbidden, mode)
             for suffix in (".spawns", ".methods"):
                 Path(str(self.log) + suffix).unlink(missing_ok=True)
 

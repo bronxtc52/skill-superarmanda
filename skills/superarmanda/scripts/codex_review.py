@@ -162,20 +162,34 @@ def _disabled_table(value):
     )
 
 
-def _require_inert_mcp(result):
-    """Runtime proof that no MCP server was started or exposes tools."""
+def _require_inert_mcp(result, config):
+    """Runtime proof that no configured MCP server started or exposes tools."""
     data = result.get("data")
     if not isinstance(data, list) or result.get("nextCursor") is not None:
         _fail("config")
+    names = []
     for status in data:
-        if not isinstance(status, dict):
+        if not isinstance(status, dict) or not isinstance(status.get("name"), str):
             _fail("config")
-        for key in ("serverInfo", "serverCapabilities", "runtimeStatus"):
-            if status.get(key) is not None:
-                _fail("config")
-        for key in ("tools", "resources", "resourceTemplates"):
-            if status.get(key) not in (None, {}, []):
-                _fail("config")
+        # Missing fields are unknown protocol, not evidence of an idle server.
+        if any(
+            key not in status
+            for key in ("serverInfo", "tools", "resources", "resourceTemplates")
+        ):
+            _fail("config")
+        if (
+            status["serverInfo"] is not None
+            or status["tools"] != {}
+            or status["resources"] != []
+            or status["resourceTemplates"] != []
+            or status.get("serverCapabilities") is not None
+            or status.get("runtimeStatus") is not None
+        ):
+            _fail("config")
+        names.append(status["name"])
+    configured = config.get("mcp_servers") or {}
+    if len(names) != len(set(names)) or set(names) != set(configured):
+        _fail("config")
 
 
 def _unsafe_config(config):
@@ -558,7 +572,7 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
             config = _read_config(server, cwd)
         if _unsafe_config(config):
             _fail("config")
-        _require_inert_mcp(server.request("mcpServerStatus/list", {}))
+        _require_inert_mcp(server.request("mcpServerStatus/list", {}), config)
         subscription = _account(server.request("account/read", {"refreshToken": False}))
         thread = server.request(
             "thread/start",
