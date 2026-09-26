@@ -108,6 +108,8 @@ for line in sys.stdin:
    if mode=="settings_no_model": ts.pop("model")
    if mode=="settings_collab_model": ts["collaborationMode"]["settings"]["model"]="other"
    if mode=="settings_profile": ts["activePermissionProfile"]={"name":"full"}
+   if mode=="settings_auto_reviewer": ts["approvalsReviewer"]="auto_review"
+   if mode=="settings_collab_type": ts["collaborationMode"]="default"
    if mode=="settings_thread": tid="other"
    if mode=="settings_missing": ts=None
    out({"method":"thread/settings/updated","params":{"threadId":tid,"threadSettings":ts}})
@@ -319,7 +321,12 @@ class Contract(unittest.TestCase):
             ):
                 self.invoke(mode)
             reached = {c["method"] for c in self.methods()}
-            self.assertFalse(reached & {"account/read", "thread/start", "turn/start"}, mode)
+            forbidden = {"account/read", "thread/start", "turn/start"}
+            if not mode.startswith(("mcp_", "status_")):
+                # Listing MCP status may start enabled servers, so it must
+                # never happen before the effective config is proven safe.
+                forbidden.add("mcpServerStatus/list")
+            self.assertFalse(reached & forbidden, mode)
             for suffix in (".spawns", ".methods"):
                 Path(str(self.log) + suffix).unlink(missing_ok=True)
 
@@ -334,6 +341,8 @@ class Contract(unittest.TestCase):
             ("settings_no_model", "identity"),
             ("settings_collab_model", "identity"),
             ("settings_profile", "identity"),
+            ("settings_auto_reviewer", "identity"),
+            ("settings_collab_type", "identity"),
             ("settings_thread", "protocol"),
             ("settings_missing", "protocol"),
         )

@@ -469,6 +469,7 @@ def _thread_settings(params):
         or sandbox.get("networkAccess") is not False
         or settings.get("approvalPolicy") != "on-request"
         or settings.get("activePermissionProfile") is not None
+        or settings.get("approvalsReviewer") not in (None, "user")
     ):
         _fail("identity")
     _identity(settings)
