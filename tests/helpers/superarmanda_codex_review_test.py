@@ -118,6 +118,8 @@ for line in sys.stdin:
    if mode=="settings_no_reviewer": ts.pop("approvalsReviewer")
    if mode=="settings_null_reviewer": ts["approvalsReviewer"]=None
    if mode=="settings_collab_type": ts["collaborationMode"]="default"
+   if mode=="settings_collab_no_model": ts["collaborationMode"]["settings"].pop("model")
+   if mode=="settings_collab_empty": ts["collaborationMode"]["settings"]={}
    if mode=="settings_thread": tid="other"
    if mode=="settings_missing": ts=None
    out({"method":"thread/settings/updated","params":{"threadId":tid,"threadSettings":ts}})
@@ -360,6 +362,8 @@ class Contract(unittest.TestCase):
             ("settings_no_reviewer", "identity"),
             ("settings_null_reviewer", "identity"),
             ("settings_collab_type", "identity"),
+            ("settings_collab_no_model", "identity"),
+            ("settings_collab_empty", "identity"),
             ("settings_thread", "protocol"),
             ("settings_missing", "protocol"),
         )
