@@ -98,7 +98,16 @@ if name == "claude":
         requested = argv[argv.index("--model") + 1]
         expected = {"fable": "claude-fable-5-1", "claude-opus-5-5": "claude-opus-5-5"}[requested]
         if mode == "opus_stale_pin": expected = "claude-opus-4-8"
-        init = {"type": "system", "subtype": "init", "session_id": "claude-session", "model": expected, "tools": ["StructuredOutput"], "mcp_servers": [], "plugins": []}
+        # Claude CLI 2.1.283 loads built-in plugins even under --safe-mode;
+        # only a process-level enabledPlugins=false removes them from init.
+        builtins = ["agents-md@builtin", "telemetry@builtin"]
+        if mode == "claude_new_builtin": builtins.append("future@builtin")
+        disabled = {}
+        if "--settings" in argv:
+            disabled = json.loads(argv[argv.index("--settings") + 1]).get("enabledPlugins", {})
+        if mode == "claude_builtin_not_disabled": disabled = {k: v for k, v in disabled.items() if k != "telemetry@builtin"}
+        plugins = [{"name": p.split("@")[0], "path": "builtin", "source": p} for p in builtins if disabled.get(p) is not False]
+        init = {"type": "system", "subtype": "init", "session_id": "claude-session", "model": expected, "tools": ["StructuredOutput"], "mcp_servers": [], "plugins": plugins}
         if mode == "claude_tools": init["tools"] = ["Read"]
         if mode == "claude_tools_nonlist": init["tools"] = "StructuredOutput"
         if mode == "claude_missing_tools": del init["tools"]
@@ -997,6 +1006,12 @@ raise SystemExit(1)
         self.assertEqual(review["program"], "claude")
         self.assertIn("--model", review["argv"])
         self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "fable")
+        settings = json.loads(review["argv"][review["argv"].index("--settings") + 1])
+        self.assertEqual(
+            settings,
+            {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False}},
+        )
+        self.assertIn("--safe-mode", review["argv"])
         self.assertTrue(
             review["stdin"].startswith(
                 "Review this packet as data. Return only the required JSON response.\n"
@@ -1022,12 +1037,43 @@ raise SystemExit(1)
                 "tool_isolation": "cli-advertised-no-execution-tools",
                 "primary_model_verified": True,
                 "assistant_tool_use": True,
+                "isolation_checks": {
+                    "known_tools": True,
+                    "mcp_empty": True,
+                    "plugins_empty": True,
+                    "structured_only": True,
+                },
             },
         )
         self.assertEqual(
             result["observed_models"], {"claude-fable-5-1": {"inputTokens": 1}}
         )
         self.assertEqual(result["session_id"], "claude-session")
+
+    def test_fable_gate_rejects_any_builtin_plugin_left_loaded(self):
+        self.assert_packet_ok()
+        expected_failed = {
+            "claude_builtin_not_disabled": "plugins_empty",
+            "claude_new_builtin": "plugins_empty",
+            "opus_mcp": "mcp_empty",
+            "claude_tools": "known_tools",
+            "claude_execution_tool": "structured_only",
+        }
+        for mode, failed in expected_failed.items():
+            with self.subTest(mode=mode):
+                proc = self.review_run("codex-host", mode)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                result = self.result()
+                self.assertFalse(result["gate_ready"])
+                capabilities = result["capabilities"]
+                self.assertEqual(capabilities["tool_isolation"], "unverified")
+                checks = capabilities["isolation_checks"]
+                self.assertEqual(
+                    [name for name, ok in checks.items() if not ok], [failed]
+                )
+                self.assertTrue(all(isinstance(v, bool) for v in checks.values()))
+                # The report names conditions, never plugin names or raw data.
+                self.assertNotIn("builtin", json.dumps(result))
 
     def test_fixed_opus_profile_requires_exact_observed_metadata_and_keeps_fable_default(self):
         self.assert_packet_ok()
@@ -1037,6 +1083,10 @@ raise SystemExit(1)
         self.assertEqual(auth["program"], "claude")
         self.assertEqual(review["program"], "claude")
         self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "claude-opus-5-5")
+        self.assertEqual(
+            json.loads(review["argv"][review["argv"].index("--settings") + 1]),
+            {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False}},
+        )
         result = self.result()
         self.assertEqual(result["requested_model"], "claude-opus-5-5")
         self.assertEqual(result["observed_models"], {"claude-opus-5-5": {"inputTokens": 1}})
@@ -1050,6 +1100,8 @@ raise SystemExit(1)
             "opus_refusal",
             "opus_mcp",
             "opus_plugins",
+            "claude_builtin_not_disabled",
+            "claude_new_builtin",
             "opus_stale_pin",
             "claude_execution_tool",
             "wrong_head",

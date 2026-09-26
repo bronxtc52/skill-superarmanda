@@ -711,6 +711,12 @@ def authenticated(cli, timeout, env, cwd):
     return {"subscription": "ChatGPT"}
 
 
+DISABLED_BUILTIN_PLUGINS = json.dumps(
+    {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False}},
+    separators=(",", ":"),
+)
+
+
 def profiles(host):
     claude_profiles = {
         "codex-host": "fable",
@@ -734,6 +740,10 @@ def profiles(host):
                 "--strict-mcp-config",
                 "--mcp-config",
                 '{"mcpServers":{}}',
+                # --safe-mode still loads built-in plugins; switch them off for
+                # this process only. init.plugins must then be empty.
+                "--settings",
+                DISABLED_BUILTIN_PLUGINS,
                 "--no-session-persistence",
                 "--permission-mode",
                 "dontAsk",
@@ -891,13 +901,17 @@ def response_from_stdout(cli, stdout, expected_model="claude-fable-5-1"):
             for event in assistant_events
         )
     )
-    no_execution_tools = (
-        known_tools
-        and init.get("mcp_servers") == []
-        and init.get("plugins") == []
-        and structured_only
-    )
+    # Booleans only: enough to name the failed isolation condition without
+    # copying plugin names, raw events, packet content or account data.
+    isolation_checks = {
+        "known_tools": known_tools,
+        "mcp_empty": init.get("mcp_servers") == [],
+        "plugins_empty": init.get("plugins") == [],
+        "structured_only": structured_only,
+    }
+    no_execution_tools = all(isolation_checks.values())
     return response, {
+        "isolation_checks": isolation_checks,
         "modelUsage": usage,
         "init": init,
         "primary_model_verified": primary_verified,
@@ -1159,6 +1173,7 @@ def review(args):
                             else "unverified",
                             "primary_model_verified": primary_verified,
                             "assistant_tool_use": metadata["assistant_tool_use"],
+                            "isolation_checks": metadata["isolation_checks"],
                         }
                         result["gate_ready"] = (
                             response["status"] == "pass"
