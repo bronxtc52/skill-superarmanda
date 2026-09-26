@@ -109,6 +109,8 @@ for line in sys.stdin:
    if mode=="settings_collab_model": ts["collaborationMode"]["settings"]["model"]="other"
    if mode=="settings_profile": ts["activePermissionProfile"]={"name":"full"}
    if mode=="settings_auto_reviewer": ts["approvalsReviewer"]="auto_review"
+   if mode=="settings_no_reviewer": ts.pop("approvalsReviewer")
+   if mode=="settings_null_reviewer": ts["approvalsReviewer"]=None
    if mode=="settings_collab_type": ts["collaborationMode"]="default"
    if mode=="settings_thread": tid="other"
    if mode=="settings_missing": ts=None
@@ -342,6 +344,8 @@ class Contract(unittest.TestCase):
             ("settings_collab_model", "identity"),
             ("settings_profile", "identity"),
             ("settings_auto_reviewer", "identity"),
+            ("settings_no_reviewer", "identity"),
+            ("settings_null_reviewer", "identity"),
             ("settings_collab_type", "identity"),
             ("settings_thread", "protocol"),
             ("settings_missing", "protocol"),
