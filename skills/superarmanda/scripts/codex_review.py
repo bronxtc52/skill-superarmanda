@@ -25,6 +25,11 @@ MAX_INPUT = 6 * MAX_PROMPT + 64 * 1024
 MAX_LINE = 1024 * 1024
 MAX_STREAM_BYTES = 8 * 1024 * 1024
 MAX_EVENTS = 4096
+MAX_DISABLED_ENTRIES = 256
+# Codex splits `-c` key paths on "." and keeps quotes literally, so only
+# names that are addressable as bare path segments can be disabled.
+ENTRY_NAME = re.compile(r"[A-Za-z0-9_@-]{1,128}")
+DISABLED_TABLES = ("mcp_servers", "plugins")
 DISABLED_FEATURES = (
     "shell_tool",
     "unified_exec",
@@ -93,7 +98,7 @@ def scrubbed_environment(source=None):
     }
 
 
-def app_server_argv():
+def app_server_argv(disabled=()):
     # Every override is passed before the server initializes.  Do not add
     # --ignore-user-config: the login's established location must remain usable.
     argv = ["codex", "app-server", "--stdio"]
@@ -121,7 +126,56 @@ def app_server_argv():
         'chatgpt_base_url="https://chatgpt.com/backend-api"',
     ):
         argv += ["-c", override]
+    # Table overrides above are merged with the user's config rather than
+    # replacing it, so each user entry is switched off for this process only.
+    for table, name in disabled:
+        argv += ["-c", f"{table}.{name}.enabled=false"]
     return argv
+
+
+def disable_overrides(config):
+    """Return `(table, name)` pairs that must be disabled for this process."""
+    if not isinstance(config, dict):
+        _fail("config")
+    pairs = []
+    for table in DISABLED_TABLES:
+        entries = config.get(table)
+        if entries in (None, {}):
+            continue
+        if not isinstance(entries, dict):
+            _fail("config")
+        for name in entries:
+            if not isinstance(name, str) or not ENTRY_NAME.fullmatch(name):
+                _fail("config")
+            pairs.append((table, name))
+    if len(pairs) > MAX_DISABLED_ENTRIES:
+        _fail("config")
+    return sorted(pairs)
+
+
+def _disabled_table(value):
+    if value in (None, {}):
+        return True
+    return isinstance(value, dict) and all(
+        isinstance(entry, dict) and entry.get("enabled") is False
+        for entry in value.values()
+    )
+
+
+def _require_inert_mcp(result):
+    """Runtime proof that no MCP server was started or exposes tools."""
+    data = result.get("data")
+    if not isinstance(data, list) or result.get("nextCursor") is not None:
+        _fail("config")
+    for status in data:
+        if not isinstance(status, dict):
+            _fail("config")
+        for key in ("serverInfo", "serverCapabilities", "runtimeStatus"):
+            if status.get(key) is not None:
+                _fail("config")
+        for key in ("tools", "resources", "resourceTemplates"):
+            if status.get(key) not in (None, {}, []):
+                _fail("config")
 
 
 def _unsafe_config(config):
@@ -168,13 +222,15 @@ def _unsafe_config(config):
         or otel.get("log_user_prompt") is not False
     ):
         return True
+    # Non-empty tables are accepted only when every entry is explicitly
+    # disabled; `_require_inert_mcp` then checks the live server state.
+    if not all(_disabled_table(config.get(table)) for table in DISABLED_TABLES):
+        return True
     unsafe = (
         "model_catalog_json",
         "model_instructions_file",
         "experimental_instructions_file",
-        "mcp_servers",
         "notify",
-        "plugins",
         "model_providers",
         "experimental_thread_store_endpoint",
         "external_store",
@@ -201,10 +257,10 @@ def _unsafe_config(config):
 
 
 class _Server:
-    def __init__(self, timeout, env, cwd):
+    def __init__(self, deadline, env, cwd, disabled=()):
         try:
             self.process = subprocess.Popen(
-                app_server_argv(),
+                app_server_argv(disabled),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -215,7 +271,7 @@ class _Server:
             )
         except OSError:
             _fail("spawn")
-        self.deadline = time.monotonic() + timeout
+        self.deadline = deadline
         self.next_id = 1
         self.events = 0
         self.stream_bytes = 0
@@ -441,6 +497,19 @@ def _account(result):
     return "ChatGPT"
 
 
+def _read_config(server, cwd):
+    server.request(
+        "initialize",
+        {
+            "clientInfo": {"name": "superarmanda", "version": "1"},
+            "capabilities": {"experimentalApi": True},
+        },
+    )
+    return server.request("config/read", {"cwd": cwd, "includeLayers": False}).get(
+        "config"
+    )
+
+
 def run_review(prompt, schema, timeout, env=None, cwd=None):
     """Return `(structured_response, safe_metadata)` or a sanitized ValueError."""
     if not isinstance(prompt, str) or not isinstance(schema, dict) or timeout <= 0:
@@ -448,20 +517,21 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
     if len(prompt.encode("utf-8")) > MAX_PROMPT:
         _fail("input")
     cwd = str(Path(cwd or os.getcwd()).resolve())
-    server = _Server(timeout, scrubbed_environment(env), cwd)
+    env = scrubbed_environment(env)
+    deadline = time.monotonic() + timeout
+    server = _Server(deadline, env, cwd)
     try:
-        server.request(
-            "initialize",
-            {
-                "clientInfo": {"name": "superarmanda", "version": "1"},
-                "capabilities": {"experimentalApi": True},
-            },
-        )
-        config = server.request(
-            "config/read", {"cwd": cwd, "includeLayers": False}
-        ).get("config")
+        # The first process only reports which user entries exist.  It never
+        # reaches account, thread or turn requests.
+        config = _read_config(server, cwd)
+        disabled = disable_overrides(config)
+        if disabled:
+            server.close()
+            server = _Server(deadline, env, cwd, disabled)
+            config = _read_config(server, cwd)
         if _unsafe_config(config):
             _fail("config")
+        _require_inert_mcp(server.request("mcpServerStatus/list", {}))
         subscription = _account(server.request("account/read", {"refreshToken": False}))
         thread = server.request(
             "thread/start",
