@@ -2853,6 +2853,33 @@ class WavesContract(unittest.TestCase):
         self.record_any("coderabbit", "pass")
         self.assertTrue(self.where()["next_action"].startswith("done"))
 
+    def test_where_precedence_disposition_before_coder_progression(self):
+        self.init_wave()
+        self.record_any("coder", "incomplete")
+        self.record_any("tester", "findings")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (6, "coordinator"))
+        self.assertIn("--outcome failed --source tester", info["next_action"])
+
+    def test_where_precedence_blocked_before_missing_coder(self):
+        self.init_wave()
+        self.record_any("cross_provider_reviewer", "unavailable")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (5, "cross_provider_reviewer"))
+        self.assertTrue(
+            info["next_action"].startswith("BLOCKED: cross_provider_reviewer unavailable")
+        )
+
+    def test_where_coder_findings_alone_text(self):
+        self.init_wave()
+        self.record_any("coder", "findings")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (4, "coder"))
+        self.assertEqual(
+            info["next_action"],
+            "step 4 coder: coder must finish or fix before tester (task implement)",
+        )
+
     # A4: safe-point staleness
     def test_safe_point_true_then_commit_is_stale_false(self):
         self.init_wave()

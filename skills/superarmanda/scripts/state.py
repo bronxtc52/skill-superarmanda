@@ -1113,10 +1113,6 @@ def derive_step(entry, verdicts):
         return 6, "coordinator", None
     if status == "needs_fix":
         return 6, "coder", None
-    if verdicts.get("coder") != "pass":
-        if verdicts.get("coder") is not None:
-            return 4, "coder", "step 4 coder: coder must finish or fix before tester"
-        return 4, "coder", None
     for role, _step in REVIEW_ORDER:
         if verdicts.get(role) in ("findings", "incomplete"):
             return (
@@ -1133,6 +1129,10 @@ def derive_step(entry, verdicts):
                 f"BLOCKED: {role} {verdicts[role]}; retry once explicitly "
                 "or escalate to the owner (not a fix-loop)",
             )
+    if verdicts.get("coder") != "pass":
+        if verdicts.get("coder") is not None:
+            return 4, "coder", "step 4 coder: coder must finish or fix before tester"
+        return 4, "coder", None
     if verdicts.get("tester") != "pass":
         return 5, "tester", None
     if verdicts.get("cross_provider_reviewer") != "pass":
