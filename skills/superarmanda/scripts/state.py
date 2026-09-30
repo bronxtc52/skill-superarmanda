@@ -1100,7 +1100,6 @@ REVIEW_ORDER = (
     ("tester", 5),
     ("cross_provider_reviewer", 5),
     ("github_codex_review", 7),
-    ("coderabbit", 7),
 )
 
 
@@ -1113,14 +1112,22 @@ def derive_step(entry, verdicts):
         return 6, "coordinator", None
     if status == "needs_fix":
         return 6, "coder", None
-    for role, _step in REVIEW_ORDER:
-        if verdicts.get(role) in ("findings", "incomplete"):
-            return (
-                6,
-                "coordinator",
-                f"record fix-loop --outcome failed --source {role} "
-                "after disposing the findings",
-            )
+    disposition = [
+        role
+        for role, _step in REVIEW_ORDER
+        if verdicts.get(role) in ("findings", "incomplete")
+    ]
+    # CodeRabbit is optional: only its findings need disposition; its
+    # error/unavailable/incomplete are recorded and ignored.
+    if verdicts.get("coderabbit") == "findings":
+        disposition.append("coderabbit")
+    if disposition:
+        return (
+            6,
+            "coordinator",
+            f"record fix-loop --outcome failed --source {disposition[0]} "
+            "after disposing the findings",
+        )
     for role, step in REVIEW_ORDER:
         if verdicts.get(role) in ("error", "unavailable"):
             return (

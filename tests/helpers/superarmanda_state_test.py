@@ -2803,7 +2803,6 @@ class WavesContract(unittest.TestCase):
             (("coder", "tester"), "cross_provider_reviewer", "incomplete"),
             (("coder", "tester", "cross_provider_reviewer"), "github_codex_review", "findings"),
             (("coder", "tester", "cross_provider_reviewer", "github_codex_review"), "coderabbit", "findings"),
-            (("coder", "tester", "cross_provider_reviewer", "github_codex_review"), "coderabbit", "incomplete"),
         ]
         for before, role, status in cases:
             with self.subTest(role=role, status=status, before=len(before)):
@@ -2819,7 +2818,7 @@ class WavesContract(unittest.TestCase):
                 self.assertFalse(info["next_action"].startswith("done"))
 
     def test_where_error_or_unavailable_is_blocked_at_that_role(self):
-        steps = {"tester": 5, "cross_provider_reviewer": 5, "github_codex_review": 7, "coderabbit": 7}
+        steps = {"tester": 5, "cross_provider_reviewer": 5, "github_codex_review": 7}
         chain = ("coder", "tester", "cross_provider_reviewer", "github_codex_review")
         for role, step in steps.items():
             for status in ("error", "unavailable"):
@@ -2941,17 +2940,18 @@ class WhereDerivationExhaustive(unittest.TestCase):
             ("tester", 5),
             ("cross_provider_reviewer", 5),
             ("github_codex_review", 7),
-            ("coderabbit", 7),
         ]
         for name, _ in reviewers:
             if verdict.get(name) in ("findings", "incomplete"):
                 return (6, "coordinator", False, name)
+        if verdict.get("coderabbit") == "findings":
+            return (6, "coordinator", False, "coderabbit")
         for name, step in reviewers:
             if verdict.get(name) in ("error", "unavailable"):
                 return (step, name, True, None)
         if verdict.get("coder") != "pass":
             return (4, "coder", False, None)
-        for name, step in reviewers[:3]:
+        for name, step in reviewers:
             if verdict.get(name) != "pass":
                 return (step, name, False, None)
         return (7, None, False, None)
@@ -2985,6 +2985,33 @@ class WhereDerivationExhaustive(unittest.TestCase):
                     self.fail(f"{task_status} {verdict}: {actual} != {expected}")
                 count += 1
         self.assertEqual(count, 4 * 6**5)
+
+    def test_named_coderabbit_cases(self):
+        module = self.load()
+        required = {
+            "coder": "pass",
+            "tester": "pass",
+            "cross_provider_reviewer": "pass",
+            "github_codex_review": "pass",
+        }
+        for status in ("unavailable", "error", "incomplete", "pass"):
+            with self.subTest(status=status):
+                verdict = dict(required, coderabbit=status)
+                self.assertEqual(
+                    self.observed(module, "in_progress", verdict),
+                    (7, None, False, None),
+                )
+        verdict = dict(required, coderabbit="findings")
+        self.assertEqual(
+            self.observed(module, "in_progress", verdict),
+            (6, "coordinator", False, "coderabbit"),
+        )
+        # coderabbit noise never masks a required-role problem
+        verdict = dict(required, tester="error", coderabbit="findings")
+        self.assertEqual(
+            self.observed(module, "in_progress", verdict),
+            (6, "coordinator", False, "coderabbit"),
+        )
 
     def test_named_case_findings_beat_error(self):
         module = self.load()
