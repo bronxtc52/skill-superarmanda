@@ -6,6 +6,7 @@ CLI as an outside client, so this verifies the public command contract rather
 than internal helper functions.
 """
 
+import copy
 import json
 import importlib.util
 import os
@@ -2706,6 +2707,64 @@ class WavesContract(unittest.TestCase):
         self.assertNotIn("Errno", proc.stderr)
         self.assertIn("regular file", proc.stderr)
         self.assertFalse(self.manifest.exists())
+
+    PROPERTY_VALUES = [None, True, 0, 1.5, "", [], {}, [[]], {"a": 1}]
+
+    def property_cases(self):
+        """Every (path, value) that makes plan_doc() invalid, selected wave = w2."""
+        doc = plan_doc()
+        paths = [(key,) for key in doc if key != "waves"] + [("waves",)]
+        paths += [("waves", 1, key) for key in doc["waves"][1]]
+        paths += [
+            ("waves", 1, "acceptance", 0),
+            ("waves", 1, "checks", 0, "name"),
+            ("waves", 1, "checks", 0, "cmd"),
+            ("waves", 1, "depends_on", 0),
+        ]
+        valid = {("waves", 1, "checks"), ("waves", 1, "depends_on")}
+        for path in paths:
+            for value in self.PROPERTY_VALUES:
+                if path in valid and value == []:
+                    continue
+                mutated = copy.deepcopy(doc)
+                target = mutated
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                yield path, value, mutated
+
+    def test_property_init_rejects_every_bad_value_cleanly(self):
+        for path, value, mutated in self.property_cases():
+            with self.subTest(path=path, value=value):
+                if self.manifest.exists():
+                    self.manifest.unlink()
+                self.write_plan(mutated)
+                proc = self.init_wave_raw(f"{self.plan}#w2")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertTrue(proc.stderr.startswith("state:"), proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertFalse(self.manifest.exists())
+
+    def test_property_where_marks_every_bad_value_as_changed(self):
+        self.init_wave("w2")
+        for path, value, mutated in self.property_cases():
+            with self.subTest(path=path, value=value):
+                self.write_plan(mutated)
+                proc = self.run_state("where")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                info = json.loads(proc.stdout)
+                self.assertEqual(info["plan_check"], "changed")
+                self.assertTrue(
+                    info["next_action"].startswith("BLOCKED: plan changed")
+                )
+
+    def test_init_from_plan_repo_format_enforced(self):
+        for bad in ("noslash", "a/b/c", "/b", "a/", "a b/c", "a/b\n"):
+            with self.subTest(bad=bad):
+                doc = plan_doc()
+                doc["repo"] = bad
+                self.write_plan(doc)
+                self.assert_init_rejected(f"{self.plan}#w1")
 
     # A4: safe-point staleness
     def test_safe_point_true_then_commit_is_stale_false(self):

@@ -27,6 +27,7 @@ DECISIONS = {"invariant", "cut_surface", "accept_limitation"}
 MAX_DECISION_NOTE_LENGTH = 500
 MAX_PLAN_BYTES = 1024 * 1024
 NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
+REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 RISKS = {"low", "medium", "high"}
 PLAN_KEYS = {"version", "chain", "repo", "base_branch", "waves"}
 WAVE_KEYS = {
@@ -740,7 +741,7 @@ def validate_wave(item, index, seen):
         or not all(is_text(entry) for entry in acceptance)
     ):
         raise PlanError(f"{where}.acceptance must be a non-empty list of strings")
-    if item["risk"] not in RISKS:
+    if not isinstance(item["risk"], str) or item["risk"] not in RISKS:
         raise PlanError(f"{where}.risk must be one of {sorted(RISKS)}")
     checks = item["checks"]
     if not isinstance(checks, list):
@@ -749,12 +750,12 @@ def validate_wave(item, index, seen):
         if (
             not isinstance(check, dict)
             or set(check) != {"name", "cmd"}
-            or not isinstance(check["name"], str)
-            or not isinstance(check["cmd"], str)
+            or not is_text(check["name"])
+            or not is_text(check["cmd"])
         ):
             raise PlanError(f"{where}.checks entries need exactly name and cmd strings")
     depends = item["depends_on"]
-    if not isinstance(depends, list) or not all(isinstance(d, str) for d in depends):
+    if not isinstance(depends, list) or not all(is_text(d) for d in depends):
         raise PlanError(f"{where}.depends_on must be a list of wave ids")
     for dependency in depends:
         if dependency not in seen:
@@ -778,6 +779,8 @@ def parse_plan(raw):
     for key in ("chain", "repo", "base_branch"):
         if not is_text(doc[key]):
             raise PlanError(f"plan {key} must be a non-empty string")
+    if REPO_PATTERN.fullmatch(doc["repo"]) is None:
+        raise PlanError("plan repo must be owner/name")
     if not isinstance(doc["waves"], list) or not doc["waves"]:
         raise PlanError("plan waves must be a non-empty list")
     seen = set()
