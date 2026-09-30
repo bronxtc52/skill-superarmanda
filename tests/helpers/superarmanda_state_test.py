@@ -2775,6 +2775,84 @@ class WavesContract(unittest.TestCase):
                 self.write_plan(doc)
                 self.assert_init_rejected(f"{self.plan}#w1")
 
+    def record_any(self, role, status, task="implement"):
+        extra = []
+        artifact = "evidence"
+        if status == "pass" and role == "cross_provider_reviewer":
+            extra = ["--reviewed-head", self.head(), "--packet-hash", "sha256:" + "a" * 64]
+        if status == "pass" and role == "github_codex_review":
+            artifact = "https://example.invalid/review"
+            extra = ["--reviewed-head", self.head()]
+        return self.cli(
+            "task-result", "--task", task, "--role", role, "--status", status,
+            "--session-id", f"{role}-{task}-session", "--head", self.head(),
+            "--artifact", artifact, *extra,
+        )
+
+    def passes(self, *roles):
+        for role in roles:
+            self.record_any(role, "pass")
+
+    def test_where_non_pass_findings_route_to_disposition(self):
+        cases = [
+            (("coder",), "tester", "findings"),
+            (("coder",), "tester", "incomplete"),
+            (("coder", "tester"), "cross_provider_reviewer", "findings"),
+            (("coder", "tester"), "cross_provider_reviewer", "incomplete"),
+            (("coder", "tester", "cross_provider_reviewer"), "github_codex_review", "findings"),
+            (("coder", "tester", "cross_provider_reviewer", "github_codex_review"), "coderabbit", "findings"),
+            (("coder", "tester", "cross_provider_reviewer", "github_codex_review"), "coderabbit", "incomplete"),
+        ]
+        for before, role, status in cases:
+            with self.subTest(role=role, status=status, before=len(before)):
+                if self.manifest.exists():
+                    self.manifest.unlink()
+                self.init_wave()
+                self.passes(*before)
+                self.record_any(role, status)
+                info = self.where()
+                self.assertEqual((info["step"], info["role"]), (6, "coordinator"))
+                self.assertIn(f"fix-loop", info["next_action"])
+                self.assertIn(f"--outcome failed --source {role}", info["next_action"])
+                self.assertFalse(info["next_action"].startswith("done"))
+
+    def test_where_error_or_unavailable_is_blocked_at_that_role(self):
+        steps = {"tester": 5, "cross_provider_reviewer": 5, "github_codex_review": 7, "coderabbit": 7}
+        chain = ("coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        for role, step in steps.items():
+            for status in ("error", "unavailable"):
+                with self.subTest(role=role, status=status):
+                    if self.manifest.exists():
+                        self.manifest.unlink()
+                    self.init_wave()
+                    self.passes(*chain[: chain.index(role)] if role in chain else chain)
+                    self.record_any(role, status)
+                    info = self.where()
+                    self.assertEqual((info["step"], info["role"]), (step, role))
+                    self.assertTrue(
+                        info["next_action"].startswith(f"BLOCKED: {role} {status}"),
+                        info["next_action"],
+                    )
+
+    def test_where_coder_non_pass_routes_to_coder(self):
+        for status in ("findings", "incomplete", "error", "unavailable"):
+            with self.subTest(status=status):
+                if self.manifest.exists():
+                    self.manifest.unlink()
+                self.init_wave()
+                self.record_any("coder", status)
+                info = self.where()
+                self.assertEqual((info["step"], info["role"]), (4, "coder"))
+                self.assertIn("coder", info["next_action"])
+                self.assertFalse(info["next_action"].startswith("done"))
+
+    def test_where_done_only_when_no_current_result_is_non_pass(self):
+        self.init_wave()
+        self.passes("coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        self.assertTrue(self.where()["next_action"].startswith("done"))
+        self.record_any("coderabbit", "pass")
+        self.assertTrue(self.where()["next_action"].startswith("done"))
+
     # A4: safe-point staleness
     def test_safe_point_true_then_commit_is_stale_false(self):
         self.init_wave()

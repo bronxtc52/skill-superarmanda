@@ -1096,24 +1096,50 @@ def pick_task(data):
     return names[0] if names else None
 
 
+REVIEW_ORDER = (
+    ("tester", 5),
+    ("cross_provider_reviewer", 5),
+    ("github_codex_review", 7),
+    ("coderabbit", 7),
+)
+
+
 def derive_step(entry, verdicts):
-    """Return (step, role) implied by task status and current-head verdicts."""
+    """Return (step, role, note); note overrides the default next_action."""
     status = entry.get("status") if entry else None
     if status == "blocked":
-        return None, None
+        return None, None, None
     if status == "needs_decision":
-        return 6, "coordinator"
+        return 6, "coordinator", None
     if status == "needs_fix":
-        return 6, "coder"
+        return 6, "coder", None
     if verdicts.get("coder") != "pass":
-        return 4, "coder"
+        if verdicts.get("coder") is not None:
+            return 4, "coder", "step 4 coder: coder must finish or fix before tester"
+        return 4, "coder", None
+    for role, _step in REVIEW_ORDER:
+        if verdicts.get(role) in ("findings", "incomplete"):
+            return (
+                6,
+                "coordinator",
+                f"record fix-loop --outcome failed --source {role} "
+                "after disposing the findings",
+            )
+    for role, step in REVIEW_ORDER:
+        if verdicts.get(role) in ("error", "unavailable"):
+            return (
+                step,
+                role,
+                f"BLOCKED: {role} {verdicts[role]}; retry once explicitly "
+                "or escalate to the owner (not a fix-loop)",
+            )
     if verdicts.get("tester") != "pass":
-        return 5, "tester"
+        return 5, "tester", None
     if verdicts.get("cross_provider_reviewer") != "pass":
-        return 5, "cross_provider_reviewer"
+        return 5, "cross_provider_reviewer", None
     if verdicts.get("github_codex_review") != "pass":
-        return 7, "github_codex_review"
-    return 7, None
+        return 7, "github_codex_review", None
+    return 7, None, None
 
 
 def where(args):
@@ -1143,7 +1169,7 @@ def where(args):
         if item["status"] != "pass"
     ]
     status_value = entry.get("status", "pending") if entry else None
-    step, role = derive_step(entry, verdicts)
+    step, role, note = derive_step(entry, verdicts)
     position = data.get("position")
     marked_step = (
         position["step"]
@@ -1182,6 +1208,8 @@ def where(args):
         )
     elif role is None:
         action = f"done: task {name} has all required results; continue to merge gate"
+    elif note is not None:
+        action = f"{note} (task {name})" if not note.startswith("BLOCKED") else note
     else:
         action = f"step {step} {role}: continue task {name}"
     print(
