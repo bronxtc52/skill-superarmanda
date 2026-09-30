@@ -2915,9 +2915,11 @@ class WavesContract(unittest.TestCase):
         self.assertEqual((info["step"], info["role"]), (4, "coder"))
         self.assertEqual(info["marked_step"], 5)
 
-    def test_where_positioned_ready_task_not_selected_while_another_is_open(self):
+    def test_where_positioned_done_task_not_selected_while_another_is_open(self):
         self.init_wave()
-        self.passes_for("a", "coder", "tester", "cross_provider_reviewer")
+        self.passes_for(
+            "a", "coder", "tester", "cross_provider_reviewer", "github_codex_review"
+        )
         self.cli("mark", "--task", "a", "--step", 7, "--safe-point", "true")
         self.record_any("coder", "pass", task="b")
         info = self.where()
@@ -2933,6 +2935,44 @@ class WavesContract(unittest.TestCase):
         info = self.where()
         self.assertEqual(info["task"], "b")
         self.assertTrue(info["next_action"].startswith("done"))
+
+    def test_where_selects_task_with_fresh_codex_or_coderabbit_findings(self):
+        full = ("coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        for role in ("github_codex_review", "coderabbit"):
+            with self.subTest(role=role):
+                if self.manifest.exists():
+                    self.manifest.unlink()
+                self.init_wave()
+                self.passes_for("a", "coder", "tester", "cross_provider_reviewer")
+                if role == "coderabbit":
+                    self.record_any("github_codex_review", "pass", task="a")
+                self.record_any(role, "findings", task="a")
+                self.passes_for("b", *full)
+                self.cli("mark", "--task", "b", "--step", 7, "--safe-point", "true")
+                info = self.where()
+                self.assertEqual(info["task"], "a")
+                self.assertEqual((info["step"], info["role"]), (6, "coordinator"))
+                self.assertIn(f"--source {role}", info["next_action"])
+
+    def test_where_ready_task_without_codex_result_is_not_complete(self):
+        self.init_wave()
+        self.passes_for("a", "coder", "tester", "cross_provider_reviewer")
+        self.passes_for("b", "coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        self.cli("mark", "--task", "b", "--step", 7, "--safe-point", "true")
+        info = self.where()
+        self.assertEqual(info["task"], "a")
+        self.assertEqual((info["step"], info["role"]), (7, "github_codex_review"))
+
+    def test_where_escapes_nel_in_next_action(self):
+        self.init_wave()
+        data = self.manifest_data()
+        data["tasks"]["a\x85b"] = {
+            "status": "blocked", "fix_cycles": 3, "results": {}, "session_roles": {},
+        }
+        self.manifest.write_text(json.dumps(data), encoding="utf-8")
+        action = self.where()["next_action"]
+        self.assertEqual(len(action.splitlines()), 1)
+        self.assertNotIn("\x85", action)
 
     def passes_for(self, task, *roles):
         for role in roles:

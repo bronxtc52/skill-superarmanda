@@ -1093,8 +1093,6 @@ def current_verdicts(entry, head, tree):
 
 
 def is_complete(entry, head, tree):
-    if entry.get("status") == "ready_for_pr_review":
-        return True
     step, role, _note = derive_step(entry, current_verdicts(entry, head, tree))
     return step == 7 and role is None
 
@@ -1114,7 +1112,7 @@ def pick_task(data, head, tree):
     return names[0] if names else None
 
 
-ONE_LINE_UNSAFE = re.compile("[\x00-\x1f\x7f\u2028\u2029]")
+ONE_LINE_UNSAFE = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
 
 
 def one_line(text):
