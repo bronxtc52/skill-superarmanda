@@ -1084,16 +1084,45 @@ def mark(args):
     print(json.dumps(data["position"], sort_keys=True))
 
 
-def pick_task(data):
+def current_verdicts(entry, head, tree):
+    return {
+        role: item["status"]
+        for role, item in sorted((entry or {}).get("results", {}).items())
+        if item.get("head") == head and item.get("tree_fingerprint") == tree
+    }
+
+
+def is_complete(entry, head, tree):
+    if entry.get("status") == "ready_for_pr_review":
+        return True
+    step, role, _note = derive_step(entry, current_verdicts(entry, head, tree))
+    return step == 7 and role is None
+
+
+def pick_task(data, head, tree):
     tasks = data["tasks"]
-    position = data.get("position")
-    if position is not None:
-        return position["task"]
     names = sorted(tasks)
+    position = data.get("position")
+    marked = position["task"] if position is not None else None
+    if marked in tasks and not is_complete(tasks[marked], head, tree):
+        return marked
     for name in names:
-        if tasks[name].get("status") not in ("ready_for_pr_review", "done"):
+        if not is_complete(tasks[name], head, tree):
             return name
+    if marked in tasks:
+        return marked
     return names[0] if names else None
+
+
+ONE_LINE_UNSAFE = re.compile("[\x00-\x1f\x7f\u2028\u2029]")
+
+
+def one_line(text):
+    """Single formatting point: escape control characters, then verify."""
+    escaped = ONE_LINE_UNSAFE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
+    if ONE_LINE_UNSAFE.search(escaped):
+        fail("internal error: next_action is not one line")
+    return escaped
 
 
 REVIEW_ORDER = (
@@ -1149,6 +1178,10 @@ def derive_step(entry, verdicts):
     return 7, None, None
 
 
+def results_any(entry, head, tree):
+    return bool(current_verdicts(entry, head, tree))
+
+
 def where(args):
     data = read(Path(args.manifest))
     location = repo(data["repo"])
@@ -1160,7 +1193,7 @@ def where(args):
         and current_tree == data["tree_fingerprint"]
     )
     check = plan_check(data)
-    name = pick_task(data)
+    name = pick_task(data, current_head, current_tree)
     entry = data["tasks"].get(name) if name is not None else None
     results = (entry or {}).get("results", {})
     current = {
@@ -1178,6 +1211,18 @@ def where(args):
     status_value = entry.get("status", "pending") if entry else None
     step, role, note = derive_step(entry, verdicts)
     position = data.get("position")
+    precode = (
+        entry is not None
+        and not results_any(entry, current_head, current_tree)
+        and status_value in ("pending", "in_progress")
+        and position is not None
+        and position["task"] == name
+        and position["head"] == current_head
+        and position["tree_fingerprint"] == current_tree
+        and position["step"] in (1, 2, 3)
+    )
+    if precode:
+        step, role = position["step"], "coordinator"
     marked_step = (
         position["step"]
         if position is not None and position["task"] == name
@@ -1213,12 +1258,15 @@ def where(args):
             f"run fix-loop --decision <{'|'.join(sorted(DECISIONS))}> "
             f"--note <text> --task {name} (decision required for source {required})"
         )
+    elif precode:
+        action = f"continue step {step} (requirements/plan) for task {name}"
     elif role is None:
         action = f"done: task {name} has all required results; continue to merge gate"
     elif note is not None:
         action = f"{note} (task {name})" if not note.startswith("BLOCKED") else note
     else:
         action = f"step {step} {role}: continue task {name}"
+    action = one_line(action)
     print(
         json.dumps(
             {

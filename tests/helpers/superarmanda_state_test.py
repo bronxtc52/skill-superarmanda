@@ -2881,6 +2881,89 @@ class WavesContract(unittest.TestCase):
             "step 4 coder: coder must finish or fix before tester (task implement)",
         )
 
+    # Run 3 fix 2: A (fresh pre-code marks), B (task selection), C (one line)
+    def test_where_fresh_precode_mark_sets_coordinator_step(self):
+        self.init_wave()
+        self.cli("mark", "--task", "t", "--step", 2, "--safe-point", "true")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (2, "coordinator"))
+        self.assertEqual(
+            info["next_action"], "continue step 2 (requirements/plan) for task t"
+        )
+
+    def test_where_stale_precode_mark_does_not_drive_step(self):
+        self.init_wave()
+        self.cli("mark", "--task", "t", "--step", 2, "--safe-point", "true")
+        self.git("commit", "--allow-empty", "-qm", "next")
+        self.cli(
+            "resume", "--repo", self.repo, "--base", self.base, "--head", self.head()
+        )
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (4, "coder"))
+
+    def test_where_precode_mark_with_results_is_derived_not_marked(self):
+        self.init_wave()
+        self.cli("mark", "--task", "t", "--step", 2, "--safe-point", "true")
+        self.record_any("coder", "pass", task="t")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (5, "tester"))
+
+    def test_where_step_4_plus_marks_stay_informational(self):
+        self.init_wave()
+        self.cli("mark", "--task", "t", "--step", 5, "--safe-point", "true")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (4, "coder"))
+        self.assertEqual(info["marked_step"], 5)
+
+    def test_where_positioned_ready_task_not_selected_while_another_is_open(self):
+        self.init_wave()
+        self.passes_for("a", "coder", "tester", "cross_provider_reviewer")
+        self.cli("mark", "--task", "a", "--step", 7, "--safe-point", "true")
+        self.record_any("coder", "pass", task="b")
+        info = self.where()
+        self.assertEqual(info["task"], "b")
+        self.assertEqual((info["step"], info["role"]), (5, "tester"))
+
+    def test_where_positioned_nonexistent_or_all_complete_selection(self):
+        self.init_wave()
+        full = ("coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        self.passes_for("a", *full)
+        self.passes_for("b", *full)
+        self.cli("mark", "--task", "b", "--step", 7, "--safe-point", "true")
+        info = self.where()
+        self.assertEqual(info["task"], "b")
+        self.assertTrue(info["next_action"].startswith("done"))
+
+    def passes_for(self, task, *roles):
+        for role in roles:
+            self.record_any(role, "pass", task=task)
+
+    def assert_one_line(self, text):
+        for ch in text:
+            self.assertFalse(
+                ch < " " or ch in "\x7f\u2028\u2029", repr(text)
+            )
+
+    def test_where_next_action_is_one_line_for_hostile_path_and_task(self):
+        for hostile in ("a\nb c", "x\u2028y", "p\u2029q", "t\x01u"):
+            with self.subTest(hostile=repr(hostile)):
+                self.manifest = Path(self.tmp.name) / f"run {hostile}.json"
+                self.init_wave()
+                data = self.manifest_data()
+                data["tasks"][f"task {hostile}"] = {
+                    "status": "blocked", "fix_cycles": 3, "results": {},
+                    "session_roles": {},
+                }
+                self.manifest.write_text(json.dumps(data), encoding="utf-8")
+                info = self.where()
+                self.assert_one_line(info["next_action"])
+                self.assertTrue(info["next_action"].startswith("BLOCKED"))
+                # stale tree path quotes the manifest path too
+                self.git("commit", "--allow-empty", "-qm", f"n{len(hostile)}{ord(hostile[1])}")
+                info = self.where()
+                self.assert_one_line(info["next_action"])
+                self.assertTrue(info["next_action"].startswith("run resume"))
+
     # A4: safe-point staleness
     def test_safe_point_true_then_commit_is_stale_false(self):
         self.init_wave()
