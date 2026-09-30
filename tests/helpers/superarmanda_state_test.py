@@ -2003,5 +2003,699 @@ class StateContract(unittest.TestCase):
         self.assertFalse(lock.exists() or lock.is_symlink())
 
 
+V060_KEYS = {
+    "version",
+    "run_id",
+    "repo",
+    "base",
+    "head",
+    "tree_fingerprint",
+    "tasks",
+    "created_at",
+    "updated_at",
+}
+
+
+def canonical_sha(obj):
+    blob = json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def wave(wave_id, depends_on=(), **overrides):
+    value = {
+        "id": wave_id,
+        "title": f"Title {wave_id}",
+        "goal": f"Goal {wave_id}",
+        "requirements": f"Requirements {wave_id}",
+        "acceptance": [f"Acceptance {wave_id}"],
+        "risk": "medium",
+        "checks": [{"name": "unit", "cmd": "bash tests/run.sh"}],
+        "depends_on": list(depends_on),
+    }
+    value.update(overrides)
+    return value
+
+
+def plan_doc(waves=None):
+    return {
+        "version": 1,
+        "chain": "chain-one",
+        "repo": "owner/name",
+        "base_branch": "main",
+        "waves": waves if waves is not None else [wave("w1"), wave("w2", ["w1"]), wave("w3")],
+    }
+
+
+class WavesContract(unittest.TestCase):
+    """init --from-plan, mark and where (spec 5.1-5.3)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name) / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q")
+        self.git("checkout", "-q", "-b", "main")
+        self.git("config", "user.email", "tester@example.invalid")
+        self.git("config", "user.name", "State Tester")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        self.git("commit", "-qm", "base")
+        self.base = self.head()
+        self.manifest = Path(self.tmp.name) / "run.json"
+        self.plan = Path(self.tmp.name) / "waves.json"
+
+    def git(self, *args, check=True):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *map(str, args)],
+            text=True,
+            capture_output=True,
+            check=check,
+        )
+
+    def head(self):
+        return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def write_plan(self, doc=None, raw=None):
+        if raw is None:
+            raw = json.dumps(doc if doc is not None else plan_doc(), indent=2)
+        data = raw if isinstance(raw, bytes) else raw.encode("utf-8")
+        self.plan.write_bytes(data)
+        return data
+
+    def run_state(self, command, *args, manifest=True):
+        argv = ["python3", str(STATE), command]
+        if manifest:
+            argv += ["--manifest", str(self.manifest)]
+        return subprocess.run(
+            [*argv, *map(str, args)], text=True, capture_output=True
+        )
+
+    def cli(self, command, *args):
+        proc = self.run_state(command, *args)
+        if proc.returncode:
+            self.fail(f"{command} failed rc={proc.returncode}: {proc.stderr}")
+        return proc
+
+    def init_args(self, selector):
+        return [
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+            "--run-id",
+            "wave-run",
+            "--from-plan",
+            selector,
+        ]
+
+    def init_wave(self, wave_id="w1", doc=None):
+        self.write_plan(doc)
+        return self.cli("init", *self.init_args(f"{self.plan}#{wave_id}"))
+
+    def init_wave_raw(self, selector):
+        return self.run_state("init", *self.init_args(selector))
+
+    def manifest_data(self):
+        return json.loads(self.manifest.read_text(encoding="utf-8"))
+
+    def where(self):
+        proc = self.cli("where")
+        return json.loads(proc.stdout)
+
+    def record(self, role, status="pass", task="implement", artifact="evidence"):
+        return self.cli(
+            "task-result",
+            "--task",
+            task,
+            "--role",
+            role,
+            "--status",
+            status,
+            "--session-id",
+            f"{role}-session",
+            "--head",
+            self.head(),
+            "--artifact",
+            artifact,
+        )
+
+    def mark(self, task="implement", step=4, safe="false"):
+        return self.run_state(
+            "mark", "--task", task, "--step", step, "--safe-point", safe
+        )
+
+    def resume(self):
+        return self.cli(
+            "resume",
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+        )
+
+    # R2: init --from-plan
+    def test_init_from_plan_records_plan_and_wave_copy(self):
+        raw = self.write_plan()
+        self.cli("init", *self.init_args(f"{self.plan}#w2"))
+        data = self.manifest_data()
+        selected = plan_doc()["waves"][1]
+        self.assertEqual(data["wave"], selected)
+        sha = hashlib.sha256(raw).hexdigest()
+        self.assertEqual(
+            data["plan"],
+            {
+                "path": str(self.plan.resolve()),
+                "sha256": sha,
+                "wave": "w2",
+                "approved_by": f"plan@{sha}",
+                "wave_sha256": canonical_sha(selected),
+            },
+        )
+        self.assertEqual(data["version"], 1)
+        self.assertEqual(data["base"], self.base)
+
+    def test_init_without_from_plan_has_exactly_the_v060_keys(self):
+        self.cli(
+            "init",
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+            "--run-id",
+            "legacy",
+        )
+        self.assertEqual(set(self.manifest_data()), V060_KEYS)
+
+    def assert_init_rejected(self, selector):
+        proc = self.init_wave_raw(selector)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(self.manifest.exists())
+        self.assertFalse(
+            Path(self.tmp.name, ".run.json.lock").exists()
+            and self.manifest.exists()
+        )
+
+    def test_init_from_plan_unknown_wave_id_rejected(self):
+        self.write_plan()
+        self.assert_init_rejected(f"{self.plan}#nope")
+
+    def test_init_from_plan_hash_without_id_rejected(self):
+        self.write_plan()
+        self.assert_init_rejected(f"{self.plan}#")
+        self.assert_init_rejected(str(self.plan))
+
+    def test_init_from_plan_missing_file_rejected(self):
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_duplicate_json_key_rejected(self):
+        raw = json.dumps(plan_doc())
+        raw = raw.replace('"chain": "chain-one"', '"chain": "a", "chain": "b"')
+        self.write_plan(raw=raw)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_duplicate_key_in_nested_wave_rejected(self):
+        raw = json.dumps(plan_doc()).replace('"risk": "medium"', '"risk": "low", "risk": "high"', 1)
+        self.write_plan(raw=raw)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_unknown_top_level_key_rejected(self):
+        doc = plan_doc()
+        doc["extra"] = 1
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_unknown_wave_key_rejected(self):
+        doc = plan_doc([wave("w1", extra="x")])
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_missing_key_rejected(self):
+        doc = plan_doc()
+        del doc["waves"][0]["goal"]
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_bad_risk_rejected(self):
+        self.write_plan(plan_doc([wave("w1", risk="extreme")]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_wrong_version_rejected(self):
+        doc = plan_doc()
+        doc["version"] = 2
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_bool_version_rejected(self):
+        doc = plan_doc()
+        doc["version"] = True
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_empty_required_strings_rejected(self):
+        for field in ("title", "goal", "requirements"):
+            with self.subTest(field=field):
+                self.write_plan(plan_doc([wave("w1", **{field: ""})]))
+                self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_empty_waves_or_acceptance_rejected(self):
+        self.write_plan(plan_doc([]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+        self.write_plan(plan_doc([wave("w1", acceptance=[])]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_bad_checks_rejected(self):
+        bad = [
+            [{"name": "n"}],
+            [{"name": "n", "cmd": "c", "x": 1}],
+            [{"name": 1, "cmd": "c"}],
+            "bash",
+        ]
+        for checks in bad:
+            with self.subTest(checks=checks):
+                self.write_plan(plan_doc([wave("w1", checks=checks)]))
+                self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_bad_wave_ids_rejected(self):
+        for bad in (".", "..", "a/b", "a b", ""):
+            with self.subTest(bad=bad):
+                self.write_plan(plan_doc([wave(bad)]))
+                self.assert_init_rejected(f"{self.plan}#{bad or 'x'}")
+
+    def test_init_from_plan_duplicate_wave_id_rejected(self):
+        self.write_plan(plan_doc([wave("w1"), wave("w1")]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_self_and_forward_dependency_rejected(self):
+        self.write_plan(plan_doc([wave("w1", ["w1"])]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+        self.write_plan(plan_doc([wave("w1", ["w2"]), wave("w2")]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+        self.write_plan(plan_doc([wave("w1", ["ghost"])]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_symlinked_plan_rejected(self):
+        real = Path(self.tmp.name) / "real-plan.json"
+        real.write_text(json.dumps(plan_doc()), encoding="utf-8")
+        self.plan.symlink_to(real)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_non_regular_file_rejected(self):
+        self.plan.mkdir()
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_over_one_mib_rejected(self):
+        doc = plan_doc([wave("w1", goal="x" * (1024 * 1024 + 1))])
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_invalid_utf8_rejected(self):
+        self.write_plan(raw=b'{"version": 1, "chain": "\xff"}')
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_not_an_object_rejected(self):
+        self.write_plan(raw="[1, 2]")
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    # R3: mark
+    def test_mark_creates_task_and_records_position(self):
+        self.init_wave()
+        before = self.manifest_data()
+        self.cli("mark", "--task", "impl", "--step", 4, "--safe-point", "true")
+        data = self.manifest_data()
+        position = data["position"]
+        self.assertEqual(
+            set(position),
+            {"task", "step", "safe_point", "head", "tree_fingerprint", "recorded_at"},
+        )
+        self.assertEqual(position["task"], "impl")
+        self.assertEqual(position["step"], 4)
+        self.assertIs(position["safe_point"], True)
+        self.assertEqual(position["head"], self.head())
+        self.assertEqual(position["tree_fingerprint"], before["tree_fingerprint"])
+        self.assertEqual(data["tasks"]["impl"]["status"], "pending")
+        self.assertEqual(data["tasks"]["impl"]["results"], {})
+
+    def test_mark_does_not_change_existing_task_status(self):
+        self.init_wave()
+        self.record("coder")
+        self.record("tester")
+        before = self.manifest_data()["tasks"]["implement"]
+        self.cli("mark", "--task", "implement", "--step", 5, "--safe-point", "false")
+        after = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(before["status"], after["status"])
+        self.assertEqual(before["results"], after["results"])
+
+    def test_mark_safe_point_false_is_boolean_false(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 6, "--safe-point", "false")
+        self.assertIs(self.manifest_data()["position"]["safe_point"], False)
+
+    def test_mark_rejects_bad_arguments_and_leaves_manifest(self):
+        self.init_wave()
+        before = self.manifest.read_bytes()
+        cases = [
+            ("impl", 0, "true"),
+            ("impl", 8, "true"),
+            ("impl", "x", "true"),
+            ("impl", 4, "maybe"),
+            ("bad/task", 4, "true"),
+            ("..", 4, "true"),
+            ("", 4, "true"),
+        ]
+        for task, step, safe in cases:
+            with self.subTest(task=task, step=step, safe=safe):
+                proc = self.mark(task, step, safe)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_mark_after_uncommitted_change_rejected_and_manifest_unchanged(self):
+        self.init_wave()
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        before = self.manifest.read_bytes()
+        proc = self.mark()
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_mark_after_new_commit_rejected_until_resume(self):
+        self.init_wave()
+        self.git("commit", "--allow-empty", "-qm", "next")
+        before = self.manifest.read_bytes()
+        proc = self.mark()
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.manifest.read_bytes(), before)
+        self.resume()
+        self.assertEqual(self.mark().returncode, 0)
+
+    def test_mark_works_on_legacy_manifest_without_wave_keys(self):
+        self.cli(
+            "init",
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+        )
+        self.assertEqual(self.mark().returncode, 0)
+        self.assertIn("position", self.manifest_data())
+
+    # R4: where
+    def test_where_fresh_marked_task_has_all_fields_defined(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 4, "--safe-point", "false")
+        info = self.where()
+        self.assertEqual(info["task"], "impl")
+        self.assertEqual(info["task_status"], "pending")
+        self.assertEqual(info["step"], 4)
+        self.assertEqual(info["role"], "coder")
+        self.assertEqual(info["verdicts"], {})
+        self.assertEqual(info["open_findings"], [])
+        self.assertIsNone(info["decision_required_for"])
+        self.assertIs(info["tree_matches"], True)
+        self.assertIs(info["safe_point"], False)
+        self.assertEqual(info["plan_check"], "match")
+        self.assertEqual(
+            info["fix_round"]["total"], "0/3"
+        )
+        self.assertIsInstance(info["next_action"], str)
+        self.assertNotIn("\n", info["next_action"])
+        for key in (
+            "tree_matches",
+            "plan_check",
+            "task",
+            "task_status",
+            "step",
+            "role",
+            "fix_round",
+            "verdicts",
+            "open_findings",
+            "decision_required_for",
+            "safe_point",
+            "next_action",
+        ):
+            self.assertIn(key, info)
+
+    def test_where_is_read_only(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 4, "--safe-point", "true")
+        before = self.manifest.read_bytes()
+        self.where()
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_where_read_only_even_when_tree_is_stale(self):
+        self.init_wave()
+        self.git("commit", "--allow-empty", "-qm", "next")
+        before = self.manifest.read_bytes()
+        info = self.where()
+        self.assertIs(info["tree_matches"], False)
+        self.assertTrue(info["next_action"].startswith("run resume"))
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_where_on_legacy_manifest_without_new_keys(self):
+        self.cli(
+            "init",
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+        )
+        before = self.manifest.read_bytes()
+        info = self.where()
+        self.assertIsNone(info["plan_check"])
+        self.assertIsNone(info["task"])
+        self.assertIsNone(info["task_status"])
+        self.assertIsNone(info["safe_point"])
+        self.assertEqual(info["step"], 4)
+        self.assertEqual(info["role"], "coder")
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_where_no_position_picks_first_unfinished_task(self):
+        self.init_wave()
+        self.record("coder", task="b-task")
+        self.record("coder", task="a-task")
+        info = self.where()
+        self.assertEqual(info["task"], "a-task")
+        self.assertEqual(info["role"], "tester")
+        self.assertEqual(info["step"], 5)
+
+    def test_where_position_task_wins_over_first_task(self):
+        self.init_wave()
+        self.record("coder", task="a-task")
+        self.cli("mark", "--task", "z-task", "--step", 4, "--safe-point", "false")
+        self.assertEqual(self.where()["task"], "z-task")
+
+    def test_where_derives_roles_through_the_review_chain(self):
+        self.init_wave()
+        self.record("coder")
+        self.assertEqual(self.where()["role"], "tester")
+        self.record("tester")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (5, "cross_provider_reviewer"))
+        self.cli(
+            "task-result",
+            "--task",
+            "implement",
+            "--role",
+            "cross_provider_reviewer",
+            "--status",
+            "pass",
+            "--session-id",
+            "xp-session",
+            "--head",
+            self.head(),
+            "--artifact",
+            "evidence",
+            "--reviewed-head",
+            self.head(),
+            "--packet-hash",
+            "sha256:" + "a" * 64,
+        )
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (7, "github_codex_review"))
+        self.assertEqual(info["task_status"], "ready_for_pr_review")
+        self.assertEqual(
+            info["verdicts"],
+            {
+                "coder": "pass",
+                "tester": "pass",
+                "cross_provider_reviewer": "pass",
+            },
+        )
+        self.cli(
+            "task-result",
+            "--task",
+            "implement",
+            "--role",
+            "github_codex_review",
+            "--status",
+            "pass",
+            "--session-id",
+            "gh-session",
+            "--head",
+            self.head(),
+            "--artifact",
+            "https://example.invalid/review",
+            "--reviewed-head",
+            self.head(),
+        )
+        info = self.where()
+        self.assertEqual(info["step"], 7)
+        self.assertIsNone(info["role"])
+        self.assertTrue(info["next_action"].startswith("done"))
+
+    def test_where_open_findings_and_needs_fix(self):
+        self.init_wave()
+        self.record("coder")
+        self.record("tester", status="findings", artifact="https://x.invalid/t")
+        self.cli("fix-loop", "--task", "implement", "--outcome", "failed", "--source", "tester")
+        info = self.where()
+        self.assertEqual(info["task_status"], "needs_fix")
+        self.assertEqual((info["step"], info["role"]), (6, "coder"))
+        self.assertEqual(
+            info["open_findings"],
+            [{"role": "tester", "status": "findings", "artifact": "https://x.invalid/t"}],
+        )
+        self.assertEqual(info["fix_round"]["tester"], "1/2")
+        self.assertEqual(info["fix_round"]["total"], "1/3")
+
+    def test_where_needs_decision_names_the_call(self):
+        self.init_wave()
+        self.record("coder")
+        for _ in range(2):
+            self.cli(
+                "fix-loop", "--task", "implement", "--outcome", "failed",
+                "--source", "tester",
+            )
+        info = self.where()
+        self.assertEqual(info["task_status"], "needs_decision")
+        self.assertEqual(info["decision_required_for"], "tester")
+        self.assertEqual((info["step"], info["role"]), (6, "coordinator"))
+        self.assertIn("fix-loop --decision", info["next_action"])
+        self.assertIn("tester", info["next_action"])
+        self.assertEqual(info["fix_round"]["tester"], "2/2")
+
+    def test_where_blocked_task(self):
+        self.init_wave()
+        self.record("coder")
+        for source in ("tester", "tester", "coderabbit"):
+            proc = self.run_state(
+                "fix-loop", "--task", "implement", "--outcome", "failed",
+                "--source", source,
+            )
+            if proc.returncode:
+                self.cli(
+                    "fix-loop", "--task", "implement", "--decision", "invariant",
+                    "--note", "n",
+                )
+                self.cli(
+                    "fix-loop", "--task", "implement", "--outcome", "failed",
+                    "--source", source,
+                )
+        info = self.where()
+        self.assertEqual(info["task_status"], "blocked")
+        self.assertIsNone(info["step"])
+        self.assertTrue(info["next_action"].startswith("BLOCKED"))
+
+    def test_where_plan_unchanged_is_match(self):
+        self.init_wave("w2")
+        self.assertEqual(self.where()["plan_check"], "match")
+
+    def test_where_selected_wave_edited_is_changed_and_blocked(self):
+        self.init_wave("w2")
+        doc = plan_doc()
+        doc["waves"][1]["goal"] = "Changed goal"
+        self.write_plan(doc)
+        info = self.where()
+        self.assertEqual(info["plan_check"], "changed")
+        self.assertTrue(info["next_action"].startswith("BLOCKED: plan changed"))
+
+    def test_where_changed_plan_takes_precedence_over_stale_tree(self):
+        self.init_wave("w2")
+        doc = plan_doc()
+        doc["waves"][1]["goal"] = "Changed goal"
+        self.write_plan(doc)
+        self.git("commit", "--allow-empty", "-qm", "next")
+        info = self.where()
+        self.assertTrue(info["next_action"].startswith("BLOCKED: plan changed"))
+
+    def test_where_other_wave_edited_is_still_match(self):
+        self.init_wave("w2")
+        doc = plan_doc()
+        doc["waves"][2]["goal"] = "Changed goal of another wave"
+        self.write_plan(doc)
+        info = self.where()
+        self.assertEqual(info["plan_check"], "match")
+        self.assertFalse(info["next_action"].startswith("BLOCKED"))
+
+    def test_where_selected_wave_removed_or_plan_invalid_is_changed(self):
+        self.init_wave("w2")
+        self.write_plan(plan_doc([wave("w1"), wave("w3")]))
+        self.assertEqual(self.where()["plan_check"], "changed")
+        self.write_plan(raw="{not json")
+        info = self.where()
+        self.assertEqual(info["plan_check"], "changed")
+        self.assertTrue(info["next_action"].startswith("BLOCKED: plan changed"))
+
+    def test_where_plan_deleted_is_missing_and_not_blocked(self):
+        self.init_wave("w2")
+        self.plan.unlink()
+        info = self.where()
+        self.assertEqual(info["plan_check"], "missing")
+        self.assertFalse(info["next_action"].startswith("BLOCKED"))
+        self.assertEqual(info["role"], "coder")
+
+    def test_where_plan_becomes_symlink_is_changed(self):
+        self.init_wave("w2")
+        real = Path(self.tmp.name) / "real.json"
+        real.write_text(self.plan.read_text(encoding="utf-8"), encoding="utf-8")
+        self.plan.unlink()
+        self.plan.symlink_to(real)
+        self.assertEqual(self.where()["plan_check"], "changed")
+
+    # A4: safe-point staleness
+    def test_safe_point_true_then_commit_is_stale_false(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 6, "--safe-point", "true")
+        self.assertIs(self.where()["safe_point"], True)
+        self.git("commit", "--allow-empty", "-qm", "moved on")
+        self.assertIs(self.where()["safe_point"], False)
+
+    def test_safe_point_true_then_dirty_tree_is_false(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 6, "--safe-point", "true")
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        self.assertIs(self.where()["safe_point"], False)
+
+    def test_safe_point_null_without_position(self):
+        self.init_wave()
+        self.assertIsNone(self.where()["safe_point"])
+
+    # R5
+    def test_read_accepts_manifests_without_new_keys(self):
+        self.cli(
+            "init",
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+        )
+        self.assertEqual(self.cli("status").returncode, 0)
+        self.assertNotIn("position", self.manifest_data())
+        self.assertNotIn("plan", self.manifest_data())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
