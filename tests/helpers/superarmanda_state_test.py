@@ -2974,6 +2974,17 @@ class WavesContract(unittest.TestCase):
         self.assertEqual(len(action.splitlines()), 1)
         self.assertNotIn("\x85", action)
 
+    def test_where_safe_point_is_null_for_a_task_other_than_the_marked_one(self):
+        self.init_wave()
+        full = ("coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        self.passes_for("b", *full)
+        self.record_any("coder", "pass", task="a")
+        self.cli("mark", "--task", "b", "--step", 7, "--safe-point", "true")
+        info = self.where()
+        self.assertEqual(info["task"], "a")
+        self.assertIsNone(info["safe_point"])
+        self.assertIsNone(info["marked_step"])
+
     def passes_for(self, task, *roles):
         for role in roles:
             self.record_any(role, "pass", task=task)

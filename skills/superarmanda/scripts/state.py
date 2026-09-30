@@ -1280,7 +1280,7 @@ def where(args):
                 "open_findings": open_findings,
                 "decision_required_for": required,
                 "safe_point": None
-                if position is None
+                if position is None or position["task"] != name
                 else position["safe_point"] is True
                 and position["head"] == current_head
                 and position["tree_fingerprint"] == current_tree,
