@@ -11,6 +11,8 @@ import json
 import importlib.util
 import os
 import hashlib
+import itertools
+import re
 import stat
 import subprocess
 import tempfile
@@ -2912,6 +2914,89 @@ class WavesContract(unittest.TestCase):
         self.assertEqual(self.cli("status").returncode, 0)
         self.assertNotIn("position", self.manifest_data())
         self.assertNotIn("plan", self.manifest_data())
+
+
+class WhereDerivationExhaustive(unittest.TestCase):
+    """derive_step against an independent reference of the normative order."""
+
+    ROLE_ORDER = (
+        "coder",
+        "tester",
+        "cross_provider_reviewer",
+        "github_codex_review",
+        "coderabbit",
+    )
+    VALUES = (None, "pass", "findings", "incomplete", "error", "unavailable")
+
+    @staticmethod
+    def reference(task_status, verdict):
+        """Returns (step, role, blocked, source) per the normative order 1-5."""
+        if task_status == "blocked":
+            return (None, None, False, None)
+        if task_status == "needs_decision":
+            return (6, "coordinator", False, None)
+        if task_status == "needs_fix":
+            return (6, "coder", False, None)
+        reviewers = [
+            ("tester", 5),
+            ("cross_provider_reviewer", 5),
+            ("github_codex_review", 7),
+            ("coderabbit", 7),
+        ]
+        for name, _ in reviewers:
+            if verdict.get(name) in ("findings", "incomplete"):
+                return (6, "coordinator", False, name)
+        for name, step in reviewers:
+            if verdict.get(name) in ("error", "unavailable"):
+                return (step, name, True, None)
+        if verdict.get("coder") != "pass":
+            return (4, "coder", False, None)
+        for name, step in reviewers[:3]:
+            if verdict.get(name) != "pass":
+                return (step, name, False, None)
+        return (7, None, False, None)
+
+    @staticmethod
+    def observed(module, task_status, verdict):
+        step, role, note = module.derive_step({"status": task_status}, verdict)
+        note = note or ""
+        match = re.search(r"--source (\S+)", note)
+        return (step, role, note.startswith("BLOCKED"), match and match.group(1))
+
+    def load(self):
+        spec = importlib.util.spec_from_file_location("state_precedence", STATE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_all_combinations_match_reference(self):
+        module = self.load()
+        count = 0
+        for task_status in ("in_progress", "needs_fix", "needs_decision", "blocked"):
+            for combo in itertools.product(self.VALUES, repeat=len(self.ROLE_ORDER)):
+                verdict = {
+                    role: value
+                    for role, value in zip(self.ROLE_ORDER, combo)
+                    if value is not None
+                }
+                expected = self.reference(task_status, verdict)
+                actual = self.observed(module, task_status, verdict)
+                if actual != expected:
+                    self.fail(f"{task_status} {verdict}: {actual} != {expected}")
+                count += 1
+        self.assertEqual(count, 4 * 6**5)
+
+    def test_named_case_findings_beat_error(self):
+        module = self.load()
+        verdict = {
+            "coder": "pass",
+            "tester": "findings",
+            "cross_provider_reviewer": "error",
+        }
+        self.assertEqual(
+            self.observed(module, "in_progress", verdict),
+            (6, "coordinator", False, "tester"),
+        )
 
 
 if __name__ == "__main__":
