@@ -764,6 +764,23 @@ def validate_wave(item, index, seen):
             )
 
 
+def check_encodable(value):
+    """Every string, including object keys, must encode as UTF-8."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                raise PlanError("plan contains a string that is not valid UTF-8")
+        elif isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+
+
 def parse_plan(raw):
     try:
         text = raw.decode("utf-8")
@@ -772,6 +789,7 @@ def parse_plan(raw):
         raise
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise PlanError(f"plan is not valid UTF-8 JSON: {exc}")
+    check_encodable(doc)
     if not isinstance(doc, dict) or set(doc) != PLAN_KEYS:
         raise PlanError(f"plan must be an object with exactly {sorted(PLAN_KEYS)}")
     if type(doc["version"]) is not int or doc["version"] != 1:
@@ -830,15 +848,16 @@ def plan_check(data):
         return None
     try:
         doc = parse_plan(read_plan_bytes(plan["path"]))
+        for item in doc["waves"]:
+            if item["id"] == plan["wave"]:
+                same = canonical_sha256(item) == plan["wave_sha256"]
+                return "match" if same else "changed"
+        return "changed"
     except PlanMissing:
         return "missing"
-    except PlanError:
+    except Exception:
+        # Whatever is wrong with the plan file, where must report it, not crash.
         return "changed"
-    for item in doc["waves"]:
-        if item["id"] == plan["wave"]:
-            same = canonical_sha256(item) == plan["wave_sha256"]
-            return "match" if same else "changed"
-    return "changed"
 
 
 def init(args):

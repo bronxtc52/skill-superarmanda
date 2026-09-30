@@ -2708,7 +2708,9 @@ class WavesContract(unittest.TestCase):
         self.assertIn("regular file", proc.stderr)
         self.assertFalse(self.manifest.exists())
 
-    PROPERTY_VALUES = [None, True, 0, 1.5, "", [], {}, [[]], {"a": 1}]
+    PROPERTY_VALUES = [
+        None, True, 0, 1.5, "", [], {}, [[]], {"a": 1}, "\ud800", "\udfff"
+    ]
 
     def property_cases(self):
         """Every (path, value) that makes plan_doc() invalid, selected wave = w2."""
@@ -2722,6 +2724,13 @@ class WavesContract(unittest.TestCase):
             ("waves", 1, "depends_on", 0),
         ]
         valid = {("waves", 1, "checks"), ("waves", 1, "depends_on")}
+        for key_path in (("\ud800",), ("waves", 1, "\udfff"), ("waves", 1, "a\ud800b")):
+            mutated = copy.deepcopy(doc)
+            target = mutated
+            for key in key_path[:-1]:
+                target = target[key]
+            target[key_path[-1]] = 1
+            yield key_path, "surrogate key", mutated
         for path in paths:
             for value in self.PROPERTY_VALUES:
                 if path in valid and value == []:
