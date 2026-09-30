@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -24,6 +25,20 @@ STATUSES = {"pass", "findings", "incomplete", "error", "unavailable"}
 FIX_SOURCES = {"cross_provider_reviewer", "github_codex_review", "coderabbit", "tester"}
 DECISIONS = {"invariant", "cut_surface", "accept_limitation"}
 MAX_DECISION_NOTE_LENGTH = 500
+MAX_PLAN_BYTES = 1024 * 1024
+NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
+RISKS = {"low", "medium", "high"}
+PLAN_KEYS = {"version", "chain", "repo", "base_branch", "waves"}
+WAVE_KEYS = {
+    "id",
+    "title",
+    "goal",
+    "requirements",
+    "acceptance",
+    "risk",
+    "checks",
+    "depends_on",
+}
 
 
 def fail(message):
@@ -643,12 +658,191 @@ def invalidate(data, head, tree):
     return invalidated
 
 
+class PlanError(Exception):
+    """waves.json is unreadable or violates the v1 schema."""
+
+
+class PlanMissing(PlanError):
+    """waves.json does not exist."""
+
+
+def plan_pairs(pairs):
+    keys = [key for key, _value in pairs]
+    if len(keys) != len(set(keys)):
+        raise PlanError("duplicate JSON key in plan")
+    return dict(pairs)
+
+
+def valid_name(value):
+    return (
+        isinstance(value, str)
+        and NAME_PATTERN.fullmatch(value) is not None
+        and value not in (".", "..")
+    )
+
+
+def plan_path(value):
+    """Absolute path with parent directories resolved; the final name is kept."""
+    path = Path(value)
+    if not path.name or path.name in (".", ".."):
+        raise PlanError("plan path must name a file")
+    return path.parent.resolve() / path.name
+
+
+def read_plan_bytes(path):
+    """Read a plan without following a final symlink; regular file, <= 1 MiB."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise PlanError("platform does not support safe plan opening")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            raise PlanMissing(f"plan does not exist: {path}")
+        except OSError:
+            pass
+        raise PlanError(f"cannot open plan: {path}")
+    except OSError as exc:
+        raise PlanError(f"cannot open plan (symlink or unreadable): {exc}")
+    with os.fdopen(fd, "rb") as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise PlanError("plan must be a regular file")
+        raw = file.read(MAX_PLAN_BYTES + 1)
+    if len(raw) > MAX_PLAN_BYTES:
+        raise PlanError("plan exceeds 1 MiB")
+    return raw
+
+
+def is_text(value):
+    return isinstance(value, str) and value != ""
+
+
+def validate_wave(item, index, seen):
+    where = f"waves[{index}]"
+    if not isinstance(item, dict) or set(item) != WAVE_KEYS:
+        raise PlanError(f"{where} must be an object with exactly {sorted(WAVE_KEYS)}")
+    if not valid_name(item["id"]):
+        raise PlanError(f"{where}.id is invalid")
+    if item["id"] in seen:
+        raise PlanError(f"{where}.id is duplicated")
+    for key in ("title", "goal", "requirements"):
+        if not is_text(item[key]):
+            raise PlanError(f"{where}.{key} must be a non-empty string")
+    acceptance = item["acceptance"]
+    if (
+        not isinstance(acceptance, list)
+        or not acceptance
+        or not all(is_text(entry) for entry in acceptance)
+    ):
+        raise PlanError(f"{where}.acceptance must be a non-empty list of strings")
+    if item["risk"] not in RISKS:
+        raise PlanError(f"{where}.risk must be one of {sorted(RISKS)}")
+    checks = item["checks"]
+    if not isinstance(checks, list):
+        raise PlanError(f"{where}.checks must be a list")
+    for check in checks:
+        if (
+            not isinstance(check, dict)
+            or set(check) != {"name", "cmd"}
+            or not isinstance(check["name"], str)
+            or not isinstance(check["cmd"], str)
+        ):
+            raise PlanError(f"{where}.checks entries need exactly name and cmd strings")
+    depends = item["depends_on"]
+    if not isinstance(depends, list) or not all(isinstance(d, str) for d in depends):
+        raise PlanError(f"{where}.depends_on must be a list of wave ids")
+    for dependency in depends:
+        if dependency not in seen:
+            raise PlanError(
+                f"{where}.depends_on {dependency!r} must reference an earlier wave"
+            )
+
+
+def parse_plan(raw):
+    try:
+        text = raw.decode("utf-8")
+        doc = json.loads(text, object_pairs_hook=plan_pairs)
+    except PlanError:
+        raise
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise PlanError(f"plan is not valid UTF-8 JSON: {exc}")
+    if not isinstance(doc, dict) or set(doc) != PLAN_KEYS:
+        raise PlanError(f"plan must be an object with exactly {sorted(PLAN_KEYS)}")
+    if type(doc["version"]) is not int or doc["version"] != 1:
+        raise PlanError("plan version must be 1")
+    for key in ("chain", "repo", "base_branch"):
+        if not is_text(doc[key]):
+            raise PlanError(f"plan {key} must be a non-empty string")
+    if not isinstance(doc["waves"], list) or not doc["waves"]:
+        raise PlanError("plan waves must be a non-empty list")
+    seen = set()
+    for index, item in enumerate(doc["waves"]):
+        validate_wave(item, index, seen)
+        seen.add(item["id"])
+    return doc
+
+
+def canonical_sha256(value):
+    blob = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def load_plan(selector):
+    """Return (plan metadata, wave copy) for `<path>#<wave-id>` or fail."""
+    location, separator, wave_id = selector.rpartition("#")
+    if not separator or not location or not wave_id:
+        fail("--from-plan must be <path>#<wave-id>")
+    try:
+        path = plan_path(location)
+        raw = read_plan_bytes(path)
+        doc = parse_plan(raw)
+    except PlanError as exc:
+        fail(f"invalid plan: {exc}")
+    selected = next((item for item in doc["waves"] if item["id"] == wave_id), None)
+    if selected is None:
+        fail(f"wave {wave_id!r} not found in plan")
+    digest = hashlib.sha256(raw).hexdigest()
+    return (
+        {
+            "path": str(path),
+            "sha256": digest,
+            "wave": wave_id,
+            "approved_by": f"plan@{digest}",
+            "wave_sha256": canonical_sha256(selected),
+        },
+        selected,
+    )
+
+
+def plan_check(data):
+    plan = data.get("plan")
+    if plan is None:
+        return None
+    try:
+        doc = parse_plan(read_plan_bytes(plan["path"]))
+    except PlanMissing:
+        return "missing"
+    except PlanError:
+        return "changed"
+    for item in doc["waves"]:
+        if item["id"] == plan["wave"]:
+            same = canonical_sha256(item) == plan["wave_sha256"]
+            return "match" if same else "changed"
+    return "changed"
+
+
 def init(args):
     path = safe_manifest_path(Path(args.manifest), repo(args.repo))
     if path.exists():
         fail("manifest already exists")
     location = repo(args.repo)
     base, head = validate_revision_pair(location, args.base, args.head)
+    plan = wave_copy = None
+    if args.from_plan is not None:
+        plan, wave_copy = load_plan(args.from_plan)
     data = {
         "version": 1,
         "run_id": args.run_id,
@@ -660,6 +854,9 @@ def init(args):
         "created_at": now(),
         "updated_at": now(),
     }
+    if plan is not None:
+        data["plan"] = plan
+        data["wave"] = wave_copy
     write(path, data)
     print(json.dumps(data, sort_keys=True))
 
@@ -835,6 +1032,158 @@ def record_fix_outcome(args, entry, data, location):
         entry["decision_required_for"] = args.source
 
 
+def mark(args):
+    if not valid_name(args.task):
+        fail("invalid task id")
+    path = Path(args.manifest)
+    data = read(path)
+    location = repo(data["repo"])
+    if data["repo"] != location:
+        fail("manifest repository is not canonical; run resume first")
+    if commit(location, "HEAD") != data["head"]:
+        fail("repository HEAD differs from manifest; run resume first")
+    if fingerprint(location) != data["tree_fingerprint"]:
+        fail("working tree changed; run resume before mark")
+    task(data, args.task)
+    data["position"] = {
+        "task": args.task,
+        "step": args.step,
+        "safe_point": args.safe_point == "true",
+        "head": data["head"],
+        "tree_fingerprint": data["tree_fingerprint"],
+        "recorded_at": now(),
+    }
+    data["updated_at"] = now()
+    write(path, data)
+    print(json.dumps(data["position"], sort_keys=True))
+
+
+def pick_task(data):
+    tasks = data["tasks"]
+    position = data.get("position")
+    if position is not None:
+        return position["task"]
+    names = sorted(tasks)
+    for name in names:
+        if tasks[name].get("status") not in ("ready_for_pr_review", "done"):
+            return name
+    return names[0] if names else None
+
+
+def derive_step(entry, verdicts):
+    """Return (step, role) implied by task status and current-head verdicts."""
+    status = entry.get("status") if entry else None
+    if status == "blocked":
+        return None, None
+    if status == "needs_decision":
+        return 6, "coordinator"
+    if status == "needs_fix":
+        return 6, "coder"
+    if verdicts.get("coder") != "pass":
+        return 4, "coder"
+    if verdicts.get("tester") != "pass":
+        return 5, "tester"
+    if verdicts.get("cross_provider_reviewer") != "pass":
+        return 5, "cross_provider_reviewer"
+    if verdicts.get("github_codex_review") != "pass":
+        return 7, "github_codex_review"
+    return 7, None
+
+
+def where(args):
+    data = read(Path(args.manifest))
+    location = repo(data["repo"])
+    current_head = commit(location, "HEAD")
+    current_tree = fingerprint(location)
+    tree_matches = (
+        data["repo"] == location
+        and current_head == data["head"]
+        and current_tree == data["tree_fingerprint"]
+    )
+    check = plan_check(data)
+    name = pick_task(data)
+    entry = data["tasks"].get(name) if name is not None else None
+    results = (entry or {}).get("results", {})
+    current = {
+        role: item
+        for role, item in results.items()
+        if item.get("head") == current_head
+        and item.get("tree_fingerprint") == current_tree
+    }
+    verdicts = {role: item["status"] for role, item in sorted(current.items())}
+    open_findings = [
+        {"role": role, "status": item["status"], "artifact": item.get("artifact")}
+        for role, item in sorted(current.items())
+        if item["status"] != "pass"
+    ]
+    status_value = entry.get("status", "pending") if entry else None
+    step, role = derive_step(entry, verdicts)
+    position = data.get("position")
+    if (
+        position is not None
+        and position["task"] == name
+        and status_value not in ("blocked", "needs_decision", "needs_fix")
+    ):
+        step = position["step"]
+    fix_round = {}
+    if entry:
+        decisions = entry.get("decisions", [])
+        for source, count in sorted(entry.get("fix_sources", {}).items()):
+            decided = sum(1 for item in decisions if item["source"] == source)
+            fix_round[source] = f"{count - decided}/2"
+    fix_round["total"] = f"{(entry or {}).get('fix_cycles', 0)}/3"
+    required = (entry or {}).get("decision_required_for")
+    if check == "changed":
+        action = (
+            "BLOCKED: plan changed since init (selected wave differs from "
+            "plan.wave_sha256); stop and ask the owner"
+        )
+    elif not tree_matches:
+        action = (
+            f"run resume --manifest {args.manifest} --repo {data['repo']} "
+            f"--base {data['base']} --head {current_head} before anything else"
+        )
+    elif name is None:
+        action = "step 4 coder: no task yet; record one with mark and start the coder"
+    elif status_value == "blocked":
+        action = (
+            f"BLOCKED: task {name} blocked after three fix cycles; "
+            "explicit human reset is required"
+        )
+    elif status_value == "needs_decision":
+        action = (
+            f"run fix-loop --decision <{'|'.join(sorted(DECISIONS))}> "
+            f"--note <text> --task {name} (decision required for source {required})"
+        )
+    elif role is None:
+        action = f"done: task {name} has all required results; continue to merge gate"
+    else:
+        action = f"step {step} {role}: continue task {name}"
+    print(
+        json.dumps(
+            {
+                "tree_matches": tree_matches,
+                "plan_check": check,
+                "task": name,
+                "task_status": status_value,
+                "step": step,
+                "role": role,
+                "fix_round": fix_round,
+                "verdicts": verdicts,
+                "open_findings": open_findings,
+                "decision_required_for": required,
+                "safe_point": None
+                if position is None
+                else position["safe_point"] is True
+                and position["head"] == current_head
+                and position["tree_fingerprint"] == current_tree,
+                "next_action": action,
+            },
+            sort_keys=True,
+        )
+    )
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
@@ -845,6 +1194,7 @@ def parser():
     q.add_argument("--base", required=True)
     q.add_argument("--head", required=True)
     q.add_argument("--run-id", default=None)
+    q.add_argument("--from-plan", default=None)
     q.set_defaults(func=init)
     q = sub.add_parser("status", parents=[common])
     q.set_defaults(func=status)
@@ -871,6 +1221,13 @@ def parser():
     q.add_argument("--source", choices=sorted(FIX_SOURCES))
     q.add_argument("--note")
     q.set_defaults(func=fix_loop)
+    q = sub.add_parser("mark", parents=[common])
+    q.add_argument("--task", required=True)
+    q.add_argument("--step", required=True, type=int, choices=range(1, 8))
+    q.add_argument("--safe-point", required=True, choices=["true", "false"])
+    q.set_defaults(func=mark)
+    q = sub.add_parser("where", parents=[common])
+    q.set_defaults(func=where)
     return p
 
 

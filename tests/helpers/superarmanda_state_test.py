@@ -2137,7 +2137,7 @@ class WavesContract(unittest.TestCase):
             "--status",
             status,
             "--session-id",
-            f"{role}-session",
+            f"{role}-{task}-session",
             "--head",
             self.head(),
             "--artifact",
