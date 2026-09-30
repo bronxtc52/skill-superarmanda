@@ -2663,6 +2663,50 @@ class WavesContract(unittest.TestCase):
         self.plan.symlink_to(real)
         self.assertEqual(self.where()["plan_check"], "changed")
 
+    def test_where_step_and_role_follow_results_not_mark(self):
+        self.init_wave()
+        self.cli("mark", "--task", "t", "--step", 4, "--safe-point", "false")
+        self.record("coder", task="t")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (5, "tester"))
+        self.assertEqual(info["marked_step"], 4)
+        self.assertIn("step 5", info["next_action"])
+        self.assertIn("tester", info["next_action"])
+
+    def test_where_marked_step_null_without_position_or_other_task(self):
+        self.init_wave()
+        self.assertIsNone(self.where()["marked_step"])
+        self.record("coder", task="a")
+        self.cli("mark", "--task", "b", "--step", 4, "--safe-point", "false")
+        self.assertEqual(self.where()["marked_step"], 4)
+
+    def test_init_from_plan_exactly_one_mib_accepted_and_one_more_rejected(self):
+        base = json.dumps(plan_doc([wave("w1", goal="")]), indent=2)
+        pad = 1024 * 1024 - len(base.encode("utf-8"))
+        self.assertGreater(pad, 0)
+        raw = base.replace('"goal": ""', '"goal": "' + "x" * pad + '"')
+        self.assertEqual(len(raw.encode("utf-8")), 1024 * 1024)
+        self.write_plan(raw=raw)
+        self.assertEqual(self.init_wave_raw(f"{self.plan}#w1").returncode, 0)
+        self.manifest.unlink()
+        self.write_plan(raw=raw.replace('"x', '"xx', 1))
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_directory_and_fifo_give_clean_message(self):
+        self.plan.mkdir()
+        proc = self.init_wave_raw(f"{self.plan}#w1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("Errno", proc.stderr)
+        self.assertIn("regular file", proc.stderr)
+        self.assertFalse(self.manifest.exists())
+        self.plan.rmdir()
+        os.mkfifo(self.plan)
+        proc = self.init_wave_raw(f"{self.plan}#w1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("Errno", proc.stderr)
+        self.assertIn("regular file", proc.stderr)
+        self.assertFalse(self.manifest.exists())
+
     # A4: safe-point staleness
     def test_safe_point_true_then_commit_is_stale_false(self):
         self.init_wave()

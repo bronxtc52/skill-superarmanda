@@ -705,9 +705,13 @@ def read_plan_bytes(path):
         raise PlanError(f"cannot open plan: {path}")
     except OSError as exc:
         raise PlanError(f"cannot open plan (symlink or unreadable): {exc}")
-    with os.fdopen(fd, "rb") as file:
-        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise PlanError("plan must be a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as file:
         raw = file.read(MAX_PLAN_BYTES + 1)
     if len(raw) > MAX_PLAN_BYTES:
         raise PlanError("plan exceeds 1 MiB")
@@ -1119,12 +1123,11 @@ def where(args):
     status_value = entry.get("status", "pending") if entry else None
     step, role = derive_step(entry, verdicts)
     position = data.get("position")
-    if (
-        position is not None
-        and position["task"] == name
-        and status_value not in ("blocked", "needs_decision", "needs_fix")
-    ):
-        step = position["step"]
+    marked_step = (
+        position["step"]
+        if position is not None and position["task"] == name
+        else None
+    )
     fix_round = {}
     if entry:
         decisions = entry.get("decisions", [])
@@ -1167,6 +1170,7 @@ def where(args):
                 "task": name,
                 "task_status": status_value,
                 "step": step,
+                "marked_step": marked_step,
                 "role": role,
                 "fix_round": fix_round,
                 "verdicts": verdicts,
