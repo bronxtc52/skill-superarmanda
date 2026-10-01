@@ -224,12 +224,16 @@ ref не обновляет, а при merge queue вообще только с�
 | `fail` | PR не найден, закрыт без мерджа или уже смержен вне гейта; check-run `completed` с `conclusion` ≠ `success`; P0/P1 Codex на HEAD; manifest нет/битый, `head` ≠ `headRefOid`, нет задач, задача `needs_decision`/`blocked`, нет tester `pass` или cross_provider_reviewer без `pass`/решения на этом HEAD; дерево не то (ниже) | статус волны `BLOCKED: merge gate: <причины>`, те же причины в окно волны, фаза `running`; обычное уведомление BLOCKED (в Telegram только причина). Следующий `DONE` снова идёт в гейт |
 | `pass` | всё прочее | см. ниже |
 
+Вердикт `pass` подтверждается вторым сбором фактов: если между чтениями изменилось критичное (check-run перезапущен,
+появилось ревью или замечание, треды, draft), вердикт `wait` «факты изменились во время сбора».
+
 Успех проверки — только `status == completed` и `conclusion == success` (`skipped`/`neutral` гейт не пропускает).
 **Codex завершил на HEAD**, если есть любое из: ревью `chatgpt-codex-connector[bot]` (тип Bot) с `commit_id == HEAD` и
 состоянием `COMMENTED`/`APPROVED`/`CHANGES_REQUESTED` (`PENDING`, `DISMISSED` — нет); его комментарий
-`Reviewed commit: <sha>`, который API сводит к HEAD; `+1` от бота на последнем `@codex review` (с маркером
-`<!-- superarmanda:codex-review head=<HEAD> -->` или созданном не раньше коммита HEAD); `+1` бота на самом PR не раньше
-коммита HEAD. Ревью старого HEAD и реакции людей не считаются. P0/P1 — inline-комментарий бота на HEAD с бейджем
+`Reviewed commit: <sha>`, который API сводит к HEAD; `+1` бота на комментарии `@codex review` с маркером
+`<!-- superarmanda:codex-review head=<HEAD> -->` именно этого HEAD (ищется среди всех комментариев; дата коммита не
+используется: её можно подделать). `+1` на самом PR и на комментарии без маркера или с маркером другого HEAD не считаются.
+Ревью старого HEAD и реакции людей не считаются. P0/P1 — inline-комментарий бота на HEAD с бейджем
 `![P0 Badge]`/`![P1 Badge]`.
 
 **Привязка к дереву.** Рабочая копия волны чистая (`git status --porcelain` пуст), её `HEAD` == `headRefOid`, и

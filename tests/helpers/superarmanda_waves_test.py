@@ -6700,8 +6700,7 @@ def green_facts(**over):
         "pr": {"state": "open", "merged": False, "draft": False, "head": HEAD},
         "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}],
         "reviews": [{"user": BOT, "commit_id": HEAD, "state": "COMMENTED"}],
-        "review_comments": [], "issue_comments": [], "pr_reactions": [], "trigger": None,
-        "head_date": "2026-10-01T10:00:00Z", "resolved": {}, "threads": [],
+        "review_comments": [], "issue_comments": [], "triggers": [], "resolved": {}, "threads": [],
     }
     facts.update(over)
     return facts
@@ -6761,35 +6760,30 @@ class GateVerdict(unittest.TestCase):
         facts["resolved"] = {}
         self.assertFalse(gate.codex_on_head(facts, HEAD)["done"])
 
-    def test_reactions_count_only_from_the_bot_and_not_before_the_head_commit(self):
-        late, early = "2026-10-01T11:00:00Z", "2026-10-01T09:00:00Z"
+    def test_thumbs_up_needs_the_marker_of_this_head_on_a_request_comment(self):  # F1
+        up = [{"id": 1, "content": "+1", "user": BOT, "created_at": "2026-10-01T09:00:00Z"}]
+        mark = lambda h: f"@codex review\n{gate.MARKER.format(head=h)}"  # noqa: E731
         cases = [
-            ("bot late", [{"content": "+1", "user": BOT, "created_at": late}], True),
-            ("bot early", [{"content": "+1", "user": BOT, "created_at": early}], False),
-            ("human", [{"content": "+1", "user": {"login": "someone", "type": "User"}, "created_at": late}], False),
-            ("impostor", [{"content": "+1", "user": HUMAN, "created_at": late}], False),
-            ("wrong emoji", [{"content": "eyes", "user": BOT, "created_at": late}], False),
+            ("marker of this head", [{"id": 7, "body": mark(HEAD), "reactions": up}], True),
+            ("marker of another head", [{"id": 7, "body": mark(OLD), "reactions": up}], False),
+            ("no marker (date rule is gone)", [{"id": 7, "body": "@codex review", "reactions": up}], False),
+            ("human thumbs", [{"id": 7, "body": mark(HEAD), "reactions": [dict(up[0], user={"login": "x", "type": "User"})]}], False),
+            ("impostor", [{"id": 7, "body": mark(HEAD), "reactions": [dict(up[0], user=HUMAN)]}], False),
+            ("wrong emoji", [{"id": 7, "body": mark(HEAD), "reactions": [dict(up[0], content="eyes")]}], False),
+            ("older request of this head counts", [{"id": 6, "body": mark(HEAD), "reactions": up},
+                                                   {"id": 7, "body": mark(OLD), "reactions": []}], True),
         ]
-        for name, reactions, want in cases:
+        for name, triggers, want in cases:
             with self.subTest(case=name):
-                facts = green_facts(pr_reactions=reactions, reviews=[])
+                facts = green_facts(reviews=[], triggers=triggers)
                 self.assertEqual(gate.codex_on_head(facts, HEAD)["done"], want)
 
-    def test_thumbs_up_on_the_review_request_comment(self):
-        reaction = [{"content": "+1", "user": BOT, "created_at": "2026-10-01T09:00:00Z"}]
-        marker = gate.MARKER.format(head=HEAD)
-        cases = [
-            ("marker of this head", {"body": f"@codex review\n{marker}", "created_at": "2026-10-01T08:00:00Z"}, True),
-            ("marker of another head", {"body": f"@codex review\n{gate.MARKER.format(head=OLD)}",
-                                        "created_at": "2026-10-01T08:00:00Z"}, False),
-            ("no marker, after the commit", {"body": "@codex review", "created_at": "2026-10-01T10:30:00Z"}, True),
-            ("no marker, before the commit", {"body": "@codex review", "created_at": "2026-10-01T09:30:00Z"}, False),
-        ]
-        for name, trig, want in cases:
-            with self.subTest(case=name):
-                trigger = dict(trig, id=7, reactions=reaction)
-                facts = green_facts(reviews=[], trigger=trigger)
-                self.assertEqual(gate.codex_on_head(facts, HEAD)["done"], want)
+    def test_old_thumbs_on_the_pr_or_a_late_date_no_longer_finish_codex(self):  # F1
+        facts = green_facts(reviews=[], pr_reactions=[{"content": "+1", "user": BOT, "created_at": "2099-01-01T00:00:00Z"}],
+                            head_date="2000-01-01T00:00:00Z",
+                            triggers=[{"id": 7, "body": "@codex review", "created_at": "2099-01-01T00:00:00Z",
+                                       "reactions": [{"content": "+1", "user": BOT}]}])
+        self.assertEqual(self.ev(facts)["verdict"], "wait")
 
     def test_pending_check_waits_and_failed_check_fails_without_a_merge(self):  # acceptance 2
         pending = [{"name": "ci", "status": "completed", "conclusion": "success"},
@@ -6940,8 +6934,6 @@ def routes_for(repo="o/r", number=5, **over):
         f"repos/{repo}/pulls/{number}/reviews": [{"user": BOT, "commit_id": HEAD, "state": "COMMENTED"}],
         f"repos/{repo}/pulls/{number}/comments": [],
         f"repos/{repo}/issues/{number}/comments": [],
-        f"repos/{repo}/issues/{number}/reactions": [],
-        f"repos/{repo}/commits/{HEAD}": {"sha": HEAD, "commit": {"committer": {"date": "2026-10-01T10:00:00Z"}}},
     }
     r.update(over)
     return r
@@ -6993,21 +6985,20 @@ class GateCollect(unittest.TestCase):
         self.assertEqual(list(facts), ["pr"])
         self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK)["verdict"], "wait")
 
-    def test_the_last_review_request_gets_its_reactions_and_a_clean_comment_is_resolved(self):
+    def test_requests_naming_this_head_get_their_reactions_and_a_clean_comment_is_resolved(self):
         short = HEAD[:7]
         comments = [
-            {"id": 1, "body": "@codex review", "created_at": "2026-10-01T08:00:00Z", "user": {"login": "me"}},
-            {"id": 2, "body": f"@codex review\n{gate.MARKER.format(head=HEAD)}", "created_at": "2026-10-01T09:00:00Z"},
+            {"id": 1, "body": f"@codex review\n{gate.MARKER.format(head=OLD)}", "user": {"login": "me"}},
+            {"id": 2, "body": f"@codex review\n{gate.MARKER.format(head=HEAD)}"},
             {"id": 3, "body": CLEAN_BODY.format(short=short), "user": BOT},
         ]
         fake = FakeGitHub(routes_for(**{
             "repos/o/r/issues/5/comments": comments,
-            "repos/o/r/issues/comments/2/reactions": [{"content": "+1", "user": BOT,
-                                                        "created_at": "2026-10-01T09:30:00Z"}],
+            "repos/o/r/issues/comments/2/reactions": [{"content": "+1", "user": BOT}],
             f"repos/o/r/commits/{short}": {"sha": HEAD},
             "repos/o/r/pulls/5/reviews": []}))
         facts = self.collect(fake)
-        self.assertEqual(facts["trigger"]["id"], 2)
+        self.assertEqual([t["id"] for t in facts["triggers"]], [2])
         self.assertEqual(facts["resolved"], {short: HEAD})
         self.assertFalse(any("comments/1/" in c for c in fake.calls if isinstance(c, str)))
         self.assertTrue(gate.codex_on_head(facts, HEAD)["done"])
@@ -7455,6 +7446,38 @@ class MergeGate(GateBase):
     def test_merge_notices_are_episodes(self):
         for key in ("merge_owner", "merge_refused", "merge_stopped"):
             self.assertIn(key, wab.NOTICE_EPISODE_ENDS)
+
+
+class GateRecheck(GateBase):  # F2: a pass rests on two equal collections
+    def verdict(self, first, second):
+        self.start()
+        seq = [first, second]
+        with mock.patch.object(wab, "gate_facts", side_effect=lambda cfg, pr: seq.pop(0)):
+            return wab.gate_check(self.cfg, "W1", self.rec())
+
+    def test_equal_collections_pass(self):
+        self.assertEqual(self.verdict(green_facts(), green_facts())["verdict"], "pass")
+
+    def test_a_new_p1_between_the_reads_waits(self):
+        p1 = [{"id": 5, "user": BOT, "commit_id": HEAD, "body": "![P1 Badge](x) late", "html_url": "u"}]
+        v = self.verdict(green_facts(), green_facts(review_comments=p1))
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("факты изменились", v["reasons"][0])
+
+    def test_a_check_run_restarted_between_the_reads_waits(self):
+        again = [{"id": 1, "name": "ci", "status": "in_progress", "conclusion": None}]
+        first = green_facts(check_runs=[{"id": 1, "name": "ci", "status": "completed", "conclusion": "success"}])
+        self.assertEqual(self.verdict(first, green_facts(check_runs=again))["verdict"], "wait")
+
+    def test_a_failed_second_collection_waits(self):
+        self.assertEqual(self.verdict(green_facts(), {"error": "gh: boom"})["verdict"], "wait")
+
+    def test_other_changes_wait_too(self):
+        for name, change in (("thread", {"threads": [{"id": "T", "isResolved": False}]}),
+                             ("review", {"reviews": [{"id": 9, "user": BOT, "commit_id": HEAD, "state": "APPROVED"}]}),
+                             ("draft", {"pr": {"state": "open", "merged": False, "draft": True, "head": HEAD}})):
+            with self.subTest(change=name):
+                self.assertEqual(self.verdict(green_facts(), green_facts(**change))["verdict"], "wait")
 
 
 class ExternalHandoffVerdict(GateBase):

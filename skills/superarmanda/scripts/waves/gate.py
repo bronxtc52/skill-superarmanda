@@ -123,16 +123,11 @@ def collect(repo, number, head, api, graphql):
     facts["reviews"] = _paged(api, f"repos/{repo}/pulls/{number}/reviews")
     facts["review_comments"] = _paged(api, f"repos/{repo}/pulls/{number}/comments")
     facts["issue_comments"] = _paged(api, f"repos/{repo}/issues/{number}/comments")
-    facts["pr_reactions"] = _paged(api, f"repos/{repo}/issues/{number}/reactions")
-    triggers = [c for c in facts["issue_comments"] if TRIGGER in (c.get("body") or "")]
-    trigger = None
-    if triggers:
-        last = triggers[-1]
-        trigger = {"id": last.get("id"), "body": last.get("body") or "", "created_at": last.get("created_at"),
-                   "reactions": _paged(api, f"repos/{repo}/issues/comments/{last.get('id')}/reactions")}
-    facts["trigger"] = trigger
-    commit = _object(api, f"repos/{repo}/commits/{head}")
-    facts["head_date"] = ((commit.get("commit") or {}).get("committer") or {}).get("date")
+    marker = MARKER.format(head=head)  # a reaction counts only on a request that names THIS head
+    facts["triggers"] = [
+        {"id": c.get("id"), "body": c.get("body") or "",
+         "reactions": _paged(api, f"repos/{repo}/issues/comments/{c.get('id')}/reactions")}
+        for c in facts["issue_comments"] if marker in (c.get("body") or "")]
     resolved = {}
     for comment in facts["issue_comments"]:
         short = pr_review.clean_commit(pr_review.text(comment)) if pr_review.trusted(comment, CODEX) else None
@@ -144,6 +139,26 @@ def collect(repo, number, head, api, graphql):
     facts["resolved"] = resolved
     facts["threads"] = _threads(graphql, repo, number)
     return facts
+
+
+def critical(facts):
+    """What the verdict depends on, reduced to comparable values: two collections of the same PR
+    state must give equal results, whatever changed in between (a rerun, a new finding) must not."""
+    if facts.get("error") or "check_runs" not in facts:
+        return ("raw", json.dumps(facts, sort_keys=True, default=str))
+    pick = lambda items, keys: [tuple(i.get(k) for k in keys) for i in items or []]  # noqa: E731
+    who = lambda i: (i.get("user") or i.get("author") or {}).get("login")  # noqa: E731
+    return json.dumps({
+        "pr": facts["pr"],
+        "runs": pick(facts["check_runs"], ("id", "name", "status", "conclusion")),
+        "reviews": [(r.get("id"), r.get("state"), r.get("commit_id"), who(r)) for r in facts["reviews"]],
+        "comments": [(c.get("id"), c.get("commit_id"), c.get("body"), who(c)) for c in facts["review_comments"]],
+        "issue": [(c.get("id"), c.get("body"), who(c)) for c in facts["issue_comments"]],
+        "triggers": [(t["id"], [(r.get("id"), r.get("content"), who(r)) for r in t["reactions"]])
+                     for t in facts["triggers"]],
+        "resolved": sorted((facts["resolved"] or {}).items()),
+        "threads": [(t.get("id"), t.get("isResolved")) for t in facts["threads"]],
+    }, sort_keys=True, default=str)
 
 
 def gather(repo, number, head, api, graphql):
@@ -168,19 +183,11 @@ def codex_on_head(facts, head):
             short = pr_review.clean_commit(pr_review.text(comment))
             if short and (facts.get("resolved") or {}).get(short) == head:
                 how.append("clean comment")
-    head_date = _ts(facts.get("head_date"))
-    trigger = facts.get("trigger")
-    if trigger:
-        bound = MARKER.format(head=head) in trigger["body"]
-        created = _ts(trigger.get("created_at"))
-        if bound or (head_date and created and created >= head_date):
-            if any(r.get("content") == "+1" and pr_review.trusted(r, CODEX) for r in trigger["reactions"]):
-                how.append("reaction on the review request")
-    for reaction in facts.get("pr_reactions") or []:
-        made = _ts(reaction.get("created_at"))
-        if (reaction.get("content") == "+1" and pr_review.trusted(reaction, CODEX)
-                and head_date and made and made >= head_date):
-            how.append("reaction on the PR")
+    marker = MARKER.format(head=head)
+    for trigger in facts.get("triggers") or []:
+        if marker in (trigger.get("body") or "") and any(
+                r.get("content") == "+1" and pr_review.trusted(r, CODEX) for r in trigger.get("reactions") or []):
+            how.append("reaction on the review request")
     inline = [c for c in facts.get("review_comments") or []
               if pr_review.trusted(c, CODEX) and c.get("commit_id") == head and pr_review.text(c)]
     p01 = [pr_review.url(c) or "" for c in inline if P01.search(c.get("body") or "")]

@@ -1957,8 +1957,12 @@ def gate_check(cfg, wave, w):
         pr = find_pr(cfg, w["cwd"])
         if pr is None:
             return dict(base, verdict="fail", reasons=["PR ветки волны не найден"])
-        v = gate.evaluate(gate_facts(cfg, pr), pr["headRefOid"], read_manifest(cfg, wave), workdir_state(w["cwd"]))
+        facts = gate_facts(cfg, pr)
+        v = gate.evaluate(facts, pr["headRefOid"], read_manifest(cfg, wave), workdir_state(w["cwd"]))
         v["number"] = pr["number"]
+        if v["verdict"] == "pass" and gate.critical(gate_facts(cfg, pr)) != gate.critical(facts):
+            # a CI rerun or a new finding between the reads: the pass would rest on stale facts
+            return dict(v, verdict="wait", reasons=["факты изменились во время сбора"])
         return v
     except gate.CollectError as e:
         return dict(base, verdict="wait", reasons=[f"сбор фактов: {e}"])
