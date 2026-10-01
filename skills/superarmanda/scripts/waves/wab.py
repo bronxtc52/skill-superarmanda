@@ -788,10 +788,40 @@ def base_branch_of(cfg, cwd):
     return name[len("origin/"):] if r.returncode == 0 and name.startswith("origin/") else None
 
 
+def verify_previous_merge(cfg, wave, cwd, branch, base, target):
+    """Squash merges (the repositories' standard) leave the wave branch's commits out of
+    origin/<base>, so the check is by PR: `gh pr view <branch>` must say MERGED and its merge
+    commit must be an ancestor of the fetched base. No gh or no PR known: an event, and go on
+    (the full gate is W5)."""
+    why = "previous branch unknown"
+    if branch and branch != base:
+        argv = ["gh", "pr", "view", branch, "--json", "state,mergeCommit"]
+        if cfg.get("repo"):
+            argv += ["--repo", str(cfg["repo"])]
+        try:
+            r = sh(*argv, check=False, timeout=GIT_TIMEOUT, cwd=str(cwd))
+            info = json.loads(r.stdout) if r.returncode == 0 else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            info = None
+        if isinstance(info, dict) and info.get("state"):
+            oid = (info.get("mergeCommit") or {}).get("oid") or ""
+            if info["state"] != "MERGED":
+                raise SystemExit(f"wave {wave} refused: previous wave not merged (PR of {branch} is "
+                                 f"{info['state']}); merge it, then launch again")
+            anc = sh("git", "-C", str(cwd), "merge-base", "--is-ancestor", oid, target,
+                     check=False, timeout=GIT_TIMEOUT) if oid else None
+            if anc is None or anc.returncode != 0:
+                raise SystemExit(f"wave {wave} refused: previous wave not merged into origin/{base} "
+                                 f"(merge commit {oid[:12] or '?'} of {branch} is not in it)")
+            return
+        why = f"no PR information for {branch}"
+    event(cfg, f"{wave}: merge of previous wave not verified (W5): {why}")
+
+
 def refresh_workdir(cfg, wave, cwd):
     """A reused workdir must not start wave N on the branch of wave N-1: clean tree, fetch the
-    base, detach on origin/<base>. The previous wave's commits (the HEAD the tree is on now)
-    must already be in origin/<base>. Refusals are SystemExit before any state is touched."""
+    base, detach on origin/<base>. The previous wave's PR (its branch is the one the tree is on)
+    must be MERGED (verify_previous_merge). Refusals are SystemExit before any state is touched."""
     git = lambda *a, **kw: sh("git", "-C", str(cwd), *a, check=False, timeout=GIT_TIMEOUT, **kw)
     base = base_branch_of(cfg, cwd)
     if not base:
@@ -802,21 +832,14 @@ def refresh_workdir(cfg, wave, cwd):
     if dirty.stdout.strip():
         raise SystemExit(f"wave {wave} refused: workdir {cwd} is not clean (git status --porcelain is not "
                          f"empty); commit, stash or remove the changes of the previous wave")
-    prev = git("rev-parse", "--verify", "-q", "HEAD^{commit}")
     fetch = git("fetch", "origin", base)
     if fetch.returncode != 0:
         raise SystemExit(f"wave {wave} refused: git fetch origin {base} failed: {fetch.stderr.strip()}")
     target = git("rev-parse", "--verify", "-q", f"refs/remotes/origin/{base}^{{commit}}")
     if target.returncode != 0:
         raise SystemExit(f"wave {wave} refused: origin/{base} not found after fetch")
-    if prev.returncode == 0 and prev.stdout.strip():
-        anc = git("merge-base", "--is-ancestor", prev.stdout.strip(), target.stdout.strip())
-        if anc.returncode != 0:
-            raise SystemExit(f"wave {wave} refused: previous wave not merged into origin/{base} "
-                             f"(HEAD {prev.stdout.strip()[:12]} is not an ancestor of origin/{base}; "
-                             f"merge its PR with a merge commit or fast-forward, then launch again)")
-    else:
-        event(cfg, f"{wave}: previous head unknown, the ancestor check is deferred to W5")
+    branch = git("symbolic-ref", "--short", "-q", "HEAD").stdout.strip()  # the previous wave's branch
+    verify_previous_merge(cfg, wave, cwd, branch, base, target.stdout.strip())
     sw = git("switch", "--detach", f"origin/{base}")
     if sw.returncode != 0:
         raise SystemExit(f"wave {wave} refused: git switch --detach origin/{base} failed: {sw.stderr.strip()}")

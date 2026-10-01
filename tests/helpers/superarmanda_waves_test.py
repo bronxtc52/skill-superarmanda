@@ -3093,19 +3093,71 @@ class W4Round24(Base):
         self.assertEqual(subprocess.run(["git", "-C", str(clone), "symbolic-ref", "-q", "HEAD"],
                                         capture_output=True).returncode, 1)  # detached
 
-    def test_unmerged_previous_wave_refuses_the_next_one(self):
-        _, clone = self.repos()
+    def gh_shim(self, body):
+        """A fake `gh` first in PATH: no real GitHub call. `body` is the shell text it runs."""
+        d = self.tmp / "ghshim"
+        d.mkdir(exist_ok=True)
+        f = d / "gh"
+        f.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
+        f.chmod(0o755)
+        p = mock.patch.dict(os.environ, {"PATH": f"{d}{os.pathsep}{os.environ['PATH']}"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def wave1_branch(self, clone):
         self.git(clone, "checkout", "-q", "-b", "wave-1")
         (clone / "b.txt").write_text("b\n", encoding="utf-8")
         self.git(clone, "add", "b.txt")
         self.git(clone, "commit", "-q", "-m", "wave 1")
+
+    def squash_into_origin(self, origin):
+        """The coordinator's `gh pr merge --squash`: a NEW commit on base, wave-1 is no ancestor."""
+        other = self.tmp / "sq"
+        subprocess.run(["git", "clone", "-q", str(origin), str(other)], check=True, capture_output=True)
+        (other / "b.txt").write_text("b\n", encoding="utf-8")
+        self.git(other, "add", "b.txt")
+        self.git(other, "commit", "-q", "-m", "wave 1 (squash)")
+        self.git(other, "push", "-q", "origin", "HEAD:main")
+        return self.git(other, "rev-parse", "HEAD")
+
+    def test_squash_merged_previous_wave_lets_the_next_one_start(self):
+        origin, clone = self.repos()
+        self.wave1_branch(clone)
+        sq = self.squash_into_origin(origin)
+        self.gh_shim(f'echo \'{{"state":"MERGED","mergeCommit":{{"oid":"{sq}"}}}}\'')
+        cfg = self.next_wave_cfg(clone)
+        self.assertTrue(wab.launch(cfg, "W2", self.prompt()))
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"), sq)
+
+    def test_previous_pr_not_merged_refuses_the_next_wave(self):
+        _, clone = self.repos()
+        self.wave1_branch(clone)
         head = self.git(clone, "rev-parse", "HEAD")
+        self.gh_shim('echo \'{"state":"OPEN","mergeCommit":null}\'')
         cfg = self.next_wave_cfg(clone)
         with self.assertRaises(SystemExit) as ctx:
             wab.launch(cfg, "W2", self.prompt())
-        self.assertIn("previous wave not merged into origin/main", str(ctx.exception))
+        self.assertIn("previous wave not merged", str(ctx.exception))
         self.assertEqual(self.git(clone, "rev-parse", "HEAD"), head)  # nothing was switched
         self.assertEqual(self.get_state(cfg)["current"], "W1")
+
+    def test_merge_commit_missing_from_origin_base_refuses(self):
+        _, clone = self.repos()
+        self.wave1_branch(clone)
+        self.gh_shim('echo \'{"state":"MERGED","mergeCommit":{"oid":"' + "e" * 40 + '"}}\'')
+        cfg = self.next_wave_cfg(clone)
+        with self.assertRaises(SystemExit) as ctx:
+            wab.launch(cfg, "W2", self.prompt())
+        self.assertIn("previous wave not merged", str(ctx.exception))
+
+    def test_unverifiable_previous_wave_continues_with_an_event(self):
+        _, clone = self.repos()
+        self.wave1_branch(clone)
+        self.gh_shim("echo gh: no network >&2; exit 1")
+        cfg = self.next_wave_cfg(clone)
+        self.assertTrue(wab.launch(cfg, "W2", self.prompt()))
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("merge of previous wave not verified (W5)", log)
 
     def test_first_wave_does_not_touch_the_checkout(self):
         _, clone = self.repos()
