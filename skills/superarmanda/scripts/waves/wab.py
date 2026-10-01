@@ -1301,13 +1301,15 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     if tmux_alive(name):
         raise SystemExit(f"tmux session {name} already exists")
     wdir = wave_dir(cfg, wave)
+    cur = st.get("current")
+    restart = cur == wave and st["waves"].get(cur, {}).get("phase") in STOPPED
+    prompt_copy = wdir / "prompt.md"
+    keep_copy = restart and restart_prompt_matches(prompt_copy, prompt_text, prompt_file, wave)
     saved = st.get("admitted_path")
     cwd = prepare_clone(cfg, st)
     # a working copy the chain already used (chain.json workdir, or the clone prepare gave the
     # first wave) still sits on the previous wave's branch: refresh it below; a fresh clone does not
     reused = bool(cfg.get("workdir")) or (bool(saved) and cwd == saved)
-    cur = st.get("current")
-    restart = cur == wave and st["waves"].get(cur, {}).get("phase") in STOPPED
     previous_window_closed(cfg, st, wave, restart, pushed)  # before the workdir is touched
     if reused and cfg["waves"].index(wave) > 0 and not restart:
         refresh_workdir(cfg, wave, cwd)
@@ -1321,18 +1323,19 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     sid = str(uuid.uuid4())  # known up front: the transcript is bound to the wave by session id
     (wdir / "status").write_text("STARTING\n", encoding="utf-8")  # the wave has not started yet
     system_prompt(cfg)
-    # after the last refusal, before the intent: delivery and recovery read only this copy
-    prompt_copy = wdir / "prompt.md"
-    fd, tmp = tempfile.mkstemp(dir=wdir, prefix=".prompt.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(prompt_text + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, prompt_copy)
-    except BaseException:
-        pathlib.Path(tmp).unlink(missing_ok=True)
-        raise
+    # after the last refusal, before the intent: delivery and recovery read only this copy;
+    # a restart keeps the copy of the stopped try (checked equal above), it is not rewritten
+    if not keep_copy:
+        fd, tmp = tempfile.mkstemp(dir=wdir, prefix=".prompt.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(prompt_text + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, prompt_copy)
+        except BaseException:
+            pathlib.Path(tmp).unlink(missing_ok=True)
+            raise
     # the intent is saved BEFORE tmux is touched: a restart finds the wave and its session id
     st["current"] = wave
     st.pop("stopped", None)
@@ -1364,20 +1367,44 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     return deliver_first_prompt(cfg, st, wave)
 
 
+def restart_prompt_matches(prompt_copy, prompt_text, prompt_file, wave):
+    """A restart (dead / not_ready) continues the stopped try: its manifest, handoff.md and branch
+    belong to the task saved in prompt.md, so that copy is the task of the new session too. True:
+    the copy exists and the passed file carries the same text (compared as read_prompt normalises
+    it: BOM and surrounding whitespace aside), the copy is kept. A different text is refused here,
+    before status STARTING and the launch intent: a silent switch would hand the old work a new
+    task, a silent ignore would hide that the operator meant another one. False: no copy (an
+    interrupted first launch), the passed file becomes the copy as on a first launch."""
+    if not (prompt_copy.exists() or prompt_copy.is_symlink()):
+        return False
+    saved = read_prompt(prompt_copy)  # an unreadable or empty copy is refused with its reason
+    if saved != prompt_text:
+        raise SystemExit(f"wab: restart of {wave}: prompt file {prompt_file} differs from the saved "
+                         f"task {prompt_copy}; a restart continues the stopped try (its manifest, "
+                         f"handoff.md and branch) with the same task. Pass {prompt_copy} itself, "
+                         f"or, for a new task, close the old try first; launch refused")
+    return True
+
+
 ATTEMPT_FILES = ("next-prompt.md", "result.md")  # file results a DONE of the wave is judged by
 
 # The first message of a restarted wave (dead / not_ready) starts with this: the restart is a
 # continuation. The manifest, handoff.md and the branch of the failed try are kept (only
 # ATTEMPT_FILES are archived), and the unchanged task in prompt.md would lead to `state.py init`,
-# which refuses an existing manifest. The note is added on delivery from the `restart` field of
-# the wave record, so prompt.md stays the checked copy and a recovery sends the same text.
+# which refuses an existing manifest. Only the manifest forbids init: handoff.md alone (a checkpoint
+# during the plan check, before init) means the preparation goes on and the first init follows.
+# The note is added on delivery from the `restart` field of the wave record, so prompt.md stays
+# the checked copy and a recovery sends the same text.
 RESTART_NOTE = ("ПЕРЕЗАПУСК волны {wave} (попытка {n}): прошлая сессия волны остановилась. "
-                "Это продолжение, а не новый старт. Если есть $WAB_DIR/handoff.md или manifest "
-                "волны — иди путём «Продолжение» (handoff.md → путь к manifest → state.py where; "
-                "при tree_matches: false — state.py resume; дальше next_action), state.py init "
-                "НЕ вызывай, даже если задача ниже говорит «--plan». Только если ни handoff.md, "
-                "ни manifest нет — начинай со «Старт». next-prompt.md и result.md прошлой попытки "
-                "убраны в attempts/: свои пиши заново.")
+                "Это продолжение, а не новый старт. Есть manifest волны (путь — в "
+                "$WAB_DIR/handoff.md, обычно $WAB_DIR/superarmanda/manifest.json) — иди путём "
+                "«Продолжение» (state.py where; при tree_matches: false — state.py resume; дальше "
+                "next_action), state.py init НЕ вызывай, даже если задача ниже говорит «--plan». "
+                "Есть только handoff.md, а manifest ещё нет (контрольная точка до init) — прочитай "
+                "handoff.md, продолжи подготовку «Старт» с записанного места и после сверки "
+                "одобренного плана выполни первый state.py init. Нет ни handoff.md, ни manifest — "
+                "начинай со «Старт». next-prompt.md и result.md прошлой попытки убраны в "
+                "attempts/: свои пиши заново.")
 
 
 def archive_attempt_files(wdir, n):

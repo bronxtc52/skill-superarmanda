@@ -6122,6 +6122,133 @@ class W4Round40RestartContinues(Base):
         self.assertTrue(man.exists() and (wdir / "handoff.md").exists())
 
 
+class W4Round41RestartRules(Base):
+    """Round 41. (1) Review MEDIUM: handoff.md may exist before the manifest (a checkpoint during
+    the plan check, before `init`); only an existing manifest forbids `state.py init`, a wave with
+    handoff.md alone reads it and runs its first `init` after the plan check. (2) Codex P2: a restart
+    takes the saved prompt.md; a passed prompt file whose text differs is refused before any
+    side effect (status STARTING, the launch intent)."""
+
+    def setUp(self):
+        super().setUp()
+        self.prompt = self.tmp / "p.md"
+        self.prompt.write_text("--wave W1 --plan /run/waves.json: start the wave\n", encoding="utf-8")
+
+    launch = W4Round40RestartContinues.launch
+    first_texts = W4Round40RestartContinues.first_texts
+
+    def dead_with_handoff_only(self, cfg):
+        wdir = wab.wave_dir(cfg, "W1")
+        (wdir / "handoff.md").write_text("plan check in progress, no manifest yet\n", encoding="utf-8")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="dead")}})
+        self.alive = False
+        return wdir
+
+    def assert_init_allowed_without_manifest(self, text, where):
+        # the ban on init is bound to the manifest, not to handoff.md
+        text = " ".join(text.split())  # markdown wraps lines anywhere
+        self.assertNotIn("handoff.md или manifest", text, where)
+        self.assertNotIn("`handoff.md` или manifest", text, where)
+        self.assertIn("только handoff.md", text.replace("`", ""), where)
+        self.assertIn("первый state.py init", text.replace("`", ""), where)
+
+    def test_restart_with_handoff_but_no_manifest_may_init(self):
+        cfg, _ = self.chain()
+        wdir = self.dead_with_handoff_only(cfg)
+        self.assertTrue(self.launch(cfg))
+        text = self.first_texts()[0]
+        self.assertIn("ПЕРЕЗАПУСК волны W1", text)
+        self.assertIn("state.py init НЕ вызывай", text)  # still there, for the manifest case
+        self.assertLess(text.index("manifest"), text.index("state.py init НЕ вызывай"))
+        self.assert_init_allowed_without_manifest(text, "first message")
+        self.assertFalse((wdir / "superarmanda" / "manifest.json").exists())
+
+    def test_protocol_and_reference_bind_the_init_ban_to_the_manifest(self):
+        proto = (WAVES / "PROTOCOL.md").read_text(encoding="utf-8")
+        rule1 = proto[proto.index("1. **Старт или продолжение.**"):proto.index("2. **Контрольная точка.**")]
+        self.assert_init_allowed_without_manifest(rule1, "PROTOCOL.md rule 1")
+        ref = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        start = ref[ref.index("### Старт: `--wave"):ref.index("1. Рабочая копия")]
+        self.assert_init_allowed_without_manifest(start, "waves.md «Старт» step 0")
+        para = ref[ref.index("Перезапуск — **продолжение, а не чистый старт**"):]
+        para = para[:para.index("\n\n")]
+        self.assert_init_allowed_without_manifest(para, "waves.md «Перезапуск волны»")
+
+    def relaunchable(self, cfg):
+        """A real first launch (prompt.md saved), then the wave dies."""
+        self.put_state(cfg, {"current": None, "waves": {}})
+        self.alive = False
+        self.assertTrue(self.launch(cfg))
+        wdir = wab.wave_dir(cfg, "W1")
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "dead"
+        self.put_state(cfg, st)
+        (wdir / "status").write_text("RUNNING\n", encoding="utf-8")
+        self.sent.clear()
+        return wdir
+
+    def test_restart_refuses_a_changed_prompt_file_before_any_side_effect(self):
+        cfg, _ = self.chain()
+        wdir = self.relaunchable(cfg)
+        saved = (wdir / "prompt.md").read_bytes()
+        before = wab.state_path(cfg).read_bytes()
+        self.prompt.write_text("--wave W1 --plan /run/waves.json: a DIFFERENT task\n", encoding="utf-8")
+        with self.assertRaisesRegex(SystemExit, r"(?s)prompt\.md.*differs|differs.*prompt\.md"):
+            self.launch(cfg)
+        self.assertEqual((wdir / "status").read_text(encoding="utf-8"), "RUNNING\n")
+        self.assertEqual(wab.state_path(cfg).read_bytes(), before)
+        self.assertEqual((wdir / "prompt.md").read_bytes(), saved)
+        self.assertEqual(self.sent, [])
+
+    def test_restart_refuses_another_file_with_another_text(self):
+        cfg, _ = self.chain()
+        wdir = self.relaunchable(cfg)
+        other = self.tmp / "other.md"
+        other.write_text("--wave W1 --plan /elsewhere.json: other\n", encoding="utf-8")
+        before = wab.state_path(cfg).read_bytes()
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            with self.assertRaises(SystemExit):
+                wab.launch(cfg, "W1", other)
+        self.assertEqual(wab.state_path(cfg).read_bytes(), before)
+        self.assertEqual((wdir / "status").read_text(encoding="utf-8"), "RUNNING\n")
+
+    def test_restart_with_the_same_prompt_file_uses_the_saved_copy(self):
+        cfg, _ = self.chain()
+        wdir = self.relaunchable(cfg)
+        saved = (wdir / "prompt.md").read_bytes()
+        inode = (wdir / "prompt.md").stat().st_ino  # kept, not rewritten by a temp file + replace
+        same = self.tmp / "copy.md"  # another path, the same text: accepted
+        same.write_text("﻿--wave W1 --plan /run/waves.json: start the wave\n\n", encoding="utf-8")
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            self.assertTrue(wab.launch(cfg, "W1", same))
+        self.assertEqual((wdir / "prompt.md").read_bytes(), saved)
+        self.assertEqual((wdir / "prompt.md").stat().st_ino, inode)
+        text = self.first_texts()[0]
+        self.assertIn("ПЕРЕЗАПУСК волны W1 (попытка 2)", text)
+        self.assertTrue(text.endswith("--wave W1 --plan /run/waves.json: start the wave"), text)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["prompt_file"], str(wdir / "prompt.md"))
+
+    def test_restart_without_a_saved_copy_takes_the_passed_file(self):
+        cfg, _ = self.chain()
+        wdir = self.relaunchable(cfg)
+        (wdir / "prompt.md").unlink()
+        self.assertTrue(self.launch(cfg))
+        self.assertEqual((wdir / "prompt.md").read_text(encoding="utf-8"),
+                         "--wave W1 --plan /run/waves.json: start the wave\n")
+        self.assertIn("ПЕРЕЗАПУСК волны W1", self.first_texts()[0])
+
+    def test_ordinary_launch_of_the_next_wave_still_writes_its_prompt(self):
+        cfg, _ = self.chain()
+        wdir = self.relaunchable(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "awaiting_merge"
+        self.put_state(cfg, st)
+        self.prompt.write_text("--wave W2 --plan /run/waves.json: next\n", encoding="utf-8")
+        self.assertTrue(self.launch(cfg, "W2"))
+        self.assertEqual((wab.wave_dir(cfg, "W2") / "prompt.md").read_text(encoding="utf-8"),
+                         "--wave W2 --plan /run/waves.json: next\n")
+
+
 class TmuxGuard(unittest.TestCase):
     """The guard itself: a socketless tmux must fail loudly, a private one passes the guard."""
 
