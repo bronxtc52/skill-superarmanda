@@ -90,7 +90,9 @@ def load_chain(path, create=True):
     if (not isinstance(waves, list) or not waves
             or not all(isinstance(w, str) and WAVE_NAME.fullmatch(w) for w in waves)):
         raise SystemExit("chain.json: waves must be a non-empty list of [A-Za-z0-9_-]+ names")
-    base = pathlib.Path(cfg["run_dir"]) if cfg.get("run_dir") else path.resolve().parent / "runs"
+    here = path.resolve().parent
+    # a relative run_dir is relative to chain.json, never to the cwd of whoever runs us
+    base = pathlib.Path(os.path.abspath(here / cfg["run_dir"])) if cfg.get("run_dir") else here / "runs"
     cfg["chain_file"] = str(path.resolve())
     cfg["run_dir"] = base / chain / run_id
     if create:
@@ -108,6 +110,11 @@ def load_state(cfg):
         st = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
         if not isinstance(st, dict):
             raise ValueError("not a JSON object")
+        waves = st.get("waves", {})
+        if not isinstance(waves, dict) or not all(isinstance(w, dict) for w in waves.values()):
+            raise ValueError("`waves` must map wave names to objects")
+        if st.get("current") is not None and not isinstance(st["current"], str):
+            raise ValueError("`current` must be a wave name or null")
     except (OSError, ValueError) as e:
         raise SystemExit(f"wab: cannot read state.json: {e}")
     st.setdefault("waves", {})
@@ -387,10 +394,10 @@ _REDACT = [
     re.compile(r"(?i)(?<![\w-])([\"']?(?:[\w.-]*(?:secret|token|password|passwd|pwd|api[_-]?key|"
                r"private[_-]?key|dsn|cookie|session|credential|connection[_-]?string|accountkey|"
                r"sharedaccesskey|signature)[\w.-]*|sig)[\"']?)(\s*[:=]\s*)"
-               r"(?:\"[^\"]*\"?|'[^']*'?|[^\s,;&}\]]+)"),                        # key as a word, value as a whole
+               r"(?!\[скрыто\])(?:\"[^\"]*\"?|'[^']*'?|[^\s,;&}\]]+)"),             # key as a word, value as a whole
     re.compile(r"(?i)\b((?:proxy-)?authorization)(\s*:\s*)(?:(?:bearer|basic|token|digest)\s+)?\S+"),
     re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"),                    # userinfo in URLs
+    re.compile(r"(?<=://)[^/\s@]+(?=@)"),                           # userinfo in URLs, with or without password
     re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),                      # e-mail addresses
     re.compile(r"\+\d[\d ()-]{8,}\d"),                                  # phone numbers (+7 ...)
     re.compile(r"(?<![\w+])(?:\+?7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)"),  # RU, no plus
@@ -610,11 +617,36 @@ def resume(cfg, st):
         if fresh:
             notify(cfg, f"wave-autobot: диспетчер перезапустился при отправке задачи волне {wave}; "
                         f"неизвестно, дошла ли она, повторно не слал. Проверь окно: tmux attach -t {name}")
+    elif phase == "updating":
+        recover_update(cfg, st, wave)
     elif phase == "dead" and tmux_alive(name):
         w["phase"] = "running"
         w.get("notified", {}).pop("dead", None)
         save_state(cfg, st)
         event(cfg, f"{wave}: window is back, supervision resumed")
+
+
+def finish_update(cfg, st, wave):
+    """Last step of the /clear + /update transition: one restart counted, status RESUMING."""
+    w = st["waves"][wave]
+    w["restarts"] = w.get("restarts", 0) + 1
+    w["phase"] = "running"
+    w["checkpoint_at"] = None
+    (wave_dir(cfg, wave) / "status").write_text("RESUMING\n", encoding="utf-8")
+    save_state(cfg, st)
+
+
+def recover_update(cfg, st, wave):
+    """The dispatcher died while /update was in flight: whether it arrived is unknown, so it
+    is NOT resent. The wave goes on with await_session set; the owner is told once."""
+    w = st["waves"][wave]
+    fresh = once_per(w, "updating", str(w.get("restarts", 0)))
+    w["await_session"] = True
+    event(cfg, f"{wave}: resumed in phase 'updating': unknown whether /update arrived, NOT resent")
+    finish_update(cfg, st, wave)
+    if fresh:
+        notify(cfg, f"wave-autobot: диспетчер перезапустился при передаче /update волне {wave}; "
+                    f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: tmux attach -t {w['tmux']}")
 
 
 def tick(cfg, st):
@@ -697,19 +729,23 @@ def tick(cfg, st):
             notify(cfg, f"wave-autobot: волна {wave} ждёт тебя.\n\n{redact(status)}\n\nОтветить: {attach}")
         return True
 
-    if status == "HANDOFF_READY" and w.get("phase") == "checkpoint":
+    if w.get("phase") == "updating":
+        recover_update(cfg, st, wave)
+        return True
+
+    if (status == "HANDOFF_READY" and w.get("phase") == "checkpoint") or w.get("phase") == "clearing":
         event(cfg, f"{wave}: handoff ready, /clear + /update (restart #{w.get('restarts', 0) + 1})")
+        w["phase"] = "clearing"  # saved before each outside action; a repeated /clear is safe
+        save_state(cfg, st)
         send_command(name, "/clear")
+        w["phase"] = "updating"  # from here /update is never resent blindly
         w["await_session"] = True  # the next session is found by its marker, not by guesswork
+        save_state(cfg, st)
         time.sleep(6)
         send_text(name, f"/update {session_marker(cfg, wave)} Продолжаем волну {wave} wave-autobot. "
                         f"Каталог волны: {wdir}. Прочитай {wdir}/handoff.md и продолжи с шага "
                         f"«Следующий шаг».")
-        w["restarts"] = w.get("restarts", 0) + 1
-        w["phase"] = "running"
-        w["checkpoint_at"] = None
-        (wdir / "status").write_text("RESUMING\n", encoding="utf-8")
-        save_state(cfg, st)
+        finish_update(cfg, st, wave)
         return True
 
     txt = pane_text(name)

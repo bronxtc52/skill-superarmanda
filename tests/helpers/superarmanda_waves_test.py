@@ -506,7 +506,13 @@ class Redaction(Base):
         ("тел +79161234567", "79161234567"),
         ("session_id=Se55Se55Se55", "Se55Se55Se55"),
         ("credential=Cr3dCr3d", "Cr3dCr3d"),
+        ("https://SECRETX9@host/p", "SECRETX9"),
+        ("https://:SECRETX9@host/p", "SECRETX9"),
     ]
+
+    def test_no_stray_bracket_after_a_cookie(self):
+        self.assertEqual(wab.redact("Cookie: session=X1"), "Cookie: [скрыто]")
+        self.assertEqual(wab.redact("Set-Cookie: a=b; Path=/"), "Set-Cookie: [скрыто]")
 
     def test_extra_classes_are_scrubbed(self):
         for text, original in self.EXTRA:
@@ -635,6 +641,17 @@ class CorruptState(Base):
                     wab.main(["wab.py", cmd, str(path)])
                 self.assertIn("wab: cannot read state.json", str(ctx.exception))
 
+    def test_malformed_wave_records_are_a_clean_error(self):
+        cfg, path = self.chain()
+        for doc in ({"waves": {"W1": "bad"}}, {"waves": []}, {"waves": {"W1": [1]}},
+                    {"current": 5, "waves": {}}):
+            wab.state_path(cfg).write_text(json.dumps(doc), encoding="utf-8")
+            for cmd in ("status", "current-tmux"):
+                with self.subTest(doc=doc, cmd=cmd):
+                    with self.assertRaises(SystemExit) as ctx:
+                        wab.main(["wab.py", cmd, str(path)])
+                    self.assertIn("wab: cannot read state.json", str(ctx.exception))
+
     def test_watch_logs_an_event_and_stops(self):
         cfg, path = self.chain()
         wab.state_path(cfg).write_text("{broken", encoding="utf-8")
@@ -644,6 +661,82 @@ class CorruptState(Base):
         self.assertIn("cannot read state.json", str(ctx.exception))
         log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
         self.assertIn("cannot read state.json", log)
+
+
+class CheckpointTransition(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg, self.path = self.chain()
+        w = self.wave_rec(phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time(),
+                          sessions=["s1"])
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": w}})
+        self.set_status(self.cfg, "W1", "HANDOFF_READY")
+        self.rec_cmd = wab.send_command.side_effect
+        self.rec_text = wab.send_text.side_effect
+
+    def boom_cmd(self, *a):
+        raise RuntimeError("dispatcher died")
+
+    def heal(self):
+        wab.send_command.side_effect = self.rec_cmd
+        wab.send_text.side_effect = self.rec_text
+
+    def kinds(self):
+        clears = [s for s in self.sent if s[:3] == ("cmd", "wv-w1", "/clear")]
+        updates = [s for s in self.sent if s[0] == "text" and s[2].startswith("/update")]
+        return len(clears), len(updates)
+
+    def w(self):
+        return self.get_state(self.cfg)["waves"]["W1"]
+
+    def test_crash_while_clearing_repeats_clear_once_and_finishes(self):
+        wab.send_command.side_effect = self.boom_cmd
+        with self.assertRaises(RuntimeError):
+            wab.tick(self.cfg, wab.load_state(self.cfg))
+        self.assertEqual((self.w()["phase"], self.w()["restarts"]), ("clearing", 0))
+        self.assertEqual(self.kinds(), (0, 0))
+        self.heal()
+        wab.tick(self.cfg, wab.load_state(self.cfg))
+        self.assertEqual(self.kinds(), (1, 1))
+        w = self.w()
+        self.assertEqual((w["phase"], w["restarts"], w["await_session"]), ("running", 1, True))
+        wab.tick(self.cfg, wab.load_state(self.cfg))
+        self.assertEqual((self.kinds(), self.w()["restarts"]), ((1, 1), 1))
+
+    def test_crash_while_updating_is_not_resent_and_notifies_once(self):
+        def boom_text(name, text):
+            raise RuntimeError("dispatcher died")
+        wab.send_text.side_effect = boom_text
+        with self.assertRaises(RuntimeError):
+            wab.tick(self.cfg, wab.load_state(self.cfg))
+        w = self.w()
+        self.assertEqual((w["phase"], w["restarts"], w["await_session"]), ("updating", 0, True))
+        self.assertEqual(self.kinds(), (1, 0))
+        self.heal()
+        for _ in range(2):
+            with mock.patch.object(wab, "bind_popup"):
+                wab.watch(self.cfg, self.path, max_ticks=1)
+        w = self.w()
+        self.assertEqual((w["phase"], w["restarts"], w["await_session"]), ("running", 1, True))
+        self.assertEqual(self.kinds(), (1, 0))  # nothing resent
+        self.assertEqual(len(self.tg), 1)
+
+    def test_updating_recovered_by_tick_alone(self):
+        w = self.w()
+        w.update(phase="updating", await_session=True)
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": w}})
+        wab.tick(self.cfg, wab.load_state(self.cfg))
+        wab.tick(self.cfg, wab.load_state(self.cfg))
+        self.assertEqual((self.kinds(), self.w()["restarts"], self.w()["phase"]), ((0, 0), 1, "running"))
+        self.assertEqual(len(self.tg), 1)
+
+    def test_clearing_is_recovered_by_resume_too(self):
+        w = self.w()
+        w.update(phase="clearing")
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": w}})
+        with mock.patch.object(wab, "bind_popup"):
+            wab.watch(self.cfg, self.path, max_ticks=1)
+        self.assertEqual((self.kinds(), self.w()["restarts"]), ((1, 1), 1))
 
 
 class AtMostOnce(Base):
@@ -1049,6 +1142,23 @@ class ChainConfig(Base):
         cfg, _ = self.chain(run_dir=str(base))
         self.assertEqual(cfg["run_dir"], base / CHAIN / RUN_ID)
         self.assertNotIn(str(WAVES), str(cfg["run_dir"]))
+
+    def test_relative_run_dir_is_resolved_against_the_chain_file(self):
+        cfg, path = self.chain(run_dir="runs")
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        old = os.getcwd()
+        os.chdir(elsewhere)
+        self.addCleanup(os.chdir, old)
+        again = wab.load_chain(path)
+        self.assertTrue(again["run_dir"].is_absolute())
+        self.assertEqual(again["run_dir"], path.parent.resolve() / "runs" / CHAIN / RUN_ID)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_wave_dir_and_system_prompt_are_absolute(self):
+        cfg, path = self.chain(run_dir="runs")
+        self.assertTrue(wab.wave_dir(cfg, "W1").is_absolute())
+        self.assertTrue(wab.system_prompt(cfg).is_absolute())
 
     def test_unsafe_identifiers_are_rejected(self):
         for field, value in (("run_id", None), ("run_id", ""), ("run_id", ".."), ("run_id", "a/b"),
