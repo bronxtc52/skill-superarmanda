@@ -808,7 +808,7 @@ class WaveOwnsStatus(Base):
 
     def restart(self, **kw):
         with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "launch", return_value=True) as ln:
-            wab.watch(self.cfg, self.path, max_ticks=1)
+            wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
         return ln
 
     def test_done_after_a_crashed_transition_is_done(self):
@@ -1015,6 +1015,119 @@ class DispatcherLock(Base):
         (cfg["run_dir"] / "state.tmp").mkdir()  # the old shared name must not matter
         wab.save_state(cfg, {"waves": {}})
         self.assertEqual(self.get_state(cfg), {"waves": {}})
+
+
+class RegistryLock(Base):
+    def make_chain(self, n):
+        d = self.tmp / f"c{n}"
+        d.mkdir()
+        doc = {"chain": f"ch{n}", "run_id": RUN_ID, "repo": "o/r", "waves": ["W1"], "tmux_prefix": f"p{n}-"}
+        path = d / "chain.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return wab.load_chain(path), path
+
+    def test_a_held_registry_lock_refuses_the_binding_without_touching_anything(self):
+        cfg, path = self.chain()
+        lock = wab.registry_path().with_name("dashes.lock")
+        lock.parent.mkdir(parents=True)
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import fcntl,sys,time; f=open(sys.argv[1],'a'); "
+             "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(60)", str(lock)],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        with mock.patch.object(wab, "REGISTRY_LOCK_TIMEOUT", 0.3):
+            wab.bind_popup(cfg, path)  # must not raise
+        self.assertFalse(wab.registry_path().exists())
+        self.assertEqual([c for c in self.tmux_calls if c[1] == "source-file"], [])
+        self.assertIn("registry", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_concurrent_registrations_keep_every_chain(self):
+        import threading
+        chains = [self.make_chain(n) for n in range(8)]
+        gate = threading.Barrier(len(chains))
+        errors = []
+
+        def run(cfg, path):
+            try:
+                gate.wait()
+                wab.bind_popup(cfg, path)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+        threads = [threading.Thread(target=run, args=c) for c in chains]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        reg = json.loads(wab.registry_path().read_text(encoding="utf-8"))
+        self.assertEqual(sorted(reg), sorted(f"p{n}-dash" for n in range(8)))
+        last = max(chains, key=lambda c: (c[0]["run_dir"] / "keys.tmux").stat().st_mtime_ns)
+        conf = (last[0]["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
+        self.assertTrue(all(f"p{n}-dash" in conf for n in range(8)))
+
+
+class WatchIdentity(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg, self.path = self.chain()
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(self.cfg, "W1", "RUNNING")
+
+    def rewrite(self, **over):
+        doc = json.loads(self.path.read_text(encoding="utf-8"))
+        doc.update(over)
+        self.path.write_text(json.dumps(doc), encoding="utf-8")
+
+    def run_watch(self, on_first_tick, ticks=3):
+        seen = []
+
+        def fake_tick(cfg, st):
+            seen.append((str(cfg["run_dir"]), cfg["ctx_limit"]))
+            if len(seen) == 1:
+                on_first_tick()
+            return True
+        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "tick", side_effect=fake_tick):
+            try:
+                wab.watch(self.cfg, self.path, max_ticks=ticks)
+                exit_ = None
+            except SystemExit as e:
+                exit_ = str(e)
+        return seen, exit_
+
+    def test_changed_run_id_stops_the_watch_before_any_tick_on_the_new_run(self):
+        seen, exit_ = self.run_watch(lambda: self.rewrite(run_id="2099-01-01"))
+        self.assertEqual(len(seen), 1)
+        self.assertIn("identity changed", exit_)
+        log = (self.cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("chain.json identity changed", log)
+        self.assertIn("keeping", log)
+        self.assertFalse((self.path.parent / "runs" / CHAIN / "2099-01-01" / "state.json").exists())
+        import fcntl  # the lock is released on the way out
+        with open(self.cfg["run_dir"] / "dispatcher.lock", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_other_identity_fields_also_stop_it(self):
+        for field, value in (("tmux_prefix", "zz-"), ("repo", "x/y"), ("waves", ["W1", "W9"]),
+                             ("merge_gate", "external"), ("workdir", "/tmp/other")):
+            with self.subTest(field=field):
+                self.cfg, self.path = self.chain()
+                seen, exit_ = self.run_watch(lambda: self.rewrite(**{field: value}))
+                self.assertEqual(len(seen), 1)
+                self.assertIn("identity changed", exit_)
+
+    def test_tunable_fields_apply_live(self):
+        seen, exit_ = self.run_watch(lambda: self.rewrite(ctx_limit=111, idle_minutes=1, titles={"W1": "x"},
+                                                           model="m", tick_seconds=5), ticks=2)
+        self.assertIsNone(exit_)
+        self.assertEqual([c for _, c in seen], [300000, 111])
+
+    def test_broken_chain_json_keeps_the_old_config(self):
+        seen, exit_ = self.run_watch(lambda: self.path.write_text("{broken", encoding="utf-8"), ticks=3)
+        self.assertIsNone(exit_)
+        self.assertEqual(len(seen), 3)
+        self.assertIn("cannot read", (self.cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
 
 class AtMostOnce(Base):

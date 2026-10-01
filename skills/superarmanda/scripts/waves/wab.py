@@ -981,6 +981,33 @@ def keys_conf(registry):
     return f"bind-key -n {key} {cmd}\n"  # Shift+Tab (BTab) is never bound here
 
 
+REGISTRY_LOCK_TIMEOUT = 10  # seconds
+
+
+class _RegistryLock:
+    """Blocking flock (polled, with a timeout) on ~/.cache/wab/dashes.lock: the registry is
+    shared by every chain of the machine, so read-modify-write-source must be one step."""
+
+    def __enter__(self):
+        path = registry_path().with_name("dashes.lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(path, "a", encoding="utf-8")
+        end = time.monotonic() + REGISTRY_LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() >= end:
+                    self.fh.close()
+                    raise TimeoutError(str(path))
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        self.fh.close()
+        return False
+
+
 def stale_btab(list_keys_output):
     """Is the root binding of Shift+Tab a leftover of an old wab version (it let the key
     through to the wave window and switched Claude out of auto mode)? Only those are ours."""
@@ -990,7 +1017,16 @@ def stale_btab(list_keys_output):
 
 def bind_popup(cfg, path):
     """Register this chain's dashboard and (re)generate keys.tmux for every registered chain.
-    tmux key bindings are global to the server, so one binding serves all chains."""
+    tmux key bindings are global to the server, so one binding serves all chains. The whole
+    read-update-write-source sequence runs under the registry lock."""
+    try:
+        with _RegistryLock():
+            _bind_popup(cfg, path)
+    except (TimeoutError, OSError) as e:
+        event(cfg, f"Ctrl+\\ binding skipped: registry lock unavailable ({type(e).__name__}: {e})")
+
+
+def _bind_popup(cfg, path):
     dash = f"{cfg['tmux_prefix']}dash"
     entry = [str(HERE / "wab-open"), str(pathlib.Path(path).resolve())]
     try:
@@ -1019,8 +1055,9 @@ def bind_popup(cfg, path):
     reg[dash] = entry
     target = registry_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(reg, indent=1, ensure_ascii=False), encoding="utf-8")
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".dashes.", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(reg, indent=1, ensure_ascii=False))
     os.replace(tmp, target)
     conf = cfg["run_dir"] / "keys.tmux"
     conf.write_text(keys_conf(reg), encoding="utf-8")
@@ -1041,6 +1078,15 @@ def _state_or_event(cfg):
         raise
 
 
+TUNABLE = ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds", "telegram",
+           "titles", "model")
+
+
+def _identity(cfg):
+    """Everything that decides WHOSE run this is: all chain.json fields except the tunable ones."""
+    return {k: v for k, v in cfg.items() if k not in TUNABLE}
+
+
 def watch(cfg, path, max_ticks=None):
     with _RunLock(cfg, "watch"):
         _watch(cfg, path, max_ticks)
@@ -1053,8 +1099,19 @@ def _watch(cfg, path, max_ticks=None):
     resume(cfg, _state_or_event(cfg))
     last = 0.0
     ticks = 0
+    pinned = _identity(cfg)
     while True:
-        cfg = load_chain(path)  # thresholds can be tuned live
+        try:
+            fresh = load_chain(path)  # thresholds can be tuned live
+        except SystemExit as e:
+            event(cfg, f"chain.json not re-read, keeping the previous settings: {e}")
+        else:
+            changed = sorted(k for k in set(pinned) | set(_identity(fresh)) if pinned.get(k) != _identity(fresh).get(k))
+            if changed:
+                event(cfg, f"chain.json identity changed ({', '.join(changed)}); keeping {pinned['run_dir']}")
+                raise SystemExit(f"wab: chain.json identity changed ({', '.join(changed)}) during watch; "
+                                 f"stopping; restart watch for the new run")
+            cfg = fresh
         st = _state_or_event(cfg)
         if not tick(cfg, st):
             event(cfg, "watch stopped: no current wave")
