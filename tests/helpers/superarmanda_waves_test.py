@@ -3309,6 +3309,7 @@ class W4Round26(Base):
     def test_done_drops_the_undelivered_handoff_but_keeps_chain_done(self):
         cfg, path = self.handoff_undelivered(waves=["W1"])
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+        self.alive = False  # the window obeys /exit (a window still open makes done exit 3, round 35)
         wab.main(["wab.py", "done", str(path), "W1"])  # Telegram still down
         box = self.get_state(cfg)["waves"]["W1"].get("outbox") or {}
         self.assertNotIn("handoff", box)
@@ -5554,6 +5555,203 @@ class W4Round34Dashboard(Base):
         row = [l for l in buf.getvalue().splitlines() if l.strip().startswith("W1")]
         self.assertTrue(row and row[0].rstrip().endswith("?"), buf.getvalue())
         self.assertNotIn("-4", row[0])
+
+
+class W4Round35(Base):
+    """Round 35: a restarted wave archives the file results of its earlier try (a stale
+    next-prompt.md never goes to the next wave); the identity of the chain is pinned in
+    state.json across launch/watch/done; `done` with a window still open exits non-zero;
+    the dashboard sums the commits of earlier attempts."""
+
+    def setUp(self):
+        super().setUp()
+        self.windows = {"wv-w1"}
+        self.exit_closes = True
+        wab.tmux_alive.side_effect = lambda n: n in self.windows
+
+        def fake_tmux(*args, **kw):
+            self.tmux_calls.append(args)
+            if "new-session" in args:
+                self.windows.add(args[args.index("-s") + 1])
+            if "send-keys" in args and "/exit" in args and self.exit_closes:
+                tgt = args[args.index("-t") + 1]
+                self.windows -= {n for n in set(self.windows) if wab.pane_target(n) == tgt}
+            return subprocess.CompletedProcess(args, 0, "", "")
+        p = mock.patch.object(wab, "tmux", side_effect=fake_tmux)
+        p.start()
+        self.addCleanup(p.stop)
+        self.prompt = self.tmp / "p.md"
+        self.prompt.write_text("go\n", encoding="utf-8")
+
+    def exits(self, name="wv-w1"):
+        return [c for c in self.tmux_calls if "send-keys" in c and "/exit" in c
+                and wab.pane_target(name) in c]
+
+    def launch(self, cfg, wave):
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            return wab.launch(cfg, wave, self.prompt)
+
+    def log(self, cfg):
+        p = cfg["run_dir"] / "events.log"
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+
+    # ----- 1: a restart archives next-prompt.md and result.md of the earlier try -----
+    def test_restart_does_not_hand_a_stale_next_prompt_to_the_next_wave(self):
+        for gate in (None, "external"):
+            with self.subTest(gate=gate):
+                cfg, _ = self.chain(merge_gate=gate)
+                wdir = wab.wave_dir(cfg, "W1")
+                for f in ("next-prompt.md", "result.md"):
+                    (wdir / f).unlink(missing_ok=True)
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="dead")}})
+                (wdir / "next-prompt.md").write_text("stale prompt of the failed try\n", encoding="utf-8")
+                (wdir / "result.md").write_text("stale result\n", encoding="utf-8")
+                self.windows = set()  # the failed try's window is gone
+                self.assertTrue(self.launch(cfg, "W1"))
+                self.assertFalse((wdir / "next-prompt.md").exists())
+                self.assertFalse((wdir / "result.md").exists())
+                st = self.get_state(cfg)
+                arch = Path(st["waves"]["W1"]["attempts"][-1]["archive"])
+                self.assertEqual((arch / "next-prompt.md").read_text(encoding="utf-8"),
+                                 "stale prompt of the failed try\n")
+                self.assertEqual((arch / "result.md").read_text(encoding="utf-8"), "stale result\n")
+                # the new try says DONE without writing its own next-prompt.md
+                self.set_status(cfg, "W1", "DONE")
+                with mock.patch.object(wab, "launch") as nxt:
+                    wab.tick(cfg, wab.load_state(cfg))
+                nxt.assert_not_called()
+                st = self.get_state(cfg)
+                self.assertEqual(st.get("stopped"), "W1: DONE without next-prompt.md")
+                self.assertNotEqual(st["waves"]["W1"]["phase"], "awaiting_merge")
+
+    def test_second_restart_keeps_both_archives(self):
+        cfg, _ = self.chain()
+        wdir = wab.wave_dir(cfg, "W1")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="dead")}})
+        archives = []
+        for n in (1, 2):
+            (wdir / "next-prompt.md").write_text(f"try {n}\n", encoding="utf-8")
+            self.windows = set()
+            self.assertTrue(self.launch(cfg, "W1"))
+            st = self.get_state(cfg)
+            archives.append(Path(st["waves"]["W1"]["attempts"][-1]["archive"]))
+            st["waves"]["W1"]["phase"] = "dead"
+            self.put_state(cfg, st)
+        self.assertNotEqual(archives[0], archives[1])
+        self.assertEqual([(a / "next-prompt.md").read_text(encoding="utf-8") for a in archives],
+                         ["try 1\n", "try 2\n"])
+
+    # ----- 2: the identity of the chain is pinned in state.json -----
+    def awaiting(self, waves=("W1", "W2"), **over):
+        cfg, path = self.chain(waves=list(waves), merge_gate="external", **over)
+        self.put_state(cfg, {"current": None, "waves": {}})
+        self.windows = set()
+        self.assertTrue(self.launch(cfg, "W1"))
+        st = self.get_state(cfg)
+        self.assertIn("identity", st)
+        st["waves"]["W1"]["phase"] = "awaiting_merge"
+        self.put_state(cfg, st)
+        self.windows = set()  # the handed-over wave's window has closed
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        return cfg, path
+
+    def rewrite(self, path, **over):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc.update(over)
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return wab.load_chain(path)
+
+    def refused_unchanged(self, cfg, fn):
+        before = wab.state_path(cfg).read_bytes()
+        calls = len(self.tmux_calls)
+        with self.assertRaises(SystemExit) as cm:
+            fn()
+        self.assertIn("identity", str(cm.exception))
+        self.assertNotIn("Traceback", str(cm.exception))
+        self.assertEqual(wab.state_path(cfg).read_bytes(), before)
+        self.assertEqual(self.tmux_calls[calls:], [])
+        self.assertIn("identity", self.log(cfg))
+
+    def test_changed_identity_between_handoff_and_launch_is_refused(self):
+        for field, value in (("waves", ["W1", "W9"]), ("repo", "x/y"), ("workdir", "/tmp/other-wd")):
+            with self.subTest(field=field):
+                cfg, path = self.awaiting()
+                fresh = self.rewrite(path, **{field: value})
+                nxt = fresh["waves"][1]
+                self.refused_unchanged(cfg, lambda: self.launch(fresh, nxt))
+
+    def test_changed_identity_between_handoff_and_watch_is_refused(self):
+        for field, value in (("waves", ["W1", "W9"]), ("repo", "x/y"), ("workdir", "/tmp/other-wd")):
+            with self.subTest(field=field):
+                cfg, path = self.awaiting()
+                fresh = self.rewrite(path, **{field: value})
+                with mock.patch.object(wab, "drop_stale_btab"):
+                    self.refused_unchanged(cfg, lambda: wab.watch(fresh, path, max_ticks=1))
+
+    def test_changed_identity_between_handoff_and_done_is_refused(self):
+        for field, value in (("waves", ["W9"]), ("repo", "x/y"), ("workdir", "/tmp/other-wd")):
+            with self.subTest(field=field):
+                cfg, path = self.awaiting(waves=("W1",))
+                fresh = self.rewrite(path, **{field: value})
+                self.refused_unchanged(cfg, lambda: wab.done_cmd(fresh))
+
+    def test_unchanged_identity_passes_and_tunables_may_change(self):
+        cfg, path = self.awaiting()
+        fresh = self.rewrite(path, ctx_limit=111, titles={"W1": "x"})
+        self.assertTrue(self.launch(fresh, "W2"))
+        self.assertEqual(self.get_state(cfg)["current"], "W2")
+        cfg, path = self.awaiting(waves=("W1",))
+        wab.done_cmd(wab.load_chain(path))
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "done")
+
+    def test_old_state_without_identity_is_migrated_not_refused(self):
+        cfg, path = self.chain(waves=["W1"], merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge")}})
+        self.windows = set()
+        with mock.patch.object(wab, "drop_stale_btab"):
+            wab.watch(cfg, path, max_ticks=1)
+        self.assertIn("identity", self.get_state(cfg))
+        fresh = self.rewrite(path, repo="x/y")
+        self.refused_unchanged(cfg, lambda: wab.done_cmd(fresh))
+        st = self.get_state(cfg)
+        del st["identity"]
+        self.put_state(cfg, st)
+        wab.done_cmd(wab.load_chain(path))
+        st = self.get_state(cfg)
+        self.assertEqual(st["waves"]["W1"]["phase"], "done")
+        self.assertIn("identity", st)
+
+    # ----- 3: done with a window still open exits non-zero -----
+    def test_cli_done_with_a_window_still_open_exits_non_zero(self):
+        cfg, path = self.chain(waves=["W1"], merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {
+            "W1": self.wave_rec(phase="awaiting_merge", pending_exit=True)}})
+        self.exit_closes = False
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            wab.main(["wab.py", "done", str(path)])
+        self.assertNotIn(cm.exception.code, (0, None))
+        self.assertIn("still open", err.getvalue())
+        self.assertTrue(self.get_state(cfg)["waves"]["W1"].get("pending_exit"))
+        self.exit_closes = True
+        wab.main(["wab.py", "done", str(path)])  # no SystemExit: rc 0
+        self.assertNotIn("pending_exit", self.get_state(cfg)["waves"]["W1"])
+
+    # ----- 4: the dashboard sums the commits of earlier attempts -----
+    def test_dashboard_commits_include_earlier_attempts(self):
+        import dash
+        w = self.wave_rec(commits=2, attempts=[{"commits": 3, "cwd": self.cwd, "started": 0},
+                                               "junk", {"commits": 1, "cwd": self.cwd, "started": 0}])
+        self.assertEqual(dash.wave_commits(w), 6)
+        # an attempt whose counter was never fixed (never ended, e.g. not_ready) adds nothing
+        w = self.wave_rec(commits=2, attempts=[{"phase": "not_ready", "start_rev": "a" * 40,
+                                                "cwd": self.cwd, "started": 0}])
+        self.assertEqual(dash.wave_commits(w), 2)
+        # a corrupt counter of an attempt makes the total unknown, like the wave's own one
+        for bad in (-1, "3", 2.5, True, None):
+            with self.subTest(bad=bad):
+                w = self.wave_rec(commits=2, attempts=[{"commits": bad, "cwd": self.cwd, "started": 0}])
+                self.assertIsNone(dash.wave_commits(w))
 
 
 class TmuxGuard(unittest.TestCase):

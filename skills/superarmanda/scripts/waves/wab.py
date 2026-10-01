@@ -1258,6 +1258,7 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     # is switched: the file may live in the previous wave's checkout and change or vanish with it
     prompt_text = read_prompt(prompt_file)
     st = load_state(cfg)
+    check_identity(cfg, st, "launch")  # a missing pin goes into the intent save below
     pushed = close_pending_windows(cfg, st)  # an entry of the coordinator: even a refused launch pushes
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
     _check_launch_allowed(cfg, st, wave, name)
@@ -1307,6 +1308,9 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
         earlier = old.get("attempts")
         attempts = [a for a in earlier if isinstance(a, dict)] if isinstance(earlier, list) else []
         attempts.append({k: v for k, v in old.items() if k not in ("attempts", "outbox")})
+        archive = archive_attempt_files(wdir, len(attempts))
+        if archive:
+            attempts[-1]["archive"] = str(archive)
     st["waves"][wave] = {"tmux": name, "cwd": cwd, "started": time.time(), "restarts": 0,
                          "phase": "launching", "notified": {}, "sessions": [sid],
                          "prompt_file": str(prompt_copy), "prompt_source": str(prompt_file)}
@@ -1320,6 +1324,28 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     save_state(cfg, st)
     start_session(cfg, st, wave)
     return deliver_first_prompt(cfg, st, wave)
+
+
+ATTEMPT_FILES = ("next-prompt.md", "result.md")  # file results a DONE of the wave is judged by
+
+
+def archive_attempt_files(wdir, n):
+    """A restart reuses the wave's directory: the file results of the earlier try (ATTEMPT_FILES)
+    move to <wave>/attempts/<n>/, so a DONE of the new try without its own next-prompt.md stops
+    the chain (_stop_without_next) instead of handing the stale one on. A crash after the move
+    and before the intent finds the files already there (same n) and reuses the directory; a
+    name already taken there gets a fresh directory, nothing is overwritten. None: nothing to keep."""
+    present = [f for f in ATTEMPT_FILES if (wdir / f).exists() or (wdir / f).is_symlink()]
+    base = wdir / "attempts" / str(n)
+    if not present:
+        return base if base.is_dir() else None
+    target = base
+    if any((base / f).exists() or (base / f).is_symlink() for f in present):
+        target = wdir / "attempts" / f"{n}-{uuid.uuid4().hex[:8]}"
+    target.mkdir(parents=True, exist_ok=True)
+    for f in present:
+        os.replace(wdir / f, target / f)
+    return target
 
 
 def start_session(cfg, st, wave):
@@ -2071,6 +2097,36 @@ def _identity(cfg):
     return {k: v for k, v in cfg.items() if k not in TUNABLE}
 
 
+def _pinned_identity(cfg):
+    """The identity as state.json keeps it: JSON values only; where chain.json lies is not part
+    of it (run_dir is), so the same file reached by another path is the same run."""
+    ident = {k: v for k, v in _identity(cfg).items() if k != "chain_file"}
+    return json.loads(json.dumps(ident, default=str, sort_keys=True))
+
+
+def check_identity(cfg, st, what):
+    """Every entry of the coordinator (launch, watch, done) compares chain.json with the identity
+    the run was started with (state.json `identity`, written by the first launch): a change of
+    waves, repo, workdir or any other non-tunable field between two calls is refused (event +
+    SystemExit) before anything is touched. A state from before the pin gets it now: True means
+    the caller still has to save it."""
+    want = _pinned_identity(cfg)
+    have = st.get("identity")
+    if have is None:
+        st["identity"] = want
+        return True
+    if not isinstance(have, dict):
+        changed = ["identity (corrupt in state.json)"]
+    else:
+        changed = sorted(k for k in set(have) | set(want) if have.get(k) != want.get(k))
+    if changed:
+        event(cfg, f"{what} refused: chain.json identity differs from the run's ({', '.join(changed)}); "
+                   f"state.json left as it is")
+        raise SystemExit(f"wab: {what} refused: chain.json identity changed since the run started "
+                         f"({', '.join(changed)}); restore chain.json or start a new run (new run_id)")
+    return False
+
+
 def _stop_event(cfg, st, path):
     wave = st.get("current")
     if wave and st["waves"].get(wave, {}).get("phase") == "awaiting_merge":
@@ -2115,7 +2171,10 @@ def _watch(cfg, path, max_ticks=None):
     require_tmux()
     event(cfg, f"watch started, ctx_limit={cfg['ctx_limit']}")
     drop_stale_btab(cfg, TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET") or "")
-    resume(cfg, _state_or_event(cfg))
+    st = _state_or_event(cfg)
+    if check_identity(cfg, st, "watch") and state_path(cfg).exists():
+        save_state(cfg, st)  # a state from before the pin: migrated, not refused
+    resume(cfg, st)
     last = 0.0
     ticks = 0
     pinned = _identity(cfg)
@@ -2152,9 +2211,12 @@ def _watch(cfg, path, max_ticks=None):
 
 def done_cmd(cfg, wave=None):
     """The coordinator merged the PR of the LAST wave: close it and finish the chain. Idempotent;
-    a repeat also pushes a window that is still open (pending_exit) and drops the flag once it is gone."""
+    a repeat also pushes a window that is still open (pending_exit) and drops the flag once it is gone.
+    False when the window is still open after /exit (the CLI exits 3 then); True otherwise."""
     with _RunLock(cfg, "done"):
         st = load_state(cfg)
+        if check_identity(cfg, st, "done") and state_path(cfg).exists():
+            save_state(cfg, st)  # a state from before the pin: migrated, not refused
         pushed = close_pending_windows(cfg, st)  # an entry of the coordinator
         waves = cfg["waves"]
         last = waves[-1]
@@ -2190,6 +2252,8 @@ def done_cmd(cfg, wave=None):
             else:
                 event(cfg, f"{wave}: window {w.get('tmux')} still open after /exit; run done again "
                            f"or close it ({attach_cmd(w.get('tmux') or '')})")
+                return False
+        return True
 
 
 def status_cmd(cfg):
@@ -2221,7 +2285,10 @@ def main(argv):
             print("wab: watch ended because the chain stopped (window gone or not started)", file=sys.stderr)
             sys.exit(3)
     elif cmd == "done" and len(argv) in (3, 4):
-        done_cmd(load_chain(path), argv[3] if len(argv) == 4 else None)
+        if done_cmd(load_chain(path), argv[3] if len(argv) == 4 else None) is False:
+            print("wab: done: the chain is finished but the last wave's window is still open after /exit; "
+                  "run done again (see events.log)", file=sys.stderr)
+            sys.exit(3)
     elif cmd == "notify":
         notify(load_chain(path), " ".join(argv[3:]))
     else:
