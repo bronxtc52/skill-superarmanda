@@ -27,6 +27,7 @@ NODE_ID = re.compile(r"[A-Za-z0-9_=+/-]+")
 SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
 COMMIT_CELL = re.compile(r"`([0-9a-f]{7,40})`")
 WAVE = re.compile(r"[A-Za-z0-9_-]+")
+RUN_ID = re.compile(r"[A-Za-z0-9._-]+")
 THREADS_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
     "{pullRequest(number:$number){reviewThreads(first:100){pageInfo{hasNextPage}"
@@ -168,7 +169,7 @@ def critical(facts):
         "pr": facts["pr"],
         "runs": pick(facts["check_runs"], ("id", "name", "status", "conclusion")),
         "reviews": [(r.get("id"), r.get("state"), r.get("commit_id"), who(r)) for r in facts["reviews"]],
-        "comments": [(c.get("id"), c.get("commit_id"), c.get("body"), who(c)) for c in facts["review_comments"]],
+        "comments": [(c.get("id"), c.get("commit_id"), c.get("original_commit_id"), c.get("body"), who(c)) for c in facts["review_comments"]],
         "issue": [(c.get("id"), c.get("body"), who(c)) for c in facts["issue_comments"]],
         "resolved": sorted((facts["resolved"] or {}).items()),
         "threads": [(t.get("id"), t.get("isResolved")) for t in facts["threads"]],
@@ -197,9 +198,19 @@ def codex_on_head(facts, head):
                 (facts.get("resolved") or {}).get(short) == head for short in summary_commits(comment)):
             how.append("review summary")
     inline = [c for c in facts.get("review_comments") or []
-              if pr_review.trusted(c, CODEX) and c.get("commit_id") == head and pr_review.text(c)]
+              if pr_review.trusted(c, CODEX) and c.get("original_commit_id") == head and pr_review.text(c)]
+    # `commit_id` of an open inline comment is moved by GitHub to the latest commit of the PR; only
+    # `original_commit_id` says which commit the review was written on
     p01 = [pr_review.url(c) or "" for c in inline if P01.search(c.get("body") or "")]
     return {"done": bool(how), "how": how[0] if how else "", "p01": p01, "findings": len(inline)}
+
+
+def old_p01(facts):
+    """Open review threads whose first comment carries a P0/P1 badge. At the gate the ones written on
+    HEAD have already failed it, so what is left is a finding from an earlier commit: not a blocker,
+    but the owner who closes the threads should see it."""
+    return sum(1 for t in facts.get("threads") or []
+               if not t.get("isResolved") and P01.search(t.get("body") or ""))
 
 
 def checks(check_runs):
@@ -277,7 +288,7 @@ def _accepted(entry, review):
 def _verdict(verdict, reasons, head, facts, **extra):
     pr = facts.get("pr") or {}
     threads = facts.get("threads") or []
-    out = {"verdict": verdict, "reasons": reasons, "draft": bool(pr.get("draft")),
+    out = {"verdict": verdict, "reasons": reasons, "draft": bool(pr.get("draft")), "old_p01": old_p01(facts),
            "unresolved": [t["id"] for t in threads if not t.get("isResolved")], "pr": pr, "head": head}
     out.update(extra)
     return out
@@ -343,17 +354,22 @@ def ready_command(repo, number):
     return shlex.join(["gh", "pr", "ready", str(number), "--repo", repo])
 
 
-def owner_script(wab_py, chain_file, wave):
-    """The script the owner runs when the gate passed but review threads are open: it only starts
-    `wab.py owner-merge`, which gates the PR AGAIN (a CI rerun or a new finding after the gate must
-    stop it) and then resolves the threads, un-drafts and merges. Paths are quoted."""
-    if not WAVE.fullmatch(str(wave)):
-        raise ValueError(f"wave must be [A-Za-z0-9_-]+, got {wave!r}")
+def owner_script(wab_py, chain_file, wave, run_id, sha):
+    """The script the owner runs when the gate passed but review threads are open. It only starts
+    `wab.py owner-merge <chain.json> <wave> <run_id> <sha>`, which refuses another run or another
+    gated sha, gates the PR AGAIN and only then resolves the threads, un-drafts and merges."""
+    for name, value, rx in (("wave", wave, WAVE), ("run_id", run_id, RUN_ID), ("sha", sha, SHA)):
+        if not (isinstance(value, str) and rx.fullmatch(value)):
+            raise ValueError(f"{name} is not valid: {value!r}")
     q = shlex.quote
     return ("#!/usr/bin/env bash\n"
-            f"# wab: gated merge of the PR of wave {wave}; generated, run by the owner\n"
+            f"# wab: gated merge of the PR of wave {wave} (run {run_id}, gated {sha[:12]}); generated, run by the owner\n"
             "set -euo pipefail\n"
-            f"exec python3 {q(str(wab_py))} owner-merge {q(str(chain_file))} {q(wave)}\n")
+            f"exec python3 {q(str(wab_py))} owner-merge {q(str(chain_file))} {q(wave)} {q(run_id)} {q(sha)}\n")
+
+
+def threads_note(old):
+    return f" (из них P0/P1 из прошлых коммитов: {old})" if old else ""
 
 
 def alarm_ready(facts, head):
@@ -372,4 +388,4 @@ def alarm_text(number, head, facts):
     open_threads = sum(1 for t in facts.get("threads") or [] if not t.get("isResolved"))
     return (f"[wab] Будильник: PR #{number} (HEAD {head[:12]}) — проверки завершены: "
             f"{runs['total'] - len(runs['failed'])} ok, неуспешные: {bad}; Codex: {verdict}; "
-            f"незакрытых тредов: {open_threads}. Разбери и продолжай по протоколу.")
+            f"незакрытых тредов: {open_threads}{threads_note(old_p01(facts))}. Разбери и продолжай по протоколу.")

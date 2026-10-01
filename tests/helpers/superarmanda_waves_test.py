@@ -6888,13 +6888,34 @@ class GateVerdict(unittest.TestCase):
 
     def test_p1_and_p0_badges_on_head_fail_p2_does_not(self):  # acceptance 3
         def inline(badge, commit=HEAD, user=BOT):
-            return {"user": user, "commit_id": commit, "body": f"**![{badge} Badge](x)** text", "html_url": "u"}
+            return {"user": user, "commit_id": HEAD, "original_commit_id": commit,
+                    "body": f"**![{badge} Badge](x)** text", "html_url": "u"}
         for badge, want in (("P1", "fail"), ("P0", "fail"), ("P2", "pass")):
             with self.subTest(badge=badge):
                 self.assertEqual(self.ev(green_facts(review_comments=[inline(badge)]))["verdict"], want)
+        # G1: GitHub moves `commit_id` of an open comment to the latest commit; `original_commit_id`
+        # says where it was written: a P1 written on an older commit is not a P1 of HEAD
         old = green_facts(review_comments=[inline("P1", commit=OLD)])
-        self.assertEqual(self.ev(old)["verdict"], "pass")  # an old head's finding is not the head's
+        self.assertEqual(self.ev(old)["verdict"], "pass")
+        self.assertEqual(gate.codex_on_head(old, HEAD)["findings"], 0)
+        self.assertEqual(gate.codex_on_head(green_facts(review_comments=[inline("P2")]), HEAD)["findings"], 1)
+        # and the other way round: written on HEAD, still counted when GitHub keeps commit_id elsewhere
+        moved = dict(inline("P1"), commit_id=OLD)
+        self.assertEqual(self.ev(green_facts(review_comments=[moved]))["verdict"], "fail")
         self.assertEqual(self.ev(green_facts(review_comments=[inline("P1", user=HUMAN)]))["verdict"], "pass")
+
+    def test_old_open_p1_threads_do_not_fail_but_are_counted_for_the_owner(self):  # G1
+        threads = [{"id": "T1", "isResolved": False, "body": "**![P1 Badge](x)** old"},
+                   {"id": "T2", "isResolved": False, "body": "![P2 Badge](x) minor"},
+                   {"id": "T3", "isResolved": True, "body": "![P0 Badge](x) fixed"}]
+        old = {"user": BOT, "commit_id": HEAD, "original_commit_id": OLD, "body": "![P1 Badge](x) old"}
+        v = self.ev(green_facts(review_comments=[old], threads=threads))
+        self.assertEqual((v["verdict"], v["old_p01"], v["unresolved"]), ("pass", 1, ["T1", "T2"]))
+
+    def test_the_comment_anchor_is_part_of_the_second_collection(self):  # G1 / F2
+        a = green_facts(review_comments=[{"id": 1, "user": BOT, "commit_id": HEAD, "original_commit_id": OLD, "body": "x"}])
+        b = green_facts(review_comments=[{"id": 1, "user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "x"}])
+        self.assertNotEqual(gate.critical(a), gate.critical(b))
 
     def test_manifest_without_tester_pass_or_with_another_head_fails(self):  # acceptance 4
         no_tester = green_manifest()
@@ -7093,31 +7114,38 @@ class GateCommands(unittest.TestCase):
             with self.subTest(repo=repo, number=number, sha=sha):
                 with self.assertRaises(ValueError):
                     gate.merge_argv(repo, number, sha)
-    def test_owner_script_only_execs_owner_merge_with_quoted_paths(self):  # D3
-        script = gate.owner_script("/opt/my tools/wab.py", "/runs/it's/chain.json", "W1")
+    def test_owner_script_only_execs_owner_merge_bound_to_run_and_sha(self):  # D3 / G2
+        script = gate.owner_script("/opt/my tools/wab.py", "/runs/it's/chain.json", "W1", "run-1", HEAD)
         self.assertTrue(script.startswith("#!/usr/bin/env bash\n"))
         self.assertIn("set -euo pipefail", script)
         last = script.rstrip().splitlines()[-1]
         self.assertEqual(shlex.split(last), ["exec", "python3", "/opt/my tools/wab.py", "owner-merge",
-                                             "/runs/it's/chain.json", "W1"])
+                                             "/runs/it's/chain.json", "W1", "run-1", HEAD])
         self.assertNotIn("gh ", script)  # no merge of its own: everything is decided by the fresh gate
         done = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, encoding="utf-8")
         self.assertEqual(done.returncode, 0, done.stderr)
-    def test_a_wave_name_cannot_inject_shell(self):
-        for bad in ("x'; touch /tmp/x #", "a b", "$(id)", "", "x\ny"):
-            with self.subTest(bad=bad):
+
+    def test_owner_script_refuses_malformed_wave_run_or_sha(self):
+        for wave, run_id, sha in (("x'; touch /tmp/x #", "r", HEAD), ("a b", "r", HEAD), ("", "r", HEAD),
+                                  ("W1", "r; x", HEAD), ("W1", "", HEAD), ("W1", "r", "abc"),
+                                  ("W1", "r", HEAD + "\n"), ("W1", "r", None)):
+            with self.subTest(wave=wave, run_id=run_id, sha=sha):
                 with self.assertRaises(ValueError):
-                    gate.owner_script("/w/wab.py", "/c/chain.json", bad)
+                    gate.owner_script("/w/wab.py", "/c/chain.json", wave, run_id, sha)
+
     def test_alarm_text(self):
         facts = green_facts(
             check_runs=[{"name": "ci", "status": "completed", "conclusion": "success"},
                         {"name": "lint", "status": "completed", "conclusion": "failure"}],
-            review_comments=[{"user": BOT, "commit_id": HEAD, "body": "![P1 Badge](x) a"},
-                             {"user": BOT, "commit_id": HEAD, "body": "![P2 Badge](x) b"}],
+            review_comments=[{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) a"},
+                             {"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P2 Badge](x) b"}],
             threads=[{"id": "T", "isResolved": False}])
         text = gate.alarm_text(5, HEAD, facts)
         for part in ("PR #5", HEAD[:12], "1 ok", "lint (failure)", "2 замечаний, P0/P1: 1", "тредов: 1"):
             self.assertIn(part, text)
+        old = green_facts(threads=[{"id": "T", "isResolved": False, "body": "![P1 Badge](x) old"},
+                                   {"id": "U", "isResolved": False, "body": "plain"}])
+        self.assertIn("незакрытых тредов: 2 (из них P0/P1 из прошлых коммитов: 1)", gate.alarm_text(5, HEAD, old))
         self.assertIn("чисто", gate.alarm_text(5, HEAD, green_facts()))
 
     def test_alarm_ready_needs_completed_checks_and_codex(self):
@@ -7332,7 +7360,7 @@ class MergeGate(GateBase):
         self.assertEqual([p for p in os.listdir(wab.wave_dir(self.cfg, "W1")) if p.startswith(".status.")], [])
 
     def test_failures_that_must_block(self):  # acceptance 3, 4, 1a
-        p1 = [{"user": BOT, "commit_id": HEAD, "body": "![P1 Badge](x) bad", "html_url": "u"}]
+        p1 = [{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) bad", "html_url": "u"}]
         no_tester = green_manifest()
         del no_tester["tasks"]["T1"]["results"]["tester"]
         other_head = green_manifest()
@@ -7391,13 +7419,14 @@ class MergeGate(GateBase):
                                           {"id": "PRRT_c", "isResolved": True}])
         self.assertTrue(self.tick())
         self.assertEqual(self.merges(), [])
-        script = self.home / ".cache" / "wab" / f"{CHAIN}-W1-merge"
+        script = self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-merge"
         self.assertTrue(script.is_file())
         self.assertEqual(script.stat().st_mode & 0o777, 0o700)
         self.assertTrue(os.access(script, os.X_OK))
         text = script.read_text(encoding="utf-8")
         self.assertIn("exec python3", text)
         self.assertIn(" owner-merge ", text)
+        self.assertTrue(text.rstrip().endswith(f"W1 {RUN_ID} {HEAD}"))
         done = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.status(), f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {script}")
@@ -7411,6 +7440,15 @@ class MergeGate(GateBase):
         self.tick()
         self.launch.assert_called_once()
         self.assertEqual(self.merges(), [])
+    def test_the_owner_notice_names_old_p0_p1_threads(self):  # G1
+        self.start()
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False, "body": "**![P1 Badge](x)** old"},
+                                          {"id": "PRRT_b", "isResolved": False, "body": "nit"}])
+        self.tick()
+        said = [t for t in self.tg if "незакрытые треды" in t]
+        self.assertEqual(len(said), 1)
+        self.assertIn("2 (из них P0/P1 из прошлых коммитов: 1)", said[0])
+
     def test_refused_merge_sends_the_ready_command(self):  # acceptance 5
         self.start()
         self.merge_rc, self.merge_err = 1, "Pull request is not mergeable: required check missing"
@@ -7521,7 +7559,7 @@ class GateRecheck(GateBase):  # F2: a pass rests on two equal collections
         self.assertEqual(self.verdict(green_facts(), green_facts())["verdict"], "pass")
 
     def test_a_new_p1_between_the_reads_waits(self):
-        p1 = [{"id": 5, "user": BOT, "commit_id": HEAD, "body": "![P1 Badge](x) late", "html_url": "u"}]
+        p1 = [{"id": 5, "user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) late", "html_url": "u"}]
         v = self.verdict(green_facts(), green_facts(review_comments=p1))
         self.assertEqual(v["verdict"], "wait")
         self.assertIn("факты изменились", v["reasons"][0])
@@ -7612,6 +7650,7 @@ class OwnerMerge(GateBase):  # D3
         super().setUp()
         self.graphql_calls = []
         self.order = []
+        self.graphql_answer = {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}
         real = self.handle
 
         def handle(args):
@@ -7623,7 +7662,7 @@ class OwnerMerge(GateBase):  # D3
         def graphql(query, variables):
             self.graphql_calls.append(variables)
             self.order.append("resolve")
-            return {"data": {}}
+            return self.graphql_answer
         p = mock.patch.object(wab, "gh_graphql", side_effect=graphql)
         p.start()
         self.addCleanup(p.stop)
@@ -7636,9 +7675,10 @@ class OwnerMerge(GateBase):  # D3
         self.tick()  # the gate passes with open threads: the owner script is written
         self.assertEqual(self.rec()["phase"], "merging")
         self.snapshot = json.dumps(self.rec(), sort_keys=True)
+        self.gated = HEAD
 
     def run_it(self):
-        return wab.owner_merge(wab.load_chain(self.path), "W1")
+        return wab.owner_merge(wab.load_chain(self.path), "W1", RUN_ID, self.gated)
 
     def refused(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -7661,7 +7701,7 @@ class OwnerMerge(GateBase):  # D3
 
     def test_a_new_p1_on_the_same_sha_stops_it(self):
         self.facts = green_facts(threads=self.facts["threads"], review_comments=[
-            {"id": 9, "user": BOT, "commit_id": HEAD, "body": "![P1 Badge](x) late", "html_url": "u"}])
+            {"id": 9, "user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) late", "html_url": "u"}])
         self.assertIn("fail", self.refused())
 
     def test_a_pending_check_stops_it(self):
@@ -7691,13 +7731,64 @@ class OwnerMerge(GateBase):  # D3
             self.run_it()
         self.assertIn("blocked by policy", str(ctx.exception))
 
+    def test_another_run_or_another_gated_sha_is_refused_before_anything(self):  # G2
+        cfg = wab.load_chain(self.path)
+        for name, run_id, sha, want in (("run", "2099-01-01", HEAD, "run"), ("sha", RUN_ID, "e" * 40, "gated sha")):
+            with self.subTest(case=name):
+                self.gh_calls.clear()
+                before = self.find_calls
+                with self.assertRaises(SystemExit) as ctx:
+                    wab.owner_merge(cfg, "W1", run_id, sha)
+                self.assertIn(want, str(ctx.exception))
+                self.assertEqual((self.gh_calls, self.order, self.graphql_calls), ([], [], []))
+                self.assertEqual(self.find_calls, before)  # not even the gate read GitHub
+        for bad in (("W1", "r; x", HEAD), ("W1", RUN_ID, "abc"), ("W1", None, None)):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                wab.owner_merge(cfg, *bad)
+
+    def test_the_old_call_form_without_run_and_sha_is_refused(self):  # G2
+        for argv in (["wab.py", "owner-merge", str(self.path), "W1"],
+                     ["wab.py", "owner-merge", str(self.path), "W1", RUN_ID]):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit) as ctx:
+                wab.main(argv)
+            self.assertIn("run_id and sha are required", str(ctx.exception))
+        self.assertEqual((self.merges(), self.order), ([], []))
+
+    def test_scripts_of_two_runs_do_not_overwrite_each_other(self):  # G2
+        cfg_a = wab.load_chain(self.path)
+        cfg_b, _ = self.chain(run_id="2099-01-01", merge_gate="auto")
+        a = wab.write_owner_script(cfg_a, "W1", HEAD)
+        b = wab.write_owner_script(cfg_b, "W1", "e" * 40)
+        self.assertNotEqual(a, b)
+        self.assertIn(RUN_ID, a.name)
+        self.assertIn("2099-01-01", b.name)
+        self.assertTrue(a.read_text(encoding="utf-8").rstrip().endswith(f"W1 {RUN_ID} {HEAD}"))
+        self.assertTrue(b.read_text(encoding="utf-8").rstrip().endswith("W1 2099-01-01 " + "e" * 40))
+
+    def test_a_thread_is_closed_only_when_the_answer_says_so(self):  # G3
+        for name, answer in (("null", {"data": {"resolveReviewThread": None}}),
+                             ("false", {"data": {"resolveReviewThread": {"thread": {"isResolved": False}}}}),
+                             ("no field", {"data": {}}),
+                             ("no data", {}),
+                             ("errors", {"errors": [{"message": "Resource not accessible"}], "data": None}),
+                             ("truthy string", {"data": {"resolveReviewThread": {"thread": {"isResolved": "true"}}}})):
+            with self.subTest(answer=name):
+                self.graphql_answer = answer
+                self.order.clear()
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_it()
+                self.assertIn("PRRT_a", str(ctx.exception))
+                self.assertEqual(self.merges(), [])
+                self.assertNotIn("ready", self.order)
+                self.assertNotIn("merge", self.order)
+
     def test_cli_command_and_exit_code(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            wab.main(["wab.py", "owner-merge", str(self.path), "W1"])
+            wab.main(["wab.py", "owner-merge", str(self.path), "W1", RUN_ID, HEAD])
         self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
         self.facts = green_facts(check_runs=[{"name": "ci", "status": "queued"}])
         with self.assertRaises(SystemExit) as ctx:
-            wab.main(["wab.py", "owner-merge", str(self.path), "W1"])
+            wab.main(["wab.py", "owner-merge", str(self.path), "W1", RUN_ID, HEAD])
         self.assertNotEqual(ctx.exception.code, 0)
 
 
@@ -7707,6 +7798,7 @@ class OwnerMergeHarness(GateBase):
     def setUp(self):
         super().setUp()
         self.graphql_calls, self.order = [], []
+        self.graphql_answer = {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}
         real = self.handle
 
         def handle(args):
@@ -7718,14 +7810,14 @@ class OwnerMergeHarness(GateBase):
         def graphql(query, variables):
             self.graphql_calls.append(variables)
             self.order.append("resolve")
-            return {"data": {}}
+            return self.graphql_answer
         p = mock.patch.object(wab, "gh_graphql", side_effect=graphql)
         p.start()
         self.addCleanup(p.stop)
 
     def run_owner_merge(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            return wab.owner_merge(wab.load_chain(self.path), "W1")
+            return wab.owner_merge(wab.load_chain(self.path), "W1", RUN_ID, HEAD)
 
     def merged_view(self, head=HEAD):
         self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": head}
@@ -7856,7 +7948,7 @@ class ExternalHandoffVerdict(GateBase):
     def test_pass_with_open_threads_carries_the_owner_script(self):
         self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
         text = self.handoff()
-        self.assertIn(str(self.home / ".cache" / "wab" / f"{CHAIN}-W1-merge"), text)
+        self.assertIn(str(self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-merge"), text)
 
     def test_fail_and_wait_and_error_are_said_plainly(self):
         self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
@@ -7911,7 +8003,7 @@ class Alarm(GateBase):
         self.running()
         self.facts = green_facts(
             check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}],
-            review_comments=[{"user": BOT, "commit_id": HEAD, "body": "![P1 Badge](x) x"}],
+            review_comments=[{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) x"}],
             threads=[{"id": "T", "isResolved": False}])
         self.tick()
         text = self.alarms()[0][2]
@@ -8067,14 +8159,15 @@ class GateWrappers(Base):
 
     def test_owner_script_file_is_private_and_replaced_not_appended(self):
         cfg, _ = self.chain()
-        path = wab.write_owner_script(cfg, "W1")
+        path = wab.write_owner_script(cfg, "W1", HEAD)
+        self.assertEqual(path.name, f"{CHAIN}-{RUN_ID}-W1-merge")
         self.assertEqual(path.stat().st_mode & 0o777, 0o700)
-        again = wab.write_owner_script(cfg, "W1")
+        again = wab.write_owner_script(cfg, "W1", HEAD)
         self.assertEqual(again, path)
         self.assertEqual([p for p in os.listdir(path.parent) if p.startswith(".merge.")], [])
         last = path.read_text(encoding="utf-8").rstrip().splitlines()[-1]
         self.assertEqual(shlex.split(last)[1:], ["python3", str(Path(wab.__file__).resolve()), "owner-merge",
-                                                 cfg["chain_file"], "W1"])
+                                                 cfg["chain_file"], "W1", RUN_ID, HEAD])
     def test_redact_keeps_the_merge_command_readable(self):
         command = gate.merge_command("o/r", 7, HEAD)
         self.assertIn(command, wab.redact(f"Выполни: {command}", wab.TG_MESSAGE_LIMIT))

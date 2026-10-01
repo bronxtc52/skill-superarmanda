@@ -6,7 +6,7 @@ Commands:
   wab.py watch  <chain.json>                        supervise until the chain ends
   wab.py status <chain.json>                        one-screen status
   wab.py done   <chain.json> [<wave>]               after the LAST wave's PR is merged: finish the chain
-  wab.py owner-merge <chain.json> <wave>            gated merge by the owner (run by the generated script)
+  wab.py owner-merge <chain.json> <wave> <run_id> <sha>  gated merge by the owner (run by the generated script)
   wab.py notify <chain.json> <text>                 Telegram message to the owner
   wab.py current-tmux <chain.json>                  tmux session name of the current wave
 
@@ -2016,13 +2016,13 @@ def _write_status(wdir, text):
     return _one_line(text)
 
 
-def write_owner_script(cfg, wave):
-    """~/.cache/wab/<chain>-<wave>-merge: executable by the owner only, it runs `owner-merge`
-    (which gates the PR again). Returns its path."""
-    text = gate.owner_script(pathlib.Path(__file__).resolve(), cfg["chain_file"], wave)
+def write_owner_script(cfg, wave, sha):
+    """~/.cache/wab/<chain>-<run_id>-<wave>-merge: executable by the owner only, bound to this run
+    and to the gated sha; it runs `owner-merge` (which gates the PR again). Returns its path."""
+    text = gate.owner_script(pathlib.Path(__file__).resolve(), cfg["chain_file"], wave, cfg["run_id"], sha)
     folder = pathlib.Path.home() / ".cache" / "wab"
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = folder / f"{cfg['chain']}-{wave}-merge"
+    path = folder / f"{cfg['chain']}-{cfg['run_id']}-{wave}-merge"
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".merge.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2050,8 +2050,9 @@ def handoff_gate_line(cfg, wave, w):
         number, sha = v["number"], v["head"]
         w["gate_sha"], w["gate_pr"] = sha, number  # saved with the hand-off: `owner-merge` gates against them
         if v["unresolved"]:
-            path = write_owner_script(cfg, wave)
-            return (f"Гейт мерджа пройден, но есть незакрытые треды ({len(v['unresolved'])}). "
+            path = write_owner_script(cfg, wave, sha)
+            return (f"Гейт мерджа пройден, но есть незакрытые треды ({len(v['unresolved'])}"
+                    f"{gate.threads_note(v['old_p01'])}). "
                     f"Выполни: {path}")
         command = gate.merge_command(cfg["repo"], number, sha)
         if v["draft"]:
@@ -2105,14 +2106,14 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
     unresolved = v["unresolved"]
     if unresolved:  # the owner closes the threads and merges; nothing is merged here
         try:
-            path = write_owner_script(cfg, wave)
+            path = write_owner_script(cfg, wave, sha)
         except (OSError, ValueError) as e:
             return _gate_failed(cfg, st, wave, w, wdir, f"скрипт владельца не записан: {e}")
         w["last_status"] = _write_status(
             wdir, f"BLOCKED: merge gate passed; {len(unresolved)} unresolved review threads; owner runs {path}")
         put_notice(w, "merge_owner", sha,
                    f"wave-autobot: волна {wave}: гейт мерджа пройден (PR #{number}, {sha[:12]}), но есть "
-                   f"незакрытые треды ревью: {len(unresolved)}. Сам не мержу.\nВыполни: {path}\n"
+                   f"незакрытые треды ревью: {len(unresolved)}{gate.threads_note(v['old_p01'])}. Сам не мержу.\nВыполни: {path}\n"
                    f"Скрипт заново проверит гейт на этом HEAD, закроет треды и смержит PR.")
         save_state(cfg, st)
         event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {path}")
@@ -2181,13 +2182,24 @@ def _regate(cfg, st, wave, w, wdir, old, new):
     return True
 
 
-def owner_merge(cfg, wave):
-    """`wab.py owner-merge <chain.json> <wave>`: what the owner's script runs. The gate is evaluated
+def owner_merge(cfg, wave, run_id, sha):
+    """`wab.py owner-merge <chain.json> <wave> <run_id> <sha>`: what the owner's script runs. It is
+    bound to the run and the gated sha the script was written for: another run (chain.json was
+    replaced) or another gated sha is refused before anything is read from GitHub. The gate is evaluated
     AGAIN (two collections); only a pass on exactly `gate_sha` goes on: open threads are resolved,
     a draft is made ready, then the squash merge pinned to the sha. The wave's record is not
     touched: the running `watch` sees MERGED. Any refusal is SystemExit (rc 1) before any action."""
+    if not (isinstance(run_id, str) and gate.RUN_ID.fullmatch(run_id) and isinstance(sha, str)
+            and gate.SHA.fullmatch(sha)):
+        raise SystemExit("wab: owner-merge: run_id and sha are required and must be well-formed; nothing done")
+    if cfg["run_id"] != run_id:
+        raise SystemExit(f"wab: owner-merge: this script is for run {run_id}, chain.json is run {cfg['run_id']}; "
+                         f"nothing done")
     st = load_state(cfg)
     w = st["waves"].get(wave)
+    if isinstance(w, dict) and isinstance(w.get("gate_sha"), str) and w["gate_sha"] != sha:
+        raise SystemExit(f"wab: owner-merge: this script is for the gated sha {sha[:12]}, the wave's gate passed "
+                         f"on {w['gate_sha'][:12]}; nothing done (use the newer script)")
     if not isinstance(w, dict) or w.get("phase") not in ("merging", "awaiting_merge") \
             or not isinstance(w.get("gate_sha"), str):
         raise SystemExit(f"wab: owner-merge: wave {wave} is not in phase merging (auto) or awaiting_merge "
@@ -2208,8 +2220,14 @@ def owner_merge(cfg, wave):
             out = gh_graphql(gate.RESOLVE_MUTATION, {"id": thread})
         except gate.CollectError as e:
             raise SystemExit(f"wab: owner-merge: thread {thread} not resolved: {e}")
-        if isinstance(out, dict) and out.get("errors"):
-            raise SystemExit(f"wab: owner-merge: thread {thread} not resolved: {str(out['errors'])[:200]}")
+        resolved = None
+        try:
+            resolved = out["data"]["resolveReviewThread"]["thread"]["isResolved"]
+        except (KeyError, TypeError):
+            pass
+        if resolved is not True:  # null, no field, false, errors: the thread is NOT closed
+            why = str(out.get("errors"))[:200] if isinstance(out, dict) and out.get("errors") else "isResolved is not true"
+            raise SystemExit(f"wab: owner-merge: thread {thread} not resolved: {why}; nothing merged")
     steps = ([["gh", "pr", "ready", str(number), "--repo", repo]] if v["draft"] else []) + [merge]
     for argv in steps:
         r = sh(*argv, check=False, timeout=120)
@@ -2890,8 +2908,11 @@ def main(argv):
             print("wab: done: the chain is finished but the last wave's window is still open after /exit; "
                   "run done again (see events.log)", file=sys.stderr)
             sys.exit(3)
-    elif cmd == "owner-merge" and len(argv) == 4:
-        owner_merge(load_chain(path, create=False), argv[3])
+    elif cmd == "owner-merge" and len(argv) == 6:
+        owner_merge(load_chain(path, create=False), argv[3], argv[4], argv[5])
+    elif cmd == "owner-merge":
+        sys.exit("wab: owner-merge <chain.json> <wave> <run_id> <sha>: run_id and sha are required "
+                 "(an old script without them is refused; use the script the dispatcher wrote last)")
     elif cmd == "notify":
         notify(load_chain(path), " ".join(argv[3:]))
     else:
