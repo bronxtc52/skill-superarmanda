@@ -147,6 +147,7 @@ class Base(unittest.TestCase):
         self.tmux_calls = []
         self.sent = []  # (kind, name, text)
         self.alive = True
+        self.kill_closes = True  # a mocked `tmux kill-session` really closes the session
         self.pane = ""
         self.ready = True
         self.tg = []
@@ -160,6 +161,8 @@ class Base(unittest.TestCase):
         def fake_sh(*args, **kw):
             if args and args[0] == "tmux":
                 self.tmux_calls.append(args)
+                if args[1:2] == ("kill-session",) and self.kill_closes:
+                    self.alive = False
                 return subprocess.CompletedProcess(args, 0, "", "")
             if args and args[0] == "gh" and not self.gh_real:
                 self.gh_calls.append(args)
@@ -6856,6 +6859,64 @@ class PlanPin(Base):
         self.enters.clear()
         self.recover(cfg, path, alive=True)
         self.assertEqual(self.enters, ["wv-w1"])
+
+    # ----- a refused pin closes the live session that holds the typed, stale prompt -----
+    def kills(self):
+        return [c for c in self.tmux_calls if "kill-session" in c]
+
+    def test_pin_refusal_after_typed_prompt_kills_session_and_allows_relaunch(self):
+        cfg, path = self.pinned()
+        self.typed_first_prompt(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.enters.clear()
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(len(self.kills()), 1)
+        self.assertIn("=wv-w1", self.kills()[0])
+        self.assertEqual(self.enters, [])
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "not_ready")
+        self.assertTrue([t for t in self.tg if "закрыта" in t], self.tg)
+        self.assertIn("closed", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+        # the corrected plan: a repeated launch of the same wave is allowed (no session left)
+        (cfg["run_dir"] / "waves.json").write_bytes(self.plan_bytes)
+        self.attempt(cfg)
+        self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
+
+    def test_pin_refusal_with_session_that_survives_kill_says_so(self):
+        cfg, path = self.pinned()
+        self.typed_first_prompt(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.kill_closes = False
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(len(self.kills()), 1)
+        self.assertTrue([t for t in self.tg if "tmux kill-session -t" in t], self.tg)
+        self.assertIn("tmux kill-session -t", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_pin_refusal_in_deliver_first_prompt_kills_live_session(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "starting"
+        self.put_state(cfg, st)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(len(self.kills()), 1)
+        self.assertEqual(self.sent, [])
+
+    def test_pin_refusal_in_recover_launch_kills_live_session(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(len(self.kills()), 1)
+        self.assertEqual(self.sent, [])
+
+    def test_pin_refusal_without_session_does_not_kill(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path, alive=False)
+        self.assertEqual(self.kills(), [])
 
     def test_plan_pin_is_tunable(self):
         cfg, _ = self.pinned()

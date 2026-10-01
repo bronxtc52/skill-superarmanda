@@ -1511,15 +1511,26 @@ def _plan_pin_refused(cfg, st, wave, drop_pending=False):
     except SystemExit as e:
         why = str(e)
         w = st["waves"][wave]
+        # a live session holds a typed or pending stale prompt: Enter in it would start the
+        # unapproved plan, and a corrected `launch` is refused while the session exists
+        closed, left = "", ""
+        if tmux_alive(w["tmux"]):
+            tmux("kill-session", "-t", session_target(w["tmux"]), check=False)
+            if tmux_alive(w["tmux"]):
+                left = f"сессия не закрыта, закрой вручную: tmux kill-session -t {w['tmux']}"
+            else:
+                closed = "сессия закрыта"
         (wave_dir(cfg, wave) / "status").write_text(why + "\n", encoding="utf-8")
         w["phase"] = "not_ready"
         if drop_pending:
             w.pop("pending_enter", None)
+        extra = f" ({closed or left})" if closed or left else ""
         if once_per(w, "not_ready", "plan_pin"):
             put_notice(w, "not_ready", "plan_pin",
-                       f"wave-autobot: волна {wave} не запущена: {redact(why)}. Цепочка стоит.")
+                       f"wave-autobot: волна {wave} не запущена: {redact(why)}{extra}. Цепочка стоит.")
         save_state(cfg, st)
-        event(cfg, f"{wave}: {why}; session/prompt NOT started")
+        event(cfg, f"{wave}: {why}; session/prompt NOT started"
+                   + (f"; session closed" if closed else f"; {left}" if left else ""))
         flush_notices(cfg, st, w)
         return True
     return False
