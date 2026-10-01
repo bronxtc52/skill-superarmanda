@@ -541,7 +541,7 @@ class Supervision(Base):
         log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
         self.assertEqual(log.count("W1: DONE without next-prompt.md; chain stopped"), 1)
         self.assertEqual(len([t for t in self.tg if "next-prompt.md" in t]), 1)
-        with mock.patch.object(wab, "time") as t, mock.patch.object(wab, "bind_popup"), \
+        with mock.patch.object(wab, "time") as t, mock.patch.object(wab, "drop_stale_btab"), \
                 contextlib.redirect_stderr(io.StringIO()):
             t.time.return_value = 0.0
             with self.assertRaises(SystemExit) as ctx:
@@ -895,7 +895,7 @@ class CorruptState(Base):
     def test_watch_logs_an_event_and_stops(self):
         cfg, path = self.chain()
         wab.state_path(cfg).write_text("{broken", encoding="utf-8")
-        with mock.patch.object(wab, "bind_popup"):
+        with mock.patch.object(wab, "drop_stale_btab"):
             with self.assertRaises(SystemExit) as ctx:
                 wab.watch(cfg, path, max_ticks=1)
         self.assertIn("cannot read state.json", str(ctx.exception))
@@ -954,7 +954,7 @@ class CheckpointTransition(Base):
         self.assertEqual(self.kinds(), (1, 0))
         self.heal()
         for _ in range(2):
-            with mock.patch.object(wab, "bind_popup"):
+            with mock.patch.object(wab, "drop_stale_btab"):
                 wab.watch(self.cfg, self.path, max_ticks=1)
         w = self.w()
         self.assertEqual((w["phase"], w["restarts"], w["await_session"]), ("running", 1, True))
@@ -974,7 +974,7 @@ class CheckpointTransition(Base):
         w = self.w()
         w.update(phase="clearing")
         self.put_state(self.cfg, {"current": "W1", "waves": {"W1": w}})
-        with mock.patch.object(wab, "bind_popup"):
+        with mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(self.cfg, self.path, max_ticks=1)
         self.assertEqual((self.kinds(), self.w()["restarts"]), ((1, 1), 1))
 
@@ -1003,7 +1003,7 @@ class WaveOwnsStatus(Base):
         return (wab.wave_dir(self.cfg, "W1") / "status").read_text(encoding="utf-8").strip()
 
     def restart(self, **kw):
-        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "launch", return_value=True) as ln:
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "launch", return_value=True) as ln:
             wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
         return ln
 
@@ -1095,7 +1095,7 @@ class LaunchIntent(Base):
         self.assertEqual(w["phase"], "launching")
         self.assertEqual(self.get_state(cfg)["current"], "W1")
         self.alive = True  # the tmux session exists now
-        with mock.patch.object(wab, "bind_popup"):
+        with mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(cfg, path, max_ticks=1)
         self.assertEqual(len(self.new_sessions()), 1)
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
@@ -1120,7 +1120,7 @@ class LaunchIntent(Base):
         wab.sh.side_effect = window_appears
         sid = self.get_state(cfg)["waves"]["W1"]["sessions"][0]
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "launching")
-        with mock.patch.object(wab, "bind_popup"):
+        with mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(cfg, path, max_ticks=1)
         started = self.new_sessions()
         self.assertEqual(len(started), 1)
@@ -1158,7 +1158,7 @@ class DispatcherLock(Base):
         cfg, path = self.chain()
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         lock = self.hold_elsewhere(cfg)
-        with mock.patch.object(wab, "bind_popup") as bind:
+        with mock.patch.object(wab, "drop_stale_btab") as bind:
             with self.assertRaises(SystemExit) as ctx:
                 wab.watch(cfg, path, max_ticks=1)
         self.assertIn("another dispatcher holds", str(ctx.exception))
@@ -1178,7 +1178,7 @@ class DispatcherLock(Base):
         cfg, path = self.chain()
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "RUNNING")
-        with mock.patch.object(wab, "bind_popup"):
+        with mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(cfg, path, max_ticks=1)
             wab.watch(cfg, path, max_ticks=1)  # would be refused if the lock leaked
         import fcntl
@@ -1195,7 +1195,7 @@ class DispatcherLock(Base):
         def tick_that_launches(c, st):
             wab.launch(c, "W2", prompt)
             return False
-        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd), \
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd), \
                 mock.patch.object(wab, "tick", side_effect=tick_that_launches):
             wab.watch(cfg, path, max_ticks=1)
         self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
@@ -1211,57 +1211,6 @@ class DispatcherLock(Base):
         (cfg["run_dir"] / "state.tmp").mkdir()  # the old shared name must not matter
         wab.save_state(cfg, {"waves": {}})
         self.assertEqual(self.get_state(cfg), {"waves": {}})
-
-
-class RegistryLock(Base):
-    def make_chain(self, n):
-        d = self.tmp / f"c{n}"
-        d.mkdir()
-        doc = {"chain": f"ch{n}", "run_id": RUN_ID, "repo": "o/r", "waves": ["W1"], "tmux_prefix": f"p{n}-"}
-        path = d / "chain.json"
-        path.write_text(json.dumps(doc), encoding="utf-8")
-        return wab.load_chain(path), path
-
-    def test_a_held_registry_lock_refuses_the_binding_without_touching_anything(self):
-        cfg, path = self.chain()
-        lock = wab.registry_path().with_name("dashes.lock")
-        lock.parent.mkdir(parents=True)
-        holder = subprocess.Popen(
-            [sys.executable, "-c", "import fcntl,sys,time; f=open(sys.argv[1],'a'); "
-             "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(60)", str(lock)],
-            stdout=subprocess.PIPE, text=True)
-        self.addCleanup(holder.wait)
-        self.addCleanup(holder.kill)
-        self.assertEqual(holder.stdout.readline().strip(), "held")
-        with mock.patch.object(wab, "REGISTRY_LOCK_TIMEOUT", 0.3):
-            wab.bind_popup(cfg, path)  # must not raise
-        self.assertFalse(wab.registry_path().exists())
-        self.assertEqual([c for c in self.tmux_calls if c[1] == "source-file"], [])
-        self.assertIn("registry", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
-
-    def test_concurrent_registrations_keep_every_chain(self):
-        import threading
-        chains = [self.make_chain(n) for n in range(8)]
-        gate = threading.Barrier(len(chains))
-        errors = []
-
-        def run(cfg, path):
-            try:
-                gate.wait()
-                wab.bind_popup(cfg, path)
-            except BaseException as e:  # noqa: BLE001
-                errors.append(e)
-        threads = [threading.Thread(target=run, args=c) for c in chains]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        self.assertEqual(errors, [])
-        reg = json.loads(wab.registry_path().read_text(encoding="utf-8"))
-        self.assertEqual(sorted(reg), sorted(f"p{n}-dash" for n in range(8)))
-        last = max(chains, key=lambda c: (c[0]["run_dir"] / "keys.tmux").stat().st_mtime_ns)
-        conf = (last[0]["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
-        self.assertTrue(all(f"p{n}-dash" in conf for n in range(8)))
 
 
 class WatchIdentity(Base):
@@ -1284,7 +1233,7 @@ class WatchIdentity(Base):
             if len(seen) == 1:
                 on_first_tick()
             return True
-        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "tick", side_effect=fake_tick):
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "tick", side_effect=fake_tick):
             try:
                 wab.watch(self.cfg, self.path, max_ticks=ticks)
                 exit_ = None
@@ -1338,7 +1287,7 @@ class CoordinatorHandoff(Base):
         self.set_status(cfg, "W1", "DONE")
         nxt = wab.wave_dir(cfg, "W1") / "next-prompt.md"
         nxt.write_text("second wave\n", encoding="utf-8")
-        with mock.patch.object(wab, "bind_popup"):
+        with mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(cfg, path, max_ticks=50)  # returns on its own: no endless loop
         log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
         self.assertIn("handed to the coordinator", log)
@@ -1355,7 +1304,7 @@ class CoordinatorHandoff(Base):
         self.lock_is_free(cfg)
         news = len([c for c in self.tmux_calls if c[1] == "new-session"])
         self.alive = True
-        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "launch") as again:
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "launch") as again:
             wab.watch(cfg, path, max_ticks=1)
         again.assert_not_called()
         self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), news)
@@ -1365,7 +1314,7 @@ class CoordinatorHandoff(Base):
         cfg, path = self.chain(merge_gate="external")
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge")}})
         self.set_status(cfg, "W1", "DONE")
-        with mock.patch.object(wab, "bind_popup"):
+        with mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(cfg, path, max_ticks=50)
         self.assertIn("handed to the coordinator", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
         self.lock_is_free(cfg)
@@ -1388,7 +1337,7 @@ class CoordinatorHandoff(Base):
                 cfg, path = self.chain(waves=["W1"], merge_gate=gate)
                 self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
                 self.set_status(cfg, "W1", "DONE")
-                with mock.patch.object(wab, "bind_popup"):
+                with mock.patch.object(wab, "drop_stale_btab"):
                     wab.watch(cfg, path, max_ticks=50)
                 self.lock_is_free(cfg)
 
@@ -1470,7 +1419,7 @@ class LaunchGuard(Base):
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
-        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
             wab.watch(cfg, path, max_ticks=3)
         log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
         self.assertIn("next wave W2 not started: TUI not ready", log)
@@ -1636,7 +1585,7 @@ class ExactTargets(Base):
         self.alive = False
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "RUNNING")
-        with mock.patch.object(wab, "bind_popup"):
+        with mock.patch.object(wab, "drop_stale_btab"):
             with self.assertRaises(SystemExit) as ctx:
                 wab.main(["wab.py", "watch", str(path)])
         self.assertEqual(ctx.exception.code, 3)
@@ -1790,7 +1739,7 @@ class TwoStepSend(Base):
         def fail(name, text, on_typed=None):
             raise subprocess.CalledProcessError(1, ["tmux"], stderr="boom")
         wab.send_text.side_effect = fail
-        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
             with self.assertRaises(SystemExit) as ctx:
                 wab.main(["wab.py", "watch", str(path)])
         self.assertEqual(ctx.exception.code, 3)
@@ -1893,7 +1842,7 @@ class AtMostOnce(Base):
                 wab.launch(cfg, "W1", prompt)
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
         self.assertTrue(self.get_state(cfg)["waves"]["W1"]["notified"].get("started"))
-        with mock.patch.object(wab, "notify") as again, mock.patch.object(wab, "bind_popup"):
+        with mock.patch.object(wab, "notify") as again, mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(cfg, cfg_path(cfg), max_ticks=1)
         self.assertFalse([c for c in again.call_args_list if "стартовала" in c[0][1]])
 
@@ -1904,7 +1853,7 @@ def cfg_path(cfg):
 
 class Resume(Base):
     def run_watch(self, cfg, path, ticks=1):
-        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "launch") as launch:
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "launch") as launch:
             wab.watch(cfg, path, max_ticks=ticks)
         return launch
 
@@ -2029,34 +1978,6 @@ class AutoGuard(Base):
 
 
 class KeysAndRegistry(Base):
-    def reg(self):
-        opener = str(WAVES / "wab-open")
-        return {
-            "wv-dash": [opener, "/srv/a/chain.json"],
-            "xy-dash": [opener, "/srv/b/chain.json"],
-        }
-
-    def test_conf_covers_both_chains_and_leaves_w_and_shift_tab_alone(self):
-        conf = wab.keys_conf(self.reg())
-        self.assertIn("wv-dash", conf)
-        self.assertIn("xy-dash", conf)
-        self.assertIn("/srv/a/chain.json", conf)
-        self.assertIn("/srv/b/chain.json", conf)
-        self.assertIn("ignore-size", conf)
-        self.assertEqual(len(re.findall(r"(?m)^bind-key\b", conf)), 1)
-        self.assertNotRegex(conf, r"bind(-key)?\s[^\n]*\bW\b")
-        self.assertNotIn("BTab", conf)
-        self.assertNotIn("unbind", conf)
-
-    def test_socket_travels_into_the_popup_command(self):
-        conf = wab.keys_conf(self.reg(), "my.sock")
-        self.assertEqual(conf.count('"WAB_TMUX_SOCKET=my.sock '), 2)
-        self.assertNotIn("WAB_TMUX_SOCKET=", wab.keys_conf(self.reg()))  # default server: reset, not set
-        for bad in ("a b", 'a"b', "a;b", "a$(x)", "a\nb", "", "a{b", "a#b"):
-            with self.subTest(bad=bad):
-                with self.assertRaises(ValueError):
-                    wab.keys_conf(self.reg(), bad)
-
     def test_wab_open_uses_the_socket_it_is_given_for_every_tmux_call(self):
         cfg, path = self.chain()
         self.put_state(cfg, {"current": "W2", "waves": {"W2": self.wave_rec("W2")}})
@@ -2076,68 +1997,6 @@ class KeysAndRegistry(Base):
         for line in lines:
             self.assertTrue(line.startswith("-L sockq "), line)
 
-    def test_unsafe_values_are_refused(self):
-        opener = str(WAVES / "wab-open")
-        bad = [
-            ["/tmp/a b/chain.json"], ['/tmp/a"b/chain.json'], ["/tmp/a$(x)/chain.json"],
-            ["/tmp/a;b/chain.json"], ["/tmp/a`b/chain.json"], ["relative/chain.json"],
-            ["/tmp/a\nbind-key x y/chain.json"], ["/tmp/a{b/chain.json"], ["/tmp/a#b/chain.json"],
-        ]
-        for (chain,) in bad:
-            with self.subTest(chain=chain):
-                with self.assertRaises(ValueError):
-                    wab.keys_conf({"wv-dash": [opener, chain]})
-        with self.assertRaises(ValueError):
-            wab.keys_conf({"wv-dash;kill-server": [opener, "/srv/a/chain.json"]})
-        with self.assertRaises(ValueError):
-            wab.keys_conf({"wv-dash": ["/o pener", "/srv/a/chain.json"]})
-
-    def test_generated_file_parses_in_a_private_tmux_server(self):
-        exe = shutil.which("tmux")
-        if not exe:
-            self.skipTest("tmux is not installed: cannot check keys.tmux syntax")
-        out = subprocess.run([exe, "-V"], capture_output=True, text=True, encoding="utf-8").stdout
-        ver = wab.parse_tmux_version(out)
-        if ver is None or ver < (3, 2):
-            self.skipTest(f"tmux {out.strip()!r} is older than 3.2: source-file -n is unavailable")
-        conf = self.tmp / "keys.tmux"
-        conf.write_text(wab.keys_conf(self.reg()), encoding="utf-8")
-        broken = self.tmp / "broken.tmux"
-        broken.write_text('bind-key -n "C-\\\\" { if-shell -F "x" {\n', encoding="utf-8")
-        sock = f"wabtest-{os.getpid()}"
-        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
-
-        def parse(path):
-            return subprocess.run([exe, "-L", sock, "-f", "/dev/null", "start-server", ";",
-                                   "source-file", "-n", str(path)],
-                                  capture_output=True, text=True, encoding="utf-8", env=env)
-        try:
-            good = parse(conf)
-            bad = parse(broken)
-        finally:
-            subprocess.run([exe, "-L", sock, "kill-server"], capture_output=True, env=env)
-        self.assertEqual((good.returncode, good.stderr.strip()), (0, ""), good.stderr)
-        self.assertNotEqual(bad.returncode, 0, "the syntax check must be able to fail")
-
-    def test_bind_popup_registers_prunes_and_refuses(self):
-        cfg, path = self.chain()
-        reg_path = wab.registry_path()
-        reg_path.parent.mkdir(parents=True)
-        alive = self.tmp / "other.json"
-        alive.write_text("{}", encoding="utf-8")
-        reg_path.write_text(json.dumps({
-            "old-dash": [str(WAVES / "wab-open"), str(alive)],
-            "gone-dash": [str(WAVES / "wab-open"), str(self.tmp / "missing.json")],
-        }), encoding="utf-8")
-        wab.bind_popup(cfg, path)
-        reg = json.loads(reg_path.read_text(encoding="utf-8"))
-        self.assertEqual(sorted(reg), ["old-dash", "wv-dash"])
-        conf = (cfg["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
-        self.assertIn("old-dash", conf)
-        self.assertNotIn("gone-dash", conf)
-        self.assertTrue([c for c in self.tmux_calls if c[1] == "source-file"])
-        self.assertEqual(list(reg_path.parent.glob("*.tmp")), [])
-
     def test_hung_az_makes_the_notice_fail_fast_and_not_raise(self):
         cfg, _ = self.chain()
         orig = load_orig("wab_orig_to")
@@ -2149,41 +2008,6 @@ class KeysAndRegistry(Base):
         with mock.patch.object(orig, "sh", side_effect=hang):
             orig.notify(cfg, "hello")  # must not raise
         self.assertTrue(any("FAILED (TimeoutExpired)" in e for e in self.events), self.events)
-
-    def test_registry_keeps_servers_apart_and_old_entries_are_the_default_server(self):
-        cfg, path = self.chain()
-        reg_path = wab.registry_path()
-        reg_path.parent.mkdir(parents=True)
-        other = self.tmp / "other.json"
-        other.write_text("{}", encoding="utf-8")
-        opener = str(WAVES / "wab-open")
-        reg_path.write_text(json.dumps({"old-dash": [opener, str(other)],
-                                        "sockB|wv-dash": [opener, str(other)]}), encoding="utf-8")
-        wab.bind_popup(cfg, path, sock="sockA")
-        reg = json.loads(reg_path.read_text(encoding="utf-8"))
-        self.assertEqual(sorted(reg), ["old-dash", "sockA|wv-dash", "sockB|wv-dash"])
-        conf = (cfg["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
-        self.assertIn("wv-dash", conf)
-        self.assertNotIn("old-dash", conf)  # default-server entry is not sourced into sockA
-        self.assertEqual(conf.count("WAB_TMUX_SOCKET=sockA "), 1)
-        self.assertNotIn("sockB", conf)
-        wab.bind_popup(cfg, path, sock="")  # default server: old entry and new one, nothing of A/B
-        conf = (cfg["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
-        self.assertIn("old-dash", conf)
-        self.assertNotIn("sockA", conf)
-        self.assertNotIn("sockB", conf)
-        reg = json.loads(reg_path.read_text(encoding="utf-8"))
-        self.assertEqual(sorted(reg), ["old-dash", "sockA|wv-dash", "sockB|wv-dash", "wv-dash"])
-
-    def test_dash_registers_its_real_session_and_unregisters_on_exit(self):
-        cfg, path = self.chain()
-        wab.bind_popup(cfg, path, session="my-work", sock="")
-        conf = (cfg["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
-        self.assertIn("#{session_name},my-work}", conf)
-        self.assertNotIn("wv-dash", conf)  # no binding for a name nobody runs in
-        wab.bind_popup(cfg, path, session="my-work", sock="", remove=True)
-        reg = json.loads(wab.registry_path().read_text(encoding="utf-8"))
-        self.assertNotIn("my-work", reg)
 
     def test_dash_own_session_reads_the_server_and_pane_from_tmux_env(self):
         try:
@@ -2213,8 +2037,6 @@ class KeysAndRegistry(Base):
             self.assertEqual(wab.tmux_argv("ls"), ("tmux", "-S", "/a/b", "ls"))
         with mock.patch.object(wab, "TMUX_SOCKET", "name"):
             self.assertEqual(wab.tmux_argv("ls"), ("tmux", "-L", "name", "ls"))
-        conf = wab.keys_conf(self.reg(), "/tmp/w/waves.sock")
-        self.assertIn("WAB_TMUX_SOCKET=/tmp/w/waves.sock ", conf)
 
     def test_dash_keeps_the_full_socket_path_unless_it_is_tmuxs_own_dir(self):
         try:
@@ -2225,33 +2047,6 @@ class KeysAndRegistry(Base):
         with mock.patch.dict(os.environ, {"TMUX": "/tmp/waves.sock,5,0", "TMUX_PANE": "%1"}), \
                 mock.patch.object(dash.subprocess, "run", return_value=done):
             self.assertEqual(dash.own_session(), ("w", "/tmp/waves.sock"))
-
-    def test_bind_popup_sends_every_tmux_call_to_the_socket_it_was_given(self):
-        cfg, path = self.chain()
-        cases = [("X", ["-L", "X"]), ("/p/x.sock", ["-S", "/p/x.sock"]), ("", [])]
-        # neither the module default nor the environment may redirect a call that names its socket
-        for env_sock in (None, "envsock"):
-            for sock, flag in cases:
-                with self.subTest(sock=sock, env=env_sock):
-                    self.tmux_calls.clear()
-                    wab.registry_path().unlink(missing_ok=True)  # other entries are probed on THEIR sockets
-                    env = {} if env_sock is None else {"WAB_TMUX_SOCKET": env_sock}
-                    os.environ.pop("WAB_TMUX_SOCKET", None)
-                    with mock.patch.object(wab, "TMUX_SOCKET", None), mock.patch.dict(os.environ, env):
-                        wab.bind_popup(cfg, path, session="s", sock=sock)
-                    kinds = {c[len(flag) + 1] for c in self.tmux_calls}
-                    self.assertIn("source-file", kinds)
-                    self.assertIn("list-keys", kinds)
-                    for call in self.tmux_calls:
-                        self.assertEqual(list(call[1:1 + len(flag)]), flag, call)
-                        self.assertNotIn(call[1 + len(flag)], ("-L", "-S"), call)
-
-    def test_dash_session_alive_uses_the_socket_it_is_given(self):
-        for sock, flag in (("X", ["-L", "X"]), ("/p/x.sock", ["-S", "/p/x.sock"])):
-            self.tmux_calls.clear()
-            with mock.patch.object(wab, "TMUX_SOCKET", None), mock.patch.dict(os.environ, {"WAB_TMUX_SOCKET": "e"}):
-                wab._dash_session_alive(sock, "s")
-            self.assertEqual(list(self.tmux_calls[0][1:3]), flag)
 
     def test_own_session_name_only_for_the_socket_dir_this_process_looks_at(self):
         try:
@@ -2297,55 +2092,6 @@ class KeysAndRegistry(Base):
         for line in lines:
             self.assertTrue(line.startswith("-S /tmp/w/s.sock "), line)
 
-    def test_real_private_server_on_a_socket_path_roundtrip(self):
-        exe = shutil.which("tmux")
-        if not exe:
-            self.skipTest("tmux is not installed")
-        sock = self.tmp / "waves.sock"
-        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
-        run = lambda *a: subprocess.run([exe, "-S", str(sock), "-f", "/dev/null", *a],  # noqa: E731
-                                        capture_output=True, text=True, env=env)
-        try:
-            self.assertEqual(run("new-session", "-d", "-s", "alive", "sleep 60").returncode, 0)
-            with mock.patch.object(wab, "sh", REAL_SH):
-                self.assertTrue(wab._dash_session_alive(str(sock), "alive"))
-                self.assertFalse(wab._dash_session_alive(str(sock), "dead"))
-                self.assertFalse(wab._dash_session_alive(str(self.tmp / "nothing.sock"), "alive"))
-        finally:
-            run("kill-server")
-
-    def test_entries_of_dead_dashboard_sessions_are_dropped_on_bind(self):
-        cfg, path = self.chain()
-        reg_path = wab.registry_path()
-        reg_path.parent.mkdir(parents=True)
-        other = self.tmp / "other.json"
-        other.write_text("{}", encoding="utf-8")
-        opener = str(WAVES / "wab-open")
-        reg_path.write_text(json.dumps({"live-dash": [opener, str(other)],
-                                        "killed-dash": [opener, str(other)]}), encoding="utf-8")
-        with mock.patch.object(wab, "_dash_session_alive", side_effect=lambda sock, name: name != "killed-dash"):
-            wab.bind_popup(cfg, path, session="mine", sock="")
-        reg = json.loads(reg_path.read_text(encoding="utf-8"))
-        self.assertEqual(sorted(reg), ["live-dash", "mine"])
-        conf = (cfg["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
-        self.assertNotIn("killed-dash", conf)
-        self.assertIn("live-dash", conf)
-
-    def test_dash_cleans_the_registry_on_sigterm(self):
-        src = (WAVES / "dash.py").read_text(encoding="utf-8")
-        self.assertIn("signal.SIGTERM", src)
-        self.assertIn("signal.SIGHUP", src)
-
-    def test_a_corrupt_registry_is_not_overwritten(self):
-        cfg, path = self.chain()
-        reg_path = wab.registry_path()
-        reg_path.parent.mkdir(parents=True)
-        reg_path.write_text("{broken", encoding="utf-8")
-        wab.bind_popup(cfg, path, session="mine", sock="")
-        self.assertEqual(reg_path.read_text(encoding="utf-8"), "{broken")
-        self.assertIn("not overwritten", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
-        self.assertFalse([c for c in self.tmux_calls if c[1] == "source-file"])
-
     def test_stale_btab_decision(self):
         old = ('bind-key -T root BTab if-shell -F "#{m:*ignore-size*,#{client_flags}}" '
                '{ send-keys BTab } { display-popup "wab-open /x/chain.json" }')
@@ -2367,28 +2113,235 @@ class KeysAndRegistry(Base):
                 return subprocess.CompletedProcess(args, 0, list_keys_output, "")
             return r
         wab.sh.side_effect = fake
-        wab.bind_popup(cfg, path)
+        wab.drop_stale_btab(cfg)
         return [c for c in calls if c[1] == "unbind-key"]
 
-    def test_bind_popup_removes_only_the_stale_wab_btab_binding(self):
+    def test_drop_stale_btab_removes_only_the_stale_wab_btab_binding(self):
         stale = 'bind-key -T root BTab if-shell -F "#{m:*ignore-size*,#{client_flags}}" { send-keys BTab }'
         self.assertEqual(len(self.run_bind(stale)), 1)
 
-    def test_bind_popup_leaves_a_foreign_btab_binding_alone(self):
+    def test_drop_stale_btab_leaves_a_foreign_btab_binding_alone(self):
         self.assertEqual(self.run_bind("bind-key -T root BTab select-pane -t :.-"), [])
         self.assertEqual(self.run_bind(""), [])
 
-    def test_bind_popup_refuses_an_unsafe_path_without_touching_tmux(self):
-        spaced = self.tmp / "my dir"
-        spaced.mkdir()
+    # ----- Ctrl+\ through the session option @wab_open (no registry) -----
+    REF_BINDING = (
+        'bind-key -n "C-\\\\" if-shell -F "#{@wab_open}" { run-shell -b "tmux display-popup -c '
+        "'#{client_name}' -E -w 95% -h 90% -T ' волна ' '#{@wab_open}'\" } { if-shell -F "
+        '"#{m:*ignore-size*,#{client_flags}}" { detach-client } { send-keys C-\\\\ } }\n')
+
+    def test_keys_conf_is_the_reference_binding_alone(self):
+        conf = wab.keys_conf()
+        self.assertEqual(conf, self.REF_BINDING)
+        self.assertEqual(len(re.findall(r"(?m)^bind-key\b", conf)), 1)
+        self.assertNotIn("BTab", conf)
+        self.assertNotIn("unbind", conf)
+        self.assertNotRegex(conf, r"bind(-key)?\s[^\n]*\bW\b")
+        self.assertFalse(hasattr(wab, "registry_path"))
+        self.assertFalse(hasattr(wab, "bind_popup"))
+
+    def tmux3(self):
+        exe = shutil.which("tmux")
+        if not exe:
+            self.skipTest("tmux is not installed")
+        ver = wab.parse_tmux_version(subprocess.run([exe, "-V"], capture_output=True, text=True,
+                                                    encoding="utf-8").stdout)
+        if ver is None or ver < (3, 2):
+            self.skipTest("tmux older than 3.2")
+        return exe
+
+    def test_our_binding_lists_exactly_like_the_reference_on_a_private_server(self):
+        exe = self.tmux3()
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        sock = f"wabkeys-{os.getpid()}"
+        ours = self.tmp / "ours.tmux"
+        ours.write_text(wab.keys_conf(), encoding="utf-8")
+        ref = self.tmp / "ref.tmux"  # as a foreign chain wrote it: the same binding in `list-keys` spelling
+        ref.write_text(self.REF_BINDING.replace("bind-key -n", "bind-key -T root"), encoding="utf-8")
+
+        def run(*a):
+            return subprocess.run([exe, "-L", sock, "-f", "/dev/null", *a], capture_output=True, text=True,
+                                  encoding="utf-8", env=env)
+
+        def cstar():
+            out = run("list-keys", "-T", "root").stdout
+            return [ln for ln in out.splitlines() if ln.split()[3:4] == ["C-\\\\"]]
+        try:
+            self.assertEqual(run("new-session", "-d", "-s", "keep", "sleep 60", ";", "source-file",
+                                 str(ref)).returncode, 0)
+            first = cstar()
+            self.assertEqual(len(first), 1, first)
+            r = run("source-file", str(ours))
+            self.assertEqual((r.returncode, r.stderr.strip()), (0, ""), r.stderr)
+            self.assertEqual(cstar(), first)  # re-sourcing ours over theirs changes nothing
+        finally:
+            run("kill-server")
+        sock2 = sock + "b"
+        try:
+            subprocess.run([exe, "-L", sock2, "-f", "/dev/null", "new-session", "-d", "-s", "keep", "sleep 60", ";",
+                            "source-file", str(ours)],
+                           capture_output=True, env=env)
+            out = subprocess.run([exe, "-L", sock2, "list-keys", "-T", "root"], capture_output=True, text=True,
+                                 encoding="utf-8", env=env).stdout
+            self.assertEqual([ln for ln in out.splitlines() if ln.split()[3:4] == ["C-\\\\"]], first)
+        finally:
+            subprocess.run([exe, "-L", sock2, "kill-server"], capture_output=True, env=env)
+
+    def test_register_dash_sets_the_option_on_its_own_server_only(self):
         cfg, path = self.chain()
-        bad = spaced / "chain.json"
-        bad.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-        wab.bind_popup(cfg, bad)
-        self.assertEqual([c for c in self.tmux_calls if c[1] == "source-file"], [])
-        self.assertFalse(wab.registry_path().exists())
-        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
-        self.assertIn("refused", log)
+        cases = [("X", ["-L", "X"]), ("/p/x.sock", ["-S", "/p/x.sock"]), ("", [])]
+        for env_sock in (None, "envsock"):
+            for sock, flag in cases:
+                with self.subTest(sock=sock, env=env_sock):
+                    self.tmux_calls.clear()
+                    os.environ.pop("WAB_TMUX_SOCKET", None)
+                    env = {} if env_sock is None else {"WAB_TMUX_SOCKET": env_sock}
+                    with mock.patch.object(wab, "TMUX_SOCKET", None), mock.patch.dict(os.environ, env):
+                        self.assertTrue(wab.register_dash(cfg, path, "my-work", sock))
+                    n = len(flag)
+                    setc = [c for c in self.tmux_calls if c[1 + n] == "set-option"]
+                    self.assertEqual(len(setc), 1)
+                    self.assertEqual(list(setc[0][2 + n:5 + n]), ["-t", "=my-work:", "@wab_open"])
+                    self.assertEqual(setc[0][5 + n], f"{WAVES / 'wab-open'} {path.resolve()}")
+                    self.assertIn("source-file", {c[1 + n] for c in self.tmux_calls})
+                    for call in self.tmux_calls:
+                        self.assertEqual(list(call[1:1 + n]), flag, call)
+                        self.assertNotIn(call[1 + n], ("-L", "-S"), call)
+
+    def test_unregister_unsets_the_option_on_the_same_server(self):
+        wab.unregister_dash("my-work", "/p/x.sock")
+        self.assertEqual(self.tmux_calls[-1],
+                         ("tmux", "-S", "/p/x.sock", "set-option", "-u", "-t", "=my-work:", "@wab_open"))
+
+    def test_unsafe_chain_path_is_refused_without_touching_tmux(self):
+        cfg, path = self.chain()
+        for name in ("my dir", "it's", 'a"b', "a;b", "a#b", "a{b", "a$(x)"):
+            with self.subTest(name=name):
+                d = self.tmp / name
+                d.mkdir()
+                bad = d / "chain.json"
+                bad.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+                self.tmux_calls.clear()
+                self.assertFalse(wab.register_dash(cfg, bad, "s", ""))
+                self.assertEqual(self.tmux_calls, [])
+        self.assertIn("refused", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def listing(self, text):
+        inner = wab.sh.side_effect
+
+        def fake(*args, **kw):
+            r = inner(*args, **kw)
+            if args[:2] == ("tmux", "list-keys"):
+                return subprocess.CompletedProcess(args, 0, text, "")
+            return r
+        wab.sh.side_effect = fake
+
+    def sourced(self):
+        return [c for c in self.tmux_calls if c[1] == "source-file"]
+
+    def test_binding_is_installed_unless_one_of_the_scheme_or_a_foreign_one_is_there(self):
+        cfg, path = self.chain()
+        ours = 'bind-key -T root C-\\\\ if-shell -F "#{@wab_open}" { x }'
+        old = 'bind-key -T root C-\\\\ if-shell -F "#{==:#{session_name},d}" { display-popup "/a/wab-open /c" }'
+        foreign = 'bind-key -T root C-\\\\ send-keys foo'
+        other = 'bind-key -T root C-x run-shell wab-open'
+        for text, installs in ((ours, False), (old, True), (foreign, False), ("", True), (other, True)):
+            with self.subTest(text=text):
+                self.tmux_calls.clear()
+                self.listing(text)
+                wab.register_dash(cfg, path, "s", "")
+                self.assertEqual(len(self.sourced()), 1 if installs else 0)
+        self.assertIn("foreign binding", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+        self.assertEqual((cfg["run_dir"] / "keys.tmux").read_text(encoding="utf-8"), wab.keys_conf())
+
+    def test_watch_never_touches_ctrl_backslash(self):
+        import inspect
+        src = inspect.getsource(wab._watch) + inspect.getsource(wab.drop_stale_btab)
+        for word in ("keys_conf", "source-file", "register_dash", "_ensure_binding", "C-\\\\"):
+            self.assertNotIn(word, src)
+        cfg, _ = self.chain()
+        self.listing('bind-key -T root BTab run-shell /a/wab-open')
+        self.tmux_calls.clear()
+        wab.drop_stale_btab(cfg)
+        self.assertEqual([c[1] for c in self.tmux_calls], ["list-keys", "unbind-key"])
+
+    def test_real_private_server_option_roundtrip_on_a_socket_path(self):
+        exe = self.tmux3()
+        cfg, path = self.chain()
+        sock = self.tmp / "waves.sock"
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        run = lambda *a: subprocess.run([exe, "-S", str(sock), "-f", "/dev/null", *a],  # noqa: E731
+                                        capture_output=True, text=True, encoding="utf-8", env=env)
+        try:
+            self.assertEqual(run("new-session", "-d", "-s", "dash", "sleep 60").returncode, 0)
+            with mock.patch.object(wab, "sh", REAL_SH):
+                self.assertTrue(wab.register_dash(cfg, path, "dash", str(sock)))
+                got = run("show-options", "-v", "-t", "=dash:", "@wab_open").stdout.strip()
+                self.assertEqual(got, f"{WAVES / 'wab-open'} {path.resolve()}")
+                keys = run("list-keys", "-T", "root").stdout
+                self.assertEqual(len([ln for ln in keys.splitlines() if ln.split()[3:4] == ["C-\\\\"]]), 1)
+                wab.unregister_dash("dash", str(sock))
+                self.assertEqual(run("show-options", "-v", "-t", "=dash:", "@wab_open").stdout.strip(), "")
+        finally:
+            run("kill-server")
+
+    def test_dash_cleans_up_on_sigterm_and_sighup_and_ignores_sigquit(self):
+        src = (WAVES / "dash.py").read_text(encoding="utf-8")
+        self.assertIn("signal.SIGTERM", src)
+        self.assertIn("signal.SIGHUP", src)
+        self.assertIn("wab.unregister_dash(", src)
+        self.assertIn("signal.signal(signal.SIGQUIT, signal.SIG_IGN)", src)
+
+    def test_dash_survives_sigquit(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        import signal as sg
+        old = {s: sg.getsignal(s) for s in (sg.SIGQUIT, sg.SIGTERM, sg.SIGHUP)}
+        for s, h in old.items():
+            self.addCleanup(sg.signal, s, h)
+
+        class Boom(Exception):
+            pass
+
+        class FakeLive:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                os.kill(os.getpid(), sg.SIGQUIT)  # would terminate the process with the default handler
+                raise Boom
+
+            def __exit__(self, *a):
+                return False
+        cfg, path = self.chain()
+        out = mock.Mock()
+        out.isatty.return_value = True
+        with mock.patch.object(dash, "Live", FakeLive), mock.patch.object(dash, "safe_render", return_value=""), \
+                mock.patch.object(dash.wab, "load_chain", return_value=cfg), \
+                mock.patch.object(dash, "own_session", return_value=(None, "")), \
+                mock.patch.object(sys, "argv", ["dash.py", str(path)]), mock.patch.object(sys, "stdout", out):
+            with self.assertRaises(Boom):
+                dash.main()
+
+    def test_wab_open_takes_the_server_from_TMUX_when_no_socket_is_set(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W2", "waves": {"W2": self.wave_rec("W2")}})
+        bindir = self.tmp / "fakebin"
+        bindir.mkdir()
+        log = self.tmp / "tmux.log"
+        fake = bindir / "tmux"
+        fake.write_text(f'#!/bin/sh\necho "$*" >> {log}\nexit 0\n', encoding="utf-8")
+        fake.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "WAB_TMUX_SOCKET"}
+        env.update(PATH=f"{bindir}:{env['PATH']}", TMUX="/tmp/w/s.sock,123,0")
+        subprocess.run([str(WAVES / "wab-open"), str(path)], stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, encoding="utf-8", env=env)
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(lines), 2)
+        for line in lines:
+            self.assertTrue(line.startswith("-S /tmp/w/s.sock "), line)
 
     def test_wab_open_contract(self):
         script = WAVES / "wab-open"
@@ -2670,13 +2623,6 @@ class W4Round20(Base):
         self.assertIn("keeping the previous settings", "\n".join(
             p.read_text(encoding="utf-8") for p in cfg["run_dir"].glob("*.log")))
 
-    def test_default_server_popup_resets_the_inherited_socket(self):
-        opener = str(WAVES / "wab-open")
-        reg = {"wv-dash": [opener, "/srv/a/chain.json"]}
-        conf = wab.keys_conf(reg)
-        self.assertIn("env -u WAB_TMUX_SOCKET " + opener, conf)
-        self.assertNotIn("env -u", wab.keys_conf(reg, "my.sock"))
-
     def test_wab_open_with_an_empty_socket_is_the_default_server(self):
         cfg, path = self.chain()
         self.put_state(cfg, {"current": "W2", "waves": {"W2": self.wave_rec("W2")}})
@@ -2702,7 +2648,7 @@ class W4Round20(Base):
         nxt = wab.wave_dir(cfg, "W1") / "next-prompt.md"
         nxt.write_text("go\n", encoding="utf-8")
         with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", False, create=True), \
-                mock.patch.object(wab, "launch") as launch, mock.patch.object(wab, "bind_popup"):
+                mock.patch.object(wab, "launch") as launch, mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(cfg, path, max_ticks=5)
         launch.assert_not_called()
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
@@ -2734,7 +2680,7 @@ class W4Round20(Base):
                     self.assertEqual(log.count("W1: DONE without next-prompt.md; chain stopped"), 1)
                     self.assertNotIn("handed to the coordinator", log)
                     self.assertEqual(len([t for t in self.tg if "next-prompt.md" in t]), 1)
-                    with mock.patch.object(wab, "time") as t, mock.patch.object(wab, "bind_popup"), \
+                    with mock.patch.object(wab, "time") as t, mock.patch.object(wab, "drop_stale_btab"), \
                             contextlib.redirect_stderr(io.StringIO()):
                         t.time.return_value = 0.0
                         with self.assertRaises(SystemExit) as ctx:

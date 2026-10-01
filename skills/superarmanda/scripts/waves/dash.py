@@ -257,6 +257,8 @@ def main():
     if not sys.stdout.isatty():
         raise SystemExit("dash.py needs a terminal (tty): run it inside tmux, not redirected "
                          "to a file or a pipe - rich draws nothing there")
+    # Ctrl+\ on a session without the binding sends SIGQUIT to the pane process: it must not kill us
+    signal.signal(signal.SIGQUIT, signal.SIG_IGN)
     cfg = wab.load_chain(sys.argv[1], create=False)
     session, sock = own_session()
     if session:  # tmux calls of this process must hit the server we run in, not an env override
@@ -264,8 +266,8 @@ def main():
             os.environ["WAB_TMUX_SOCKET"] = sock
         else:
             os.environ.pop("WAB_TMUX_SOCKET", None)
-    if session:  # Ctrl+\ is bound to the session the dashboard really runs in
-        wab.bind_popup(cfg, sys.argv[1], session=session, sock=sock)
+    if session:  # Ctrl+\ works in the session the dashboard really runs in: it carries @wab_open
+        wab.register_dash(cfg, sys.argv[1], session, sock)
     for sig in (signal.SIGTERM, signal.SIGHUP):  # the finally below must run on these too
         signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
     try:
@@ -274,8 +276,8 @@ def main():
                 time.sleep(3)
                 live.update(safe_render(cfg))
     finally:
-        if session:  # do not keep hijacking Ctrl+\ in a session that no longer shows the dashboard
-            wab.bind_popup(cfg, sys.argv[1], session=session, sock=sock, remove=True)
+        if session:  # a session that no longer shows the dashboard must not open the popup on Ctrl+\
+            wab.unregister_dash(session, sock)
 
 
 if __name__ == "__main__":

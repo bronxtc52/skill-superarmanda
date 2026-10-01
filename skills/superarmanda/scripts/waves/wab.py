@@ -53,10 +53,6 @@ def projects_dir():
     return pathlib.Path.home() / ".claude" / "projects"
 
 
-def registry_path():
-    return pathlib.Path.home() / ".cache" / "wab" / "dashes.json"
-
-
 # ---------- config and state ----------
 
 # Upper bounds: a day of minutes, an hour between ticks, ten million tokens are already absurd.
@@ -1248,67 +1244,36 @@ def _tick(cfg, st):
 
 
 # ---------- Ctrl+\ popup ----------
+#
+# One global root binding of Ctrl+\ serves every dashboard of a tmux server. It reads the session
+# option @wab_open ("<wab-open> <chain.json>") of the session the key is pressed in: set (a
+# dashboard runs there) - open the wave popup; unset - close a popup client or pass the key on.
+# Each dashboard (dash.py) sets the option on its own session and unsets it on exit; a killed
+# session takes the option with it, so there is no registry to prune.
 
 SAFE_PATH = re.compile(r"/[A-Za-z0-9_./+-]*")
-SAFE_DASH = re.compile(r"[A-Za-z0-9_-]+")
+
+# byte-for-byte what `tmux list-keys -T root` shows for it; other chains install the same text
+KEYS_BINDING = (
+    'bind-key -n "C-\\\\" if-shell -F "#{@wab_open}" '
+    '{ run-shell -b "tmux display-popup -c \'#{client_name}\' -E -w 95% -h 90% -T \' волна \' '
+    '\'#{@wab_open}\'" } '
+    '{ if-shell -F "#{m:*ignore-size*,#{client_flags}}" { detach-client } { send-keys C-\\\\ } }\n')
 
 
-SAFE_SOCKET = re.compile(r"[A-Za-z0-9_./+-]+")
+def keys_conf():
+    """tmux config of the global Ctrl+\\ binding (Shift+Tab and prefix+W are not touched)."""
+    return KEYS_BINDING
 
 
-def keys_conf(registry, socket=None):
-    """tmux config for the Ctrl+\\ toggle, from {dash session: [opener, chain.json]}.
-    On a registered dashboard the key opens that chain's current wave in a popup; inside a
-    popup client (attached with -f ignore-size) it closes it; elsewhere it reaches the app.
-    prefix+W and Shift+Tab are not touched. Anything outside a conservative character set is
-    refused: the values end up inside tmux config syntax. `socket` (a -L name of the server the
-    binding is sourced into) travels into the popup command as WAB_TMUX_SOCKET=..., because the
-    server's own environment need not carry it."""
-    if socket is not None and not (isinstance(socket, str) and SAFE_SOCKET.fullmatch(socket)):
-        raise ValueError(f"unsafe tmux socket {socket!r}: [A-Za-z0-9_./+-]")
-    # the popup inherits the tmux SERVER's environment, which may still hold another server's socket:
-    # the default server clears it explicitly
-    env = f"WAB_TMUX_SOCKET={socket} " if socket else "env -u WAB_TMUX_SOCKET "
-    key = '"C-\\\\"'
-    cmd = (f'if-shell -F "#{{m:*ignore-size*,#{{client_flags}}}}" '
-           f'{{ detach-client }} {{ send-keys {key} }}')
-    for dash, entry in sorted(registry.items()):
-        if (not isinstance(dash, str) or not SAFE_DASH.fullmatch(dash) or not isinstance(entry, (list, tuple))
-                or len(entry) != 2 or not all(isinstance(p, str) and SAFE_PATH.fullmatch(p) for p in entry)):
-            raise ValueError(f"unsafe registry entry {dash!r}: names [A-Za-z0-9_-], paths absolute "
-                             f"[A-Za-z0-9_./+-]")
-        opener, chain = entry
-        cmd = (f'if-shell -F "#{{==:#{{session_name}},{dash}}}" '
-               f'{{ display-popup -E -w 95% -h 90% -T " волна (назад: Ctrl+\\\\) " "{env}{opener} {chain}" }} '
-               f'{{ {cmd} }}')
-    return f"bind-key -n {key} {cmd}\n"  # Shift+Tab (BTab) is never bound here
-
-
-REGISTRY_LOCK_TIMEOUT = 10  # seconds
-
-
-class _RegistryLock:
-    """Blocking flock (polled, with a timeout) on ~/.cache/wab/dashes.lock: the registry is
-    shared by every chain of the machine, so read-modify-write-source must be one step."""
-
-    def __enter__(self):
-        path = registry_path().with_name("dashes.lock")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.fh = open(path, "a", encoding="utf-8")
-        end = time.monotonic() + REGISTRY_LOCK_TIMEOUT
-        while True:
-            try:
-                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return self
-            except OSError:
-                if time.monotonic() >= end:
-                    self.fh.close()
-                    raise TimeoutError(str(path))
-                time.sleep(0.05)
-
-    def __exit__(self, *exc):
-        self.fh.close()
-        return False
+def wab_open_value(path):
+    """The @wab_open value `<wab-open> <chain.json>`. Both paths end up inside quotes of a tmux
+    format and a shell command: only a conservative character set (no spaces, quotes) is allowed."""
+    opener, chain = str(HERE / "wab-open"), str(pathlib.Path(path).resolve())
+    for p in (opener, chain):
+        if not SAFE_PATH.fullmatch(p):
+            raise ValueError(f"unsafe path {p!r}: absolute, [A-Za-z0-9_./+-] only")
+    return f"{opener} {chain}"
 
 
 def stale_btab(list_keys_output):
@@ -1318,110 +1283,67 @@ def stale_btab(list_keys_output):
                for line in (list_keys_output or "").splitlines())
 
 
-def sock_id(sock=None):
-    """Identity of the tmux server in the registry: the -L name or the -S socket path (contains
-    `/`), "" for the default server."""
-    if sock is not None:
-        return sock
-    return TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET") or ""
-
-
-def reg_key(sock, name):
-    """Registry key. The default server keeps the bare session name (old entries have no
-    socket and mean exactly that); another server is `<socket>|<session>`."""
-    return f"{sock}|{name}" if sock else name
-
-
-def split_key(key):
-    sock, _, name = key.rpartition("|")
-    return sock, name
-
-
 def tmux_on(sock, *args, **kw):
     """A tmux call on exactly the server `sock` names ("" = the default server, said explicitly):
     neither TMUX_SOCKET nor $WAB_TMUX_SOCKET may redirect it."""
     return sh("tmux", *sock_flag(sock), *args, **kw)
 
 
-def _dash_session_alive(sock, name):
-    """Does the dashboard session still exist on ITS server? A killed dashboard (kill -9,
-    kill-session) leaves its registry entry behind and the key would stay hijacked there.
-    An unanswerable question (timeout, no tmux binary) keeps the entry."""
-    try:
-        r = tmux_on(sock, "has-session", "-t", session_target(name), check=False, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return True
-    return r.returncode == 0
+def _root_cstar(list_keys_output):
+    """The root-table lines that bind Ctrl+\\ (key shown as C-\\\\)."""
+    out = []
+    for line in (list_keys_output or "").splitlines():
+        tok = line.split()
+        if "root" in tok and tok.index("root") + 1 < len(tok) and tok[tok.index("root") + 1] == "C-\\\\":
+            out.append(line)
+    return out
 
 
-def bind_popup(cfg, path, session=None, sock=None, remove=False):
-    """Register a dashboard session of this chain (default `<prefix>dash`; dash.py passes the
-    session it really runs in) and (re)generate keys.tmux for the registered chains of THIS
-    tmux server. tmux key bindings are global to a server, so one binding serves all its
-    chains; chains on other servers stay in the registry untouched. `remove` drops the entry.
-    The whole read-update-write-source sequence runs under the registry lock."""
-    try:
-        with _RegistryLock():
-            _bind_popup(cfg, path, session, sock, remove)
-    except (TimeoutError, OSError) as e:
-        event(cfg, f"Ctrl+\\ binding skipped: registry lock unavailable ({type(e).__name__}: {e})")
-
-
-def _bind_popup(cfg, path, session=None, sock=None, remove=False):
-    dash = session or f"{cfg['tmux_prefix']}dash"
-    sock = sock_id(sock)
-    mine = reg_key(sock, dash)
-    entry = [str(HERE / "wab-open"), str(pathlib.Path(path).resolve())]
-    try:
-        keys_conf({dash: entry}, sock or None)
-    except ValueError as e:
-        event(cfg, f"Ctrl+\\ binding refused: {e}")
+def _ensure_binding(cfg, sock):
+    """Install the global Ctrl+\\ binding unless one of the @wab_open scheme is already there.
+    A binding that is neither ours nor an old wab one is somebody else's: left alone, with an event."""
+    r = tmux_on(sock, "list-keys", "-T", "root", check=False)
+    if r.returncode != 0:
+        event(cfg, f"Ctrl+\\ binding skipped: list-keys failed: {r.stderr.strip() or r.stdout.strip()}")
         return
-    try:
-        old = json.loads(registry_path().read_text(encoding="utf-8"))
-        if not isinstance(old, dict):
-            raise ValueError("not a JSON object")
-    except FileNotFoundError:
-        old = {}
-    except (OSError, ValueError) as e:  # other chains' entries must not be wiped by a bad read
-        event(cfg, f"Ctrl+\\ binding skipped: registry {registry_path()} unreadable "
-                   f"({type(e).__name__}: {e}); not overwritten, fix or remove it")
+    cur = _root_cstar(r.stdout)
+    if any("#{@wab_open}" in line for line in cur):
         return
-    reg = {}
-    for name, val in old.items():
-        if name == mine:
-            continue
-        try:
-            keys_conf({split_key(name)[1]: val}, split_key(name)[0] or None)
-        except ValueError:
-            event(cfg, f"registry entry {name!r} dropped: unsafe")
-            continue
-        if not pathlib.Path(val[1]).is_file():
-            event(cfg, f"registry entry {name!r} dropped: chain file is gone")
-            continue
-        if not _dash_session_alive(*split_key(name)):
-            event(cfg, f"registry entry {name!r} dropped: its session is gone")
-            continue
-        reg[name] = val
-    if not remove:
-        reg[mine] = entry
-    target = registry_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".dashes.", suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(json.dumps(reg, indent=1, ensure_ascii=False))
-    os.replace(tmp, target)
+    if cur and not any("wab-open" in line for line in cur):
+        event(cfg, "Ctrl+\\ binding skipped: a foreign binding is in place")
+        return
     conf = cfg["run_dir"] / "keys.tmux"
-    try:  # only this server's sessions: the file is sourced into this server alone
-        text = keys_conf({split_key(k)[1]: v for k, v in reg.items() if split_key(k)[0] == sock},
-                         sock or None)
+    conf.write_text(keys_conf(), encoding="utf-8")
+    r = tmux_on(sock, "source-file", str(conf), check=False)
+    if r.returncode != 0:
+        event(cfg, f"toggle key bind failed: {r.stderr.strip() or r.stdout.strip()}")
+
+
+# `set-option -t =name` fails ("no such session"): an option target is a pane, pane_target() = `=name:`.
+def register_dash(cfg, path, session, sock=""):
+    """Called by dash.py inside tmux: mark its own session with @wab_open (and make sure the global
+    binding exists). `sock` names the server the dashboard runs in."""
+    try:
+        value = wab_open_value(path)
     except ValueError as e:
         event(cfg, f"Ctrl+\\ binding refused: {e}")
-        return
-    conf.write_text(text, encoding="utf-8")
-    r = tmux_on(sock, "source-file", str(conf), check=False)
-    event(cfg, "Ctrl+\\ toggles the wave popup" if r.returncode == 0
-          else f"toggle key bind failed: {r.stderr.strip() or r.stdout.strip()}")
+        return False
+    r = tmux_on(sock, "set-option", "-t", pane_target(session), "@wab_open", value, check=False)
+    if r.returncode != 0:
+        event(cfg, f"@wab_open not set: {r.stderr.strip() or r.stdout.strip()}")
+        return False
+    _ensure_binding(cfg, sock)
+    event(cfg, "Ctrl+\\ toggles the wave popup")
+    return True
+
+
+def unregister_dash(session, sock=""):
+    """Unset @wab_open of the dashboard's session (exit, SIGTERM/SIGHUP). A killed session needs no cleanup."""
+    tmux_on(sock, "set-option", "-u", "-t", pane_target(session), "@wab_open", check=False)
+
+
+def drop_stale_btab(cfg, sock=""):
+    """Remove a Shift+Tab binding left by an old wab version; never touches Ctrl+\\."""
     keys = tmux_on(sock, "list-keys", "-T", "root", "BTab", check=False)
     if keys.returncode == 0 and stale_btab(keys.stdout):  # a foreign Shift+Tab binding stays
         tmux_on(sock, "unbind-key", "-n", "BTab", check=False)
@@ -1486,7 +1408,7 @@ def watch(cfg, path, max_ticks=None):
 def _watch(cfg, path, max_ticks=None):
     require_tmux()
     event(cfg, f"watch started, ctx_limit={cfg['ctx_limit']}")
-    bind_popup(cfg, path)
+    drop_stale_btab(cfg, TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET") or "")
     resume(cfg, _state_or_event(cfg))
     last = 0.0
     ticks = 0
