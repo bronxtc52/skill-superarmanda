@@ -2906,6 +2906,256 @@ class W4Round23Notices(Base):
         self.assertTrue(any("next-prompt" in t for t in self.tg), self.tg)
 
 
+class W4Round24(Base):
+    """Round 24: no stale snapshot over a newer state, handoff notices through the outbox, `done`,
+    a fresh checkout for the next wave, redaction of dash-separated tokens."""
+
+    def setUp(self):
+        super().setUp()
+        self.down = False
+        self.attempts = 0
+
+        def flaky(cfg, text):
+            self.attempts += 1
+            if self.down:
+                raise OSError("telegram down")
+            self.tg.append(text)
+        p = mock.patch.object(wab, "_send_telegram", side_effect=flaky)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def prompt(self):
+        f = self.tmp / "p.md"
+        f.write_text("go\n", encoding="utf-8")
+        return f
+
+    # ----- 1: a notice flush must not roll the state back after launch -----
+    def test_flush_after_launch_keeps_the_new_current_and_record(self):
+        cfg, _ = self.chain()
+        self.alive = False
+        old = {"value": "x", "text": "old notice", "next_at": 0}
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(outbox={"no_next": old})}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.down = True
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            wab.tick(cfg, wab.load_state(cfg))
+        st = self.get_state(cfg)
+        self.assertEqual(st["current"], "W2")
+        self.assertIn("W2", st["waves"])
+        self.assertEqual(st["waves"]["W2"]["phase"], "running")
+        self.assertTrue(st["waves"]["W2"]["sessions"])
+        self.assertIn("no_next", st["waves"]["W1"].get("outbox", {}))  # the stale notice is still kept
+
+    # ----- 2: handoff and chain-finished notices survive a Telegram failure -----
+    def test_handoff_notice_is_retried_by_the_next_watch_exactly_once(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.down = True
+        wab.watch(cfg, path, max_ticks=3)
+        self.assertEqual(self.tg, [])
+        self.assertIn("handoff", self.get_state(cfg)["waves"]["W1"].get("outbox", {}))
+        self.down = False
+        wab.watch(cfg, path, max_ticks=3)
+        self.assertEqual(len([t for t in self.tg if "сдала PR" in t]), 1, self.tg)
+        wab.watch(cfg, path, max_ticks=3)
+        self.assertEqual(len([t for t in self.tg if "сдала PR" in t]), 1)
+        self.assertFalse(self.get_state(cfg)["waves"]["W1"].get("outbox"))
+
+    def test_watch_drains_the_handoff_notice_before_it_exits(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        calls = []
+
+        def once_down(c, text):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("down")
+            self.tg.append(text)
+        with mock.patch.object(wab, "_send_telegram", side_effect=once_down):
+            wab.watch(cfg, path, max_ticks=3)
+        self.assertEqual(len(self.tg), 1)
+
+    def test_chain_finished_notice_goes_through_the_outbox(self):
+        cfg, path = self.chain(waves=["W1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        self.down = True
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertIn("chain_done", self.get_state(cfg)["waves"]["W1"].get("outbox", {}))
+        self.down = False
+        wab.watch(cfg, path, max_ticks=3)
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1, self.tg)
+        wab.watch(cfg, path, max_ticks=3)
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1)
+
+    # ----- 3: the last wave has a way to finish -----
+    def last_wave_awaiting(self, **over):
+        cfg, path = self.chain(waves=["W1"], merge_gate="external", **over)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge")}})
+        self.set_status(cfg, "W1", "DONE")
+        return cfg, path
+
+    def test_done_command_finishes_the_chain_after_the_last_merge(self):
+        cfg, path = self.last_wave_awaiting()
+        wab.main(["wab.py", "done", str(path), "W1"])
+        st = self.get_state(cfg)
+        self.assertEqual(st["waves"]["W1"]["phase"], "done")
+        self.assertIsNone(st["current"])
+        self.assertIn("chain finished", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1)
+        wab.main(["wab.py", "done", str(path)])  # again, wave omitted: nothing new
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1)
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+
+    def test_done_defaults_to_the_current_wave_and_refuses_the_rest(self):
+        cfg, path = self.last_wave_awaiting()
+        wab.main(["wab.py", "done", str(path)])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "done")
+        cfg, path = self.chain(merge_gate="external")  # W1, W2: W1 is not the last wave
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge")}})
+        with self.assertRaises(SystemExit) as ctx:
+            wab.main(["wab.py", "done", str(path), "W1"])
+        self.assertIn("launch", str(ctx.exception))
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+        cfg, path = self.chain(waves=["W1"], merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="running")}})
+        with self.assertRaises(SystemExit):
+            wab.main(["wab.py", "done", str(path), "W1"])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
+        with self.assertRaises(SystemExit):
+            wab.main(["wab.py", "done", str(path), "W9"])
+
+    def test_handoff_of_the_last_wave_names_the_done_command(self):
+        cfg, path = self.last_wave_awaiting()
+        wab._stop_event(cfg, wab.load_state(cfg), path)
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        wab_py = shlex.quote(str(Path(wab.__file__).resolve()))
+        self.assertIn(f"python3 {wab_py} done {path.resolve()} W1", log)
+
+    # ----- 4: the next wave starts on the fresh base, not on the previous branch -----
+    def git(self, cwd, *args):
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x.y",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@x.y")
+        return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True,
+                              text=True, env=env).stdout.strip()
+
+    def repos(self):
+        origin, clone = self.tmp / "origin.git", self.tmp / "wd"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True, capture_output=True)
+        self.git(clone, "checkout", "-q", "-b", "main")
+        (clone / "a.txt").write_text("a\n", encoding="utf-8")
+        self.git(clone, "add", "a.txt")
+        self.git(clone, "commit", "-q", "-m", "base")
+        self.git(clone, "push", "-q", "origin", "main")
+        return origin, clone
+
+    def next_wave_cfg(self, clone, **over):
+        cfg, _ = self.chain(workdir=str(clone), base_branch="main", **over)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="done")}})
+        self.alive = False
+        return cfg
+
+    def test_dirty_workdir_refuses_the_next_wave(self):
+        _, clone = self.repos()
+        cfg = self.next_wave_cfg(clone)
+        (clone / "junk.txt").write_text("x\n", encoding="utf-8")
+        with self.assertRaises(SystemExit) as ctx:
+            wab.launch(cfg, "W2", self.prompt())
+        self.assertIn("not clean", str(ctx.exception))
+        self.assertEqual(self.get_state(cfg)["current"], "W1")
+
+    def test_clean_workdir_goes_detached_to_origin_base(self):
+        origin, clone = self.repos()
+        self.git(clone, "checkout", "-q", "-b", "wave-1")
+        (clone / "b.txt").write_text("b\n", encoding="utf-8")
+        self.git(clone, "add", "b.txt")
+        self.git(clone, "commit", "-q", "-m", "wave 1")
+        self.git(clone, "push", "-q", "origin", "HEAD:main")  # merged by the coordinator
+        other = self.tmp / "other"
+        subprocess.run(["git", "clone", "-q", str(origin), str(other)], check=True, capture_output=True)
+        (other / "c.txt").write_text("c\n", encoding="utf-8")
+        self.git(other, "add", "c.txt")
+        self.git(other, "commit", "-q", "-m", "later")
+        self.git(other, "push", "-q", "origin", "HEAD:main")
+        want = self.git(other, "rev-parse", "HEAD")
+        cfg = self.next_wave_cfg(clone)
+        self.assertTrue(wab.launch(cfg, "W2", self.prompt()))
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"), want)
+        self.assertEqual(subprocess.run(["git", "-C", str(clone), "symbolic-ref", "-q", "HEAD"],
+                                        capture_output=True).returncode, 1)  # detached
+
+    def test_unmerged_previous_wave_refuses_the_next_one(self):
+        _, clone = self.repos()
+        self.git(clone, "checkout", "-q", "-b", "wave-1")
+        (clone / "b.txt").write_text("b\n", encoding="utf-8")
+        self.git(clone, "add", "b.txt")
+        self.git(clone, "commit", "-q", "-m", "wave 1")
+        head = self.git(clone, "rev-parse", "HEAD")
+        cfg = self.next_wave_cfg(clone)
+        with self.assertRaises(SystemExit) as ctx:
+            wab.launch(cfg, "W2", self.prompt())
+        self.assertIn("previous wave not merged into origin/main", str(ctx.exception))
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"), head)  # nothing was switched
+        self.assertEqual(self.get_state(cfg)["current"], "W1")
+
+    def test_first_wave_does_not_touch_the_checkout(self):
+        _, clone = self.repos()
+        (clone / "junk.txt").write_text("x\n", encoding="utf-8")
+        cfg, _ = self.chain(workdir=str(clone), base_branch="main")
+        self.alive = False
+        self.assertTrue(wab.launch(cfg, "W1", self.prompt()))
+        self.assertTrue((clone / "junk.txt").exists())
+
+    def test_base_branch_must_be_a_string(self):
+        for bad in (5, ["main"], ""):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                self.chain(workdir=str(self.tmp), base_branch=bad)
+
+    # ----- 5: the handoff command in the docs is the one the runtime prints -----
+    def test_docs_handoff_command_is_the_absolute_python_call(self):
+        text = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        lines = [l for l in text.splitlines() if "launch <chain.json> <следующая-волна>" in l]
+        self.assertTrue(lines)
+        for l in lines:
+            self.assertTrue(l.startswith("python3 <"), l)
+            self.assertNotRegex(l, r"&& wab\.py")
+        self.assertRegex(text, r"wab\.py done")
+        self.assertIn("base_branch", text)
+
+    # ----- 6: dash-separated opaque tokens -----
+    def test_base64url_token_with_dashes_is_masked(self):
+        tok = "abcD3-fgh8_ijkL-mnoP4-qrs9_tuvW-xyzA5-bcd2"
+        self.assertGreaterEqual(len(tok), 40)
+        for text in (tok, f"token is {tok} ok", f"x {tok}"):
+            with self.subTest(text=text):
+                out = wab.redact(text)
+                self.assertNotIn("abcD3", out)
+                self.assertNotIn("xyzA5", out)
+                self.assertIn("[скрыто]", out)
+        for limit in (600, 1200):
+            self.assertLessEqual(len(wab.redact(tok * 300, limit)), limit)
+
+    def test_ordinary_dashed_words_and_paths_are_not_masked(self):
+        keep = ["feat/waves-dispatcher", "skills/superarmanda/scripts/waves/wab.py",
+                "superarmanda-waves-dispatcher-and-dashboard",
+                "skills/superarmanda/references/review-contract.md",
+                "docs/specs/2026-09-12-remove-external-review-and-more",
+                "tests/helpers/superarmanda_waves_test.py",
+                "commit " + "3c71c34b" + "0" * 32]
+        for text in keep:
+            with self.subTest(text=text):
+                self.assertEqual(wab.redact(text), text)
+
+
 class Utf8(Base):
     def test_subprocess_and_files_are_explicitly_utf8(self):
         seen = {}

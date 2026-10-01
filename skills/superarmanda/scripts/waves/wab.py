@@ -5,6 +5,7 @@ Commands:
   wab.py launch <chain.json> <wave> <prompt-file>   start one wave in tmux
   wab.py watch  <chain.json>                        supervise until the chain ends
   wab.py status <chain.json>                        one-screen status
+  wab.py done   <chain.json> [<wave>]               after the LAST wave's PR is merged: finish the chain
   wab.py notify <chain.json> <text>                 Telegram message to the owner
   wab.py current-tmux <chain.json>                  tmux session name of the current wave
 
@@ -116,6 +117,9 @@ def load_chain(path, create=True):
                          "one per approved run")
     if not PREFIX.fullmatch(str(cfg["tmux_prefix"])):
         raise SystemExit("chain.json: tmux_prefix must match [A-Za-z0-9_-]+")
+    if "base_branch" in cfg and not (isinstance(cfg["base_branch"], str) and cfg["base_branch"].strip()
+                                     and not cfg["base_branch"].startswith("-")):
+        raise SystemExit(f"chain.json: base_branch must be a non-empty branch name, got {cfg['base_branch']!r}")
     if cfg.get("merge_gate") not in (None, "", "external"):
         raise SystemExit(f"chain.json: merge_gate must be absent or \"external\", got {cfg['merge_gate']!r}")
     waves = cfg.get("waves")
@@ -545,6 +549,10 @@ _tg = {}
 TG_LIMIT = 600        # quoted wave text (result.md, BLOCKED question)
 TG_MESSAGE_LIMIT = 1200  # whole message; quoted text is capped at TG_LIMIT first, so the
                          # framing and the attach command after it always fit
+# A long run of base64/base64url characters. Without a dash any 40+ run is a blob; with a dash
+# (base64url) it is one only when it mixes upper case, lower case and digits: plain
+# `kebab-case-words` and paths of letters, dates and slashes stay readable.
+_OPAQUE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}")
 _REDACT = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
     re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"),
@@ -565,12 +573,17 @@ _REDACT = [
     re.compile(r"\+\d[\d ()-]{8,}\d"),                                  # phone numbers (+7 ...)
     re.compile(r"(?<![\w+])(?:\+?7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)"),  # RU, no plus
     re.compile(r"(?<!\d)\d{3}[-\s]\d{3}[-\s]\d{2}[-\s]\d{2}(?!\d)"),             # 10 digits, separated
-    re.compile(r"\b[A-Za-z0-9+/_]{40,}={0,2}"),                          # long opaque blobs
+    _OPAQUE,                                                            # long opaque blobs
 ]
 
 
 _SHA_LABEL = re.compile(r"(?i)(?:\b(?:commit|sha|head|reviewed_head|base|packet_hash)(?:\s+|\s*[=:]\s*)"
                         r"|sha256\s*[:=]\s*)$")
+
+
+def _readable_dashed(m):
+    t = m.group(0)
+    return "-" in t and not (re.search(r"[A-Z]", t) and re.search(r"[a-z]", t) and re.search(r"\d", t))
 
 
 def _keep_match(m):
@@ -582,7 +595,8 @@ def _keep_match(m):
 def redact(text, limit=TG_LIMIT):
     for rx in _REDACT:
         text = rx.sub(lambda m: (m.group(1) + m.group(2) + "[скрыто]") if rx.groups >= 2 and m.group(2)
-                      else m.group(0) if _keep_match(m) else "[скрыто]", text)
+                      else m.group(0) if _keep_match(m) or (rx is _OPAQUE and _readable_dashed(m))
+                      else "[скрыто]", text)
     return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
 
 
@@ -645,16 +659,16 @@ def drop_notice(w, key):
     w.get("outbox", {}).pop(key, None)
 
 
-def flush_notices(cfg, st, w):
+def flush_notices(cfg, st, w, force=False):
     """Send the queued notices that are due; one attempt per notice per NOTIFY_RETRY_SECONDS
-    (also bounds the `telegram FAILED` events)."""
+    (also bounds the `telegram FAILED` events). `force` ignores the interval (the watch is leaving)."""
     box = w.get("outbox")
     if not box:
         return
     now = time.time()
     tried = False
     for key, item in list(box.items()):
-        if item.get("next_at", 0) > now:
+        if item.get("next_at", 0) > now and not force:
             continue
         tried = True
         if notify(cfg, item["text"]):
@@ -665,6 +679,29 @@ def flush_notices(cfg, st, w):
         w.pop("outbox", None)
     if tried:
         save_state(cfg, st)
+
+
+DRAIN_ATTEMPTS = 3
+
+
+def pending_notices(st):
+    return any(rec.get("outbox") for rec in st.get("waves", {}).values())
+
+
+def drain_notices(cfg):
+    """The watch is about to exit (handoff, chain finished, chain stopped) and nobody will tick
+    again: try the undelivered notices a few more times, ignoring the retry interval. What is
+    still undelivered stays in the state; the next `watch` (or `done`) sends it before it exits."""
+    for attempt in range(DRAIN_ATTEMPTS):
+        st = load_state(cfg)
+        if not pending_notices(st):
+            return
+        for rec in st["waves"].values():
+            flush_notices(cfg, st, rec, force=True)
+        if not pending_notices(st):
+            return
+        if attempt + 1 < DRAIN_ATTEMPTS:
+            time.sleep(min(cfg["tick_seconds"], 10))
 
 
 # ---------- launch ----------
@@ -736,6 +773,54 @@ def prepare_clone(cfg):
         raise SystemExit(f"admission refused: rc={r.returncode} {r.stdout.strip()} {r.stderr.strip()}")
     event(cfg, "admission: host policy, cc-autonomy prepare")
     return out["admitted_path"]
+
+
+GIT_TIMEOUT = 120
+
+
+def base_branch_of(cfg, cwd):
+    """chain.json `base_branch`, else the branch origin's HEAD points at; None when unknown."""
+    if cfg.get("base_branch"):
+        return cfg["base_branch"]
+    r = sh("git", "-C", str(cwd), "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False,
+           timeout=GIT_TIMEOUT)
+    name = r.stdout.strip()
+    return name[len("origin/"):] if r.returncode == 0 and name.startswith("origin/") else None
+
+
+def refresh_workdir(cfg, wave, cwd):
+    """A reused workdir must not start wave N on the branch of wave N-1: clean tree, fetch the
+    base, detach on origin/<base>. The previous wave's commits (the HEAD the tree is on now)
+    must already be in origin/<base>. Refusals are SystemExit before any state is touched."""
+    git = lambda *a, **kw: sh("git", "-C", str(cwd), *a, check=False, timeout=GIT_TIMEOUT, **kw)
+    base = base_branch_of(cfg, cwd)
+    if not base:
+        raise SystemExit(f"wave {wave} refused: base_branch is not set in chain.json and origin/HEAD is unknown")
+    dirty = git("status", "--porcelain")
+    if dirty.returncode != 0:
+        raise SystemExit(f"wave {wave} refused: git status failed in {cwd}: {dirty.stderr.strip()}")
+    if dirty.stdout.strip():
+        raise SystemExit(f"wave {wave} refused: workdir {cwd} is not clean (git status --porcelain is not "
+                         f"empty); commit, stash or remove the changes of the previous wave")
+    prev = git("rev-parse", "--verify", "-q", "HEAD^{commit}")
+    fetch = git("fetch", "origin", base)
+    if fetch.returncode != 0:
+        raise SystemExit(f"wave {wave} refused: git fetch origin {base} failed: {fetch.stderr.strip()}")
+    target = git("rev-parse", "--verify", "-q", f"refs/remotes/origin/{base}^{{commit}}")
+    if target.returncode != 0:
+        raise SystemExit(f"wave {wave} refused: origin/{base} not found after fetch")
+    if prev.returncode == 0 and prev.stdout.strip():
+        anc = git("merge-base", "--is-ancestor", prev.stdout.strip(), target.stdout.strip())
+        if anc.returncode != 0:
+            raise SystemExit(f"wave {wave} refused: previous wave not merged into origin/{base} "
+                             f"(HEAD {prev.stdout.strip()[:12]} is not an ancestor of origin/{base}; "
+                             f"merge its PR with a merge commit or fast-forward, then launch again)")
+    else:
+        event(cfg, f"{wave}: previous head unknown, the ancestor check is deferred to W5")
+    sw = git("switch", "--detach", f"origin/{base}")
+    if sw.returncode != 0:
+        raise SystemExit(f"wave {wave} refused: git switch --detach origin/{base} failed: {sw.stderr.strip()}")
+    event(cfg, f"{wave}: workdir {cwd} detached on origin/{base} ({target.stdout.strip()[:12]})")
 
 
 MANDATE_HEADER = "Прогон: "
@@ -817,6 +902,10 @@ def _launch(cfg, wave, prompt_file):
         raise SystemExit(f"tmux session {name} already exists")
     wdir = wave_dir(cfg, wave)
     cwd = prepare_clone(cfg)
+    cur = st.get("current")
+    restart = cur == wave and st["waves"].get(cur, {}).get("phase") in STOPPED
+    if cfg.get("workdir") and cfg["waves"].index(wave) > 0 and not restart:
+        refresh_workdir(cfg, wave, cwd)
     prompt_path = pathlib.Path(prompt_file).resolve()
     if not prompt_path.is_file():
         raise SystemExit(f"prompt file {prompt_file} not found")
@@ -1152,8 +1241,10 @@ def _tick(cfg, st):
             event(cfg, f"{wave}: DONE, awaiting merge by the coordinator")
         else:
             event(cfg, f"{wave}: DONE, merge gate not implemented yet (W5); handing off to coordinator")
-        notify(cfg, f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n"
-                    f"Мердж и запуск следующей волны — за координатором.")
+        queue_notice(cfg, st, w, "handoff", "1",
+                     f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n"
+                     + ("Мердж и запуск следующей волны — за координатором." if not is_last else
+                        f"Мердж последнего PR и завершение цепочки (wab.py done) — за координатором."))
         if tmux_alive(name):
             tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
             tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
@@ -1180,12 +1271,16 @@ def _tick(cfg, st):
             st["current"] = None
             save_state(cfg, st)
             event(cfg, "chain finished")
-            notify(cfg, "wave-autobot: цепочка завершена, все волны готовы.")
+            queue_notice(cfg, st, w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
             return False
         if not nxt.exists():
             return _stop_without_next(cfg, st, w, wave, now)
         save_state(cfg, st)
-        return launch(cfg, waves[idx + 1], nxt)
+        started = launch(cfg, waves[idx + 1], nxt)
+        fresh_st = load_state(cfg)  # launch saved a newer snapshot (new current, new record):
+        st.clear()                  # the caller's dict must not be written back over it
+        st.update(fresh_st)
+        return started
 
     if not tmux_alive(name):
         _mark_dead(cfg, st, wave, status)
@@ -1458,7 +1553,9 @@ def _stop_event(cfg, st, path):
                        f"{shlex.quote(str(cfg['run_dir'] / wave / 'next-prompt.md'))} "
                        f"&& {wab_py} watch {shlex.quote(str(chain_file))}")
         else:
-            event(cfg, f"{wave}: handed to the coordinator; it is the last wave, nothing to launch after the merge")
+            wab_py = f"python3 {shlex.quote(str(pathlib.Path(__file__).resolve()))}"
+            event(cfg, f"{wave}: handed to the coordinator; it is the last wave, nothing to launch; "
+                       f"after the merge of its PR run: {wab_py} done {shlex.quote(str(chain_file))} {wave}")
         event(cfg, "watch stopped: handed to the coordinator")
         return True
     elif wave and st["waves"].get(wave, {}).get("phase") == "not_ready":
@@ -1504,6 +1601,7 @@ def _watch(cfg, path, max_ticks=None):
             cfg = fresh
         st = _state_or_event(cfg)
         if not tick(cfg, st):
+            drain_notices(cfg)  # handoff / chain-finished notices must not be lost with the exit
             return _stop_event(cfg, load_state(cfg), path)
         ticks += 1
         st = load_state(cfg)
@@ -1515,6 +1613,36 @@ def _watch(cfg, path, max_ticks=None):
         if max_ticks is not None and ticks >= max_ticks:
             return
         time.sleep(cfg["tick_seconds"])
+
+
+def done_cmd(cfg, wave=None):
+    """The coordinator merged the PR of the LAST wave: close it and finish the chain. Idempotent."""
+    with _RunLock(cfg, "done"):
+        st = load_state(cfg)
+        waves = cfg["waves"]
+        last = waves[-1]
+        wave = wave or st.get("current") or last
+        if wave not in waves:
+            raise SystemExit(f"wab: unknown wave {wave}; chain.json waves: {waves}")
+        if wave != last:
+            raise SystemExit(f"wab: done is for the last wave {last}, not {wave}; for {wave} the merge is "
+                             f"followed by `launch` of {waves[waves.index(wave) + 1]}")
+        w = st["waves"].get(wave)
+        if not w:
+            raise SystemExit(f"wab: wave {wave} has no record; nothing to finish")
+        if w.get("phase") not in ("awaiting_merge", "done"):
+            raise SystemExit(f"wab: wave {wave} is {w.get('phase')}; done only after its DONE hand-off "
+                             f"(awaiting_merge)")
+        if w.get("phase") == "awaiting_merge":
+            w["phase"] = "done"
+            w.setdefault("finished", time.time())
+            if st.get("current") == wave:
+                st["current"] = None
+            save_state(cfg, st)
+            event(cfg, "chain finished")
+            queue_notice(cfg, st, w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
+        else:
+            flush_notices(cfg, st, w, force=True)  # a repeat call sends what was not delivered
 
 
 def status_cmd(cfg):
@@ -1545,6 +1673,8 @@ def main(argv):
         if watch(load_chain(path), path) is False:
             print("wab: watch ended because the chain stopped (window gone or not started)", file=sys.stderr)
             sys.exit(3)
+    elif cmd == "done" and len(argv) in (3, 4):
+        done_cmd(load_chain(path), argv[3] if len(argv) == 4 else None)
     elif cmd == "notify":
         notify(load_chain(path), " ".join(argv[3:]))
     else:
