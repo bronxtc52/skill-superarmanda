@@ -110,6 +110,18 @@ def commits_since(cwd, started, until=None):
     return len(r.stdout.splitlines()) if r.returncode == 0 else 0
 
 
+def wave_commits(w):
+    """A wave's commits: the number fixed when it ended (`commits`), else `start_rev..HEAD` in its
+    workdir (its own HEAD only: other branches and fetched refs do not count). A record from before
+    `start_rev` existed keeps the time window over the repository."""
+    if isinstance(w.get("commits"), int) and not isinstance(w.get("commits"), bool):
+        return w["commits"]
+    if isinstance(w.get("start_rev"), str):
+        n = wab.count_wave_commits(w.get("cwd"), w["start_rev"])
+        return n if n is not None else 0
+    return commits_since(w["cwd"], w["started"], w.get("finished"))
+
+
 def wave_state(cfg, st, wave):
     w = st["waves"].get(wave)
     if not w:
@@ -164,7 +176,7 @@ def waves_table(cfg, st):
             Text(wave, style="bold"), Text(f"{icon} {label}", style=colour),
             fmt_dur(end - w["started"]), bar(w.get("tokens", 0), cfg["ctx_limit"], 16),
             ktok(w.get("peak", 0)), str(w.get("restarts", 0)), str(s["turns"]), str(s["tools"]),
-            str(s["agents"]), ktok(s["out"]), str(commits_since(w["cwd"], w["started"], w.get("finished"))))
+            str(s["agents"]), ktok(s["out"]), str(wave_commits(w)))
     return tb
 
 

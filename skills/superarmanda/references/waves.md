@@ -389,10 +389,14 @@ severity проходят через `fix-loop`, отсутствия P0/P1 ма
   `wab-open` в popup берёт сервер из `$TMUX` (путь сокета, `-S`), если `WAB_TMUX_SOCKET` пуст.
   Нечитаемый или пустой (на перезаписи) `status` дашборд показывает последним известным статусом
   волны (`last_status`), как и `watch`, а не `STARTING`.
-  Столбец коммитов считает `git log --all` от старта волны до её конца (`finished` в записи
-  волны ставится при переходе в `done`, `awaiting_merge` или `dead` и снимается, если окно
-  мёртвой волны вернулось), так что следующая волна в том же `workdir` не растит счётчик
-  завершённой.
+  Столбец коммитов считает только то, что получил HEAD волны: `launch` сохраняет в записи
+  `start_rev` (HEAD рабочей копии после обновления), дашборд считает
+  `git rev-list --count <start_rev>..HEAD` в `cwd` волны. Чужие ветки и полученные `fetch`
+  remote-refs не учитываются. При переходе в `done`, `awaiting_merge` или `dead` число
+  фиксируется в записи (`commits`) вместе с `finished`, так что следующая волна, переключившая
+  общий `workdir`, счётчик завершённой не меняет. Если окно мёртвой волны вернулось, оба поля
+  снимаются. У старых записей без `start_rev` остаётся прежний подсчёт: `git log --all` от
+  старта до `finished`.
 
 Каталог прогона: `<база>/<chain>/<run_id>`, где база — `run_dir` из `chain.json` или
 `<каталог chain.json>/runs`. Журнал волны находится по `session_id`, а после `/clear` — по
@@ -425,7 +429,8 @@ severity проходят через `fix-loop`, отсутствия P0/P1 ма
   `~/.claude/rules/autonomy-allowlist.md` (правило). Есть хотя бы один (в том числе битый
   симлинк) — host **managed**. Нет ни одного — **unmanaged**.
 - **Managed, helper не рабочий** (файла нет, это каталог, битый симлинк, `prepare` вернул
-  ненулевой код, не JSON, `"ok": false` или без `admitted_path`) — отказ запуска (fail-closed),
+  ненулевой код, не JSON, JSON не-объект (`[]`, `null`, число, строка), `"ok": false` или без
+  `admitted_path`) — отказ запуска (fail-closed),
   а не переход в unmanaged.
 - **Managed:** первая волна вызывает `python3 ~/.claude/bin/cc-autonomy.py prepare <repo>` и
   сохраняет `admitted_path` в `state.json` сразу (отказ дальше по пути не приводит к новому
@@ -437,7 +442,10 @@ severity проходят через `fix-loop`, отсутствия P0/P1 ма
   совпадает с сохранённым в state `admitted_path`; любой другой `workdir`, в том числе до
   первого `prepare` (state ещё пуст), — отказ `SystemExit` «on a managed host workdir comes
   from cc-autonomy prepare». Убери `workdir` из `chain.json`, и клон даст host.
-- **Unmanaged:** `workdir` обязателен; без него — ошибка «нет host-политики».
+- **Unmanaged:** `workdir` обязателен; без него — ошибка «нет host-политики». `workdir`
+  должен быть корнем checkout или worktree: после `resolve` он совпадает с
+  `git rev-parse --show-toplevel` (симлинк на корень подходит). Подкаталог чужого checkout —
+  отказ «workdir must be the root of an isolated checkout/worktree».
 
 Применённый режим пишется в журнал событий (`admission: …`).
 
@@ -471,6 +479,8 @@ python3 <абсолютный путь>/wab.py launch <chain.json> <следую
 `<абсолютный путь>` — тот, что диспетчер печатает в журнал событий (команда передачи готова к копированию). `launch` помечает прежнюю волну `done`, запускает следующую, второй `watch` ведёт её дальше.
 
 Если не-последняя волна в `workdir`: перед стартом следующей `launch` требует чистое дерево (`git status --porcelain` пусто), делает `git fetch origin <base_branch>` и `git switch --detach origin/<base_branch>`; PR прошлой волны (её ветка — та, на которой стоит дерево) проверяется через `gh pr view <ветка> --json state,mergeCommit`: нужен `MERGED`, а merge-коммит должен быть предком `origin/<base_branch>` — так проходит и `gh pr merge --squash` (коммиты ветки при squash предками не будут, поэтому по HEAD дерева предок не проверяется). Не `MERGED` или merge-коммита нет в базе — отказ «previous wave not merged». `gh` недоступен или PR неизвестен — событие «merge of previous wave not verified (W5)» и запуск продолжается; полный гейт — W5. `base_branch` берётся из `chain.json`, без него — из `origin/HEAD`, иначе отказ. Первая волна и перезапуск остановившейся волны checkout не трогают.
+
+Закрытие прошлой волны до переключения `workdir`: переход в `awaiting_merge` (и отметка `done`) сохраняется вместе с намерением закрыть окно (`pending_exit` в записи волны), и только потом окну уходит `/exit`. Если диспетчер упал между сохранением и `/exit`, после рестарта `watch` (и каждый тик) дожимает `/exit` по флагу; флаг снимается, когда окна больше нет. Перед обновлением `workdir` и стартом следующей волны `launch` проверяет, что tmux-сессия предыдущей волны (по её имени, на том же сокете) завершена: при `pending_exit` повторяет `/exit` и ждёт до 30 секунд, иначе — отказ `SystemExit` «previous wave session <имя> is still running; wait or close it» до любого изменения state и checkout.
 
 **Последняя волна.** После `DONE` последней волны запускать нечего: после мерджа её PR координатор завершает цепочку командой `python3 <абсолютный путь>/wab.py done <chain.json> [<волна>]` (волна по умолчанию текущая; допустима только последняя и только из `awaiting_merge`; повтор безопасен). Волна становится `done`, `current` — пустым, в журнал пишется `chain finished`. Для не-последней волны `done` отказывает: там после мерджа идёт `launch`.
 

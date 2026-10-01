@@ -5110,6 +5110,174 @@ class W4Round32TesterP3(Base):
                 self.assertIn("empty", str(cm.exception))
 
 
+class W4Round33(Base):
+    """Round 33: a non-object from prepare is a clean refusal; the previous wave's window is
+    closed before the shared workdir is switched (and the intent to close it survives a crash);
+    an unmanaged workdir is the root of a checkout; the dashboard counts a wave's commits from
+    its own start revision, not every ref of the repository."""
+
+    def git(self, cwd, *args):
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x.y",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@x.y")
+        return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True,
+                              text=True, env=env).stdout.strip()
+
+    def repo(self, name="wd"):
+        p = self.tmp / name
+        p.mkdir()
+        self.git(p, "init", "-q")
+        self.git(p, "commit", "-q", "--allow-empty", "-m", "base")
+        return p
+
+    def prompt(self):
+        p = self.tmp / "p.md"
+        p.write_text("task\n", encoding="utf-8")
+        return p
+
+    # ----- 1: prepare printed valid JSON that is not an object -----
+    def test_non_object_json_from_prepare_is_a_clean_refusal(self):
+        r = self.home / ".claude" / "rules" / "autonomy-allowlist.md"
+        r.parent.mkdir(parents=True, exist_ok=True)
+        r.write_text("# host policy\n", encoding="utf-8")
+        h = self.home / ".claude" / "bin" / "cc-autonomy.py"
+        h.parent.mkdir(parents=True, exist_ok=True)
+        cfg, _ = self.chain()
+        for raw in ("[]", "null", "5", '"x"', "[1, 2]", "true"):
+            with self.subTest(raw=raw):
+                h.write_text(f"print({raw!r})\n", encoding="utf-8")
+                with self.assertRaises(SystemExit) as cm:
+                    wab.prepare_clone(cfg)
+                self.assertIn("admission refused", str(cm.exception))
+
+    # ----- 2: the previous wave's window is closed before the workdir is switched -----
+    def test_crash_between_awaiting_merge_and_exit_sends_exit_after_restart(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+
+        def crash(*args, **kw):
+            if "send-keys" in args:
+                raise _Crash()
+            return subprocess.CompletedProcess(args, 0, "", "")
+        with mock.patch.object(wab, "tmux", side_effect=crash):
+            with self.assertRaises(_Crash):
+                wab.tick(cfg, wab.load_state(cfg))
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "awaiting_merge")
+        self.assertTrue(w.get("pending_exit"))
+        exits = lambda: [c for c in self.tmux_calls if "send-keys" in c and "/exit" in c]
+        self.assertFalse(exits())
+        with mock.patch.object(wab, "drop_stale_btab"):
+            wab.watch(cfg, path, max_ticks=5)  # the restarted dispatcher
+        self.assertTrue(exits(), self.tmux_calls)
+        self.assertTrue(self.get_state(cfg)["waves"]["W1"].get("pending_exit"))  # window still open
+        self.alive = False
+        with mock.patch.object(wab, "drop_stale_btab"):
+            wab.watch(cfg, path, max_ticks=5)
+        self.assertNotIn("pending_exit", self.get_state(cfg)["waves"]["W1"])
+
+    def test_crash_between_done_and_exit_sends_exit_after_restart(self):
+        cfg, _ = self.chain(waves=["W1", "W2", "W3"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+
+        def crash(*args, **kw):
+            if "send-keys" in args:
+                raise _Crash()
+            return subprocess.CompletedProcess(args, 0, "", "")
+        with mock.patch.object(wab, "tmux", side_effect=crash):
+            with self.assertRaises(_Crash):
+                wab.tick(cfg, wab.load_state(cfg))
+        self.assertTrue(self.get_state(cfg)["waves"]["W1"].get("pending_exit"))
+        with mock.patch.object(wab, "launch", return_value=True):
+            wab.tick(cfg, wab.load_state(cfg))
+        self.assertTrue([c for c in self.tmux_calls if "send-keys" in c and "/exit" in c])
+
+    def test_launch_refuses_while_the_previous_wave_window_is_alive(self):
+        wd = self.repo()
+        cfg, _ = self.chain(workdir=str(wd), base_branch="main")
+        self.put_state(cfg, {"current": "W1", "waves": {
+            "W1": self.wave_rec(phase="awaiting_merge", cwd=str(wd), pending_exit=True)}})
+        head = self.git(wd, "rev-parse", "HEAD")
+        refreshed = []
+        with mock.patch.object(wab, "tmux_alive", side_effect=lambda n: n == "wv-w1"), \
+                mock.patch.object(wab, "refresh_workdir", side_effect=lambda *a: refreshed.append(a)):
+            with self.assertRaises(SystemExit) as cm:
+                wab.launch(cfg, "W2", self.prompt())
+        self.assertIn("previous wave session wv-w1 is still running", str(cm.exception))
+        self.assertEqual(refreshed, [])
+        self.assertFalse([c for c in self.tmux_calls if "new-session" in c])
+        self.assertEqual(self.git(wd, "rev-parse", "HEAD"), head)
+        st = self.get_state(cfg)
+        self.assertEqual((st["current"], st["waves"]["W1"]["phase"]), ("W1", "awaiting_merge"))
+        self.assertNotIn("W2", st["waves"])
+        # the window is gone: the same launch goes through and the flag is dropped
+        self.alive = False
+        with mock.patch.object(wab, "refresh_workdir", side_effect=lambda *a: refreshed.append(a)):
+            self.assertTrue(wab.launch(cfg, "W2", self.prompt()))
+        self.assertEqual(len(refreshed), 1)
+        self.assertNotIn("pending_exit", self.get_state(cfg)["waves"]["W1"])
+
+    # ----- 3: an unmanaged workdir is the root of a checkout -----
+    def test_unmanaged_workdir_must_be_the_root_of_a_checkout(self):
+        wd = self.repo()
+        sub = wd / "sub"
+        sub.mkdir()
+        cfg, _ = self.chain(workdir=str(sub))
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_clone(cfg)
+        self.assertIn("workdir must be the root of an isolated checkout/worktree", str(cm.exception))
+        cfg, _ = self.chain(workdir=str(wd))
+        self.assertEqual(wab.prepare_clone(cfg), str(wd.resolve()))
+        wt = self.tmp / "wt"
+        self.git(wd, "worktree", "add", "-q", "--detach", str(wt))
+        cfg, _ = self.chain(workdir=str(wt))
+        self.assertEqual(wab.prepare_clone(cfg), str(wt.resolve()))
+        link = self.tmp / "link"
+        link.symlink_to(wd)
+        self.assertIsNone(wab.isolated_workdir(str(link)))
+        self.assertIsNotNone(wab.isolated_workdir(str(sub)))
+
+    # ----- 4: commits of a wave from its own start revision -----
+    def test_commits_count_from_the_wave_start_revision_only(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        wd = self.repo()
+        start = self.git(wd, "rev-parse", "HEAD")
+        cfg, _ = self.chain(workdir=str(wd), merge_gate="external")
+        self.alive = False
+        self.assertTrue(wab.launch(cfg, "W1", self.prompt()))
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w.get("start_rev"), start)
+        self.git(wd, "commit", "-q", "--allow-empty", "-m", "w1")
+        # another branch and a fetched remote ref with commits inside the wave's window
+        self.git(wd, "branch", "other")
+        self.git(wd, "switch", "-q", "other")
+        self.git(wd, "commit", "-q", "--allow-empty", "-m", "o1")
+        self.git(wd, "commit", "-q", "--allow-empty", "-m", "o2")
+        self.git(wd, "update-ref", "refs/remotes/origin/feature", "HEAD")
+        self.git(wd, "switch", "-q", "-")
+        self.assertEqual(dash.wave_commits(self.get_state(cfg)["waves"]["W1"]), 1)
+        # the wave hands off: the count is fixed in the record, a later HEAD does not change it
+        self.alive = True
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        wab.tick(cfg, wab.load_state(cfg))
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual((w["phase"], w.get("commits")), ("awaiting_merge", 1))
+        self.git(wd, "switch", "-q", "--detach", "other")
+        self.assertEqual(dash.wave_commits(w), 1)
+        # an old record without start_rev keeps the time-window count
+        legacy = {k: v for k, v in w.items() if k not in ("start_rev", "commits")}
+        with mock.patch.object(dash, "commits_since", return_value=7) as cs:
+            self.assertEqual(dash.wave_commits(legacy), 7)
+        cs.assert_called_once()
+
+
 class TmuxGuard(unittest.TestCase):
     """The guard itself: a socketless tmux must fail loudly, a private one passes the guard."""
 

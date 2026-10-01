@@ -239,6 +239,27 @@ def load_state(cfg):
 ENDED_PHASES = ("done", "awaiting_merge", "dead")
 
 
+def count_wave_commits(cwd, start_rev):
+    """Commits of a wave: `start_rev..HEAD` in its workdir (only what its HEAD gained since the
+    launch, never other branches or fetched refs). None when git cannot tell."""
+    if not cwd or not isinstance(start_rev, str) or not re.fullmatch(r"[0-9a-f]{7,64}", start_rev):
+        return None
+    try:
+        r = sh("git", "-C", str(cwd), "rev-list", "--count", f"{start_rev}..HEAD", check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else None
+
+
+def head_rev(cwd):
+    try:
+        r = sh("git", "-C", str(cwd), "rev-parse", "--verify", "-q", "HEAD^{commit}", check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rev = r.stdout.strip()
+    return rev if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", rev) else None
+
+
 def save_state(cfg, st):
     waves = st.get("waves")
     if isinstance(waves, dict):  # an episode that ended with this save loses its stale notice here
@@ -247,8 +268,13 @@ def save_state(cfg, st):
             if isinstance(rec, dict):  # `finished`: the end of the wave's work (dash counts commits up to it)
                 if rec.get("phase") in ENDED_PHASES:
                     rec.setdefault("finished", time.time())
+                    if "commits" not in rec and isinstance(rec.get("start_rev"), str):
+                        n = count_wave_commits(rec.get("cwd"), rec["start_rev"])
+                        if n is not None:  # fixed now: the shared HEAD moves on with the next wave
+                            rec["commits"] = n
                 else:
                     rec.pop("finished", None)  # a dead wave is back: it has not ended
+                    rec.pop("commits", None)
     target = state_path(cfg)
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".state.", suffix=".tmp")  # unique per writer
     try:
@@ -951,6 +977,10 @@ def isolated_workdir(path):
     r = sh("git", "-C", str(path), "rev-parse", "--show-toplevel", check=False)
     if r.returncode != 0:
         return f"not a git checkout: {r.stderr.strip()}"
+    top = r.stdout.strip()
+    if not top or not _same_path(path, top):  # a subdirectory of someone else's checkout is not isolated
+        return (f"workdir must be the root of an isolated checkout/worktree "
+                f"(git top level is {top or '?'})")
     try:
         if pathlib.Path(path).stat().st_uid != os.getuid():
             return f"{path} is not owned by the current user"
@@ -1007,7 +1037,9 @@ def admit(cfg, st=None):
         out = json.loads(r.stdout)
     except ValueError:
         out = {}
-    path = out.get("admitted_path") if isinstance(out, dict) else None
+    if not isinstance(out, dict):  # valid JSON that is not an object ([], null, 5, "x"): no answer
+        out = {}
+    path = out.get("admitted_path")
     if r.returncode != 0 or not out.get("ok") or not isinstance(path, str) or not path:
         raise SystemExit(f"admission refused: rc={r.returncode} {r.stdout.strip()} {r.stderr.strip()}")
     event(cfg, f"admission: host policy, cc-autonomy prepare -> {path}")
@@ -1236,6 +1268,7 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     reused = bool(cfg.get("workdir")) or (bool(saved) and cwd == saved)
     cur = st.get("current")
     restart = cur == wave and st["waves"].get(cur, {}).get("phase") in STOPPED
+    previous_window_closed(cfg, st, wave, restart)  # before the workdir is touched
     if reused and cfg["waves"].index(wave) > 0 and not restart:
         refresh_workdir(cfg, wave, cwd)
     prev = st.get("current")
@@ -1274,6 +1307,9 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     st["waves"][wave] = {"tmux": name, "cwd": cwd, "started": time.time(), "restarts": 0,
                          "phase": "launching", "notified": {}, "sessions": [sid],
                          "prompt_file": str(prompt_copy), "prompt_source": str(prompt_file)}
+    start_rev = head_rev(cwd)  # after the refresh: the dashboard counts the wave's commits from it
+    if start_rev:
+        st["waves"][wave]["start_rev"] = start_rev
     if attempts:
         st["waves"][wave]["attempts"] = attempts  # the earlier try is kept, not overwritten
     if carried:
@@ -1427,10 +1463,59 @@ def once_per(w, key, value):
 
 
 def resume(cfg, st):
+    close_pending_windows(cfg, st)
     try:
         advance_pending(cfg, st)
     except _WindowGone:
         pass  # recorded as dead; tick follows
+
+
+EXIT_WAIT = 30  # seconds the next launch waits for the previous wave's window after /exit
+
+
+def close_window(cfg, st, w):
+    """Carry out a saved intent to close a finished wave's window (`pending_exit`): /exit while
+    the window is alive; the flag is dropped (and saved) once the window is gone. Repeatable, so
+    a dispatcher that died between the save and /exit sends it after the restart."""
+    if not isinstance(w, dict) or not w.get("pending_exit"):
+        return False
+    name = w.get("tmux")
+    if isinstance(name, str) and name and tmux_alive(name):
+        tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
+        tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
+        return True
+    w.pop("pending_exit", None)
+    save_state(cfg, st)
+    return False
+
+
+def close_pending_windows(cfg, st):
+    for rec in list((st.get("waves") or {}).values()):
+        if isinstance(rec, dict) and rec.get("pending_exit"):
+            close_window(cfg, st, rec)
+
+
+def previous_window_closed(cfg, st, wave, restart):
+    """The wave before `wave` must not still run in its window when the shared workdir is switched
+    under it: a pending /exit is pushed and waited for (EXIT_WAIT), else the launch is refused."""
+    idx = cfg["waves"].index(wave)
+    if idx == 0 or restart:
+        return
+    before = st["waves"].get(cfg["waves"][idx - 1])
+    if not isinstance(before, dict) or not isinstance(before.get("tmux"), str):
+        return
+    name = before["tmux"]
+    for attempt in range(EXIT_WAIT + 1):
+        if not tmux_alive(name):
+            before.pop("pending_exit", None)  # saved with the launch intent
+            return
+        if not before.get("pending_exit") or attempt == EXIT_WAIT:
+            break  # nobody asked it to close, or it did not within EXIT_WAIT
+        if attempt == 0:
+            close_window(cfg, st, before)
+        time.sleep(1)
+    raise SystemExit(f"wab: wave {wave} refused: previous wave session {name} is still running; "
+                     f"wait or close it ({attach_cmd(name)})")
 
 
 def advance_pending(cfg, st):
@@ -1579,6 +1664,7 @@ def tick(cfg, st):
 
 
 def _tick(cfg, st):
+    close_pending_windows(cfg, st)
     wave = st.get("current")
     if not wave:
         return False
@@ -1626,6 +1712,7 @@ def _tick(cfg, st):
         # and the phase stops a second hand-off, so a restart does not queue it twice
         w["phase"] = "awaiting_merge"
         w["finished"] = now
+        w["pending_exit"] = True  # the intent to close the window, in the same save as the phase
         put_notice(w, "handoff", "1",
                    f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n"
                    + ("Мердж и запуск следующей волны — за координатором." if not is_last else
@@ -1636,9 +1723,7 @@ def _tick(cfg, st):
         else:
             event(cfg, f"{wave}: DONE, merge gate not implemented yet (W5); handing off to coordinator")
         flush_notices(cfg, st, w)
-        if tmux_alive(name):
-            tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
-            tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
+        close_window(cfg, st, w)
         return False
 
     if status == "DONE":
@@ -1648,6 +1733,7 @@ def _tick(cfg, st):
         fresh = once_per(w, "done", "1")  # a restart between this and the next launch must not repeat it
         if fresh:
             w["finished"] = now
+            w["pending_exit"] = True  # the intent to close the window, in the same save as the mark
             put_notice(w, "done", "1",
                        f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
                        f"Целиком: {wdir}/result.md")
@@ -1659,9 +1745,7 @@ def _tick(cfg, st):
         save_state(cfg, st)
         if fresh:
             event(cfg, f"{wave}: DONE")
-            if tmux_alive(name):
-                tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
-                tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
+        close_window(cfg, st, w)
         if last:
             event(cfg, "chain finished")
             flush_notices(cfg, st, w)
