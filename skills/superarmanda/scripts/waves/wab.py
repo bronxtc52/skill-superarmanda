@@ -1337,12 +1337,18 @@ def split_key(key):
     return sock, name
 
 
+def tmux_on(sock, *args, **kw):
+    """A tmux call on exactly the server `sock` names ("" = the default server, said explicitly):
+    neither TMUX_SOCKET nor $WAB_TMUX_SOCKET may redirect it."""
+    return sh("tmux", *sock_flag(sock), *args, **kw)
+
+
 def _dash_session_alive(sock, name):
     """Does the dashboard session still exist on ITS server? A killed dashboard (kill -9,
     kill-session) leaves its registry entry behind and the key would stay hijacked there.
     An unanswerable question (timeout, no tmux binary) keeps the entry."""
     try:
-        r = sh("tmux", *sock_flag(sock), "has-session", "-t", session_target(name), check=False, timeout=10)
+        r = tmux_on(sock, "has-session", "-t", session_target(name), check=False, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return True
     return r.returncode == 0
@@ -1413,12 +1419,12 @@ def _bind_popup(cfg, path, session=None, sock=None, remove=False):
         event(cfg, f"Ctrl+\\ binding refused: {e}")
         return
     conf.write_text(text, encoding="utf-8")
-    r = tmux("source-file", str(conf), check=False)
+    r = tmux_on(sock, "source-file", str(conf), check=False)
     event(cfg, "Ctrl+\\ toggles the wave popup" if r.returncode == 0
           else f"toggle key bind failed: {r.stderr.strip() or r.stdout.strip()}")
-    keys = tmux("list-keys", "-T", "root", "BTab", check=False)
+    keys = tmux_on(sock, "list-keys", "-T", "root", "BTab", check=False)
     if keys.returncode == 0 and stale_btab(keys.stdout):  # a foreign Shift+Tab binding stays
-        tmux("unbind-key", "-n", "BTab", check=False)
+        tmux_on(sock, "unbind-key", "-n", "BTab", check=False)
         event(cfg, "removed a stale wab binding of Shift+Tab")
 
 

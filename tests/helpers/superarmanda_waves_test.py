@@ -5,8 +5,23 @@ Nothing here talks to a user's tmux server: every tmux/claude/Telegram interacti
 through module functions that are patched, TMUX is removed from the environment and
 TMUX_TMPDIR points into a throw-away directory. The only real tmux use is A8, on a private
 `-L wabtest-<pid>` socket that is killed afterwards.
+
+The module enforces this itself (TMUX_GUARD below, active before any test runs):
+  * TMUX_TMPDIR is a fresh temporary directory, TMUX/TMUX_PANE/WAB_TMUX_SOCKET are unset;
+  * subprocess.Popen (so run/call/check_output too), os.system and os.popen raise AssertionError
+    for a tmux command without `-L`/`-S`;
+  * a `tmux` shim first in PATH refuses the same for scripts (wab-open) and then execs the
+    real tmux.
+
+MANUAL CHECKS (a human or an agent poking at the dispatcher) must follow the same rules, or
+they hit the REAL tmux server: the global Ctrl+backslash binding gets rebound to a test session
+and live sessions are lost (incident W4, 2026-10-01):
+  * `export TMUX_TMPDIR=$(mktemp -d)`; `unset TMUX TMUX_PANE WAB_TMUX_SOCKET`;
+  * every tmux call carries `-L <name>` or `-S <path>`; never run dash.py or wab.py on the
+    default server.
 """
 
+import atexit
 import contextlib
 import hashlib
 import io
@@ -23,6 +38,58 @@ import unittest
 import uuid
 from pathlib import Path
 from unittest import mock
+
+# ---------- TMUX_GUARD: no test may touch a tmux server it did not create ----------
+def _install_tmux_guard():
+    tmpdir = tempfile.mkdtemp(prefix="wabtmux-")
+    atexit.register(shutil.rmtree, tmpdir, True)
+    os.environ["TMUX_TMPDIR"] = tmpdir
+    for var in ("TMUX", "TMUX_PANE", "WAB_TMUX_SOCKET"):
+        os.environ.pop(var, None)
+    real = shutil.which("tmux")
+    if real:  # a shim that refuses a socketless tmux and then execs the real binary
+        shim_dir = Path(tmpdir) / "tmux-shim"
+        shim_dir.mkdir()
+        shim = shim_dir / "tmux"
+        shim.write_text(
+            '#!/bin/sh\n'
+            'ok=0\n'
+            'for a in "$@"; do case "$a" in -L|-S) ok=1;; esac; done\n'
+            '[ "$#" = 1 ] && [ "$1" = "-V" ] && ok=1\n'
+            'if [ "$ok" != 1 ]; then echo "tmux without a private socket in tests: tmux $*" >&2; exit 97; fi\n'
+            f'exec "{real}" "$@"\n', encoding="utf-8")
+        shim.chmod(0o755)
+        os.environ["PATH"] = f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    def private(argv):
+        return any(a in ("-L", "-S") for a in argv)
+
+    def check(args, shell=False):
+        if isinstance(args, (str, bytes, os.PathLike)):
+            text = os.fsdecode(args)
+            if shell:
+                if re.search(r"\btmux\b", text) and not re.search(r"(^|\s)-[LS](\s|$)", text):
+                    raise AssertionError("tmux without a private socket in tests: " + text)
+                return
+            argv = [text]
+        else:
+            argv = [os.fsdecode(a) for a in args]
+        if argv and os.path.basename(argv[0]) == "tmux" and argv[1:] != ["-V"] and not private(argv):
+            raise AssertionError("tmux without a private socket in tests: " + " ".join(argv))
+
+    orig_init = subprocess.Popen.__init__
+
+    def popen_init(self, args, *a, **kw):
+        check(args, kw.get("shell") or (len(a) > 7 and a[7]))
+        orig_init(self, args, *a, **kw)
+    subprocess.Popen.__init__ = popen_init
+    orig_system, orig_popen = os.system, os.popen
+    os.system = lambda cmd: (check(cmd, True), orig_system(cmd))[1]
+    os.popen = lambda cmd, *a, **kw: (check(cmd, True), orig_popen(cmd, *a, **kw))[1]
+    return tmpdir
+
+
+TMUX_GUARD_DIR = _install_tmux_guard()
 
 ROOT = Path(__file__).resolve().parents[2]
 WAVES = ROOT / "skills" / "superarmanda" / "scripts" / "waves"
@@ -2123,13 +2190,14 @@ class KeysAndRegistry(Base):
             import dash
         except ImportError as exc:
             self.skipTest(f"rich is not installed: {exc}")
-        env = {"TMUX": "/tmp/tmux-1000/sockZ,123,0", "TMUX_PANE": "%3"}
+        sockdir = f"{os.environ['TMUX_TMPDIR']}/tmux-{os.getuid()}"
+        env = {"TMUX": f"{sockdir}/sockZ,123,0", "TMUX_PANE": "%3"}
         with mock.patch.dict(os.environ, env), mock.patch.object(
                 dash.subprocess, "run",
                 return_value=subprocess.CompletedProcess([], 0, "my-work\n", "")) as run:
             self.assertEqual(dash.own_session(), ("my-work", "sockZ"))
         self.assertIn("%3", run.call_args[0][0])
-        with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-1000/default,1,0", "TMUX_PANE": "%1"}), \
+        with mock.patch.dict(os.environ, {"TMUX": f"{sockdir}/default,1,0", "TMUX_PANE": "%1"}), \
                 mock.patch.object(dash.subprocess, "run",
                                   return_value=subprocess.CompletedProcess([], 0, "s\n", "")):
             self.assertEqual(dash.own_session(), ("s", ""))
@@ -2157,6 +2225,60 @@ class KeysAndRegistry(Base):
         with mock.patch.dict(os.environ, {"TMUX": "/tmp/waves.sock,5,0", "TMUX_PANE": "%1"}), \
                 mock.patch.object(dash.subprocess, "run", return_value=done):
             self.assertEqual(dash.own_session(), ("w", "/tmp/waves.sock"))
+
+    def test_bind_popup_sends_every_tmux_call_to_the_socket_it_was_given(self):
+        cfg, path = self.chain()
+        cases = [("X", ["-L", "X"]), ("/p/x.sock", ["-S", "/p/x.sock"]), ("", [])]
+        # neither the module default nor the environment may redirect a call that names its socket
+        for env_sock in (None, "envsock"):
+            for sock, flag in cases:
+                with self.subTest(sock=sock, env=env_sock):
+                    self.tmux_calls.clear()
+                    wab.registry_path().unlink(missing_ok=True)  # other entries are probed on THEIR sockets
+                    env = {} if env_sock is None else {"WAB_TMUX_SOCKET": env_sock}
+                    os.environ.pop("WAB_TMUX_SOCKET", None)
+                    with mock.patch.object(wab, "TMUX_SOCKET", None), mock.patch.dict(os.environ, env):
+                        wab.bind_popup(cfg, path, session="s", sock=sock)
+                    kinds = {c[len(flag) + 1] for c in self.tmux_calls}
+                    self.assertIn("source-file", kinds)
+                    self.assertIn("list-keys", kinds)
+                    for call in self.tmux_calls:
+                        self.assertEqual(list(call[1:1 + len(flag)]), flag, call)
+                        self.assertNotIn(call[1 + len(flag)], ("-L", "-S"), call)
+
+    def test_dash_session_alive_uses_the_socket_it_is_given(self):
+        for sock, flag in (("X", ["-L", "X"]), ("/p/x.sock", ["-S", "/p/x.sock"])):
+            self.tmux_calls.clear()
+            with mock.patch.object(wab, "TMUX_SOCKET", None), mock.patch.dict(os.environ, {"WAB_TMUX_SOCKET": "e"}):
+                wab._dash_session_alive(sock, "s")
+            self.assertEqual(list(self.tmux_calls[0][1:3]), flag)
+
+    def test_own_session_name_only_for_the_socket_dir_this_process_looks_at(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        uid = os.getuid()
+        done = subprocess.CompletedProcess([], 0, "w\n", "")
+
+        def own(tmux_env, tmpdir):
+            env = {"TMUX": tmux_env, "TMUX_PANE": "%1"}
+            with mock.patch.dict(os.environ, env), mock.patch.object(dash.subprocess, "run", return_value=done):
+                if tmpdir is None:
+                    os.environ.pop("TMUX_TMPDIR", None)
+                else:
+                    os.environ["TMUX_TMPDIR"] = tmpdir
+                return dash.own_session()
+        # same directory `-L` reads here: the short name
+        self.assertEqual(own(f"/x/y/tmux-{uid}/r18a,1,0", "/x/y"), ("w", "r18a"))
+        self.assertEqual(own(f"/x/y/tmux-{uid}/default,1,0", "/x/y"), ("w", ""))
+        self.assertEqual(own(f"/tmp/tmux-{uid}/r18a,1,0", None), ("w", "r18a"))
+        # a tmux-<uid> directory elsewhere (another TMUX_TMPDIR): `-L` would name ANOTHER server
+        self.assertEqual(own(f"/tmp/claude-1000/xyz/tmux-{uid}/r18a,1,0", "/other"),
+                         ("w", f"/tmp/claude-1000/xyz/tmux-{uid}/r18a"))
+        self.assertEqual(own(f"/tmp/claude-1000/xyz/tmux-{uid}/r18a,1,0", None),
+                         ("w", f"/tmp/claude-1000/xyz/tmux-{uid}/r18a"))
+        self.assertEqual(own(f"/x/y/tmux-{uid}/default,1,0", "/z"), ("w", f"/x/y/tmux-{uid}/default"))
 
     def test_wab_open_uses_dash_S_for_a_socket_path(self):
         cfg, path = self.chain()
@@ -2743,6 +2865,48 @@ class Dashboard(Base):
     def test_rich_is_imported_by_dash_only(self):
         self.assertNotRegex((WAVES / "wab.py").read_text(encoding="utf-8"), r"(?m)^\s*(import|from)\s+rich")
         self.assertIn("from rich", (WAVES / "dash.py").read_text(encoding="utf-8"))
+
+
+class TmuxGuard(unittest.TestCase):
+    """The guard itself: a socketless tmux must fail loudly, a private one passes the guard."""
+
+    def test_the_environment_is_private(self):
+        for var in ("TMUX", "TMUX_PANE", "WAB_TMUX_SOCKET"):
+            self.assertNotIn(var, os.environ)
+        self.assertTrue(os.environ["TMUX_TMPDIR"].startswith(tempfile.gettempdir()))
+
+    def test_subprocess_refuses_tmux_without_a_socket(self):
+        for call in (subprocess.run, subprocess.call, subprocess.check_output, subprocess.Popen):
+            with self.assertRaisesRegex(AssertionError, "tmux without a private socket in tests"):
+                call(["tmux", "ls"])
+        with self.assertRaises(AssertionError):
+            subprocess.run(["/usr/bin/tmux", "kill-server"])
+        with self.assertRaises(AssertionError):
+            subprocess.run("tmux ls", shell=True)
+        with self.assertRaises(AssertionError):
+            os.system("tmux ls")
+
+    def test_a_private_socket_passes_the_guard(self):
+        for argv in (["tmux", "-L", "wabguard-x", "ls"], ["tmux", "-S", "/nonexistent/x.sock", "ls"]):
+            try:
+                subprocess.run(argv, capture_output=True, timeout=30)
+            except AssertionError:
+                self.fail(f"guard refused {argv}")
+            except (OSError, subprocess.SubprocessError):
+                pass  # no tmux or no server: the guard let it through, which is the point
+        try:
+            subprocess.run("tmux -L wabguard-x ls", shell=True, capture_output=True, timeout=30)
+        except AssertionError:
+            self.fail("guard refused a shell tmux with -L")
+
+    def test_the_path_shim_refuses_a_socketless_tmux_from_a_script(self):
+        if not shutil.which("tmux"):
+            self.skipTest("tmux is not installed")
+        r = subprocess.run(["bash", "-c", "tmux ls"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 97)
+        self.assertIn("without a private socket", r.stderr)
+        r = subprocess.run(["bash", "-c", "tmux -L wabguard-x ls"], capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(r.returncode, 97, r.stderr)
 
 
 class Packaging(unittest.TestCase):

@@ -234,8 +234,11 @@ def own_session():
     if not tmux_env or not pane:
         return None, ""
     path = tmux_env.split(",")[0]
-    if re.fullmatch(r"tmux-\d+", os.path.basename(os.path.dirname(path))):
-        sock = os.path.basename(path)  # a `-L` name in tmux's own socket directory
+    # `-L name` looks into $TMUX_TMPDIR (or /tmp) + tmux-<uid>: the short name is valid only for a
+    # socket in exactly that directory, else it would name another server in this process
+    own_dir = os.path.join(os.environ.get("TMUX_TMPDIR") or "/tmp", f"tmux-{os.getuid()}")
+    if os.path.realpath(os.path.dirname(path)) == os.path.realpath(own_dir):
+        sock = os.path.basename(path)
         sock = "" if sock == "default" else sock
     else:
         sock = path  # `tmux -S <path>`: only the full path names this server
