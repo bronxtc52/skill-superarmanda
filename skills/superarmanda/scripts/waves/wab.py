@@ -26,6 +26,7 @@ import math
 import os
 import pathlib
 import re
+import stat
 import shlex
 import subprocess
 import sys
@@ -99,6 +100,8 @@ def _check_types(cfg):
         bad("titles", "an object of wave id -> string")
     if "mandate_sha256" in cfg and not isinstance(cfg["mandate_sha256"], str):
         bad("mandate_sha256", "a string of 64 lowercase hex characters")
+    if "plan_sha256" in cfg and not isinstance(cfg["plan_sha256"], str):
+        bad("plan_sha256", "a string of 64 lowercase hex characters")
 
 
 def load_chain(path, create=True):
@@ -145,6 +148,10 @@ def load_chain(path, create=True):
         # a present pin is never "no pin": "", null, false or 0 must not let a wave start unpinned
         raise SystemExit(f"chain.json: mandate_sha256 must be 64 lowercase hex characters (the sha256 "
                          f"of mandate.md), got {cfg['mandate_sha256']!r}; leave it out for no pin")
+    if "plan_sha256" in cfg and not (isinstance(cfg["plan_sha256"], str)
+                                     and MANDATE_PIN.fullmatch(cfg["plan_sha256"])):
+        raise SystemExit(f"chain.json: plan_sha256 must be 64 lowercase hex characters (the sha256 "
+                         f"of the approved waves.json), got {cfg['plan_sha256']!r}; leave it out for no pin")
     chain = cfg.get("chain") or ""
     run_id = cfg.get("run_id") or ""
     if not _plain_name(chain):
@@ -1220,6 +1227,34 @@ HANDED_OVER = ("awaiting_merge", "done")
 STOPPED = ("dead", "not_ready")
 
 
+PLAN_MAX_BYTES = 1024 * 1024
+
+
+def check_plan_pin(cfg):
+    """chain.json `plan_sha256` pins the approved <run_dir>/waves.json: waves may write into
+    run_dir, so changed, missing or non-regular bytes refuse the launch. No key: no check."""
+    if "plan_sha256" not in cfg:
+        return
+    plan = cfg["run_dir"] / "waves.json"
+    head = "BLOCKED: plan changed since approval: "
+    tail = "; the approved plan is not what is on disk, ask the owner (re-pin plan_sha256 in chain.json)"
+    nofollow = lambda path, flags: os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)  # binary, "rb"
+    try:
+        with open(plan, "rb", opener=nofollow) as f:
+            info = os.fstat(f.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise SystemExit(f"{head}{plan} is not a regular file{tail}")
+            raw = f.read(PLAN_MAX_BYTES + 1)
+        if len(raw) > PLAN_MAX_BYTES:
+            raise SystemExit(f"{head}{plan} is larger than {PLAN_MAX_BYTES} bytes{tail}")
+    except OSError as e:
+        raise SystemExit(f"{head}{plan} cannot be read ({e.strerror or e}){tail}")
+    got = hashlib.sha256(raw).hexdigest()
+    if got != cfg["plan_sha256"]:
+        raise SystemExit(f"BLOCKED: plan changed since approval: waves.json sha256 {got} != "
+                         f"chain.json plan_sha256 {cfg['plan_sha256']}")
+
+
 def _check_launch_allowed(cfg, st, wave, name):
     """The chain state decides, before any outside action. No bypass flag."""
     waves, records, cur = cfg["waves"], st["waves"], st.get("current")
@@ -1300,6 +1335,7 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     _check_launch_allowed(cfg, st, wave, name)
     if tmux_alive(name):
         raise SystemExit(f"tmux session {name} already exists")
+    check_plan_pin(cfg)  # before prepare_clone, the workdir and the STARTING record
     wdir = wave_dir(cfg, wave)
     cur = st.get("current")
     restart = cur == wave and st["waves"].get(cur, {}).get("phase") in STOPPED
@@ -1434,8 +1470,9 @@ def start_session(cfg, st, wave):
            "--name", f"wab-{cfg['chain']}-{wave}", "--session-id", w["sessions"][0]]
     if cfg["model"]:
         cmd += ["--model", cfg["model"]]
+    pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
     tmux("new-session", "-d", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
-       "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *cmd)
+       "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *pin, *cmd)
     w["phase"] = "starting"
     save_state(cfg, st)
 
@@ -2163,7 +2200,7 @@ def _state_or_event(cfg):
 
 
 TUNABLE = ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds", "telegram",
-           "titles", "model")
+           "titles", "model", "plan_sha256")
 
 
 def _identity(cfg):

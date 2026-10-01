@@ -6534,6 +6534,127 @@ class W4Round45DashHeaderAttemptStart(Base):
         self.assertIn(f"в работе {dash.fmt_dur(100)}", self.header_text(dash, cfg, st, now))
 
 
+class PlanPin(Base):
+    """T1: chain.json plan_sha256 pins the approved waves.json before every wave launch."""
+
+    def setUp(self):
+        super().setUp()
+        self.alive = False
+        self.prompt = self.tmp / "p.md"
+        self.prompt.write_text("go\n", encoding="utf-8")
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+        self.plan_bytes = b'{"waves": []}\n'
+        self.pin = hashlib.sha256(self.plan_bytes).hexdigest()
+
+    def pinned(self, write=True, **over):
+        cfg, path = self.chain(plan_sha256=self.pin, **over)
+        if write:
+            (cfg["run_dir"] / "waves.json").write_bytes(self.plan_bytes)
+        return cfg, path
+
+    def attempt(self, cfg, wave="W1"):
+        self.tmux_calls.clear()
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd) as pc:
+            self.prepare = pc
+            return wab.launch(cfg, wave, self.prompt)
+
+    def refused(self, cfg):
+        with self.assertRaises(SystemExit) as cm:
+            self.attempt(cfg)
+        self.assertTrue(str(cm.exception).startswith("BLOCKED: plan changed since approval"),
+                        str(cm.exception))
+        self.assertFalse(self.prepare.called)
+        self.assertEqual([c for c in self.tmux_calls if c[1] == "new-session"], [])
+        st = wab.load_state(cfg)
+        self.assertNotEqual(st.get("waves", {}).get("W1", {}).get("phase"), "starting")
+        return str(cm.exception)
+
+    def test_matching_pin_launches(self):
+        cfg, _ = self.pinned()
+        self.assertTrue(self.attempt(cfg))
+        self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
+
+    def test_changed_plan_refuses_before_any_launch_step(self):
+        cfg, _ = self.pinned()
+        (cfg["run_dir"] / "waves.json").write_bytes(self.plan_bytes + b" ")
+        self.refused(cfg)
+
+    def test_deleted_plan_refuses(self):
+        cfg, _ = self.pinned(write=False)
+        self.refused(cfg)
+
+    def test_symlinked_or_non_regular_plan_refuses(self):
+        cfg, _ = self.pinned(write=False)
+        target = self.tmp / "real.json"
+        target.write_bytes(self.plan_bytes)
+        os.symlink(target, cfg["run_dir"] / "waves.json")
+        self.refused(cfg)
+        os.unlink(cfg["run_dir"] / "waves.json")
+        (cfg["run_dir"] / "waves.json").mkdir()
+        self.refused(cfg)
+
+    def test_oversized_plan_refuses(self):
+        cfg, _ = self.pinned(write=False)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"x" * (1024 * 1024 + 1))
+        self.refused(cfg)
+
+    def test_no_pin_does_not_read_waves_json(self):
+        cfg, _ = self.chain()
+        (cfg["run_dir"] / "waves.json").write_bytes(b"anything")
+        with mock.patch.object(wab.os, "open", wraps=os.open) as op:
+            self.assertTrue(self.attempt(cfg))
+        self.assertFalse([c for c in op.call_args_list if "waves.json" in str(c.args[0])])
+
+    def test_invalid_pin_is_refused_by_load_chain(self):
+        for bad in ("", None, 0, False, "A" * 64, "0" * 63, "g" * 64, 5):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as cm:
+                    self.chain(plan_sha256=bad) if bad is not None else \
+                        wab.load_chain(self.write_raw(plan_sha256=None))
+                self.assertIn("plan_sha256", str(cm.exception))
+
+    def write_raw(self, **over):
+        doc = {"chain": CHAIN, "run_id": RUN_ID, "repo": "o/r", "waves": ["W1", "W2"],
+               "tmux_prefix": "wv-", **over}
+        path = self.tmp / "raw-chain.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path
+
+    def test_dispatcher_launch_of_next_wave_refuses_on_changed_plan(self):
+        cfg, _ = self.pinned()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd) as pc:
+            wab.tick(cfg, wab.load_state(cfg))
+        self.assertFalse(pc.called)
+        st = self.get_state(cfg)
+        self.assertIn("launch of W2 refused", st.get("stopped", ""))
+        self.assertNotIn("W2", st["waves"])
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("plan changed since approval", log)
+
+    def test_pin_goes_into_tmux_env_only_when_set(self):
+        cfg, _ = self.pinned()
+        self.attempt(cfg)
+        new = [c for c in self.tmux_calls if c[1] == "new-session"][0]
+        self.assertIn(f"WAB_PLAN_SHA256={self.pin}", new)
+        cfg2, _ = self.chain()
+        self.put_state(cfg2, {})
+        self.alive = False
+        self.attempt(cfg2)
+        new = [c for c in self.tmux_calls if c[1] == "new-session"][0]
+        self.assertFalse([a for a in new if str(a).startswith("WAB_PLAN_SHA256")])
+
+    def test_plan_pin_is_tunable(self):
+        cfg, _ = self.pinned()
+        other = dict(cfg, plan_sha256="1" * 64)
+        self.assertEqual(wab._identity(cfg), wab._identity(other))
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")

@@ -2184,6 +2184,43 @@ class WavesContract(unittest.TestCase):
         self.assertEqual(data["version"], 1)
         self.assertEqual(data["base"], self.base)
 
+    # T1: init --expect-sha256 pins the approved plan bytes
+    def test_init_expect_sha256_match_creates_manifest(self):
+        raw = self.write_plan()
+        sha = hashlib.sha256(raw).hexdigest()
+        self.cli("init", *self.init_args(f"{self.plan}#w1"), "--expect-sha256", sha)
+        self.assertEqual(self.manifest_data()["plan"]["sha256"], sha)
+
+    def test_init_expect_sha256_mismatch_creates_no_manifest(self):
+        self.write_plan()
+        want = "0" * 64
+        proc = self.run_state(
+            "init", *self.init_args(f"{self.plan}#w1"), "--expect-sha256", want
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("plan changed since approval", proc.stderr)
+        self.assertFalse(self.manifest.exists())
+
+    def test_init_expect_sha256_rejects_invalid_hex(self):
+        raw = self.write_plan()
+        sha = hashlib.sha256(raw).hexdigest()
+        for bad in (sha.upper(), sha[:63], sha + "0", "g" * 64, ""):
+            with self.subTest(bad=bad):
+                proc = self.run_state(
+                    "init", *self.init_args(f"{self.plan}#w1"), "--expect-sha256", bad
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertFalse(self.manifest.exists())
+
+    def test_init_expect_sha256_requires_from_plan(self):
+        proc = self.run_state(
+            "init", "--repo", self.repo, "--base", self.base, "--head", self.head(),
+            "--run-id", "legacy", "--expect-sha256", "0" * 64,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--expect-sha256 requires --from-plan", proc.stderr)
+        self.assertFalse(self.manifest.exists())
+
     def test_init_without_from_plan_has_exactly_the_v060_keys(self):
         self.cli(
             "init",
