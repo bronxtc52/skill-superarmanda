@@ -1955,9 +1955,10 @@ def gh_graphql(query, variables):
 
 
 def find_pr(cfg, cwd):
-    """The PR of the wave's branch (the branch of its working copy) INTO the chain's base branch: an
-    open one, else the newest. None: no branch yet or no PR; CollectError: gh could not tell or the
-    base branch is unknown (it is never guessed: several PRs of one branch may go to different bases)."""
+    """The PR of the wave's branch (the branch of its working copy) from the chain's repository INTO the
+    chain's base branch: the open one, else the newest. None: no branch yet or no PR; CollectError: gh
+    could not tell, the base branch is unknown (it is never guessed: several PRs of one branch may go to
+    different bases) or two open PRs match (never chosen by number)."""
     repo = cfg.get("repo")
     if not repo:
         raise gate.CollectError("repo is not set in chain.json")
@@ -1972,12 +1973,28 @@ def find_pr(cfg, cwd):
     if not base:
         raise gate.CollectError("base branch is unknown (set base_branch in chain.json or origin/HEAD)")
     items = _json(_gh("pr", "list", "--repo", repo, "--head", branch, "--base", base, "--state", "all", "--json",
-                      "number,headRefOid,isDraft,state,baseRefName"), "gh pr list")
+                      "number,headRefOid,isDraft,state,baseRefName,headRepositoryOwner,headRepository"), "gh pr list")
     items = [i for i in items if isinstance(i, dict) and isinstance(i.get("number"), int)
-             and isinstance(i.get("headRefOid"), str) and i.get("baseRefName") == base] \
+             and isinstance(i.get("headRefOid"), str) and i.get("baseRefName") == base
+             and _head_repo(i) == repo.lower()] \
         if isinstance(items, list) else []
-    pool = [i for i in items if i.get("state") == "OPEN"] or items
+    opened = [i for i in items if i.get("state") == "OPEN"]
+    if len(opened) > 1:
+        raise gate.CollectError(f"several open PRs of branch {branch} into {base}: "
+                                + ", ".join(f"#{i['number']}" for i in opened))
+    pool = opened or items
     return max(pool, key=lambda i: i["number"]) if pool else None
+
+
+def _head_repo(item):
+    """owner/name of the repository a PR comes from, lowercased; "" when gh did not say. `gh pr list --head`
+    matches the branch name only, so a fork's same-named branch is told apart here (the wave pushes its
+    branch into the chain's own repository)."""
+    owner = item.get("headRepositoryOwner")
+    head = item.get("headRepository")
+    login = owner.get("login") if isinstance(owner, dict) else None
+    name = head.get("name") if isinstance(head, dict) else None
+    return f"{login}/{name}".lower() if isinstance(login, str) and isinstance(name, str) and login and name else ""
 
 
 def gate_facts(cfg, pr):

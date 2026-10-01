@@ -169,7 +169,7 @@ def critical(facts):
     return json.dumps({
         "pr": facts["pr"],
         "runs": pick(facts["check_runs"], ("id", "name", "status", "conclusion")),
-        "reviews": [(r.get("id"), r.get("state"), r.get("commit_id"), who(r)) for r in facts["reviews"]],
+        "reviews": [(r.get("id"), r.get("state"), r.get("commit_id"), r.get("body"), who(r)) for r in facts["reviews"]],
         "comments": [(c.get("id"), c.get("commit_id"), c.get("original_commit_id"), c.get("body"), who(c)) for c in facts["review_comments"]],
         "issue": [(c.get("id"), c.get("body"), who(c)) for c in facts["issue_comments"]],
         "resolved": sorted((facts["resolved"] or {}).items()),
@@ -202,8 +202,12 @@ def codex_on_head(facts, head):
               if pr_review.trusted(c, CODEX) and c.get("original_commit_id") == head and pr_review.text(c)]
     # `commit_id` of an open inline comment is moved by GitHub to the latest commit of the PR; only
     # `original_commit_id` says which commit the review was written on
-    p01 = [pr_review.url(c) or "" for c in inline if P01.search(c.get("body") or "")]
-    return {"done": bool(how), "how": how[0] if how else "", "p01": p01, "findings": len(inline)}
+    # a P0/P1 badge may also sit in the body of a review written on HEAD, not only in its inline comments
+    bodies = [r for r in facts.get("reviews") or []
+              if pr_review.trusted(r, CODEX) and r.get("commit_id") == head and P01.search(r.get("body") or "")]
+    p01 = ([pr_review.url(c) or "" for c in inline if P01.search(c.get("body") or "")]
+           + [pr_review.url(r) or "" for r in bodies])
+    return {"done": bool(how), "how": how[0] if how else "", "p01": p01, "findings": len(inline) + len(bodies)}
 
 
 def old_p01(facts):

@@ -99,6 +99,7 @@ import wab  # noqa: E402
 
 REAL_SH = wab.sh
 REAL_FIND_PR = wab.find_pr
+OWN_HEAD = {"headRepositoryOwner": {"login": "o"}, "headRepository": {"name": "r"}}  # PR from the chain repo "o/r"
 CHAIN = "demo"
 RUN_ID = "2026-10-01"
 
@@ -7266,6 +7267,23 @@ class GateVerdict(unittest.TestCase):
         self.assertIn("release", v["reasons"][0])
         self.assertIn("main", v["reasons"][0])
 
+    def test_a_p1_badge_in_the_body_of_a_codex_review_on_head_fails(self):  # CodeRabbit on cf32fbd
+        def review(body, commit=HEAD, user=BOT):
+            return {"user": user, "commit_id": commit, "state": "COMMENTED", "body": body, "html_url": "r"}
+        on_head = green_facts(reviews=[review("**![P1 Badge](x)** in the body")])
+        self.assertEqual(self.ev(on_head)["verdict"], "fail")
+        self.assertEqual(gate.codex_on_head(on_head, HEAD)["findings"], 1)
+        self.assertIn("1 замечаний, P0/P1: 1", gate.alarm_text(5, HEAD, on_head))
+        for facts in (green_facts(reviews=[review("**![P1 Badge](x)** old", commit=OLD), review("clean")]),
+                      green_facts(reviews=[review("![P2 Badge](x) minor")]),
+                      green_facts(reviews=[review("clean"), review("**![P1 Badge](x)**", user=HUMAN)])):
+            with self.subTest(facts=facts["reviews"]):
+                self.assertNotEqual(self.ev(facts)["verdict"], "fail")
+
+    def test_the_review_body_is_critical(self):
+        later = green_facts(reviews=[dict(green_facts()["reviews"][0], body="**![P1 Badge](x)** added")])
+        self.assertNotEqual(gate.critical(green_facts()), gate.critical(later))
+
     def test_an_unknown_base_waits_never_passes(self):
         facts = green_facts()
         del facts["pr"]["base"]
@@ -8931,9 +8949,9 @@ class GateWrappers(Base):
     def test_find_pr_takes_the_open_pr_of_the_branch_else_the_newest(self):
         cfg, _ = self.chain(base_branch="main")
         self.git_branch()
-        prs = [{"number": 3, "headRefOid": "1" * 40, "isDraft": False, "state": "MERGED", "baseRefName": "main"},
-               {"number": 9, "headRefOid": "2" * 40, "isDraft": False, "state": "CLOSED", "baseRefName": "main"},
-               {"number": 5, "headRefOid": "3" * 40, "isDraft": True, "state": "OPEN", "baseRefName": "main"}]
+        prs = [{"number": 3, "headRefOid": "1" * 40, "isDraft": False, "state": "MERGED", "baseRefName": "main", **OWN_HEAD},
+               {"number": 9, "headRefOid": "2" * 40, "isDraft": False, "state": "CLOSED", "baseRefName": "main", **OWN_HEAD},
+               {"number": 5, "headRefOid": "3" * 40, "isDraft": True, "state": "OPEN", "baseRefName": "main", **OWN_HEAD}]
         self.gh(lambda a: _cp(a, out=json.dumps(prs)))
         self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 5)
         argv = self.gh_calls[-1]
@@ -8954,12 +8972,35 @@ class GateWrappers(Base):
     def test_find_pr_filters_by_the_base_branch(self):  # P1-a
         cfg, _ = self.chain(base_branch="main")
         self.git_branch()
-        prs = [{"number": 4, "headRefOid": "1" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "main"},
-               {"number": 8, "headRefOid": "2" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "release"}]
+        prs = [{"number": 4, "headRefOid": "1" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "main", **OWN_HEAD},
+               {"number": 8, "headRefOid": "2" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "release", **OWN_HEAD}]
         self.gh(lambda a: _cp(a, out=json.dumps(prs)))
         self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 4)  # the newest one is in a foreign base
         self.gh(lambda a: _cp(a, out=json.dumps(prs[1:])))
         self.assertIsNone(self.find_pr(cfg, self.cwd))  # only a foreign base: no PR of this wave
+
+    def test_find_pr_takes_only_prs_from_the_chain_repository(self):  # Codex P1 on cf32fbd
+        cfg, _ = self.chain(base_branch="main")
+        self.git_branch()
+        own = {"number": 4, "headRefOid": "1" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "main", **OWN_HEAD}
+        fork = {"number": 8, "headRefOid": "2" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "main",
+                "headRepositoryOwner": {"login": "stranger"}, "headRepository": {"name": "r"}}
+        self.gh(lambda a: _cp(a, out=json.dumps([own, fork])))
+        self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 4)  # a newer PR of a fork's same-named branch
+        argv = self.gh_calls[-1]
+        fields = argv[argv.index("--json") + 1]
+        self.assertIn("headRepositoryOwner", fields)
+        self.assertIn("headRepository", fields)
+        self.gh(lambda a: _cp(a, out=json.dumps([fork])))
+        self.assertIsNone(self.find_pr(cfg, self.cwd))  # only a fork's PR: not the wave's
+        bare = {k: v for k, v in own.items()}
+        bare.pop("headRepositoryOwner"); bare.pop("headRepository")
+        self.gh(lambda a: _cp(a, out=json.dumps([bare])))
+        self.assertIsNone(self.find_pr(cfg, self.cwd))  # the head repository unknown: never guessed
+        twin = dict(own, number=6, headRefOid="3" * 40)
+        self.gh(lambda a: _cp(a, out=json.dumps([own, twin])))
+        with self.assertRaises(gate.CollectError):  # two open PRs of the wave's branch: ambiguous, not "newest"
+            self.find_pr(cfg, self.cwd)
 
     def test_find_pr_with_an_unknown_base_is_a_collect_error(self):  # P1-a
         cfg, _ = self.chain()  # no base_branch, no origin/HEAD in the working copy
