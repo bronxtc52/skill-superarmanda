@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import uuid
@@ -72,6 +73,34 @@ def _plain_name(value):
     return bool(NAME.fullmatch(value)) and set(value) != {"."}
 
 
+# chain.json field -> what it must be. Checked before any field is used, so a wrong type is a
+# SystemExit with the reason (the live re-read in `watch` keeps the previous settings on it),
+# never a TypeError/ValueError later. Optional string fields: absent or null = not set.
+OPTIONAL_STRINGS = ("run_dir", "workdir", "repo", "model", "base_branch", "merge_gate")
+
+
+def _check_types(cfg):
+    def bad(key, want):
+        raise SystemExit(f"chain.json: {key} must be {want}, got {cfg[key]!r}")
+    for key in ("chain", "run_id"):
+        if key in cfg and not isinstance(cfg[key], str):
+            bad(key, "a string")
+    for key in OPTIONAL_STRINGS + ("tmux_prefix",):
+        v = cfg.get(key)
+        if v is not None and not isinstance(v, str):
+            bad(key, "a string" + ("" if key == "tmux_prefix" else " or null"))
+        if isinstance(v, str) and "\x00" in v:
+            bad(key, "a string without NUL characters")
+    tg = cfg.get("telegram")
+    if not (tg is None or tg is False or isinstance(tg, dict)):  # "", 0 and [] are typos, not «off»
+        bad("telegram", "an object, false or null")
+    titles = cfg.get("titles")
+    if titles is not None and not (isinstance(titles, dict) and all(isinstance(v, str) for v in titles.values())):
+        bad("titles", "an object of wave id -> string")
+    if "mandate_sha256" in cfg and not isinstance(cfg["mandate_sha256"], str):
+        bad("mandate_sha256", "a string of 64 lowercase hex characters")
+
+
 def load_chain(path, create=True):
     """Read chain.json. The run directory is <base>/<chain>/<run_id>, where base is
     `run_dir` from chain.json or <directory of chain.json>/runs. run_id is mandatory and is
@@ -84,6 +113,7 @@ def load_chain(path, create=True):
         raise SystemExit(f"chain.json: cannot read {path}: {e}")
     if not isinstance(cfg, dict):
         raise SystemExit("chain.json: must be a JSON object")
+    _check_types(cfg)
     cfg.setdefault("ctx_limit", 300_000)
     cfg.setdefault("idle_minutes", 12)
     cfg.setdefault("handoff_timeout_minutes", 25)
@@ -98,12 +128,6 @@ def load_chain(path, create=True):
             raise SystemExit(f"chain.json: {key} must be a positive number, got {v!r}")
         if v > NUM_LIMITS[key]:  # time.sleep(1e10) raises OverflowError and kills `watch`
             raise SystemExit(f"chain.json: {key} must be at most {NUM_LIMITS[key]}, got {v!r}")
-    if cfg["model"] is not None and not isinstance(cfg["model"], str):
-        raise SystemExit(f"chain.json: model must be a string or null, got {cfg['model']!r}")
-    titles = cfg.get("titles")
-    if titles is not None and not (isinstance(titles, dict)
-                                   and all(isinstance(v, str) for v in titles.values())):
-        raise SystemExit("chain.json: titles must be an object of wave id -> string")
     tg = cfg.get("telegram")
     if tg and not isinstance(tg, dict):
         raise SystemExit("chain.json: telegram must be an object")
@@ -116,8 +140,8 @@ def load_chain(path, create=True):
         # a present pin is never "no pin": "", null, false or 0 must not let a wave start unpinned
         raise SystemExit(f"chain.json: mandate_sha256 must be 64 lowercase hex characters (the sha256 "
                          f"of mandate.md), got {cfg['mandate_sha256']!r}; leave it out for no pin")
-    chain = str(cfg.get("chain") or "")
-    run_id = str(cfg.get("run_id") or "")
+    chain = cfg.get("chain") or ""
+    run_id = cfg.get("run_id") or ""
     if not _plain_name(chain):
         raise SystemExit("chain.json: chain is required ([A-Za-z0-9._-]+, not a dot segment)")
     if not _plain_name(run_id):
@@ -136,15 +160,18 @@ def load_chain(path, create=True):
         raise SystemExit("chain.json: waves must be a non-empty list of [A-Za-z0-9_-]+ names")
     if len({w.lower() for w in waves}) != len(waves):  # tmux session names are lower-cased
         raise SystemExit("chain.json: duplicate wave id in waves (compared case-insensitively)")
-    here = path.resolve().parent
-    # a relative run_dir is relative to chain.json, never to the cwd of whoever runs us
-    base = pathlib.Path(os.path.abspath(here / cfg["run_dir"])) if cfg.get("run_dir") else here / "runs"
-    if cfg.get("workdir"):  # absolute before admission, state and transcript lookup
-        cfg["workdir"] = str(pathlib.Path(os.path.abspath(here / cfg["workdir"])).resolve())
-    cfg["chain_file"] = str(path.resolve())
-    cfg["run_dir"] = base / chain / run_id
-    if create:
-        cfg["run_dir"].mkdir(parents=True, exist_ok=True)
+    try:
+        here = path.resolve().parent
+        # a relative run_dir is relative to chain.json, never to the cwd of whoever runs us
+        base = pathlib.Path(os.path.abspath(here / cfg["run_dir"])) if cfg.get("run_dir") else here / "runs"
+        if cfg.get("workdir"):  # absolute before admission, state and transcript lookup
+            cfg["workdir"] = str(pathlib.Path(os.path.abspath(here / cfg["workdir"])).resolve())
+        cfg["chain_file"] = str(path.resolve())
+        cfg["run_dir"] = base / chain / run_id
+        if create:
+            cfg["run_dir"].mkdir(parents=True, exist_ok=True)
+    except (OSError, RuntimeError, ValueError) as e:  # symlink loop, no permission, a file in the way
+        raise SystemExit(f"chain.json: run_dir/workdir cannot be used: {e}")
     return cfg
 
 
@@ -562,9 +589,13 @@ TG_LIMIT = 600        # quoted wave text (result.md, BLOCKED question)
 TG_MESSAGE_LIMIT = 1200  # whole message; quoted text is capped at TG_LIMIT first, so the
                          # framing and the attach command after it always fit
 # A long run of base64/base64url characters. Without a dash any 40+ run is a blob; with a dash
-# (base64url) it is one only when it mixes upper case, lower case and digits: plain
-# `kebab-case-words` and paths of letters, dates and slashes stay readable.
+# it stays readable only when every part between -, /, _ and + looks like a word (see
+# _readable_dashed): `kebab-case-words`, paths, dates stay, base64url and UUID-like keys go.
 _OPAQUE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}")
+# 32+ hex digits, bare or in dashed groups (UUID, hex keys); a bare 40-64 hex after an explicit
+# SHA label survives (_keep_match). Shorter than _OPAQUE's 40, so it is its own rule.
+_HEX_KEY = re.compile(r"(?<![A-Za-z0-9+/_-])(?=(?:-?[0-9A-Fa-f]){32})[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*"
+                      r"(?![A-Za-z0-9+/_-])")
 _REDACT = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
     re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"),
@@ -585,6 +616,7 @@ _REDACT = [
     re.compile(r"\+\d[\d ()-]{8,}\d"),                                  # phone numbers (+7 ...)
     re.compile(r"(?<![\w+])(?:\+?7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)"),  # RU, no plus
     re.compile(r"(?<!\d)\d{3}[-\s]\d{3}[-\s]\d{2}[-\s]\d{2}(?!\d)"),             # 10 digits, separated
+    _HEX_KEY,                                                           # UUID, hex keys
     _OPAQUE,                                                            # long opaque blobs
 ]
 
@@ -593,9 +625,17 @@ _SHA_LABEL = re.compile(r"(?i)(?:\b(?:commit|sha|head|reviewed_head|base|packet_
                         r"|sha256\s*[:=]\s*)$")
 
 
+# A word-like part of a dashed token: short, one letter case (or Capitalized), digits only, or a
+# short lower-case+digits tag (v2, sha256, abcd1234). A segment of 9+ mixing letters and digits,
+# or mixed case with digits, is not a word.
+_WORDISH = re.compile(r".{0,3}|[a-z]+|[A-Z]+|[A-Z][a-z]+|\d+|[a-z0-9]{1,8}")
+
+
 def _readable_dashed(m):
+    """Known limit of the heuristic: a secret made only of word-like parts (e.g. dictionary words
+    joined by dashes) stays readable; dashed hex is caught earlier by _HEX_KEY."""
     t = m.group(0)
-    return "-" in t and not (re.search(r"[A-Z]", t) and re.search(r"[a-z]", t) and re.search(r"\d", t))
+    return "-" in t and all(_WORDISH.fullmatch(part) for part in re.split(r"[-/_+=]", t))
 
 
 def _keep_match(m):
@@ -667,6 +707,8 @@ def put_notice(w, key, value, text):
     The notice is removed only after the transport took it, so a transient Telegram failure is
     retried by later ticks instead of being lost; supervision never waits for it. At least once,
     not exactly once: a crash or a lost transport reply after the actual delivery sends it again."""
+    if key not in NOTICE_EPISODE_ENDS:  # a programming error: the notice would never become stale
+        raise ValueError(f"put_notice: key {key!r} has no row in NOTICE_EPISODE_ENDS")
     box = w.setdefault("outbox", {})
     cur = box.get(key)
     if cur is None or cur.get("value") != value:
@@ -1043,31 +1085,45 @@ def _check_launch_allowed(cfg, st, wave, name):
         raise SystemExit(f"wab: wave {wave} is already {records[wave]['phase']}; launch refused")
 
 
+_INVISIBLE = ("Cc", "Cf", "Cs", "Cn", "Zs", "Zl", "Zp")  # controls, format (BOM, ZWSP), separators
+
+
 def read_prompt(path):
-    """The task text of a prompt file: a readable regular file, valid UTF-8, not just whitespace.
+    """The task text of a prompt file: a readable regular file, valid UTF-8, with at least one
+    visible character (BOM, zero-width and control characters alone are empty).
     Anything else is refused with the reason, so a launch never sends only the dispatcher's
     header nor fails after the session and the launch intent already exist."""
-    if not path.is_file():
-        raise SystemExit(f"wab: prompt file {path} not found; launch refused")
+    path = pathlib.Path(path)
     try:
-        raw = path.read_bytes()
+        target = path.resolve(strict=True)
+    except FileNotFoundError:
+        why = "is a broken symlink" if path.is_symlink() else "not found"
+        raise SystemExit(f"wab: prompt file {path} {why}; launch refused")
+    except (OSError, RuntimeError) as e:  # a symlink loop, no permission on a parent
+        raise SystemExit(f"wab: prompt file {path}: cannot resolve the path ({e}); launch refused")
+    if not target.is_file():
+        raise SystemExit(f"wab: prompt file {path} is not a regular file; launch refused")
+    try:
+        raw = target.read_bytes()
     except OSError as e:
         raise SystemExit(f"wab: cannot read prompt file {path} ({e.strerror or type(e).__name__}); launch refused")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as e:
         raise SystemExit(f"wab: prompt file {path} is not valid UTF-8 (byte {e.start}); launch refused")
-    if not text.strip():
-        raise SystemExit(f"wab: prompt file {path} is empty (only whitespace); launch refused")
-    return text.strip()
+    if all(unicodedata.category(c) in _INVISIBLE for c in text):
+        raise SystemExit(f"wab: prompt file {path} is empty (only whitespace or invisible characters); "
+                         f"launch refused")
+    return text.lstrip("\ufeff").strip()
 
 
 def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     require_tmux()
     if wave not in cfg["waves"]:
         raise SystemExit(f"unknown wave {wave}; chain.json waves: {cfg['waves']}")
-    prompt_path = pathlib.Path(prompt_file).resolve()
-    read_prompt(prompt_path)  # before anything is prepared, saved or started
+    # the checked text, read BEFORE anything is prepared, saved or started and before the workdir
+    # is switched: the file may live in the previous wave's checkout and change or vanish with it
+    prompt_text = read_prompt(prompt_file)
     st = load_state(cfg)
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
     _check_launch_allowed(cfg, st, wave, name)
@@ -1089,6 +1145,18 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     sid = str(uuid.uuid4())  # known up front: the transcript is bound to the wave by session id
     (wdir / "status").write_text("STARTING\n", encoding="utf-8")  # the wave has not started yet
     system_prompt(cfg)
+    # after the last refusal, before the intent: delivery and recovery read only this copy
+    prompt_copy = wdir / "prompt.md"
+    fd, tmp = tempfile.mkstemp(dir=wdir, prefix=".prompt.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(prompt_text + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, prompt_copy)
+    except BaseException:
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        raise
     # the intent is saved BEFORE tmux is touched: a restart finds the wave and its session id
     st["current"] = wave
     st.pop("stopped", None)
@@ -1102,7 +1170,7 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
         attempts.append({k: v for k, v in old.items() if k not in ("attempts", "outbox")})
     st["waves"][wave] = {"tmux": name, "cwd": cwd, "started": time.time(), "restarts": 0,
                          "phase": "launching", "notified": {}, "sessions": [sid],
-                         "prompt_file": str(prompt_path)}
+                         "prompt_file": str(prompt_copy), "prompt_source": str(prompt_file)}
     if attempts:
         st["waves"][wave]["attempts"] = attempts  # the earlier try is kept, not overwritten
     if carried:
@@ -1227,14 +1295,21 @@ def deliver_first_prompt(cfg, st, wave):
             return False  # phase `sending` stays on disk; a restart will not resend blindly
     except _WindowGone:
         return False
+    _started(cfg, st, wave)
+    return True
+
+
+def _started(cfg, st, wave):
+    """sending -> running after the task reached the window: the phase, the «started» mark and its
+    notice in one save, then the event. The normal path and the Enter-only recovery share it."""
+    w = st["waves"][wave]
     w["phase"] = "running"
     if once_per(w, "started", "1"):
         put_notice(w, "started", "1",
-                   f"wave-autobot: стартовала волна {wave}.\nСмотреть: {attach_cmd(name)}\n(выйти: Ctrl-b d)")
+                   f"wave-autobot: стартовала волна {wave}.\nСмотреть: {attach_cmd(w['tmux'])}\n(выйти: Ctrl-b d)")
     save_state(cfg, st)
-    event(cfg, f"{wave}: launched in tmux {name}, cwd {cwd}")
+    event(cfg, f"{wave}: launched in tmux {w['tmux']}, cwd {w['cwd']}")
     flush_notices(cfg, st, w)
-    return True
 
 
 # ---------- supervision ----------
@@ -1281,8 +1356,7 @@ def advance_pending(cfg, st):
     elif phase == "sending" and w.get("pending_enter") == "first prompt":
         event(cfg, f"{wave}: resumed in phase 'sending': the text is typed, pressing only Enter")
         if _deliver(cfg, st, wave, "first prompt", send_text, ""):
-            w["phase"] = "running"
-            save_state(cfg, st)
+            _started(cfg, st, wave)
     elif phase == "sending":
         event(cfg, f"{wave}: resumed in phase 'sending': unknown whether the task was delivered, "
                    f"NOT resent")
@@ -1791,6 +1865,9 @@ def _watch(cfg, path, max_ticks=None):
             fresh = load_chain(path)  # thresholds can be tuned live
         except SystemExit as e:
             event(cfg, f"chain.json not re-read, keeping the previous settings: {e}")
+        except Exception as e:  # noqa: BLE001 - load_chain refuses with SystemExit; anything else is a
+            # bug, and a live edit must still never kill the supervision
+            event(cfg, f"chain.json not re-read, keeping the previous settings: {type(e).__name__}: {e}")
         else:
             changed = sorted(k for k in set(pinned) | set(_identity(fresh)) if pinned.get(k) != _identity(fresh).get(k))
             if changed:

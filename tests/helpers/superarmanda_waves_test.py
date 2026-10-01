@@ -1770,7 +1770,9 @@ class TickAdvancesPendingTransitions(Base):
         self.assertEqual(self.w(cfg)["phase"], "running")
         self.assertNotIn("pending_enter", self.w(cfg))
         wab.tick(cfg, wab.load_state(cfg))
-        self.assertEqual((self.enters, len(self.tg)), (["wv-w1"], 1))
+        # round 30: the Enter-only recovery finishes the start like the normal path («стартовала» once)
+        self.assertEqual((self.enters, len(self.tg)), (["wv-w1"], 2))
+        self.assertIn("стартовала волна W1", self.tg[-1])
 
     def test_sending_without_pending_enter_is_not_resent_and_goes_on(self):
         cfg, _ = self.chain()
@@ -4289,6 +4291,336 @@ class W4Round29PromptFile(Base):
         with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
             self.assertTrue(wab.launch(cfg, "W1", p))
         self.assertIn("задача", self.sent[-1][2])
+
+
+class W4Round30ChainTypes(Base):
+    """Round 30: every chain.json field is type-checked by load_chain (SystemExit with the reason,
+    never TypeError/ValueError later), and a live edit with a wrong type keeps `watch` alive with
+    the previous settings."""
+
+    BAD = {
+        "chain": [5, ["demo"], {"a": 1}, True],
+        "run_id": [20261001, ["r"], {"a": 1}, True],
+        "run_dir": [5, ["x"], {"a": 1}, True, "a\x00b"],
+        "workdir": [5, ["x"], {"a": 1}, True, "a\x00b"],
+        "repo": [5, ["o/r"], {"a": 1}, True],
+        "tmux_prefix": [5, ["wv-"], True],
+        "telegram": [True, "kv", [1], [], 0, ""],
+        "titles": [["x"], "x", {"W1": 5}],
+        "model": [5, ["m"], True],
+        "base_branch": [5, ["main"], True],
+        "merge_gate": [5, ["external"], True],
+        "waves": ["W1", {"W1": 1}, [1]],
+        "mandate_sha256": [5, ["a" * 64]],
+        "ctx_limit": ["x", [1], {"a": 1}, True],
+        "idle_minutes": ["x", [1]],
+        "handoff_timeout_minutes": ["x", {}],
+        "tick_seconds": ["1", [1]],
+    }
+
+    def test_every_field_with_a_wrong_type_is_a_clear_refusal(self):
+        for field, values in self.BAD.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    try:
+                        self.chain(**{field: value})
+                    except SystemExit as e:
+                        self.assertIn("chain.json", str(e))
+                        self.assertIn(field, str(e))
+                    except Exception as e:  # noqa: BLE001
+                        self.fail(f"{field}={value!r}: {type(e).__name__}: {e}")
+                    else:
+                        self.fail(f"{field}={value!r} was accepted")
+
+    def test_correct_types_still_load(self):
+        cfg, _ = self.chain(run_dir="rd", workdir=self.cwd, repo="o/r", model="m", base_branch="main",
+                            merge_gate="external", titles={"W1": "x"}, telegram=False,
+                            mandate_sha256="a" * 64, idle_minutes=0)
+        self.assertTrue(str(cfg["run_dir"]).endswith(f"rd/{CHAIN}/{RUN_ID}"))
+        for tg in (False, {}):
+            with self.subTest(telegram=tg):
+                self.chain(telegram=tg)
+
+    def run_watch(self, cfg, path, on_first_tick, ticks=3):
+        seen = []
+
+        def fake_tick(c, st):
+            seen.append((str(c["run_dir"]), c["ctx_limit"]))
+            if len(seen) == 1:
+                on_first_tick()
+            return True
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "tick", side_effect=fake_tick):
+            try:
+                wab.watch(cfg, path, max_ticks=ticks)
+                exit_ = None
+            except SystemExit as e:
+                exit_ = str(e)
+        return seen, exit_
+
+    def test_live_edit_with_a_wrong_type_keeps_watch_alive_and_the_old_settings(self):
+        for field, values in self.BAD.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    cfg, path = self.chain()
+                    self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                    log = cfg["run_dir"] / "events.log"
+                    if log.exists():
+                        log.unlink()
+
+                    def edit():
+                        doc = json.loads(path.read_text(encoding="utf-8"))
+                        doc["ctx_limit"] = 111  # a good change in the same edit is not applied either
+                        doc[field] = value
+                        path.write_text(json.dumps(doc), encoding="utf-8")
+                    seen, exit_ = self.run_watch(cfg, path, edit)
+                    self.assertIsNone(exit_)
+                    self.assertEqual(len(seen), 3)
+                    self.assertEqual({c for _, c in seen}, {300000})
+                    self.assertEqual({r for r, _ in seen}, {str(cfg["run_dir"])})
+                    self.assertIn("chain.json not re-read", log.read_text(encoding="utf-8"))
+
+    def test_watch_survives_an_unexpected_error_while_reloading(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        real = wab.load_chain
+        calls = []
+
+        def boom(p, create=True):
+            calls.append(p)
+            if len(calls) == 1:
+                raise TypeError("unexpected")
+            return real(p, create)
+        with mock.patch.object(wab, "load_chain", side_effect=boom):
+            seen, exit_ = self.run_watch(cfg, path, lambda: None)
+        self.assertIsNone(exit_)
+        self.assertEqual(len(seen), 3)
+        self.assertIn("TypeError", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+
+class W4Round30PromptCopy(Base):
+    """Round 30: the checked prompt text is kept as an unchanged copy in the wave directory before
+    the workdir is switched and before the launch intent is saved; delivery and recovery read only
+    the copy."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(wab, "prepare_clone", return_value=self.cwd)
+        p.start()
+        self.addCleanup(p.stop)
+        self.cfg, _ = self.chain(workdir=self.cwd)
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="done")}})
+        self.prompt = Path(self.cwd) / "next-prompt.md"  # lives in the previous wave's checkout
+        self.prompt.write_text("исходная задача W2\n", encoding="utf-8")
+        self.alive = False
+
+    def switch(self, how):
+        def refresh(cfg, wave, cwd):
+            if how == "change":
+                self.prompt.write_text("ЧУЖОЙ текст из базовой ветки\n", encoding="utf-8")
+            else:
+                self.prompt.unlink()
+        return mock.patch.object(wab, "refresh_workdir", side_effect=refresh)
+
+    def assert_original_sent(self):
+        self.assertIn("исходная задача W2", self.sent[-1][2])
+        self.assertNotIn("ЧУЖОЙ", self.sent[-1][2])
+        rec = self.get_state(self.cfg)["waves"]["W2"]
+        copy = wab.wave_dir(self.cfg, "W2") / "prompt.md"
+        self.assertEqual(rec["prompt_file"], str(copy))
+        self.assertIn("исходная задача W2", copy.read_text(encoding="utf-8"))
+
+    def test_prompt_changed_by_the_switch_is_delivered_as_checked(self):
+        with self.switch("change"):
+            self.assertTrue(wab.launch(self.cfg, "W2", self.prompt))
+        self.assert_original_sent()
+
+    def test_prompt_removed_by_the_switch_is_delivered_as_checked(self):
+        with self.switch("remove"):
+            self.assertTrue(wab.launch(self.cfg, "W2", self.prompt))
+        self.assert_original_sent()
+
+    def test_recovery_after_a_crash_between_intent_and_send_uses_the_same_text(self):
+        with self.switch("change"), mock.patch.object(wab, "start_session", side_effect=_Crash):
+            with self.assertRaises(_Crash):
+                wab.launch(self.cfg, "W2", self.prompt)
+        self.assertEqual(self.get_state(self.cfg)["waves"]["W2"]["phase"], "launching")
+        self.prompt.write_text("ещё один ЧУЖОЙ текст\n", encoding="utf-8")
+        self.alive = True
+        with mock.patch.object(wab, "drop_stale_btab"):
+            wab.resume(self.cfg, wab.load_state(self.cfg))
+        self.assert_original_sent()
+
+    def test_a_refused_launch_leaves_no_copy(self):
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="running")}})
+        with self.assertRaises(SystemExit):
+            wab.launch(self.cfg, "W2", self.prompt)
+        self.assertFalse((self.cfg["run_dir"] / "W2" / "prompt.md").exists())
+
+
+class W4Round30PromptEdges(Base):
+    """Round 30 (tester P3): symlink loop, directory, dangling symlink and invisible-only text are
+    clean refusals before anything is prepared."""
+
+    def refused(self, path):
+        cfg, _ = self.chain()
+        self.alive = False
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd) as prep:
+            try:
+                wab.launch(cfg, "W1", path)
+            except SystemExit as e:
+                msg = str(e)
+            except Exception as e:  # noqa: BLE001
+                self.fail(f"{type(e).__name__}: {e}")
+            else:
+                self.fail("launched")
+        self.assertFalse(prep.called)
+        self.assertEqual(self.sent, [])
+        self.assertIn("prompt", msg)
+        return msg
+
+    def test_symlink_loop(self):
+        p = self.tmp / "loop.md"
+        p.symlink_to(p)
+        self.assertIn("cannot resolve", self.refused(p))
+
+    def test_directory_is_not_a_file(self):
+        d = self.tmp / "dir.md"
+        d.mkdir()
+        self.assertIn("not a regular file", self.refused(d))
+
+    def test_dangling_symlink(self):
+        p = self.tmp / "dangling.md"
+        p.symlink_to(self.tmp / "nowhere.md")
+        self.assertIn("broken symlink", self.refused(p))
+
+    def test_missing_file(self):
+        self.assertIn("not found", self.refused(self.tmp / "absent.md"))
+
+    def test_invisible_only_text_is_empty(self):
+        for raw in (b"\xef\xbb\xbf", "​​\n".encode(), b"\x00\x00\n",
+                    "﻿ ​⁠­\x00　\n".encode()):
+            with self.subTest(raw=raw):
+                p = self.tmp / "p.md"
+                p.write_bytes(raw)
+                self.assertIn("empty", self.refused(p))
+
+    def test_bom_before_real_text_launches_without_the_bom(self):
+        cfg, _ = self.chain()
+        p = self.tmp / "p.md"
+        p.write_bytes("﻿задача\n".encode())
+        self.alive = False
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            self.assertTrue(wab.launch(cfg, "W1", p))
+        self.assertIn("задача", self.sent[-1][2])
+        self.assertNotIn("﻿", self.sent[-1][2])
+
+
+def _outbox_violations(src):
+    """Writers of the outbox outside the notice functions, and put_notice used as a value."""
+    import ast
+    allowed = {"put_notice", "drop_notice", "drop_ended_episodes", "ack_wave_notices", "flush_notices",
+               "pending_notices", "_launch"}
+    tree = ast.parse(src)
+    parent = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and node.value == "outbox":
+            fn = node
+            while fn is not None and not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                fn = parent.get(fn)
+            if fn is None or fn.name not in allowed:
+                bad.append(f"'outbox' in {fn.name if fn else '<module>'} line {node.lineno}")
+        if isinstance(node, ast.Name) and node.id == "put_notice":
+            up = parent.get(node)
+            if not (isinstance(up, ast.Call) and up.func is node):
+                bad.append(f"put_notice used as a value at line {node.lineno}")
+        if isinstance(node, ast.Attribute) and node.attr == "put_notice":
+            up = parent.get(node)
+            if not (isinstance(up, ast.Call) and up.func is node):
+                bad.append(f"put_notice used as a value at line {node.lineno}")
+    return bad
+
+
+class W4Round30NoticeGuard(Base):
+    """Round 30 (tester P3): the completeness test of NOTICE_EPISODE_ENDS cannot be bypassed: the
+    outbox is touched only by the notice functions, put_notice is never aliased, and a key without
+    an episode end is refused at run time."""
+
+    def test_put_notice_refuses_a_key_without_an_episode_end(self):
+        with self.assertRaises(ValueError):
+            wab.put_notice({}, "bogus_key", "1", "text")
+
+    def test_outbox_is_touched_only_by_the_notice_functions(self):
+        self.assertEqual(_outbox_violations((WAVES / "wab.py").read_text(encoding="utf-8")), [])
+
+    def test_the_guard_sees_aliases_and_direct_writes(self):
+        src = ("def put_notice(w, k, v, t):\n    pass\n"
+               "def f(w):\n    send = put_notice\n    w['outbox'] = {}\n"
+               "def g(w):\n    w.setdefault('outbox', {})['x'] = 1\n"
+               "def h(m, w):\n    import functools\n    functools.partial(m.put_notice, w)\n")
+        self.assertEqual(len(_outbox_violations(src)), 4, _outbox_violations(src))
+
+
+class W4Round30Redact(Base):
+    """Round 30 (Codex P1): a dashed token of only hex (UUID, hex keys) and a long letters+digits
+    segment are masked; kebab words and paths stay readable."""
+
+    def test_dashed_hex_and_long_mixed_segments_are_masked(self):
+        for tok in ("01234567-89ab-cdef-0123-456789abcdefabcd",
+                    "123e4567-e89b-12d3-a456-426614174000",
+                    "A1B2C3D4-E5F6-A7B8-C9D0-E1F2A3B4C5D6",
+                    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+                    "build-x7k2m9q4w8e1r5t3y6u0-and-more-stuff-here"):
+            for text in (tok, f"key {tok} end", f"id={tok}"):
+                with self.subTest(text=text):
+                    out = wab.redact(text)
+                    self.assertNotIn(tok, out)
+                    self.assertIn("[скрыто]", out)
+
+    def test_paths_kebab_words_and_labelled_shas_survive(self):
+        keep = ["wave-autobot/runs/superarmanda-waves/2026-10-01/W4/sa/coder-report.md",
+                "superarmanda-waves", "feat/waves-dispatcher", "cc-admission-abcd1234/checkout",
+                "2026-10-01-2026-10-02", "deadbeef-cafe", "sha 3f2a9c1d4e5b6a7988776655443322110099aabb",
+                "superarmanda-waves-dispatcher-and-dashboard"]
+        for text in keep:
+            with self.subTest(text=text):
+                self.assertEqual(wab.redact(text), text)
+
+
+class W4Round30PendingEnterStarted(Base):
+    """Round 30 (Codex P2): recovery that only presses Enter for the first prompt finishes the start
+    exactly like the normal path: the «started» mark, notice and event in one save."""
+
+    def test_crash_after_the_text_and_before_enter_still_reports_the_start_once(self):
+        cfg, path = self.chain()
+        p = self.tmp / "p.md"
+        p.write_text("do it\n", encoding="utf-8")
+
+        def typed_then_crash(name, text, on_typed=None, **kw):
+            self.sent.append(("text", name, text))
+            on_typed()
+            raise _Crash()
+        self.alive = False
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd), \
+                mock.patch.object(wab, "send_text", side_effect=typed_then_crash):
+            with self.assertRaises(_Crash):
+                wab.launch(cfg, "W1", p)
+        rec = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual((rec["phase"], rec.get("pending_enter")), ("sending", "first prompt"))
+        self.assertEqual(self.tg, [])
+        self.alive = True
+        with mock.patch.object(wab, "drop_stale_btab"):
+            wab.resume(cfg, wab.load_state(cfg))
+            wab.resume(cfg, wab.load_state(cfg))
+        self.assertEqual(len(self.enters), 1)
+        rec = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(rec["phase"], "running")
+        self.assertEqual(rec["notified"].get("started"), "1")
+        self.assertEqual(len([t for t in self.tg if "стартовала волна W1" in t]), 1, self.tg)
+        self.assertIn("W1: launched in tmux", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
 
 class TmuxGuard(unittest.TestCase):
