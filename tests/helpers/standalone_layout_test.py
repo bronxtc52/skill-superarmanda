@@ -15,6 +15,7 @@ EXPECTED_FILES = {
     "references/workflow.md",
     "references/review-contract.md",
     "references/pr-review.md",
+    "references/waves.md",
     "schemas/review-result.schema.json",
     "scripts/state.py",
     "scripts/review.py",
