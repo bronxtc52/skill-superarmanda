@@ -528,7 +528,7 @@ def redact(text, limit=TG_LIMIT):
     for rx in _REDACT:
         text = rx.sub(lambda m: (m.group(1) + m.group(2) + "[скрыто]") if rx.groups >= 2 and m.group(2)
                       else m.group(0) if re.fullmatch(r"[0-9a-fA-F]{40,64}", m.group(0)) else "[скрыто]", text)
-    return text if len(text) <= limit else text[:limit].rstrip() + " …"
+    return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
 
 
 def _secret(vault, name):

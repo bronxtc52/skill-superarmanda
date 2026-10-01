@@ -569,8 +569,14 @@ class Redaction(Base):
 
     def test_limits(self):
         long = "слово " * 400
-        self.assertLessEqual(len(wab.redact(long)), 602)
-        self.assertLessEqual(len(wab.redact(long, 1200)), 1202)
+        self.assertLessEqual(len(wab.redact(long)), 600)
+        self.assertLessEqual(len(wab.redact(long, 1200)), 1200)
+        for body in (("x" * 39 + " ") * 200, "я" * 5000, "ab " * 2000, "слово " * 400):
+            for limit in (120, 600, 1200):
+                with self.subTest(body=body[:6], limit=limit):
+                    out = wab.redact(body, limit)
+                    self.assertLessEqual(len(out), limit)
+                    self.assertTrue(out.endswith("…"))
         self.assertEqual(wab.redact("short"), "short")
 
     def test_notify_redacts_and_caps_the_whole_message(self):
@@ -578,7 +584,7 @@ class Redaction(Base):
         wab.notify(cfg, "leak password=hunter2hunter2 " + "я" * 3000)
         self.assertEqual(len(self.tg), 1)
         self.assertNotIn("hunter2hunter2", self.tg[0])
-        self.assertLessEqual(len(self.tg[0]), 1202)
+        self.assertLessEqual(len(self.tg[0]), 1200)
 
     def test_quoted_wave_text_is_capped_at_600(self):
         cfg, _ = self.chain()
@@ -588,7 +594,7 @@ class Redaction(Base):
         with mock.patch.object(wab, "launch"):
             wab.tick(cfg, wab.load_state(cfg))
         self.assertTrue(self.tg)
-        self.assertLess(self.tg[0].count("ж"), 620)
+        self.assertLessEqual(self.tg[0].count("ж"), 600)
 
     def test_telegram_without_config_is_skipped_with_an_event(self):
         for value in (None, False, {}):
