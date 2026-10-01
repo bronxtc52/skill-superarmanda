@@ -24,6 +24,7 @@ EXPECTED_FILES = {
     "scripts/install-skill.py",
     "scripts/waves/wab.py",
     "scripts/waves/dash.py",
+    "scripts/waves/gate.py",
     "scripts/waves/PROTOCOL.md",
     "scripts/waves/wab-open",
 }

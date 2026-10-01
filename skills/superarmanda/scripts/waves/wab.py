@@ -38,6 +38,10 @@ import urllib.request
 import uuid
 
 HERE = pathlib.Path(__file__).resolve().parent
+if str(HERE) not in sys.path:  # gate.py lies next to this file, also when it is loaded by path
+    sys.path.insert(0, str(HERE))
+import gate  # noqa: E402  (stdlib only, like this module)
+
 PROTOCOL = HERE / "PROTOCOL.md"
 MIN_TMUX = (3, 2)
 PERMISSION_MARKERS = ("Do you want to proceed", "Do you want to make this edit",
@@ -59,9 +63,12 @@ def projects_dir():
 # ---------- config and state ----------
 
 # Upper bounds: a day of minutes, an hour between ticks, ten million tokens are already absurd.
-# The merge gate (wait for MERGED, fetch the base, ancestor check) is W5. Until it exists a DONE of a
-# non-last wave never launches the next one by itself: it is handed to the coordinator like `external`.
-MERGE_GATE_IMPLEMENTED = False
+# merge_gate: absent/"" - a DONE of a non-last wave is handed to the coordinator (like `external`);
+# "external" - the same plus the gate verdict in the hand-off; "auto" - the dispatcher runs the gate,
+# merges and launches the next wave itself (see «merge gate» below).
+MERGE_GATES = (None, "", "external", "auto")
+GATE_POLL_SECONDS = 60    # the merge gate / the wait for MERGED is asked no more often than this
+ALARM_POLL_SECONDS = 120  # the alarm of a running wave: GitHub is asked no more often than this
 
 NUM_LIMITS = {"ctx_limit": 10_000_000, "idle_minutes": 1440, "handoff_timeout_minutes": 1440,
               "tick_seconds": 3600}
@@ -164,8 +171,11 @@ def load_chain(path, create=True):
     if "base_branch" in cfg and not (isinstance(cfg["base_branch"], str) and cfg["base_branch"].strip()
                                      and not cfg["base_branch"].startswith("-")):
         raise SystemExit(f"chain.json: base_branch must be a non-empty branch name, got {cfg['base_branch']!r}")
-    if cfg.get("merge_gate") not in (None, "", "external"):
-        raise SystemExit(f"chain.json: merge_gate must be absent or \"external\", got {cfg['merge_gate']!r}")
+    if cfg.get("merge_gate") not in MERGE_GATES:
+        raise SystemExit(f"chain.json: merge_gate must be absent, \"external\" or \"auto\", "
+                         f"got {cfg['merge_gate']!r}")
+    if cfg.get("merge_gate") == "auto" and not cfg.get("repo"):
+        raise SystemExit("chain.json: merge_gate \"auto\" needs repo (owner/name) to find the PR and merge it")
     waves = cfg.get("waves")
     if (not isinstance(waves, list) or not waves
             or not all(isinstance(w, str) and WAVE_NAME.fullmatch(w) for w in waves)):
@@ -864,6 +874,8 @@ def _status(w):
 #   permission, idle, auto_off   window gone   # + SCREEN_EPISODE_ENDS: the prompt left the screen /
 #                                              #   the pane moved / auto mode is back
 #   handoff             the phase left awaiting_merge (the coordinator confirmed it); + ack
+#   merge_owner, merge_refused   the phase left merging (the PR is merged, or the wave goes on)
+#   merge_stopped       the phase left awaiting_merge (the coordinator took over); + ack
 #   done, no_next, launch_refused   None: only the coordinator's confirmation (ack)
 #   chain_done          None and kept even on ack: the end of the chain must get through
 NOTICE_EPISODE_ENDS = {
@@ -880,6 +892,9 @@ NOTICE_EPISODE_ENDS = {
     "idle": _gone,
     "auto_off": _gone,
     "handoff": lambda w: w.get("phase") != "awaiting_merge",
+    "merge_owner": lambda w: w.get("phase") != "merging",
+    "merge_refused": lambda w: w.get("phase") != "merging",
+    "merge_stopped": lambda w: w.get("phase") != "awaiting_merge",
     "done": None,
     "no_next": None,
     "launch_refused": None,
@@ -1838,6 +1853,393 @@ def _launch_refused(cfg, st, wave, nxt, why):
     flush_notices(cfg, st, w)
 
 
+# ---------- merge gate and alarm (W5) ----------
+#
+# `merge_gate: auto`: a DONE wave is not closed. Phase `gate`: every GATE_POLL_SECONDS the facts
+# (GitHub API + the manifest + the wave's working copy) go through gate.evaluate:
+#   wait  - one event per reason, nothing else;
+#   fail  - status `BLOCKED: merge gate: <reasons>`, the reasons into the wave's window, phase
+#           `running` (the usual BLOCKED notice follows; the wave fixes and writes DONE again);
+#   pass  - the head the verdict is about is kept (`gate_sha`, `gate_pr`) and the phase is `merging`:
+#           no open threads -> `gh pr merge --squash --match-head-commit <sha>` (at most once per sha,
+#           the mark is saved BEFORE the call); open threads -> a script for the owner, nothing is merged.
+# Phase `merging` waits for the PR to be MERGED with exactly `gate_sha` as its head, then the wave is
+# completed like any DONE (window closed, next wave launched or the chain finished). Everything that
+# reaches GitHub goes through gh_api, gh_graphql, find_pr, gate_facts, workdir_state, read_manifest
+# and `sh`, so tests replace them.
+
+GH_TIMEOUT = 60
+MAX_STATUS = 500
+
+
+def _gh(*args, timeout=GH_TIMEOUT):
+    try:
+        r = sh("gh", *args, check=False, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise gate.CollectError(f"gh {args[0]}: {type(e).__name__}")
+    if r.returncode != 0:
+        why = (r.stderr or r.stdout or "").strip().replace("\n", " ")[:200] or f"rc={r.returncode}"
+        raise gate.CollectError(f"gh {' '.join(args[:2])}: {why}")
+    return r.stdout
+
+
+def _json(text, what):
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise gate.CollectError(f"{what}: not JSON")
+
+
+def gh_api(path):
+    return _json(_gh("api", path), f"gh api {path.split('?')[0]}")
+
+
+def gh_graphql(query, variables):
+    argv = ["api", "graphql", "-f", f"query={query}"]
+    for key, value in variables.items():  # -F types a number, -f keeps a string
+        argv += ["-F" if isinstance(value, int) and not isinstance(value, bool) else "-f", f"{key}={value}"]
+    return _json(_gh(*argv), "gh api graphql")
+
+
+def find_pr(cfg, cwd):
+    """The PR of the wave's branch (the branch of its working copy): an open one, else the newest.
+    None: no branch yet or no PR; CollectError: gh could not tell."""
+    repo = cfg.get("repo")
+    if not repo:
+        raise gate.CollectError("repo is not set in chain.json")
+    try:
+        r = sh("git", "-C", str(cwd), "symbolic-ref", "--short", "-q", "HEAD", check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise gate.CollectError(f"git: {type(e).__name__}")
+    branch = r.stdout.strip()
+    if r.returncode != 0 or not branch:
+        return None  # detached HEAD: the wave has not made its branch yet
+    items = _json(_gh("pr", "list", "--repo", repo, "--head", branch, "--state", "all", "--json",
+                      "number,headRefOid,isDraft,state"), "gh pr list")
+    items = [i for i in items if isinstance(i, dict) and isinstance(i.get("number"), int)
+             and isinstance(i.get("headRefOid"), str)] if isinstance(items, list) else []
+    pool = [i for i in items if i.get("state") == "OPEN"] or items
+    return max(pool, key=lambda i: i["number"]) if pool else None
+
+
+def gate_facts(cfg, pr):
+    return gate.gather(cfg["repo"], pr["number"], pr["headRefOid"], gh_api, gh_graphql)
+
+
+def workdir_state(cwd):
+    """{clean, head, fingerprint} of the wave's working copy; what cannot be read is False/None."""
+    try:
+        r = sh("git", "-C", str(cwd), "status", "--porcelain", check=False, timeout=GIT_TIMEOUT)
+        clean = r.returncode == 0 and not r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        clean = False
+    try:
+        fingerprint = gate.fingerprint(cwd)
+    except (SystemExit, Exception):  # state.py refuses with SystemExit; nothing may stop the watch
+        fingerprint = None
+    return {"clean": clean, "head": head_rev(cwd), "fingerprint": fingerprint}
+
+
+def read_manifest(cfg, wave):
+    """<wave dir>/superarmanda/manifest.json as written by state.py; None when it cannot be read."""
+    try:
+        data = json.loads((cfg["run_dir"] / wave / "superarmanda" / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def gate_check(cfg, wave, w):
+    """The verdict of the merge gate for the wave's PR. Never raises: whatever goes wrong is a
+    `wait` (and never a `pass`)."""
+    base = {"pr": {}, "head": None, "unresolved": [], "draft": False, "number": None}
+    try:
+        pr = find_pr(cfg, w["cwd"])
+        if pr is None:
+            return dict(base, verdict="fail", reasons=["PR ветки волны не найден"])
+        v = gate.evaluate(gate_facts(cfg, pr), pr["headRefOid"], read_manifest(cfg, wave), workdir_state(w["cwd"]))
+        v["number"] = pr["number"]
+        return v
+    except gate.CollectError as e:
+        return dict(base, verdict="wait", reasons=[f"сбор фактов: {e}"])
+    except Exception as e:  # noqa: BLE001 - fail closed: an unexpected error is a wait, never a pass
+        return dict(base, verdict="wait", reasons=[f"гейт: {type(e).__name__}: {e}"])
+
+
+def _one_line(text, limit=MAX_STATUS):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
+
+
+def _write_status(wdir, text):
+    """The dispatcher's own status line, atomically (the wave may read the file at any moment)."""
+    fd, tmp = tempfile.mkstemp(dir=wdir, prefix=".status.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(_one_line(text) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, wdir / "status")
+    except BaseException:
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        raise
+    return _one_line(text)
+
+
+def write_owner_script(cfg, wave, number, sha, thread_ids):
+    """~/.cache/wab/<chain>-<wave>-merge: executable by the owner only. Returns its path."""
+    text = gate.owner_script(cfg["repo"], number, sha, thread_ids)
+    folder = pathlib.Path.home() / ".cache" / "wab"
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = folder / f"{cfg['chain']}-{wave}-merge"
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".merge.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o700)
+        os.replace(tmp, path)
+    except BaseException:
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        raise
+    return path
+
+
+def handoff_gate_line(cfg, wave, w):
+    """One line for the hand-off notice of `merge_gate: external`: the verdict and, when the gate
+    passed, the command (or the owner's script). Best effort: nothing here may stop the hand-off."""
+    try:
+        v = gate_check(cfg, wave, w)
+        reasons = _one_line("; ".join(v["reasons"]), 300)
+        if v["verdict"] == "wait" and reasons.startswith("сбор фактов"):
+            return f"Гейт мерджа не проверен: {reasons}"
+        if v["verdict"] != "pass":
+            return f"Гейт мерджа {'ждёт' if v['verdict'] == 'wait' else 'не пройден'}: {reasons}"
+        number, sha = v["number"], v["head"]
+        if v["unresolved"]:
+            path = write_owner_script(cfg, wave, number, sha, v["unresolved"])
+            return (f"Гейт мерджа пройден, но есть незакрытые треды ({len(v['unresolved'])}). "
+                    f"Выполни: {path}")
+        command = gate.merge_command(cfg["repo"], number, sha)
+        if v["draft"]:
+            command = f"{gate.ready_command(cfg['repo'], number)} && {command}"
+        return f"Гейт мерджа пройден. Мердж: {command}"
+    except Exception as e:  # noqa: BLE001
+        return f"Гейт мерджа не проверен: {type(e).__name__}: {_one_line(e, 200)}"
+
+
+def _gate_tick(cfg, st, wave, w, wdir, now):
+    if w.get("phase") != "gate":
+        w["phase"] = "gate"  # the window stays open: the wave may be asked to fix something
+        save_state(cfg, st)
+    if now - (w.get("gate_at") or 0) < GATE_POLL_SECONDS:
+        return True
+    w["gate_at"] = now
+    v = gate_check(cfg, wave, w)
+    reasons = "; ".join(v["reasons"])
+    if v["verdict"] == "wait":
+        if once_per(w, "gate_wait", reasons):
+            event(cfg, f"{wave}: merge gate waits: {reasons}")
+        save_state(cfg, st)
+        return True
+    w.get("notified", {}).pop("gate_wait", None)
+    if v["verdict"] == "fail":
+        return _gate_failed(cfg, st, wave, w, wdir, reasons)
+    return _gate_passed(cfg, st, wave, w, wdir, v)
+
+
+def _gate_failed(cfg, st, wave, w, wdir, reasons):
+    w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate: {reasons}")
+    w["phase"] = "running"  # the wave goes on; its next DONE is gated again
+    save_state(cfg, st)
+    event(cfg, f"{wave}: merge gate failed: {reasons}")
+    _deliver(cfg, st, wave, "gate failure", send_text,
+             f"[wab] Гейт мерджа не пройден: {_one_line(reasons, 1500)}. Исправь причину, при необходимости "
+             f"перезапиши manifest и снова запиши DONE в $WAB_DIR/status (или BLOCKED с вопросом).")
+    save_state(cfg, st)
+    return True
+
+
+def _gate_passed(cfg, st, wave, w, wdir, v):
+    repo, number, sha = cfg["repo"], v["number"], v["head"]
+    try:
+        merge = gate.merge_command(repo, number, sha)
+    except ValueError as e:
+        return _gate_failed(cfg, st, wave, w, wdir, f"недопустимые repo/PR/sha: {e}")
+    w["gate_sha"], w["gate_pr"] = sha, number
+    w["phase"] = "merging"
+    w["merge_poll_at"] = time.time()
+    unresolved = v["unresolved"]
+    if unresolved:  # the owner closes the threads and merges; nothing is merged here
+        try:
+            path = write_owner_script(cfg, wave, number, sha, unresolved)
+        except (OSError, ValueError) as e:
+            return _gate_failed(cfg, st, wave, w, wdir, f"скрипт владельца не записан: {e}")
+        w["last_status"] = _write_status(
+            wdir, f"BLOCKED: merge gate passed; {len(unresolved)} unresolved review threads; owner runs {path}")
+        put_notice(w, "merge_owner", sha,
+                   f"wave-autobot: волна {wave}: гейт мерджа пройден (PR #{number}, {sha[:12]}), но есть "
+                   f"незакрытые треды ревью: {len(unresolved)}. Сам не мержу.\nВыполни: {path}\n"
+                   f"Скрипт проверит HEAD, закроет треды и смержит PR.")
+        save_state(cfg, st)
+        event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {path}")
+        flush_notices(cfg, st, w)
+        return True
+    if w.get("merge_called") == sha:  # never twice for one sha
+        save_state(cfg, st)
+        return True
+    w["merge_called"] = sha  # saved BEFORE the call: a crash in it must not merge again
+    save_state(cfg, st)
+    steps = ([["gh", "pr", "ready", str(number), "--repo", repo]] if v["draft"] else []) + [gate.merge_argv(repo, number, sha)]
+    refused = None
+    for argv in steps:
+        try:
+            r = sh(*argv, check=False, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            refused = type(e).__name__
+            break
+        if r.returncode != 0:
+            refused = _one_line(r.stderr or r.stdout or f"rc={r.returncode}", 200)
+            break
+    w["merge_rc"] = 0 if refused is None else 1
+    if refused is None:
+        save_state(cfg, st)
+        event(cfg, f"{wave}: merge gate passed, merge of PR #{number} requested at {sha[:12]}")
+        return True
+    command = merge if not v["draft"] else f"{gate.ready_command(repo, number)} && {merge}"
+    w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate passed; merge refused: {refused}")
+    put_notice(w, "merge_refused", sha,
+               f"wave-autobot: волна {wave}: гейт пройден, мердж отклонён: {refused}. Выполни: {command}")
+    save_state(cfg, st)
+    event(cfg, f"{wave}: merge gate passed, merge refused: {refused}")
+    flush_notices(cfg, st, w)
+    return True
+
+
+def _merge_stopped(cfg, st, wave, w, wdir, why, now):
+    """The PR was merged with another head or closed: the next wave is not launched by the
+    dispatcher; the coordinator takes over (awaiting_merge) and decides."""
+    w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate: {why}")
+    w["phase"] = "awaiting_merge"
+    w["finished"] = now
+    w["pending_exit"] = True
+    if once_per(w, "merge_stopped", why):
+        put_notice(w, "merge_stopped", why,
+                   f"wave-autobot: волна {wave}: {why}. Следующую волну не запускаю: проверь PR и реши сам.")
+    save_state(cfg, st)
+    event(cfg, f"{wave}: {why}; next wave NOT launched")
+    flush_notices(cfg, st, w)
+    close_window(cfg, st, w)
+    return False
+
+
+def _merging_tick(cfg, st, wave, w, wdir, now):
+    if now - (w.get("merge_poll_at") or 0) < GATE_POLL_SECONDS:
+        return True
+    w["merge_poll_at"] = now
+    number, sha = w.get("gate_pr"), w.get("gate_sha")
+    if not (isinstance(number, int) and isinstance(sha, str)):
+        return _merge_stopped(cfg, st, wave, w, wdir, "в записи волны нет gate_pr/gate_sha", now)
+    try:
+        info = _json(_gh("pr", "view", str(number), "--repo", str(cfg["repo"]), "--json",
+                         "state,mergeCommit,headRefOid"), "gh pr view")
+        if not isinstance(info, dict):
+            raise gate.CollectError("gh pr view: unexpected response")
+    except gate.CollectError as e:
+        if once_per(w, "merge_view_error", str(e)[:150]):
+            event(cfg, f"{wave}: PR #{number} state not read: {e}")
+        save_state(cfg, st)
+        return True
+    w.get("notified", {}).pop("merge_view_error", None)
+    state = info.get("state")
+    if state == "MERGED":
+        head = info.get("headRefOid")
+        if head != sha:
+            return _merge_stopped(cfg, st, wave, w, wdir,
+                                  f"PR #{number} смержен с HEAD {str(head)[:12]}, а гейт проверял {sha[:12]}", now)
+        return _complete_wave(cfg, st, wave, w, wdir, now)
+    if state == "CLOSED":
+        return _merge_stopped(cfg, st, wave, w, wdir, f"PR #{number} закрыт без мерджа", now)
+    if "merge_rc" not in w and once_per(w, "merge_unknown", sha):
+        event(cfg, f"{wave}: PR #{number} is not merged and the result of the merge call is unknown; waiting")
+    save_state(cfg, st)
+    return True
+
+
+def _alarm_tick(cfg, st, wave, w, now):
+    """A RUNNING wave with an open PR whose checks are all completed and on which Codex has finished
+    gets ONE message per head with the results (so it need not poll them itself)."""
+    if now - (w.get("alarm_at") or 0) < ALARM_POLL_SECONDS:
+        return
+    w["alarm_at"] = now
+    try:
+        pr = find_pr(cfg, w["cwd"])
+        if not pr or pr.get("state") != "OPEN":
+            return
+        head = pr["headRefOid"]
+        facts = gate_facts(cfg, pr)
+    except gate.CollectError as e:
+        if once_per(w, "alarm_error", str(e)[:150]):
+            event(cfg, f"{wave}: alarm: PR facts not collected: {e}")
+        return
+    w.get("notified", {}).pop("alarm_error", None)
+    if facts.get("error"):
+        if once_per(w, "alarm_error", str(facts["error"])[:150]):
+            event(cfg, f"{wave}: alarm: PR facts not collected: {facts['error']}")
+        return
+    if not gate.alarm_ready(facts, head):
+        return
+    if once_per(w, "alarm", head):
+        save_state(cfg, st)  # the mark first: one message per head, even across a restart
+        event(cfg, f"{wave}: alarm: PR #{pr['number']} checks completed and Codex finished at {head[:12]}")
+        if not _deliver(cfg, st, wave, "alarm", send_text, gate.alarm_text(pr["number"], head, facts)):
+            w.get("notified", {}).pop("alarm", None)  # not delivered: the next poll tries again
+
+
+def _complete_wave(cfg, st, wave, w, wdir, now):
+    """The wave's PR is in (merged, or there is nothing to merge): done, window closed, then the
+    chain ends (last wave) or the next wave is launched by the dispatcher. True: the watch goes on."""
+    waves = cfg["waves"]
+    idx = waves.index(wave)
+    nxt = wdir / "next-prompt.md"
+    fresh = once_per(w, "done", "1")  # a restart between this and the next launch must not repeat it
+    if fresh:
+        w["finished"] = now
+        w["pending_exit"] = True  # the intent to close the window, in the same save as the mark
+        put_notice(w, "done", "1",
+                   f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
+                   f"Целиком: {wdir}/result.md")
+    w["phase"] = "done"
+    last = idx + 1 >= len(waves)
+    if last:  # the end of the chain goes into the same save as the mark
+        st["current"] = None
+        put_notice(w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
+    save_state(cfg, st)
+    if fresh:
+        event(cfg, f"{wave}: DONE")
+    close_window(cfg, st, w)
+    if last:
+        event(cfg, "chain finished")
+        flush_notices(cfg, st, w)
+        return False
+    if not nxt.exists():
+        return _stop_without_next(cfg, st, w, wave, now)
+    why = next_prompt_problem(nxt)
+    if why:
+        return _stop_without_next(cfg, st, w, wave, now, why)
+    flush_notices(cfg, st, w)  # «волна завершена» goes out before the next wave starts
+    try:
+        started = launch(cfg, waves[idx + 1], nxt, by_dispatcher=True)
+    except SystemExit as e:  # refused before its intent (previous window alive, admission...)
+        _launch_refused(cfg, st, wave, waves[idx + 1], str(e))
+        return False
+    fresh_st = load_state(cfg)  # launch saved a newer snapshot (new current, new record):
+    st.clear()                  # the caller's dict must not be written back over it
+    st.update(fresh_st)
+    return started
+
+
 def tick(cfg, st):
     try:
         alive = _tick(cfg, st)
@@ -1883,74 +2285,47 @@ def _tick(cfg, st):
         recover_launch(cfg, st, wave)
         return True
 
+    if w.get("phase") == "gate" and status != "DONE":
+        w["phase"] = "running"  # the wave took its DONE back while the gate waited
+    if w.get("phase") == "merging":  # the gate passed: wait for MERGED (whatever the status file says now)
+        return _merging_tick(cfg, st, wave, w, wdir, now)
+
     # DONE first: a wave may finish and close its window between two ticks
-    external = cfg.get("merge_gate") == "external"
+    gate_mode = cfg.get("merge_gate")
+    external = gate_mode == "external"
     waves = cfg["waves"]
     is_last = waves.index(wave) + 1 >= len(waves)
-    if status == "DONE" and (external or (not MERGE_GATE_IMPLEMENTED and not is_last)):
+    if status == "DONE" and gate_mode == "auto" and w.get("phase") != "done":
+        return _gate_tick(cfg, st, wave, w, wdir, now)  # phase `done`: completion was cut short, see below
+    if status == "DONE" and gate_mode != "auto" and (external or not is_last):
         nxt = wdir / "next-prompt.md"
         if not is_last and not nxt.exists():  # the coordinator's launch would fail: stop loudly now
             return _stop_without_next(cfg, st, w, wave, now)
         why = None if is_last else next_prompt_problem(nxt)
         if why:  # present but refused by the same check as the launch: not handed over either
             return _stop_without_next(cfg, st, w, wave, now, why)
+        gate_line = f"{handoff_gate_line(cfg, wave, w)}\n\n" if external else ""
         # the phase and its notice in ONE save: a crash after it still owes the notice (at least once),
         # and the phase stops a second hand-off, so a restart does not queue it twice
         w["phase"] = "awaiting_merge"
         w["finished"] = now
         w["pending_exit"] = True  # the intent to close the window, in the same save as the phase
         put_notice(w, "handoff", "1",
-                   f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n"
+                   f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n{gate_line}"
                    + ("Мердж и запуск следующей волны — за координатором." if not is_last else
                       f"Мердж последнего PR и завершение цепочки (wab.py done) — за координатором."))
         save_state(cfg, st)
         if external:
             event(cfg, f"{wave}: DONE, awaiting merge by the coordinator")
         else:
-            event(cfg, f"{wave}: DONE, merge gate not implemented yet (W5); handing off to coordinator")
+            event(cfg, f"{wave}: DONE, no merge_gate: handing off to coordinator")
         flush_notices(cfg, st, w)
         close_window(cfg, st, w)
         return False
 
-    if status == "DONE":
-        waves = cfg["waves"]
-        idx = waves.index(wave)
-        nxt = wdir / "next-prompt.md"
-        fresh = once_per(w, "done", "1")  # a restart between this and the next launch must not repeat it
-        if fresh:
-            w["finished"] = now
-            w["pending_exit"] = True  # the intent to close the window, in the same save as the mark
-            put_notice(w, "done", "1",
-                       f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
-                       f"Целиком: {wdir}/result.md")
-        w["phase"] = "done"
-        last = idx + 1 >= len(waves)
-        if last:  # the end of the chain goes into the same save as the mark
-            st["current"] = None
-            put_notice(w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
-        save_state(cfg, st)
-        if fresh:
-            event(cfg, f"{wave}: DONE")
-        close_window(cfg, st, w)
-        if last:
-            event(cfg, "chain finished")
-            flush_notices(cfg, st, w)
-            return False
-        if not nxt.exists():
-            return _stop_without_next(cfg, st, w, wave, now)
-        why = next_prompt_problem(nxt)
-        if why:
-            return _stop_without_next(cfg, st, w, wave, now, why)
-        flush_notices(cfg, st, w)  # «волна завершена» goes out before the next wave starts
-        try:
-            started = launch(cfg, waves[idx + 1], nxt, by_dispatcher=True)
-        except SystemExit as e:  # refused before its intent (previous window alive, admission...)
-            _launch_refused(cfg, st, wave, waves[idx + 1], str(e))
-            return False
-        fresh_st = load_state(cfg)  # launch saved a newer snapshot (new current, new record):
-        st.clear()                  # the caller's dict must not be written back over it
-        st.update(fresh_st)
-        return started
+    if status == "DONE":  # the last wave without merge_gate (the chain ends as before), or a completion
+        # of `auto` that was cut short (phase `done`: restart, a refused launch): it is carried on
+        return _complete_wave(cfg, st, wave, w, wdir, now)
 
     if not tmux_alive(name):
         _mark_dead(cfg, st, wave, status)
@@ -2065,6 +2440,8 @@ def _tick(cfg, st):
             save_state(cfg, st)
             event(cfg, f"{wave}: pane idle {cfg['idle_minutes']}+ min, status={status}")
             flush_notices(cfg, st, w)
+    if w.get("phase") == "running" and status == "RUNNING" and cfg.get("repo"):
+        _alarm_tick(cfg, st, wave, w, now)  # one message per head when checks and Codex are done
     save_state(cfg, st)
     return True
 

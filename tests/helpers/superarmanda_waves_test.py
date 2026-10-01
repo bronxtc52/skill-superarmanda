@@ -98,6 +98,7 @@ sys.path.insert(0, str(WAVES))
 import wab  # noqa: E402
 
 REAL_SH = wab.sh
+REAL_FIND_PR = wab.find_pr
 CHAIN = "demo"
 RUN_ID = "2026-10-01"
 
@@ -152,10 +153,19 @@ class Base(unittest.TestCase):
         self.cwd = str(self.tmp / "clone")
         Path(self.cwd).mkdir()
 
+        self.gh_calls = []
+        self.gh_real = False  # gh_shim() puts a fake `gh` into PATH: then the real subprocess call runs it
+        self.gh_handler = None  # args -> CompletedProcess; without it every `gh` fails, never the network
+
         def fake_sh(*args, **kw):
             if args and args[0] == "tmux":
                 self.tmux_calls.append(args)
                 return subprocess.CompletedProcess(args, 0, "", "")
+            if args and args[0] == "gh" and not self.gh_real:
+                self.gh_calls.append(args)
+                if self.gh_handler:
+                    return self.gh_handler(args)
+                return subprocess.CompletedProcess(args, 1, "", "gh is not available in tests")
             return REAL_SH(*args, **kw)
 
         def patch(name, **kw):
@@ -172,8 +182,8 @@ class Base(unittest.TestCase):
         patch("press_enter", side_effect=lambda n: self.enters.append(n))
         patch("wait_ready", side_effect=lambda name, timeout=90: self.ready)
         patch("require_tmux")
-        # the auto-merge branch is W5; legacy launch tests exercise it, the fail-closed ones turn it off
-        patch("MERGE_GATE_IMPLEMENTED", new=True, create=True)
+        # nothing may reach GitHub: no PR is known unless a test sets one (see MergeGateBase)
+        patch("find_pr", return_value=None)
         patch("_send_telegram", side_effect=lambda cfg, text: self.tg.append(text))
         sleeper = mock.patch("time.sleep")
         sleeper.start()
@@ -232,6 +242,23 @@ class Base(unittest.TestCase):
 
     def messages(self):
         return [t for t in self.tg]
+
+    # ----- merge_gate "auto": a wave whose PR is already MERGED at the sha the gate passed -----
+    def merged_view(self, args):
+        if args[:3] == ("gh", "pr", "view"):
+            doc = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": "c" * 40}
+            return subprocess.CompletedProcess(args, 0, json.dumps(doc), "")
+        return subprocess.CompletedProcess(args, 1, "", "unexpected gh call in tests")
+
+    def auto_chain(self, **over):
+        """chain.json with merge_gate "auto" and a `gh` that reports every PR MERGED."""
+        cfg, path = self.chain(merge_gate="auto", **over)
+        self.gh_handler = self.merged_view
+        return cfg, path
+
+    def auto_rec(self, name="W1", **kw):
+        """A wave record in phase `merging`: the gate passed at sha c*40 for PR #7."""
+        return self.wave_rec(name, phase="merging", gate_pr=7, gate_sha="c" * 40, **kw)
 
 
 # ---------------------------------------------------------------- A1
@@ -487,9 +514,9 @@ class Supervision(Base):
         self.assertEqual(len(self.tg), 2)
 
     def test_done_with_dead_session_launches_the_next_wave(self):
-        cfg, _ = self.chain()
+        cfg, _ = self.auto_chain()
         self.alive = False
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "result.md").write_text("PR #1\n", encoding="utf-8")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
@@ -500,8 +527,8 @@ class Supervision(Base):
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "done")
 
     def test_done_is_not_notified_twice_when_watch_restarts_before_the_next_launch(self):
-        cfg, _ = self.chain()
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        cfg, _ = self.auto_chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         with mock.patch.object(wab, "launch", side_effect=KeyboardInterrupt):
@@ -978,6 +1005,8 @@ class WaveOwnsStatus(Base):
         return ln
 
     def test_done_after_a_crashed_transition_is_done(self):
+        cfg, _ = self.auto_chain()  # same chain.json, now with the gate: the PR is merged already
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(self.cfg, "W1", "DONE")
         ln = self.restart()
         self.assertEqual(self.status(), "DONE")
@@ -1098,8 +1127,8 @@ class LaunchIntent(Base):
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
 
     def test_previous_wave_is_saved_done_before_the_next_launch(self):
-        cfg, _ = self.chain()
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        cfg, _ = self.auto_chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         seen = {}
@@ -1383,10 +1412,10 @@ class LaunchGuard(Base):
                 self.assertEqual(w["attempts"][0]["phase"], phase)
 
     def test_failed_next_launch_is_reported_with_its_reason(self):
-        cfg, path = self.chain()
+        cfg, path = self.auto_chain()
         self.alive = False
         self.ready = False
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
@@ -1693,8 +1722,8 @@ class TwoStepSend(Base):
         self.assertEqual((self.w(cfg)["phase"], self.w(cfg)["restarts"]), ("running", 1))
 
     def test_watch_exits_nonzero_when_the_next_wave_does_not_reach_running(self):
-        cfg, path = self.chain()
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        cfg, path = self.auto_chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         calls = {"wv-w2": 0}
@@ -2530,12 +2559,12 @@ class Mandate(Base):
 
 class ChainConfig(Base):
     def test_unknown_merge_gate_fails_closed(self):
-        for bad in ("externl", "EXTERNAL", "auto", 1, True):
+        for bad in ("externl", "EXTERNAL", "Auto", 1, True):
             with self.subTest(bad=bad):
                 with self.assertRaises(SystemExit) as ctx:
                     self.chain(merge_gate=bad)
                 self.assertIn("merge_gate", str(ctx.exception))
-        for ok in (None, "", "external"):
+        for ok in (None, "", "external", "auto"):
             with self.subTest(ok=ok):
                 self.chain(merge_gate=ok)
 
@@ -2706,52 +2735,49 @@ class W4Round20(Base):
         for line in lines:
             self.assertNotRegex(line, r"(^|\s)-[LS]\s")
 
-    def test_without_merge_gate_done_hands_off_until_w5_exists(self):
+    def test_without_merge_gate_done_hands_off_to_the_coordinator(self):
         cfg, path = self.chain()
         self.alive = False
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "DONE")
         nxt = wab.wave_dir(cfg, "W1") / "next-prompt.md"
         nxt.write_text("go\n", encoding="utf-8")
-        with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", False, create=True), \
-                mock.patch.object(wab, "launch") as launch, mock.patch.object(wab, "drop_stale_btab"):
+        with mock.patch.object(wab, "launch") as launch, mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(cfg, path, max_ticks=5)
         launch.assert_not_called()
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
         log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
-        self.assertIn("merge gate not implemented yet (W5); handing off to coordinator", log)
+        self.assertIn("no merge_gate: handing off to coordinator", log)
         self.assertIn(f"wab.py launch {path.resolve()} W2 {nxt}", log)
 
     def test_last_wave_without_merge_gate_finishes_as_before(self):
         cfg, _ = self.chain(waves=["W1"])
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "DONE")
-        with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", False, create=True):
-            self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
         self.assertIsNone(self.get_state(cfg)["current"])
         self.assertIn("chain finished", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
     def test_external_done_without_next_prompt_stops_loudly(self):
-        for gate, impl in (("external", True), (None, False)):
+        for gate in ("external", None):
             with self.subTest(gate=gate):
                 self.tg.clear()
                 cfg, path = self.chain(merge_gate=gate)
                 (cfg["run_dir"] / "events.log").unlink(missing_ok=True)  # shared run dir between subtests
                 self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
                 self.set_status(cfg, "W1", "DONE")
-                with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", impl, create=True):
-                    self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
-                    self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
-                    log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
-                    self.assertEqual(log.count("W1: DONE without next-prompt.md; chain stopped"), 1)
-                    self.assertNotIn("handed to the coordinator", log)
-                    self.assertEqual(len([t for t in self.tg if "next-prompt.md" in t]), 1)
-                    with mock.patch.object(wab, "time") as t, mock.patch.object(wab, "drop_stale_btab"), \
-                            contextlib.redirect_stderr(io.StringIO()):
-                        t.time.return_value = 0.0
-                        with self.assertRaises(SystemExit) as ctx:
-                            wab.main(["wab.py", "watch", str(path)])
-                    self.assertEqual(ctx.exception.code, 3)
+                self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+                self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+                log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+                self.assertEqual(log.count("W1: DONE without next-prompt.md; chain stopped"), 1)
+                self.assertNotIn("handed to the coordinator", log)
+                self.assertEqual(len([t for t in self.tg if "next-prompt.md" in t]), 1)
+                with mock.patch.object(wab, "time") as t, mock.patch.object(wab, "drop_stale_btab"), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    t.time.return_value = 0.0
+                    with self.assertRaises(SystemExit) as ctx:
+                        wab.main(["wab.py", "watch", str(path)])
+                self.assertEqual(ctx.exception.code, 3)
 
     def test_enabled_telegram_needs_all_three_fields_as_strings(self):
         full = {"keyvault": "kv", "token_secret": "t", "chat_secret": "c"}
@@ -2895,8 +2921,7 @@ class W4Round23Notices(Base):
         self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(self.cfg, "W1", "DONE")
         (wab.wave_dir(self.cfg, "W1") / "result.md").write_text("r\n", encoding="utf-8")
-        with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", False):
-            self.tick()  # chain stops: current is None afterwards
+        self.tick()  # chain stops: current is None afterwards
         self.assertIn("no_next", self.rec().get("outbox", {}))
         self.down = False
         self.due()
@@ -2932,10 +2957,10 @@ class W4Round24(Base):
 
     # ----- 1: a notice flush must not roll the state back after launch -----
     def test_flush_after_launch_keeps_the_new_current_and_record(self):
-        cfg, _ = self.chain()
+        cfg, _ = self.auto_chain()
         self.alive = False
         old = {"value": "x", "text": "old notice", "next_at": 0}
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(outbox={"no_next": old})}})
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec(outbox={"no_next": old})}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         self.down = True
@@ -3101,6 +3126,7 @@ class W4Round24(Base):
         p = mock.patch.dict(os.environ, {"PATH": f"{d}{os.pathsep}{os.environ['PATH']}"})
         p.start()
         self.addCleanup(p.stop)
+        self.gh_real = True
 
     def wave1_branch(self, clone):
         self.git(clone, "checkout", "-q", "-b", "wave-1")
@@ -3617,8 +3643,8 @@ class W4Round28(Base):
         self.assertEqual(self.count("не запускаю"), 1, self.tg)
 
     def test_tick_done_before_the_next_launch(self):
-        cfg, path = self.chain()
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        cfg, path = self.auto_chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("done") == "1"
@@ -5083,17 +5109,16 @@ class W4Round32NextPrompt(Base):
     coordinator's launch will accept (read_prompt); an unusable one stops like a missing one."""
 
     def test_unusable_next_prompt_is_not_handed_over(self):
-        for gate, impl in (("external", True), (None, False), (None, True)):
+        for gate in ("external", None):
             for content in (b"", b"  \n\t", b"\xff\xfe bad", "\u200b\u3164".encode()):
-                with self.subTest(gate=gate, impl=impl, content=content):
+                with self.subTest(gate=gate, content=content):
                     self.tg.clear()
                     cfg, _ = self.chain(merge_gate=gate)
                     (cfg["run_dir"] / "events.log").unlink(missing_ok=True)
                     self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
                     self.set_status(cfg, "W1", "DONE")
                     (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_bytes(content)
-                    with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", impl, create=True), \
-                            mock.patch.object(wab, "launch") as launch:
+                    with mock.patch.object(wab, "launch") as launch:
                         self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
                     launch.assert_not_called()
                     st = self.get_state(cfg)
@@ -5492,31 +5517,34 @@ class W4Round34(Base):
 
     # ----- invariant: every terminal transition ends with the window closed -----
     def test_every_terminal_transition_closes_the_window(self):
-        cases = [  # (name, merge_gate, gate implemented, waves, next-prompt.md, then)
-            ("awaiting_merge, next wave", "external", True, ["W1", "W2"], b"go\n", None),
-            ("awaiting_merge, last wave + done", "external", True, ["W1"], None, "done"),
-            ("external, no next-prompt", "external", True, ["W1", "W2"], None, None),
-            ("external, unusable next-prompt", "external", True, ["W1", "W2"], b" \n", None),
-            ("no gate yet, no next-prompt", None, False, ["W1", "W2"], None, None),
-            ("no gate yet, last wave + done", None, False, ["W1"], None, "done"),
-            ("internal, last wave", None, True, ["W1"], None, None),
-            ("internal, no next-prompt", None, True, ["W1", "W2"], None, None),
-            ("internal, unusable next-prompt", None, True, ["W1", "W2"], b"\xff", None),
-            ("internal, next launched by the dispatcher", None, True, ["W1", "W2"], b"go\n", "launch"),
+        cases = [  # (name, merge_gate, "auto" = the PR is merged already, waves, next-prompt.md, then)
+            ("awaiting_merge, next wave", "external", False, ["W1", "W2"], b"go\n", None),
+            ("awaiting_merge, last wave + done", "external", False, ["W1"], None, "done"),
+            ("external, no next-prompt", "external", False, ["W1", "W2"], None, None),
+            ("external, unusable next-prompt", "external", False, ["W1", "W2"], b" \n", None),
+            ("no gate, next wave handed over", None, False, ["W1", "W2"], b"go\n", None),
+            ("no gate, no next-prompt", None, False, ["W1", "W2"], None, None),
+            ("no gate, last wave + done", None, False, ["W1"], None, "done"),
+            ("no gate, unusable next-prompt", None, False, ["W1", "W2"], b"\xff", None),
+            ("auto, merged, last wave", "auto", True, ["W1"], None, None),
+            ("auto, merged, no next-prompt", "auto", True, ["W1", "W2"], None, None),
+            ("auto, merged, unusable next-prompt", "auto", True, ["W1", "W2"], b"\xff", None),
+            ("auto, merged, next launched by the dispatcher", "auto", True, ["W1", "W2"], b"go\n", "launch"),
         ]
-        for name, gate, impl, waves, nxt, then in cases:
+        for name, gate, merged, waves, nxt, then in cases:
             with self.subTest(case=name):
                 self.windows = {"wv-w1"}
                 self.tmux_calls.clear()
                 cfg, path = self.chain(merge_gate=gate, waves=waves)
-                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                self.gh_handler = self.merged_view if merged else None
+                self.put_state(cfg, {"current": "W1", "waves": {
+                    "W1": self.auto_rec() if merged else self.wave_rec()}})
                 self.set_status(cfg, "W1", "DONE")
                 p = wab.wave_dir(cfg, "W1") / "next-prompt.md"
                 p.unlink(missing_ok=True)
                 if nxt is not None:
                     p.write_bytes(nxt)
-                with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", impl, create=True), \
-                        mock.patch.object(wab, "launch", return_value=True):
+                with mock.patch.object(wab, "launch", return_value=True):
                     wab.tick(cfg, wab.load_state(cfg))
                     if then == "done":
                         wab.done_cmd(cfg)
@@ -5555,8 +5583,8 @@ class W4Round34(Base):
     # ----- 6: a refused launch inside the dispatcher's tick -----
     def test_dispatcher_launch_refusal_is_an_event_and_a_notice(self):
         wd = self.repo()
-        cfg, path = self.chain(workdir=str(wd), base_branch="main")
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(cwd=str(wd))}})
+        cfg, path = self.auto_chain(workdir=str(wd), base_branch="main")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec(cwd=str(wd))}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         self.exit_closes = False  # the previous wave's window will not close: launch refuses
@@ -6623,8 +6651,9 @@ class PlanPin(Base):
         return path
 
     def test_dispatcher_launch_of_next_wave_refuses_on_changed_plan(self):
-        cfg, _ = self.pinned()
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        cfg, _ = self.pinned(merge_gate="auto")
+        self.gh_handler = self.merged_view
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
@@ -6655,12 +6684,1032 @@ class PlanPin(Base):
         self.assertEqual(wab._identity(cfg), wab._identity(other))
 
 
+# ---------------------------------------------------------------- W5: gate.py (pure functions)
+import gate  # noqa: E402
+
+HEAD = "a" * 40
+OLD = "b" * 40
+FP = "f" * 64
+BOT = {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+HUMAN = {"login": "chatgpt-codex-connector[bot]", "type": "User"}
+CLEAN_BODY = "Codex Review: Didn't find any major issues. :rocket:\n\n**Reviewed commit:** `{short}`"
+
+
+def green_facts(**over):
+    facts = {
+        "pr": {"state": "open", "merged": False, "draft": False, "head": HEAD},
+        "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}],
+        "reviews": [{"user": BOT, "commit_id": HEAD, "state": "COMMENTED"}],
+        "review_comments": [], "issue_comments": [], "pr_reactions": [], "trigger": None,
+        "head_date": "2026-10-01T10:00:00Z", "resolved": {}, "threads": [],
+    }
+    facts.update(over)
+    return facts
+
+
+def result(status="pass", head=HEAD, fp=FP, at="2026-10-01T10:05:00Z"):
+    return {"status": status, "head": head, "tree_fingerprint": fp, "recorded_at": at, "session_id": "s"}
+
+
+def green_manifest(**task):
+    entry = {"status": "ready_for_pr_review", "decisions": [],
+             "results": {"tester": result(), "cross_provider_reviewer": result()}}
+    entry.update(task)
+    return {"head": HEAD, "tasks": {"T1": entry}}
+
+
+WORK = {"clean": True, "head": HEAD, "fingerprint": FP}
+
+
+class GateVerdict(unittest.TestCase):
+    def ev(self, facts=None, manifest="green", work=None, head=HEAD):
+        return gate.evaluate(green_facts() if facts is None else facts, head,
+                             green_manifest() if manifest == "green" else manifest, WORK if work is None else work)
+
+    def test_everything_in_order_passes(self):
+        v = self.ev()
+        self.assertEqual((v["verdict"], v["reasons"], v["unresolved"], v["draft"]), ("pass", [], [], False))
+
+    def test_stale_codex_review_waits(self):  # acceptance 1
+        v = self.ev(green_facts(reviews=[{"user": BOT, "commit_id": OLD, "state": "COMMENTED"}]))
+        self.assertEqual(v["verdict"], "wait")
+
+    def test_codex_review_pending_or_dismissed_on_head_waits(self):  # acceptance 1
+        for state in ("PENDING", "DISMISSED", ""):
+            with self.subTest(state=state):
+                v = self.ev(green_facts(reviews=[{"user": BOT, "commit_id": HEAD, "state": state}]))
+                self.assertEqual(v["verdict"], "wait")
+
+    def test_codex_review_states_that_finish(self):
+        for state in ("COMMENTED", "APPROVED", "CHANGES_REQUESTED"):
+            with self.subTest(state=state):
+                done = gate.codex_on_head(
+                    green_facts(reviews=[{"user": BOT, "commit_id": HEAD, "state": state}]), HEAD)
+                self.assertTrue(done["done"])
+
+    def test_a_human_with_the_bot_login_is_not_codex(self):
+        facts = green_facts(reviews=[{"user": HUMAN, "commit_id": HEAD, "state": "COMMENTED"}])
+        self.assertEqual(self.ev(facts)["verdict"], "wait")
+
+    def test_clean_comment_resolving_to_head_finishes(self):
+        short = HEAD[:7]
+        facts = green_facts(reviews=[], issue_comments=[{"user": BOT, "body": CLEAN_BODY.format(short=short)}],
+                            resolved={short: HEAD})
+        self.assertEqual(gate.codex_on_head(facts, HEAD)["how"], "clean comment")
+        facts["resolved"] = {short: OLD}
+        self.assertFalse(gate.codex_on_head(facts, HEAD)["done"])
+        facts["resolved"] = {}
+        self.assertFalse(gate.codex_on_head(facts, HEAD)["done"])
+
+    def test_reactions_count_only_from_the_bot_and_not_before_the_head_commit(self):
+        late, early = "2026-10-01T11:00:00Z", "2026-10-01T09:00:00Z"
+        cases = [
+            ("bot late", [{"content": "+1", "user": BOT, "created_at": late}], True),
+            ("bot early", [{"content": "+1", "user": BOT, "created_at": early}], False),
+            ("human", [{"content": "+1", "user": {"login": "someone", "type": "User"}, "created_at": late}], False),
+            ("impostor", [{"content": "+1", "user": HUMAN, "created_at": late}], False),
+            ("wrong emoji", [{"content": "eyes", "user": BOT, "created_at": late}], False),
+        ]
+        for name, reactions, want in cases:
+            with self.subTest(case=name):
+                facts = green_facts(pr_reactions=reactions, reviews=[])
+                self.assertEqual(gate.codex_on_head(facts, HEAD)["done"], want)
+
+    def test_thumbs_up_on_the_review_request_comment(self):
+        reaction = [{"content": "+1", "user": BOT, "created_at": "2026-10-01T09:00:00Z"}]
+        marker = gate.MARKER.format(head=HEAD)
+        cases = [
+            ("marker of this head", {"body": f"@codex review\n{marker}", "created_at": "2026-10-01T08:00:00Z"}, True),
+            ("marker of another head", {"body": f"@codex review\n{gate.MARKER.format(head=OLD)}",
+                                        "created_at": "2026-10-01T08:00:00Z"}, False),
+            ("no marker, after the commit", {"body": "@codex review", "created_at": "2026-10-01T10:30:00Z"}, True),
+            ("no marker, before the commit", {"body": "@codex review", "created_at": "2026-10-01T09:30:00Z"}, False),
+        ]
+        for name, trig, want in cases:
+            with self.subTest(case=name):
+                trigger = dict(trig, id=7, reactions=reaction)
+                facts = green_facts(reviews=[], trigger=trigger)
+                self.assertEqual(gate.codex_on_head(facts, HEAD)["done"], want)
+
+    def test_pending_check_waits_and_failed_check_fails_without_a_merge(self):  # acceptance 2
+        pending = [{"name": "ci", "status": "completed", "conclusion": "success"},
+                   {"name": "e2e", "status": "in_progress", "conclusion": None}]
+        v = self.ev(green_facts(check_runs=pending))
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("e2e", v["reasons"][0])
+        failed = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
+        v = self.ev(green_facts(check_runs=failed))
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn("ci", v["reasons"][0])
+
+    def test_success_needs_completed_and_success_not_a_status_word(self):
+        for run in ({"name": "x", "status": "completed", "conclusion": "skipped"},
+                    {"name": "x", "status": "completed", "conclusion": "neutral"},
+                    {"name": "x", "status": "completed", "conclusion": None},
+                    {"name": "x", "status": "queued", "conclusion": "success"}):
+            with self.subTest(run=run):
+                got = gate.checks([run])
+                self.assertTrue(got["pending"] or got["failed"])
+        self.assertEqual(gate.checks([{"name": "x", "status": "completed", "conclusion": "success"}]),
+                         {"total": 1, "pending": [], "failed": []})
+
+    def test_no_check_runs_waits(self):
+        self.assertEqual(self.ev(green_facts(check_runs=[]))["verdict"], "wait")
+
+    def test_p1_and_p0_badges_on_head_fail_p2_does_not(self):  # acceptance 3
+        def inline(badge, commit=HEAD, user=BOT):
+            return {"user": user, "commit_id": commit, "body": f"**![{badge} Badge](x)** text", "html_url": "u"}
+        for badge, want in (("P1", "fail"), ("P0", "fail"), ("P2", "pass")):
+            with self.subTest(badge=badge):
+                self.assertEqual(self.ev(green_facts(review_comments=[inline(badge)]))["verdict"], want)
+        old = green_facts(review_comments=[inline("P1", commit=OLD)])
+        self.assertEqual(self.ev(old)["verdict"], "pass")  # an old head's finding is not the head's
+        self.assertEqual(self.ev(green_facts(review_comments=[inline("P1", user=HUMAN)]))["verdict"], "pass")
+
+    def test_manifest_without_tester_pass_or_with_another_head_fails(self):  # acceptance 4
+        no_tester = green_manifest()
+        del no_tester["tasks"]["T1"]["results"]["tester"]
+        self.assertEqual(self.ev(manifest=no_tester)["verdict"], "fail")
+        tester_old_head = green_manifest()
+        tester_old_head["tasks"]["T1"]["results"]["tester"] = result(head=OLD)
+        self.assertEqual(self.ev(manifest=tester_old_head)["verdict"], "fail")
+        tester_findings = green_manifest()
+        tester_findings["tasks"]["T1"]["results"]["tester"] = result("findings")
+        self.assertEqual(self.ev(manifest=tester_findings)["verdict"], "fail")
+        other = green_manifest()
+        other["head"] = OLD
+        self.assertEqual(self.ev(manifest=other)["verdict"], "fail")
+        for broken in (None, [], {"head": HEAD}, {"head": HEAD, "tasks": {}}):
+            with self.subTest(manifest=broken):
+                self.assertEqual(self.ev(manifest=broken)["verdict"], "fail")
+
+    def test_task_statuses_needs_decision_and_blocked_fail(self):
+        for status in ("needs_decision", "blocked"):
+            with self.subTest(status=status):
+                self.assertEqual(self.ev(manifest=green_manifest(status=status))["verdict"], "fail")
+
+    def test_results_on_another_tree_or_a_dirty_copy_fail(self):  # acceptance 1a
+        dirty_result = green_manifest()
+        dirty_result["tasks"]["T1"]["results"]["tester"] = result(fp="0" * 64)
+        self.assertEqual(self.ev(manifest=dirty_result)["verdict"], "fail")
+        dirty_review = green_manifest()
+        dirty_review["tasks"]["T1"]["results"]["cross_provider_reviewer"] = result(fp="0" * 64)
+        self.assertEqual(self.ev(manifest=dirty_review)["verdict"], "fail")
+        self.assertEqual(self.ev(work={"clean": False, "head": HEAD, "fingerprint": FP})["verdict"], "fail")
+        self.assertEqual(self.ev(work={"clean": True, "head": OLD, "fingerprint": FP})["verdict"], "fail")
+        self.assertEqual(self.ev(work={"clean": True, "head": HEAD, "fingerprint": None})["verdict"], "fail")
+        self.assertEqual(self.ev(work={})["verdict"], "fail")
+
+    def test_reviewer_findings_need_a_decision_made_on_this_result(self):  # acceptance 1b
+        def manifest(decisions, at="2026-10-01T10:05:00Z"):
+            m = green_manifest(decisions=decisions)
+            m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = result("findings", at=at)
+            return m
+
+        def decision(**kw):
+            return dict({"source": "cross_provider_reviewer", "decision": "accept_limitation",
+                         "note": "n", "recorded_at": "2026-10-01T10:10:00Z"}, **kw)
+        cases = [
+            ("no decision", [], "fail"),
+            ("older than the result", [decision(recorded_at="2026-10-01T10:00:00Z")], "fail"),
+            ("another source", [decision(source="tester")], "fail"),
+            ("invariant", [decision(decision="invariant")], "fail"),
+            ("cut_surface", [decision(decision="cut_surface")], "fail"),
+            ("accept_limitation on this result", [decision()], "pass"),
+            ("same instant", [decision(recorded_at="2026-10-01T10:05:00Z")], "pass"),
+        ]
+        for name, decisions, want in cases:
+            with self.subTest(case=name):
+                self.assertEqual(self.ev(manifest=manifest(decisions))["verdict"], want)
+        other = manifest([decision()])
+        other["tasks"]["T1"]["results"]["cross_provider_reviewer"]["status"] = "unavailable"
+        self.assertEqual(self.ev(manifest=other)["verdict"], "fail")
+
+    def test_pr_head_other_than_the_gated_one_waits(self):
+        facts = green_facts()
+        facts["pr"]["head"] = OLD
+        self.assertEqual(self.ev(facts)["verdict"], "wait")
+
+    def test_closed_or_merged_pr_fails_and_a_collection_error_only_waits(self):
+        facts = green_facts()
+        facts["pr"]["state"] = "closed"
+        self.assertEqual(self.ev(facts)["verdict"], "fail")
+        facts["pr"]["merged"] = True
+        self.assertEqual(self.ev(facts)["verdict"], "fail")
+        v = self.ev({"error": "gh api: boom"})
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("boom", v["reasons"][0])
+
+    def test_unresolved_threads_and_draft_are_reported_on_a_pass(self):
+        facts = green_facts(threads=[{"id": "T_1", "isResolved": False}, {"id": "T_2", "isResolved": True}])
+        facts["pr"]["draft"] = True
+        v = self.ev(facts)
+        self.assertEqual((v["verdict"], v["unresolved"], v["draft"]), ("pass", ["T_1"], True))
+
+
+class FakeGitHub:
+    """`api` and `graphql` over a table of responses; a list route is cut into pages of 100."""
+
+    def __init__(self, routes, threads=None):
+        self.routes, self.calls = routes, []
+        self.threads = threads if threads is not None else {"nodes": [], "pageInfo": {"hasNextPage": False}}
+
+    def api(self, path):
+        self.calls.append(path)
+        base, _, query = path.partition("?")
+        if base not in self.routes:
+            raise gate.CollectError(f"{path}: HTTP 404")
+        value = self.routes[base]
+        if "per_page=100" not in query:
+            return value
+        page = int(re.search(r"(?:^|&)page=(\d+)", query).group(1))
+        key, items = (None, value) if isinstance(value, list) else next(iter(value.items()))
+        part = items[(page - 1) * 100:page * 100]
+        return part if key is None else {key: part, "total_count": len(items)}
+
+    def graphql(self, query, variables):
+        self.calls.append(("graphql", variables))
+        return {"data": {"repository": {"pullRequest": {"reviewThreads": self.threads}}}}
+
+
+def routes_for(repo="o/r", number=5, **over):
+    r = {
+        f"repos/{repo}/pulls/{number}": {"state": "open", "merged": False, "draft": False, "head": {"sha": HEAD}},
+        f"repos/{repo}/commits/{HEAD}/check-runs": {"check_runs": [
+            {"name": "ci", "status": "completed", "conclusion": "success"}]},
+        f"repos/{repo}/pulls/{number}/reviews": [{"user": BOT, "commit_id": HEAD, "state": "COMMENTED"}],
+        f"repos/{repo}/pulls/{number}/comments": [],
+        f"repos/{repo}/issues/{number}/comments": [],
+        f"repos/{repo}/issues/{number}/reactions": [],
+        f"repos/{repo}/commits/{HEAD}": {"sha": HEAD, "commit": {"committer": {"date": "2026-10-01T10:00:00Z"}}},
+    }
+    r.update(over)
+    return r
+
+
+class GateCollect(unittest.TestCase):
+    def collect(self, fake, head=HEAD):
+        return gate.collect("o/r", 5, head, fake.api, fake.graphql)
+
+    def test_collects_every_fact_and_evaluates_to_pass(self):
+        fake = FakeGitHub(routes_for())
+        facts = self.collect(fake)
+        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK)["verdict"], "pass")
+
+    def test_check_runs_are_read_page_by_page_and_a_pending_run_on_page_two_waits(self):
+        runs = [{"name": f"c{i}", "status": "completed", "conclusion": "success"} for i in range(100)]
+        runs.append({"name": "late", "status": "queued", "conclusion": None})
+        fake = FakeGitHub(routes_for(**{f"repos/o/r/commits/{HEAD}/check-runs": {"check_runs": runs}}))
+        facts = self.collect(fake)
+        self.assertEqual(len(facts["check_runs"]), 101)
+        self.assertEqual(sum("check-runs" in c for c in fake.calls if isinstance(c, str)), 2)
+        v = gate.evaluate(facts, HEAD, green_manifest(), WORK)
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("late", v["reasons"][0])
+
+    def test_too_many_pages_is_a_collection_error(self):
+        runs = [{"name": "c", "status": "completed", "conclusion": "success"}] * (100 * gate.MAX_PAGES + 1)
+        fake = FakeGitHub(routes_for(**{f"repos/o/r/commits/{HEAD}/check-runs": {"check_runs": runs}}))
+        with self.assertRaises(gate.CollectError):
+            self.collect(fake)
+        self.assertIn("error", gate.gather("o/r", 5, HEAD, fake.api, fake.graphql))
+
+    def test_more_than_100_review_threads_is_a_collection_error(self):
+        fake = FakeGitHub(routes_for(), threads={"nodes": [], "pageInfo": {"hasNextPage": True}})
+        with self.assertRaises(gate.CollectError):
+            self.collect(fake)
+
+    def test_a_failing_api_call_is_an_error_fact_never_a_pass(self):
+        routes = routes_for()
+        del routes["repos/o/r/pulls/5/reviews"]
+        fake = FakeGitHub(routes)
+        facts = gate.gather("o/r", 5, HEAD, fake.api, fake.graphql)
+        self.assertIn("error", facts)
+        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK)["verdict"], "wait")
+
+    def test_a_pr_with_another_head_returns_early(self):
+        fake = FakeGitHub(routes_for(**{"repos/o/r/pulls/5": {"state": "open", "head": {"sha": OLD}}}))
+        facts = self.collect(fake)
+        self.assertEqual(list(facts), ["pr"])
+        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK)["verdict"], "wait")
+
+    def test_the_last_review_request_gets_its_reactions_and_a_clean_comment_is_resolved(self):
+        short = HEAD[:7]
+        comments = [
+            {"id": 1, "body": "@codex review", "created_at": "2026-10-01T08:00:00Z", "user": {"login": "me"}},
+            {"id": 2, "body": f"@codex review\n{gate.MARKER.format(head=HEAD)}", "created_at": "2026-10-01T09:00:00Z"},
+            {"id": 3, "body": CLEAN_BODY.format(short=short), "user": BOT},
+        ]
+        fake = FakeGitHub(routes_for(**{
+            "repos/o/r/issues/5/comments": comments,
+            "repos/o/r/issues/comments/2/reactions": [{"content": "+1", "user": BOT,
+                                                        "created_at": "2026-10-01T09:30:00Z"}],
+            f"repos/o/r/commits/{short}": {"sha": HEAD},
+            "repos/o/r/pulls/5/reviews": []}))
+        facts = self.collect(fake)
+        self.assertEqual(facts["trigger"]["id"], 2)
+        self.assertEqual(facts["resolved"], {short: HEAD})
+        self.assertFalse(any("comments/1/" in c for c in fake.calls if isinstance(c, str)))
+        self.assertTrue(gate.codex_on_head(facts, HEAD)["done"])
+
+    def test_importing_gate_leaves_the_import_path_alone(self):
+        before = list(sys.path)
+        import importlib
+        importlib.reload(gate)
+        self.assertEqual(sys.path, before)
+        self.assertTrue(callable(gate.fingerprint))
+
+
+class GateCommands(unittest.TestCase):
+    def test_merge_argv_and_command(self):
+        argv = gate.merge_argv("o/r", 12, HEAD)
+        self.assertEqual(argv, ["gh", "pr", "merge", "12", "--repo", "o/r", "--squash", "--match-head-commit", HEAD])
+        self.assertEqual(gate.merge_command("o/r", 12, HEAD), " ".join(argv))
+
+    def test_unsafe_values_are_refused_before_a_command_is_built(self):
+        for repo, number, sha in (("o/r'; touch /tmp/x; '", 1, HEAD), ("o r", 1, HEAD), ("o/r", 0, HEAD),
+                                  ("o/r", "1", HEAD), ("o/r", 1, "abc"), ("o/r", 1, HEAD + "; x")):
+            with self.subTest(repo=repo, number=number, sha=sha):
+                with self.assertRaises(ValueError):
+                    gate.merge_argv(repo, number, sha)
+                with self.assertRaises(ValueError):
+                    gate.owner_script(repo, number, sha, [])
+
+    def test_owner_script_is_valid_bash_and_does_the_steps_in_order(self):
+        script = gate.owner_script("o/r", 12, HEAD, ["PRRT_kwDOabc", "PRRT_kwDOdef"])
+        self.assertTrue(script.startswith("#!/usr/bin/env bash\n"))
+        self.assertIn("set -euo pipefail", script)
+        for needle in ("headRefOid", "isDraft", "gh pr ready 12 --repo o/r"):
+            self.assertIn(needle, script)
+        self.assertEqual(script.count("resolveReviewThread"), 2)
+        self.assertLess(script.index("headRefOid"), script.index("isDraft"))
+        self.assertLess(script.index("isDraft"), script.index("resolveReviewThread"))
+        self.assertTrue(script.rstrip().endswith(gate.merge_command("o/r", 12, HEAD)))
+        done = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, encoding="utf-8")
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_a_thread_id_cannot_inject_shell(self):
+        for bad in ("x'; touch /tmp/x #", "a b", "$(id)", "", "x\ny"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    gate.owner_script("o/r", 1, HEAD, [bad])
+
+    def test_alarm_text(self):
+        facts = green_facts(
+            check_runs=[{"name": "ci", "status": "completed", "conclusion": "success"},
+                        {"name": "lint", "status": "completed", "conclusion": "failure"}],
+            review_comments=[{"user": BOT, "commit_id": HEAD, "body": "![P1 Badge](x) a"},
+                             {"user": BOT, "commit_id": HEAD, "body": "![P2 Badge](x) b"}],
+            threads=[{"id": "T", "isResolved": False}])
+        text = gate.alarm_text(5, HEAD, facts)
+        for part in ("PR #5", HEAD[:12], "1 ok", "lint (failure)", "2 замечаний, P0/P1: 1", "тредов: 1"):
+            self.assertIn(part, text)
+        self.assertIn("чисто", gate.alarm_text(5, HEAD, green_facts()))
+
+    def test_alarm_ready_needs_completed_checks_and_codex(self):
+        self.assertTrue(gate.alarm_ready(green_facts(), HEAD))
+        pending = green_facts(check_runs=[{"name": "x", "status": "queued"}])
+        self.assertFalse(gate.alarm_ready(pending, HEAD))
+        self.assertFalse(gate.alarm_ready(green_facts(check_runs=[]), HEAD))
+        self.assertFalse(gate.alarm_ready(green_facts(reviews=[]), HEAD))
+        self.assertFalse(gate.alarm_ready({"error": "x"}, HEAD))
+        self.assertFalse(gate.alarm_ready({"pr": {"head": OLD}}, HEAD))
+
+
+# ---------------------------------------------------------------- W5: merge gate and alarm in wab.py
+def _cp(args, rc=0, out="", err=""):
+    return subprocess.CompletedProcess(args, rc, out, err)
+
+
+class GateBase(Base):
+    """A DONE/RUNNING wave of merge_gate "auto" whose GitHub facts, manifest and working copy are
+    fixtures; `gh` answers `pr view` (self.view), `pr merge` and `pr ready` (self.merge_rc/_err)."""
+
+    def setUp(self):
+        super().setUp()
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts()
+        self.manifest = green_manifest()
+        self.work = dict(WORK)
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD}
+        self.merge_rc, self.merge_err, self.ready_rc = 0, "", 0
+        self.find_calls = 0
+
+        def find_pr(cfg, cwd):
+            self.find_calls += 1
+            if isinstance(self.pr, Exception):
+                raise self.pr
+            return self.pr
+
+        def patch(name, **kw):
+            p = mock.patch.object(wab, name, **kw)
+            started = p.start()
+            self.addCleanup(p.stop)
+            return started
+        patch("find_pr", side_effect=find_pr)
+        patch("gate_facts", side_effect=lambda cfg, pr: self.facts)
+        patch("read_manifest", side_effect=lambda cfg, wave: self.manifest)
+        patch("workdir_state", side_effect=lambda cwd: self.work)
+        patch("GATE_POLL_SECONDS", new=0)
+        patch("ALARM_POLL_SECONDS", new=0)
+        self.launch = patch("launch", return_value=True)
+        patch("drop_stale_btab")
+        self.gh_handler = self.handle
+
+    def handle(self, args):
+        if args[:3] == ("gh", "pr", "view"):
+            return _cp(args, out=json.dumps(self.view))
+        if args[:3] == ("gh", "pr", "merge"):
+            return _cp(args, self.merge_rc, "", self.merge_err)
+        if args[:3] == ("gh", "pr", "ready"):
+            return _cp(args, self.ready_rc, "", "cannot mark ready" if self.ready_rc else "")
+        return _cp(args, 1, "", "unexpected gh call")
+
+    def merges(self):
+        return [c for c in self.gh_calls if c[:3] == ("gh", "pr", "merge")]
+
+    def start(self, status="DONE", phase="running", **chain):
+        chain.setdefault("merge_gate", "auto")
+        cfg, path = self.chain(**chain)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase=phase)}})
+        if status:
+            self.set_status(cfg, "W1", status)
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        (wab.wave_dir(cfg, "W1") / "result.md").write_text("PR #7\n", encoding="utf-8")
+        self.cfg, self.path = cfg, path
+        return cfg
+
+    def tick(self, cfg=None):
+        cfg = cfg or self.cfg
+        return wab.tick(cfg, wab.load_state(cfg))
+
+    def rec(self, wave="W1"):
+        return self.get_state(self.cfg)["waves"][wave]
+
+    def status(self, wave="W1"):
+        return (wab.wave_dir(self.cfg, wave) / "status").read_text(encoding="utf-8").strip()
+
+    def log(self):
+        return (self.cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+
+    def merge_it(self):
+        """One tick that passes the gate and calls merge."""
+        self.assertTrue(self.tick())
+        self.assertEqual(len(self.merges()), 1)
+
+
+class MergeGate(GateBase):
+    def test_wait_never_merges_and_is_logged_once_per_reason(self):  # acceptance 1, 2
+        pending = [{"name": "ci", "status": "completed", "conclusion": "success"},
+                   {"name": "e2e", "status": "in_progress", "conclusion": None}]
+        cfg = self.start()
+        self.facts = green_facts(check_runs=pending)
+        for _ in range(3):
+            self.assertTrue(self.tick())
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.log().count("merge gate waits"), 1)
+        self.assertEqual(self.rec()["phase"], "gate")
+        self.assertNotIn("pending_exit", self.rec())  # the window stays open
+        self.facts = green_facts(reviews=[])  # another reason
+        self.tick()
+        self.assertEqual(self.log().count("merge gate waits"), 2)
+        self.assertEqual(self.tg, [])
+
+    def test_a_collection_error_or_another_head_waits(self):
+        cfg = self.start()
+        self.pr = gate.CollectError("gh: no network")
+        self.tick()
+        self.pr = {"number": 7, "headRefOid": OLD, "isDraft": False, "state": "OPEN"}  # PR moved on
+        self.tick()
+        self.assertEqual(self.merges(), [])
+        self.assertIn("no network", self.log())
+        self.assertEqual(self.rec()["phase"], "gate")
+
+    def test_stale_codex_review_is_not_merged(self):  # acceptance 1
+        self.start()
+        self.facts = green_facts(reviews=[{"user": BOT, "commit_id": OLD, "state": "COMMENTED"}])
+        self.tick()
+        self.assertEqual(self.merges(), [])
+
+    def test_gate_is_asked_at_most_once_per_interval(self):
+        self.start()
+        self.facts = green_facts(reviews=[])
+        with mock.patch.object(wab, "GATE_POLL_SECONDS", 60):
+            for _ in range(4):
+                self.tick()
+        self.assertEqual(self.find_calls, 1)
+
+    def test_pass_merges_once_then_waits_for_merged(self):  # acceptance 5
+        self.start()
+        self.merge_it()
+        self.assertEqual(self.merges()[0], tuple(gate.merge_argv("o/r", 7, HEAD)))
+        rec = self.rec()
+        self.assertEqual((rec["phase"], rec["gate_sha"], rec["gate_pr"]), ("merging", HEAD, 7))
+        for _ in range(3):  # still OPEN: nothing is merged again, nothing is launched
+            self.assertTrue(self.tick())
+        self.assertEqual(len(self.merges()), 1)
+        self.launch.assert_not_called()
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        self.assertTrue(self.tick())
+        self.launch.assert_called_once()
+        self.assertEqual(self.launch.call_args[0][1], "W2")
+        self.assertTrue(self.launch.call_args[1]["by_dispatcher"])
+        rec = self.rec()
+        self.assertEqual(rec["phase"], "done")
+        self.assertTrue(rec["pending_exit"])
+        self.assertEqual(len([t for t in self.tg if "волна W1 завершена" in t]), 1)
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_a_restarted_watch_in_merging_does_not_merge_again(self):
+        self.start()
+        self.merge_it()
+        for _ in range(2):
+            wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(self.rec()["phase"], "done")
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_a_crash_after_the_merge_mark_never_merges_twice(self):
+        cfg = self.start()
+        real = wab.sh
+        state = {"boom": True}
+
+        def die_in_merge(*args, **kw):
+            if args[:3] == ("gh", "pr", "merge") and state["boom"]:
+                state["boom"] = False
+                raise KeyboardInterrupt
+            return real(*args, **kw)
+        with mock.patch.object(wab, "sh", side_effect=die_in_merge):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick()
+        self.assertEqual(self.rec()["merge_called"], HEAD)  # the mark was saved BEFORE the call
+        for _ in range(2):
+            wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(self.merges(), [])
+
+    def test_failed_check_blocks_with_the_reason_and_tells_the_window(self):  # acceptance 2
+        self.start()
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
+        self.assertTrue(self.tick())
+        self.assertEqual(self.merges(), [])
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: "))
+        self.assertIn("ci (failure)", self.status())
+        self.assertEqual(self.rec()["phase"], "running")
+        told = [s for s in self.sent if s[1] == "wv-w1" and "Гейт мерджа не пройден" in s[2]]
+        self.assertEqual(len(told), 1)
+        self.assertIn("ci (failure)", told[0][2])
+        self.tick()  # the usual BLOCKED notice: the reason, never a merge command
+        blocked = [t for t in self.tg if "ждёт тебя" in t]
+        self.assertEqual(len(blocked), 1)
+        self.assertIn("ci (failure)", blocked[0])
+        self.assertNotIn("gh pr merge", blocked[0])
+
+    def test_status_file_is_replaced_atomically(self):
+        self.start()
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
+        real = os.replace
+        seen = []
+        with mock.patch("os.replace", side_effect=lambda a, b: (seen.append(str(b)), real(a, b))[1]):
+            self.tick()
+        self.assertTrue(any(p.endswith("/W1/status") for p in seen), seen)
+        self.assertEqual([p for p in os.listdir(wab.wave_dir(self.cfg, "W1")) if p.startswith(".status.")], [])
+
+    def test_failures_that_must_block(self):  # acceptance 3, 4, 1a
+        p1 = [{"user": BOT, "commit_id": HEAD, "body": "![P1 Badge](x) bad", "html_url": "u"}]
+        no_tester = green_manifest()
+        del no_tester["tasks"]["T1"]["results"]["tester"]
+        other_head = green_manifest()
+        other_head["head"] = OLD
+        dirty_result = green_manifest()
+        dirty_result["tasks"]["T1"]["results"]["tester"] = result(fp="0" * 64)
+        cases = {
+            "P1 on head": (green_facts(review_comments=p1), green_manifest(), WORK),
+            "no tester pass": (green_facts(), no_tester, WORK),
+            "manifest head": (green_facts(), other_head, WORK),
+            "no manifest": (green_facts(), None, WORK),
+            "tester on another tree": (green_facts(), dirty_result, WORK),
+            "dirty working copy": (green_facts(), green_manifest(), {**WORK, "clean": False}),
+            "closed PR": (green_facts(pr={"state": "closed", "merged": False, "draft": False, "head": HEAD}),
+                          green_manifest(), WORK),
+        }
+        for name, (facts, manifest, work) in cases.items():
+            with self.subTest(case=name):
+                self.facts, self.manifest, self.work = facts, manifest, work
+                self.start()
+                self.tick()
+                self.assertEqual(self.merges(), [], name)
+                self.assertTrue(self.status().startswith("BLOCKED: merge gate: "), (name, self.status()))
+                self.assertEqual(self.rec()["phase"], "running", name)
+
+    def test_no_pr_for_the_branch_blocks(self):
+        self.start()
+        self.pr = None
+        self.tick()
+        self.assertIn("PR ветки волны не найден", self.status())
+        self.assertEqual(self.merges(), [])
+
+    def test_a_blocked_wave_that_writes_done_again_is_gated_again(self):
+        self.start()
+        self.facts = green_facts(reviews=[])
+        self.facts["check_runs"] = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "running")
+        self.facts = green_facts()
+        self.set_status(self.cfg, "W1", "DONE")
+        self.merge_it()
+
+    def test_done_taken_back_while_waiting_returns_to_running(self):
+        self.start()
+        self.facts = green_facts(reviews=[])
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "gate")
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "running")
+
+    def test_open_threads_get_an_owner_script_and_no_merge(self):  # acceptance 6
+        self.start()
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False},
+                                          {"id": "PRRT_b", "isResolved": False},
+                                          {"id": "PRRT_c", "isResolved": True}])
+        self.assertTrue(self.tick())
+        self.assertEqual(self.merges(), [])
+        script = self.home / ".cache" / "wab" / f"{CHAIN}-W1-merge"
+        self.assertTrue(script.is_file())
+        self.assertEqual(script.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(os.access(script, os.X_OK))
+        text = script.read_text(encoding="utf-8")
+        self.assertEqual(text.count("resolveReviewThread"), 2)
+        self.assertTrue(text.rstrip().endswith(gate.merge_command("o/r", 7, HEAD)))
+        done = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.status(), f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {script}")
+        self.assertEqual(self.rec()["phase"], "merging")
+        said = [t for t in self.tg if "незакрытые треды" in t]
+        self.assertEqual(len(said), 1)
+        self.assertIn(f"Выполни: {script}", said[0])
+        self.assertNotIn("gh pr merge", said[0])
+        # the owner runs it: MERGED at the gated head -> the next wave starts
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        self.tick()
+        self.launch.assert_called_once()
+        self.assertEqual(self.merges(), [])
+
+    def test_refused_merge_sends_the_ready_command(self):  # acceptance 5
+        self.start()
+        self.merge_rc, self.merge_err = 1, "Pull request is not mergeable: required check missing"
+        self.assertTrue(self.tick())
+        self.assertEqual(len(self.merges()), 1)
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate passed; merge refused"))
+        self.assertEqual(self.rec()["phase"], "merging")
+        sent = [t for t in self.tg if "мердж отклонён" in t]
+        self.assertEqual(len(sent), 1)
+        self.assertIn(f"gh pr merge 7 --repo o/r --squash --match-head-commit {HEAD}", sent[0])
+        self.assertIn("not mergeable", sent[0])
+        for _ in range(2):
+            self.tick()
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(len([t for t in self.tg if "мердж отклонён" in t]), 1)
+        # the owner merges by hand: the chain goes on
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        self.tick()
+        self.launch.assert_called_once()
+
+    def test_a_draft_pr_is_made_ready_before_the_merge(self):
+        self.start()
+        self.pr["isDraft"] = True
+        self.facts["pr"]["draft"] = True
+        self.merge_it()
+        kinds = [c[:3] for c in self.gh_calls if c[:3] in (("gh", "pr", "ready"), ("gh", "pr", "merge"))]
+        self.assertEqual(kinds, [("gh", "pr", "ready"), ("gh", "pr", "merge")])
+        self.assertIn(("gh", "pr", "ready", "7", "--repo", "o/r"), self.gh_calls)
+
+    def test_a_failed_ready_is_a_refused_merge(self):
+        self.start()
+        self.pr["isDraft"] = True
+        self.facts["pr"]["draft"] = True
+        self.ready_rc = 1
+        self.tick()
+        self.assertEqual(self.merges(), [])
+        sent = [t for t in self.tg if "мердж отклонён" in t]
+        self.assertEqual(len(sent), 1)
+        self.assertIn("gh pr ready 7 --repo o/r && gh pr merge 7", sent[0])
+
+    def test_merged_with_another_head_blocks_and_launches_nothing(self):  # acceptance 1c
+        self.start()
+        self.merge_it()
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": OLD}
+        self.assertFalse(self.tick())  # the watch hands the chain over
+        self.launch.assert_not_called()
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: PR #7 смержен с HEAD"))
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+        self.assertEqual(len([t for t in self.tg if "смержен с HEAD" in t]), 1)
+        self.assertIn("next wave NOT launched", self.log())
+
+    def test_closed_pr_blocks_and_launches_nothing(self):
+        self.start()
+        self.merge_it()
+        self.view = {"state": "CLOSED", "mergeCommit": None, "headRefOid": HEAD}
+        self.assertFalse(self.tick())
+        self.launch.assert_not_called()
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: PR #7 закрыт без мерджа"))
+
+    def test_an_unreadable_pr_state_waits(self):
+        self.start()
+        self.merge_it()
+        self.gh_handler = lambda args: _cp(args, 1, "", "HTTP 502")
+        self.assertTrue(self.tick())
+        self.assertTrue(self.tick())
+        self.launch.assert_not_called()
+        self.assertEqual(self.log().count("state not read"), 1)
+
+    def test_the_last_wave_ends_the_chain_after_the_merge(self):
+        cfg = self.start(waves=["W1"])
+        self.merge_it()
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        self.assertFalse(self.tick())
+        self.assertIsNone(self.get_state(cfg)["current"])
+        self.assertIn("chain finished", self.log())
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1)
+        self.launch.assert_not_called()
+
+    def test_without_merge_gate_nothing_is_gated_and_the_wave_is_handed_over(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(self.find_calls, 0)
+        self.assertEqual(self.gh_calls, [])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+
+    def test_auto_needs_a_repo(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.chain(merge_gate="auto", repo=None)
+        self.assertIn("repo", str(ctx.exception))
+
+    def test_merge_notices_are_episodes(self):
+        for key in ("merge_owner", "merge_refused", "merge_stopped"):
+            self.assertIn(key, wab.NOTICE_EPISODE_ENDS)
+
+
+class ExternalHandoffVerdict(GateBase):
+    def handoff(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        (wab.wave_dir(cfg, "W1") / "result.md").write_text("PR #7\n", encoding="utf-8")
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(len(self.tg), 1, self.tg)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+        return self.tg[0]
+
+    def test_pass_carries_the_merge_command(self):
+        text = self.handoff()
+        self.assertIn("Гейт мерджа пройден", text)
+        self.assertIn(f"gh pr merge 7 --repo o/r --squash --match-head-commit {HEAD}", text)
+        self.assertEqual(self.merges(), [])  # external never merges
+
+    def test_pass_with_open_threads_carries_the_owner_script(self):
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
+        text = self.handoff()
+        self.assertIn(str(self.home / ".cache" / "wab" / f"{CHAIN}-W1-merge"), text)
+
+    def test_fail_and_wait_and_error_are_said_plainly(self):
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
+        self.assertIn("Гейт мерджа не пройден: проверки неуспешны: ci (failure)", self.handoff())
+
+    def test_unreadable_facts_never_stop_the_handoff(self):
+        self.pr = gate.CollectError("gh: boom")
+        text = self.handoff()
+        self.assertIn("Гейт мерджа не проверен", text)
+        self.assertIn("boom", text)
+
+
+class Alarm(GateBase):
+    def running(self, **chain):
+        return self.start(status="RUNNING", **chain)
+
+    def alarms(self):
+        return [s for s in self.sent if "Будильник" in s[2]]
+
+    def test_one_message_per_head_after_checks_and_codex_finish(self):  # acceptance 9
+        self.running()
+        for _ in range(4):
+            self.assertTrue(self.tick())
+        self.assertEqual(len(self.alarms()), 1)
+        text = self.alarms()[0][2]
+        for part in ("PR #7", HEAD[:12], "1 ok", "чисто", "тредов: 0"):
+            self.assertIn(part, text)
+        self.assertEqual(self.alarms()[0][1], "wv-w1")
+        # a new head is a new alarm
+        new = "e" * 40
+        self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new},
+                                 reviews=[{"user": BOT, "commit_id": new, "state": "COMMENTED"}])
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(len(self.alarms()), 2)
+        self.assertIn(new[:12], self.alarms()[1][2])
+
+    def test_pending_checks_or_codex_not_finished_send_nothing(self):  # acceptance 9
+        self.running()
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+        for _ in range(3):
+            self.tick()
+        self.facts = green_facts(reviews=[])
+        for _ in range(3):
+            self.tick()
+        self.facts = green_facts(check_runs=[])
+        self.tick()
+        self.assertEqual(self.alarms(), [])
+
+    def test_failed_checks_and_findings_are_reported(self):
+        self.running()
+        self.facts = green_facts(
+            check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}],
+            review_comments=[{"user": BOT, "commit_id": HEAD, "body": "![P1 Badge](x) x"}],
+            threads=[{"id": "T", "isResolved": False}])
+        self.tick()
+        text = self.alarms()[0][2]
+        for part in ("ci (failure)", "1 замечаний, P0/P1: 1", "тредов: 1"):
+            self.assertIn(part, text)
+
+    def test_only_a_running_wave_with_an_open_pr_is_watched(self):
+        for name, setup in (
+                ("closed PR", lambda: setattr(self, "pr", {**self.pr, "state": "CLOSED"})),
+                ("no PR", lambda: setattr(self, "pr", None)),
+                ("blocked wave", lambda: self.set_status(self.cfg, "W1", "BLOCKED: q")),
+                ("done wave", lambda: self.set_status(self.cfg, "W1", "STARTING"))):
+            with self.subTest(case=name):
+                self.running()
+                self.sent.clear()
+                setup()
+                self.tick()
+                self.assertEqual(self.alarms(), [], name)
+        self.running(repo=None, merge_gate=None)
+        self.find_calls = 0
+        self.tick()
+        self.assertEqual(self.find_calls, 0)  # no repo, no GitHub
+
+    def test_gate_errors_are_one_event_and_no_message(self):
+        self.running()
+        self.pr = gate.CollectError("gh: rate limited")
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.alarms(), [])
+        self.assertEqual(self.log().count("alarm: PR facts not collected"), 1)
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.facts = {"error": "gh api: boom"}
+        self.tick()
+        self.assertEqual(self.alarms(), [])
+        self.facts = green_facts()
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+
+    def test_github_is_asked_at_most_once_per_interval(self):
+        self.running()
+        with mock.patch.object(wab, "ALARM_POLL_SECONDS", 120):
+            for _ in range(5):
+                self.tick()
+        self.assertEqual(self.find_calls, 1)
+
+    def test_a_failed_delivery_is_retried_not_lost(self):
+        self.running()
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = lambda *a, **kw: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["tmux"]))
+        self.tick()
+        self.assertEqual(self.alarms(), [])
+        wab.send_text.side_effect = real
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+
+
+class GateWrappers(Base):
+    """gh_api, gh_graphql, find_pr, workdir_state, read_manifest, write_owner_script: the thin layer
+    between gate.py and the machine, over a fake `gh`."""
+
+    def setUp(self):
+        super().setUp()
+        self.find_pr = REAL_FIND_PR
+
+    def gh(self, handler):
+        self.gh_handler = handler
+
+    def test_gh_api_returns_json_and_raises_collect_error_otherwise(self):
+        self.gh(lambda a: _cp(a, out='{"x": 1}'))
+        self.assertEqual(wab.gh_api("repos/o/r/pulls/1?per_page=100&page=1"), {"x": 1})
+        self.assertEqual(self.gh_calls[-1], ("gh", "api", "repos/o/r/pulls/1?per_page=100&page=1"))
+        self.gh(lambda a: _cp(a, 1, "", "HTTP 404"))
+        with self.assertRaises(gate.CollectError) as ctx:
+            wab.gh_api("repos/o/r/x")
+        self.assertIn("404", str(ctx.exception))
+        self.gh(lambda a: _cp(a, out="<html>"))
+        with self.assertRaises(gate.CollectError):
+            wab.gh_api("repos/o/r/x")
+
+        def timeout(a):
+            raise subprocess.TimeoutExpired(a, 60)
+        self.gh(timeout)
+        with self.assertRaises(gate.CollectError):
+            wab.gh_api("repos/o/r/x")
+
+    def test_gh_graphql_types_the_number(self):
+        self.gh(lambda a: _cp(a, out='{"data": {}}'))
+        self.assertEqual(wab.gh_graphql("query{x}", {"owner": "o", "name": "r", "number": 5}), {"data": {}})
+        argv = self.gh_calls[-1]
+        self.assertEqual(argv[:3], ("gh", "api", "graphql"))
+        self.assertIn("number=5", argv)
+        self.assertEqual(argv[argv.index("number=5") - 1], "-F")
+        self.assertEqual(argv[argv.index("owner=o") - 1], "-f")
+
+    def git_branch(self, branch="feat/x"):
+        REAL_SH("git", "-C", self.cwd, "init", "-q", "-b", branch)
+        REAL_SH("git", "-C", self.cwd, "-c", "user.name=t", "-c", "user.email=t@example.com",
+                "commit", "-q", "--allow-empty", "-m", "c")
+
+    def test_find_pr_takes_the_open_pr_of_the_branch_else_the_newest(self):
+        cfg, _ = self.chain()
+        self.git_branch()
+        prs = [{"number": 3, "headRefOid": "1" * 40, "isDraft": False, "state": "MERGED"},
+               {"number": 9, "headRefOid": "2" * 40, "isDraft": False, "state": "CLOSED"},
+               {"number": 5, "headRefOid": "3" * 40, "isDraft": True, "state": "OPEN"}]
+        self.gh(lambda a: _cp(a, out=json.dumps(prs)))
+        self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 5)
+        argv = self.gh_calls[-1]
+        self.assertEqual(argv[:6], ("gh", "pr", "list", "--repo", "o/r", "--head"))
+        self.assertEqual(argv[argv.index("--head") + 1], "feat/x")
+        self.assertIn("all", argv)
+        self.gh(lambda a: _cp(a, out=json.dumps(prs[:2])))
+        self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 9)
+        self.gh(lambda a: _cp(a, out="[]"))
+        self.assertIsNone(self.find_pr(cfg, self.cwd))
+        self.gh(lambda a: _cp(a, 1, "", "boom"))
+        with self.assertRaises(gate.CollectError):
+            self.find_pr(cfg, self.cwd)
+
+    def test_find_pr_without_a_branch_or_a_repo(self):
+        cfg, _ = self.chain()
+        self.assertIsNone(self.find_pr(cfg, self.cwd))  # not even a git repository
+        cfg_no_repo, _ = self.chain(repo=None)
+        with self.assertRaises(gate.CollectError):
+            self.find_pr(cfg_no_repo, self.cwd)
+
+    def test_workdir_state_reads_cleanliness_head_and_fingerprint(self):
+        self.git_branch()
+        got = wab.workdir_state(self.cwd)
+        self.assertTrue(got["clean"])
+        self.assertEqual(got["head"], REAL_SH("git", "-C", self.cwd, "rev-parse", "HEAD").stdout.strip())
+        self.assertEqual(got["fingerprint"], gate.fingerprint(self.cwd))
+        (Path(self.cwd) / "dirty.txt").write_text("x\n", encoding="utf-8")
+        again = wab.workdir_state(self.cwd)
+        self.assertFalse(again["clean"])
+        self.assertNotEqual(again["fingerprint"], got["fingerprint"])
+
+    def test_workdir_state_of_a_non_repository_is_unknown_not_an_exception(self):
+        got = wab.workdir_state(self.cwd)
+        self.assertEqual((got["clean"], got["head"], got["fingerprint"]), (False, None, None))
+
+    def test_read_manifest(self):
+        cfg, _ = self.chain()
+        self.assertIsNone(wab.read_manifest(cfg, "W1"))
+        folder = wab.wave_dir(cfg, "W1") / "superarmanda"
+        folder.mkdir()
+        (folder / "manifest.json").write_text("{broken", encoding="utf-8")
+        self.assertIsNone(wab.read_manifest(cfg, "W1"))
+        (folder / "manifest.json").write_text("[1]", encoding="utf-8")
+        self.assertIsNone(wab.read_manifest(cfg, "W1"))
+        (folder / "manifest.json").write_text('{"head": "x", "tasks": {}}', encoding="utf-8")
+        self.assertEqual(wab.read_manifest(cfg, "W1")["head"], "x")
+
+    def test_owner_script_file_is_private_and_replaced_not_appended(self):
+        cfg, _ = self.chain()
+        path = wab.write_owner_script(cfg, "W1", 7, HEAD, ["PRRT_a"])
+        self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+        again = wab.write_owner_script(cfg, "W1", 7, HEAD, ["PRRT_a", "PRRT_b"])
+        self.assertEqual(again, path)
+        self.assertEqual(path.read_text(encoding="utf-8").count("resolveReviewThread"), 2)
+        self.assertEqual([p for p in os.listdir(path.parent) if p.startswith(".merge.")], [])
+
+    def test_redact_keeps_the_merge_command_readable(self):
+        command = gate.merge_command("o/r", 7, HEAD)
+        self.assertIn(command, wab.redact(f"Выполни: {command}", wab.TG_MESSAGE_LIMIT))
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
         mods = set(re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", src))
-        stdlib = set(sys.stdlib_module_names)
+        stdlib = set(sys.stdlib_module_names) | {"gate"}  # gate.py is the sibling module, stdlib-only itself
         self.assertFalse(mods - stdlib, mods - stdlib)
+        gate_src = (WAVES / "gate.py").read_text(encoding="utf-8")
+        gate_mods = set(re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", gate_src))
+        self.assertFalse(gate_mods - set(sys.stdlib_module_names), gate_mods)
         self.assertNotRegex(src, r"curl[^\n]*\|\s*python")
 
     def test_protocol_describes_the_waves_mode(self):
