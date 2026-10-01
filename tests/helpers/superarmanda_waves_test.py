@@ -4190,6 +4190,44 @@ class W4Round29EpisodeEnds(Base):
         self.restore()
         self.assertEqual(self.count("вышла из режима auto"), 1, self.tg)
 
+    # ----- round 37: a screen episode ends on screen even while the wave is BLOCKED -----
+    # The BLOCKED branch of the tick returns before the normal screen checks; a screen notice
+    # stuck in the outbox (Telegram down) must not go out once its prompt / silence / plan mode
+    # left the screen, while the BLOCKED notice itself goes out exactly once.
+    def blocked_after(self, pane):
+        self.pane = pane
+        self.set_status(self.cfg, "W1", "BLOCKED: question")
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("ждёт тебя"), 1, self.tg)
+
+    def test_permission_is_stale_once_the_prompt_left_while_blocked(self):
+        self.permission()
+        self.blocked_after("working")
+        self.assertEqual(self.count("ждёт подтверждения"), 0, self.tg)
+
+    def test_idle_is_stale_once_the_pane_moved_while_blocked(self):
+        self.idle()
+        self.blocked_after("e\nf\ng\nh\ni")
+        self.assertEqual(self.count("молчит"), 0, self.tg)
+
+    def test_auto_off_is_stale_once_auto_mode_is_back_while_blocked(self):
+        self.auto_off()
+        self.blocked_after(AutoGuard.ON)
+        self.assertEqual(self.count("вышла из режима auto"), 0, self.tg)
+
+    def test_permission_still_on_screen_while_blocked_is_delivered_once(self):
+        self.permission()
+        self.blocked_after(self.pane)
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("ждёт подтверждения"), 1, self.tg)
+        self.assertEqual(self.count("ждёт тебя"), 1, self.tg)
+
+    def test_every_screen_episode_has_a_screen_end(self):
+        self.assertEqual(set(wab.SCREEN_EPISODE_ENDS), {"permission", "idle", "auto_off"})
+        self.assertLessEqual(set(wab.SCREEN_EPISODE_ENDS), set(wab.NOTICE_EPISODE_ENDS))
+
     # ----- handoff: ends when the wave leaves awaiting_merge (the coordinator confirmed it) -----
     def test_handoff_is_stale_once_the_wave_left_awaiting_merge(self):
         w = self.wave_rec(phase="done", outbox={"handoff": {"value": "1", "text": "old handoff", "next_at": 0}})
@@ -4215,6 +4253,76 @@ class W4Round29EpisodeEnds(Base):
         self.restore()
         self.restore()
         self.assertEqual(sorted(self.tg), ["old chain_done", "old done", "old no_next"])
+
+
+class W4Round37DashTerminalPhase(Base):
+    """Round 37: a terminal phase (the window is gone or the wave is handed over) wins over a
+    stale status in the file: no «ждёт тебя» and no attach command for a closed window."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import dash  # noqa: F401
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        import dash
+        self.dash = dash
+
+    def render_text(self, cfg):
+        from rich.console import Console
+        buf = io.StringIO()
+        Console(file=buf, width=200, force_terminal=False).print(self.dash.safe_render(cfg))
+        return buf.getvalue()
+
+    def test_dead_wins_over_a_stale_blocked_status(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="dead", last_status="BLOCKED: q")}})
+        self.set_status(cfg, "W1", "BLOCKED: q")
+        self.alive = False
+        self.assertEqual(self.dash.wave_state(cfg, wab.load_state(cfg), "W1")[0], "dead")
+        text = self.render_text(cfg)
+        self.assertIn("окно закрыто", text)
+        self.assertNotIn("ждёт тебя", text)
+        self.assertNotIn("attach -t", text)
+
+    def test_a_gone_window_wins_over_blocked_before_the_watch_marks_it(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "BLOCKED: q")
+        self.alive = False
+        self.assertEqual(self.dash.wave_state(cfg, wab.load_state(cfg), "W1")[0], "dead")
+
+    def test_handed_over_and_done_win_over_a_stale_blocked_status(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": None, "waves": {
+            "W1": self.wave_rec("W1", phase="awaiting_merge"), "W2": self.wave_rec("W2", phase="done")}})
+        self.set_status(cfg, "W1", "BLOCKED: q")
+        self.set_status(cfg, "W2", "BLOCKED: q")
+        st = wab.load_state(cfg)
+        self.assertEqual(self.dash.wave_state(cfg, st, "W1")[0], "awaiting_merge")
+        self.assertEqual(self.dash.wave_state(cfg, st, "W2")[0], "DONE")
+
+    def test_every_window_gone_phase_has_a_dashboard_state(self):
+        self.assertEqual(set(self.dash.TERMINAL_PHASES), set(wab.WINDOW_GONE))
+        for key in self.dash.TERMINAL_PHASES.values():
+            self.assertIn(key, self.dash.STYLE)
+
+    def test_handed_over_current_wave_shows_no_attach(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge")}})
+        self.set_status(cfg, "W1", "BLOCKED: q")
+        text = self.render_text(cfg)
+        self.assertIn("ждёт мерджа", text)
+        self.assertNotIn("attach -t", text)
+
+    def test_blocked_with_a_live_window_still_waits_for_the_owner(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "BLOCKED: q")
+        self.assertEqual(self.dash.wave_state(cfg, wab.load_state(cfg), "W1")[0], "BLOCKED")
+        text = self.render_text(cfg)
+        self.assertIn("ждёт тебя", text)
+        self.assertIn("attach -t", text)
 
 
 class W4Round29PromptFile(Base):

@@ -797,7 +797,8 @@ def put_notice(w, key, value, text):
     """Put a notice about a standing episode (`key`, `value`) into the wave's outbox, IN MEMORY only.
     `key` is a literal with a row in NOTICE_EPISODE_ENDS (the end of its episode): once the
     episode is over the notice is stale and leaves the outbox undelivered (key -> end:
-    started/tmux_failed/permission/idle/auto_off -> window gone; not_ready, no_prompt,
+    started/tmux_failed -> window gone; permission/idle/auto_off -> window gone or their screen
+    end (SCREEN_EPISODE_ENDS); not_ready, no_prompt,
     checkpoint_timeout, dead, handoff -> their phase is left; sending -> the wave wrote a status;
     updating -> the new session is bound; blocked -> status not BLOCKED; done/no_next/
     launch_refused -> ack only;
@@ -841,8 +842,8 @@ def _status(w):
 # Every notice is about an episode, and it is stale once the episode is over. Key -> the end of
 # its episode as a predicate on the wave record (applied by drop_ended_episodes on EVERY save and
 # before every send), None = ended only by the coordinator's confirmation (ack_wave_notices).
-# Ends that are not in the record (the screen) are dropped inline where they are seen; they are
-# listed after `#`. A new put_notice key without a row here fails the completeness test.
+# Ends that are not in the record but on the screen are in SCREEN_EPISODE_ENDS (listed after `#`).
+# A new put_notice key without a row here fails the completeness test.
 #   started             window gone / wave finished
 #   not_ready           the phase left not_ready (a relaunch); + ack
 #   no_prompt           the phase left starting (the task was sent after all)
@@ -852,8 +853,8 @@ def _status(w):
 #   tmux_failed         window gone   # + the next successful action (_act)
 #   dead                the phase left dead (the window is back); + ack on a relaunch
 #   blocked             the status is no longer BLOCKED, or window gone
-#   permission, idle, auto_off   window gone   # + the prompt left the screen / the pane moved /
-#                                              #   auto mode is back (_tick)
+#   permission, idle, auto_off   window gone   # + SCREEN_EPISODE_ENDS: the prompt left the screen /
+#                                              #   the pane moved / auto mode is back
 #   handoff             the phase left awaiting_merge (the coordinator confirmed it); + ack
 #   done, no_next, launch_refused   None: only the coordinator's confirmation (ack)
 #   chain_done          None and kept even on ack: the end of the chain must get through
@@ -891,6 +892,40 @@ def drop_ended_episodes(w):
             drop_notice(w, key)
     box = w.get("outbox")
     return before != (set(box) if isinstance(box, dict) else set())
+
+
+def pane_digest(txt):
+    """Idleness is judged without the last two non-empty lines (spinner, timer, footer)."""
+    body = [l for l in txt.splitlines() if l.strip()][:-2]
+    return hashlib.sha1("\n".join(body).encode("utf-8")).hexdigest()
+
+
+# Episodes whose end is seen on the screen of a live window: key -> predicate on (record, screen),
+# screen = {"txt", "digest", "auto_off"}. Applied by end_screen_episodes on EVERY tick with a live
+# window, before any branch of the tick returns (BLOCKED, updating, clearing, checkpoint...) and
+# before the outbox is sent: a notice stuck in the outbox must not go out once its condition left
+# the screen, whatever the wave does meanwhile. The window being gone ends them via NOTICE_EPISODE_ENDS.
+SCREEN_EPISODE_ENDS = {
+    "permission": lambda w, s: not any(m in s["txt"] for m in PERMISSION_MARKERS),
+    "idle": lambda w, s: s["digest"] != w.get("pane_digest"),
+    "auto_off": lambda w, s: s["auto_off"] is False,
+}
+
+
+def end_screen_episodes(w, txt, now):
+    """The one place where screen episodes end: drop the ended ones (notice and mark), then move
+    the screen bookkeeping on (the idle clock restarts on a new digest, auto mode back resets the
+    off counter). In memory only: the caller's next save persists it. Returns the screen."""
+    screen = {"txt": txt, "digest": pane_digest(txt), "auto_off": auto_mode_off(txt)}
+    for key, ended in SCREEN_EPISODE_ENDS.items():
+        if ended(w, screen):
+            drop_notice(w, key)
+    if screen["digest"] != w.get("pane_digest"):
+        w["pane_digest"], w["pane_changed"] = screen["digest"], now
+    if screen["auto_off"] is False:
+        w["auto_off_ticks"] = 0
+        w["auto_alerted"] = False
+    return screen
 
 
 KEEP_ON_ACK = ("chain_done",)  # the end of the chain is never stale: it must get through
@@ -1838,7 +1873,12 @@ def _tick(cfg, st):
         _mark_dead(cfg, st, wave, status)
         return False  # the chain stops; restart the wave by hand, then run watch again
 
+    # screen episodes end on screen before any branch below returns or sends the outbox
+    screen = end_screen_episodes(w, pane_text(name), now)
+    txt = screen["txt"]
+
     if w.get("phase") in ("starting", "sending"):  # the first prompt is not through yet
+        save_state(cfg, st)  # a screen episode that ended is not sent by another record's flush
         advance_pending(cfg, st)
         return True
 
@@ -1875,7 +1915,6 @@ def _tick(cfg, st):
         finish_update(cfg, st, wave)
         return True
 
-    txt = pane_text(name)
     awaiting = bool(w.get("await_session"))
     if awaiting:
         sid = find_new_session(cfg, st, wave)
@@ -1914,8 +1953,8 @@ def _tick(cfg, st):
             flush_notices(cfg, st, w)
 
     if w.get("phase") == "running":  # a wave out of auto mode asks for every step
-        off = auto_mode_off(txt)
-        if off:
+        off = screen["auto_off"]
+        if off:  # its end (auto mode back) is in end_screen_episodes
             w["auto_off_ticks"] = w.get("auto_off_ticks", 0) + 1
             if w["auto_off_ticks"] >= 2 and not w.get("auto_alerted"):
                 w["auto_alerted"] = True
@@ -1925,13 +1964,7 @@ def _tick(cfg, st):
                 save_state(cfg, st)
                 event(cfg, f"{wave}: window is not in auto mode")
                 flush_notices(cfg, st, w)
-        elif off is False:
-            w["auto_off_ticks"] = 0
-            w["auto_alerted"] = False
-            drop_notice(w, "auto_off")
 
-    if not any(m in txt for m in PERMISSION_MARKERS):
-        drop_notice(w, "permission")
     if any(m in txt for m in PERMISSION_MARKERS):
         if once_per(w, "permission", "visible"):  # one episode while the prompt stays on screen
             put_notice(w, "permission", "visible",
@@ -1940,13 +1973,8 @@ def _tick(cfg, st):
             event(cfg, f"{wave}: permission prompt on screen")
             flush_notices(cfg, st, w)
 
-    # idleness is judged without the last two non-empty lines (spinner, timer, footer)
-    body = [l for l in txt.splitlines() if l.strip()][:-2]
-    digest = hashlib.sha1("\n".join(body).encode("utf-8")).hexdigest()
-    if digest != w.get("pane_digest"):
-        w["pane_digest"], w["pane_changed"] = digest, now
-        drop_notice(w, "idle")
-    elif now - w.get("pane_changed", now) > cfg["idle_minutes"] * 60:
+    digest = screen["digest"]  # a new digest already restarted the clock (end_screen_episodes)
+    if now - w.get("pane_changed", now) > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
             put_notice(w, "idle", digest,
                        f"wave-autobot: волна {wave} молчит {cfg['idle_minutes']}+ мин "

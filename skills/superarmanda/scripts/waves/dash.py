@@ -169,19 +169,26 @@ def fmt_commits(n):
     return "?" if n is None else str(n)
 
 
+# A terminal phase wins over the status file: the file keeps the wave's last word (a BLOCKED
+# question of a window that has since closed), the phase is what the watch decided afterwards.
+# Every phase of wab.WINDOW_GONE has a row (a test holds it).
+TERMINAL_PHASES = {"dead": "dead", "awaiting_merge": "awaiting_merge", "done": "DONE"}
+
+
 def wave_state(cfg, st, wave):
     w = st["waves"].get(wave)
     if not w:
         return "pending", w
+    if w.get("phase") in TERMINAL_PHASES:
+        return TERMINAL_PHASES[w["phase"]], w
     status = wave_status(cfg, wave, w)
+    # the window is gone before the watch noticed it: nobody to answer, no attach
+    if st.get("current") == wave and status != "DONE" and not wab.tmux_alive(w["tmux"]):
+        return "dead", w
     if status.startswith("BLOCKED"):
         return "BLOCKED", w
-    if w.get("phase") == "awaiting_merge":
-        return "awaiting_merge", w
     if w.get("phase") == "checkpoint" and status != "HANDOFF_READY":
         return "checkpoint", w
-    if st.get("current") == wave and not wab.tmux_alive(w["tmux"]) and status != "DONE":
-        return "dead", w
     return status or "STARTING", w
 
 
@@ -231,6 +238,7 @@ def current_panel(cfg, st):
                      title="Текущая волна", border_style="grey42")
     w = st["waves"][wave]
     status = wave_status(cfg, wave, w)
+    key, _ = wave_state(cfg, st, wave)
     head = Text()
     if BINDING:
         head.append(" Ctrl+\\ ", style="bold black on bright_yellow")
@@ -238,8 +246,14 @@ def current_panel(cfg, st):
     elif BINDING is False:
         head.append("Ctrl+\\ не подключён (см. события)  ·  ", style="grey50")
     head.append(f"{wave}  ", style="bold magenta")
-    head.append(wab.attach_cmd(w["tmux"]), style="bold white on grey23")
-    head.append(f"   статус: {status}", style="yellow" if status.startswith("BLOCKED") else "green")
+    if key == "dead" or w.get("phase") in TERMINAL_PHASES:
+        # no window to attach to; the file's status is only the wave's last word
+        _, colour, label = STYLE[key]
+        head.append(label, style=colour)
+        head.append(f"   последний статус: {status}", style="grey62")
+    else:
+        head.append(wab.attach_cmd(w["tmux"]), style="bold white on grey23")
+        head.append(f"   статус: {status}", style="yellow" if key == "BLOCKED" else "green")
     ctx = Group(Text("Контекст ", style="bold").append(bar(w.get("tokens", 0), cfg["ctx_limit"], 40)),
                 Text("История  ", style="bold").append(spark(w.get("ctx_hist", []), cfg["ctx_limit"])))
     lines = [l for l in wab.pane_text(w["tmux"]).splitlines() if l.strip()][-14:]
