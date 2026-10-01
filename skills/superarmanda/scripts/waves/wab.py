@@ -520,7 +520,7 @@ _REDACT = [
     re.compile(r"(?i)(?<![\w-])([\"']?(?:[\w.-]*(?:secret|token|password|passwd|pwd|api[_-]?key|"
                r"private[_-]?key|dsn|cookie|session|credential|connection[_-]?string|accountkey|"
                r"sharedaccesskey|signature)[\w.-]*|sig)[\"']?)(\s*[:=]\s*)"
-               r"(?!\[скрыто\])(?:\"[^\"]*\"?|'[^']*'?|[^\s,;&}\]]+)"),             # key as a word, value as a whole
+               r"(?!\[скрыто\])(?:\"(?:[^\"\\]|\\.)*\"?|'(?:[^'\\]|\\.)*'?|[^\s,;&}\]]+)"),             # key as a word, value as a whole
     re.compile(r"(?i)\b((?:proxy-)?authorization)(\s*:\s*)(?:(?:bearer|basic|token|digest)\s+)?\S+"),
     re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(r"(?<=://)[^/\s@]+(?=@)"),                           # userinfo in URLs, with or without password
@@ -1159,12 +1159,20 @@ SAFE_PATH = re.compile(r"/[A-Za-z0-9_./+-]*")
 SAFE_DASH = re.compile(r"[A-Za-z0-9_-]+")
 
 
-def keys_conf(registry):
+SAFE_SOCKET = re.compile(r"[A-Za-z0-9_./+-]+")
+
+
+def keys_conf(registry, socket=None):
     """tmux config for the Ctrl+\\ toggle, from {dash session: [opener, chain.json]}.
     On a registered dashboard the key opens that chain's current wave in a popup; inside a
     popup client (attached with -f ignore-size) it closes it; elsewhere it reaches the app.
     prefix+W and Shift+Tab are not touched. Anything outside a conservative character set is
-    refused: the values end up inside tmux config syntax."""
+    refused: the values end up inside tmux config syntax. `socket` (a -L name of the server the
+    binding is sourced into) travels into the popup command as WAB_TMUX_SOCKET=..., because the
+    server's own environment need not carry it."""
+    if socket is not None and not (isinstance(socket, str) and SAFE_SOCKET.fullmatch(socket)):
+        raise ValueError(f"unsafe tmux socket {socket!r}: [A-Za-z0-9_./+-]")
+    env = f"WAB_TMUX_SOCKET={socket} " if socket else ""
     key = '"C-\\\\"'
     cmd = (f'if-shell -F "#{{m:*ignore-size*,#{{client_flags}}}}" '
            f'{{ detach-client }} {{ send-keys {key} }}')
@@ -1175,7 +1183,7 @@ def keys_conf(registry):
                              f"[A-Za-z0-9_./+-]")
         opener, chain = entry
         cmd = (f'if-shell -F "#{{==:#{{session_name}},{dash}}}" '
-               f'{{ display-popup -E -w 95% -h 90% -T " волна (назад: Ctrl+\\\\) " "{opener} {chain}" }} '
+               f'{{ display-popup -E -w 95% -h 90% -T " волна (назад: Ctrl+\\\\) " "{env}{opener} {chain}" }} '
                f'{{ {cmd} }}')
     return f"bind-key -n {key} {cmd}\n"  # Shift+Tab (BTab) is never bound here
 
@@ -1259,7 +1267,13 @@ def _bind_popup(cfg, path):
         f.write(json.dumps(reg, indent=1, ensure_ascii=False))
     os.replace(tmp, target)
     conf = cfg["run_dir"] / "keys.tmux"
-    conf.write_text(keys_conf(reg), encoding="utf-8")
+    sock = TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET") or None
+    try:
+        text = keys_conf(reg, sock)
+    except ValueError as e:
+        event(cfg, f"Ctrl+\\ binding refused: {e}")
+        return
+    conf.write_text(text, encoding="utf-8")
     r = tmux("source-file", str(conf), check=False)
     event(cfg, "Ctrl+\\ toggles the wave popup" if r.returncode == 0
           else f"toggle key bind failed: {r.stderr.strip() or r.stdout.strip()}")

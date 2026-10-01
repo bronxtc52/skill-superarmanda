@@ -498,6 +498,19 @@ class Supervision(Base):
 
 # ---------------------------------------------------------------- A4
 class Redaction(Base):
+    def test_escaped_quotes_and_backslashes_do_not_leak_a_secret_tail(self):
+        cases = [
+            '{"password":"alpha\\"secret-tail"}', "token='a\\'b-tail' x", 'api_key="p\\\\q\\"r-tail" y',
+            'password=a\\"b-tail', '{"secret": "x\\\\", "n": 1}',
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                out = wab.redact(text)
+                for part in ("alpha", "secret-tail", "b-tail", "r-tail", "p\\"):
+                    self.assertNotIn(part, out)
+                self.assertLessEqual(len(wab.redact(text * 200, 600)), 600)
+                self.assertLessEqual(len(wab.redact(text * 200, 1200)), 1200)
+
     def test_bare_long_hex_is_masked_but_labelled_shas_survive(self):
         key = "ab12" * 16  # 64 hex chars, no label: a key
         self.assertEqual(wab.redact(key), "[скрыто]")
@@ -1886,6 +1899,34 @@ class KeysAndRegistry(Base):
         self.assertNotRegex(conf, r"bind(-key)?\s[^\n]*\bW\b")
         self.assertNotIn("BTab", conf)
         self.assertNotIn("unbind", conf)
+
+    def test_socket_travels_into_the_popup_command(self):
+        conf = wab.keys_conf(self.reg(), "my.sock")
+        self.assertEqual(conf.count('"WAB_TMUX_SOCKET=my.sock '), 2)
+        self.assertNotIn("WAB_TMUX_SOCKET", wab.keys_conf(self.reg()))
+        for bad in ("a b", 'a"b', "a;b", "a$(x)", "a\nb", "", "a{b", "a#b"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    wab.keys_conf(self.reg(), bad)
+
+    def test_wab_open_uses_the_socket_it_is_given_for_every_tmux_call(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W2", "waves": {"W2": self.wave_rec("W2")}})
+        bindir = self.tmp / "fakebin"
+        bindir.mkdir()
+        log = self.tmp / "tmux.log"
+        fake = bindir / "tmux"
+        fake.write_text(f'#!/bin/sh\necho "$*" >> {log}\nexit 0\n', encoding="utf-8")
+        fake.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "WAB_TMUX_SOCKET"}
+        env["PATH"] = f"{bindir}:{env['PATH']}"
+        env["WAB_TMUX_SOCKET"] = "sockq"
+        subprocess.run([str(WAVES / "wab-open"), str(path)], stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, encoding="utf-8", env=env)
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(lines), 2)
+        for line in lines:
+            self.assertTrue(line.startswith("-L sockq "), line)
 
     def test_unsafe_values_are_refused(self):
         opener = str(WAVES / "wab-open")
