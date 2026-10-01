@@ -2331,6 +2331,20 @@ def owner_merge(cfg, wave, run_id, sha):
         print(f"wab: owner-merge: PR #{number} переведён в ready; дождись завершения проверок "
               f"и запусти скрипт ещё раз ({len(v['unresolved'])} threads resolved)", flush=True)
         return
+    if v["unresolved"]:
+        # The threads took time: CI may have restarted or a new P1 / thread appeared on the same head
+        # (`--match-head-commit` pins only the sha). Gate once more right before the merge. Without
+        # closed threads the first gate was seconds ago, so it is not repeated.
+        v2 = gate_check(cfg, wave, w)
+        if v2["verdict"] != "pass":
+            raise SystemExit(f"wab: owner-merge: гейт изменился после закрытия тредов: {v2['verdict']}: "
+                             f"{'; '.join(v2['reasons'])}; ничего не смержено")
+        if v2["head"] != w["gate_sha"] or v2["number"] != w.get("gate_pr"):
+            raise SystemExit(f"wab: owner-merge: гейт изменился после закрытия тредов: PR head "
+                             f"{str(v2['head'])[:12]} is not the gated {w['gate_sha'][:12]}; ничего не смержено")
+        if v2["unresolved"]:
+            raise SystemExit(f"wab: owner-merge: гейт изменился после закрытия тредов: появились новые треды, "
+                             f"запусти скрипт ещё раз ({len(v2['unresolved'])} open); ничего не смержено")
     r = sh(*merge, check=False, timeout=120)
     if r.returncode != 0:
         raise SystemExit(f"wab: owner-merge: `{' '.join(merge[:3])}` failed: "

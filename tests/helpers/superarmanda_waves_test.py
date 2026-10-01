@@ -8155,6 +8155,7 @@ class OwnerMerge(GateBase):  # D3
         def graphql(query, variables):
             self.graphql_calls.append(variables)
             self.order.append("resolve")
+            self.on_resolve(variables)
             return self.graphql_answer
         p = mock.patch.object(wab, "gh_graphql", side_effect=graphql)
         p.start()
@@ -8170,8 +8171,49 @@ class OwnerMerge(GateBase):  # D3
         self.snapshot = json.dumps(self.rec(), sort_keys=True)
         self.gated = HEAD
 
+    def on_resolve(self, variables):  # by default the closed thread is closed on GitHub too
+        for t in self.facts.get("threads", []):
+            if t["id"] == variables["id"]:
+                t["isResolved"] = True
+
     def run_it(self):
         return wab.owner_merge(wab.load_chain(self.path), "W1", RUN_ID, self.gated)
+
+    def test_facts_changing_while_threads_close_stop_the_merge(self):  # r13 HIGH
+        self.not_draft()
+        self.on_resolve = lambda v: self.facts.__setitem__(
+            "check_runs", [{"id": 1, "name": "ci", "status": "in_progress", "conclusion": None}])
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("гейт изменился после закрытия тредов", str(ctx.exception))
+        self.assertIn("ничего не смержено", str(ctx.exception))
+        self.assertEqual(self.merges(), [])
+        self.assertNotIn("merge", self.order)
+
+    def test_a_new_p1_while_threads_close_stops_the_merge(self):  # r13 HIGH
+        self.not_draft()
+        self.on_resolve = lambda v: self.facts.__setitem__("review_comments", [
+            {"id": 9, "user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) late", "html_url": "u"}])
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("гейт изменился после закрытия тредов", str(ctx.exception))
+        self.assertEqual(self.merges(), [])
+
+    def test_a_new_open_thread_while_threads_close_stops_the_merge(self):  # r13 HIGH
+        self.not_draft()
+        self.on_resolve = lambda v: self.facts["threads"].append({"id": "PRRT_new", "isResolved": False})
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("появились новые треды, запусти скрипт ещё раз", str(ctx.exception))
+        self.assertEqual(self.merges(), [])
+        self.assertNotIn("merge", self.order)
+
+    def test_unchanged_facts_after_closing_threads_merge_as_before(self):  # r13 HIGH
+        self.not_draft()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.run_it()
+        self.assertEqual(self.order, ["resolve", "resolve", "merge"])
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
 
     def not_draft(self):  # the owner made it ready earlier: the run that merges sees a non-draft PR
         self.pr["isDraft"] = False
@@ -8309,6 +8351,8 @@ class OwnerMerge(GateBase):  # D3
                              ("truthy string", {"data": {"resolveReviewThread": {"thread": {"isResolved": "true"}}}})):
             with self.subTest(answer=name):
                 self.graphql_answer = answer
+                for t in self.facts["threads"]:  # an earlier subtest closed them in the fixture
+                    t["isResolved"] = t["id"] == "PRRT_b"
                 self.order.clear()
                 with self.assertRaises(SystemExit) as ctx:
                     self.run_it()
@@ -8346,6 +8390,9 @@ class OwnerMergeHarness(GateBase):
         def graphql(query, variables):
             self.graphql_calls.append(variables)
             self.order.append("resolve")
+            for t in self.facts.get("threads", []):  # a closed thread is closed on GitHub too
+                if t["id"] == variables["id"]:
+                    t["isResolved"] = True
             return self.graphql_answer
         p = mock.patch.object(wab, "gh_graphql", side_effect=graphql)
         p.start()
