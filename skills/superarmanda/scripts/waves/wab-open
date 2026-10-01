@@ -5,7 +5,10 @@
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 name=$(python3 -X utf8 "$here/wab.py" current-tmux "$1")
-if [ -z "$name" ] || ! tmux has-session -t "$name" 2>/dev/null; then
+# exact session names (=name): a bare wv-w1 would also match wv-w10; WAB_TMUX_SOCKET selects a -L socket
+tm=(tmux)
+[ -n "${WAB_TMUX_SOCKET:-}" ] && tm+=(-L "$WAB_TMUX_SOCKET")
+if [ -z "$name" ] || ! "${tm[@]}" has-session -t "=$name" 2>/dev/null; then
   echo "Нет активной волны (цепочка завершена или окно закрыто). Enter — закрыть."; read -r; exit 0
 fi
-TMUX= exec tmux -u attach -f ignore-size -t "$name"
+TMUX= exec "${tm[@]}" -u attach -f ignore-size -t "=$name"

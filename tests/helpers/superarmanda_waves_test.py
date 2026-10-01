@@ -1377,6 +1377,73 @@ class Episodes(Base):
         self.assertEqual(len(self.tg), 2)
 
 
+class ExactTargets(Base):
+    def setUp(self):
+        super().setUp()
+        exe = shutil.which("tmux")
+        if not exe:
+            self.skipTest("tmux is not installed")
+        out = subprocess.run([exe, "-V"], capture_output=True, text=True, encoding="utf-8").stdout
+        ver = wab.parse_tmux_version(out)
+        if ver is None or ver < (3, 2):
+            self.skipTest(f"tmux {out.strip()!r} is older than 3.2")
+        self.exe = exe
+        self.sock = f"wabtest-{os.getpid()}"
+        self.env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        self.addCleanup(lambda: subprocess.run([exe, "-L", self.sock, "kill-server"],
+                                               capture_output=True, env=self.env))
+        self.w = load_orig("wab_targets")  # unpatched copy: real tmux functions
+        self.w.TMUX_SOCKET = self.sock
+
+    def tm(self, *args):
+        return subprocess.run([self.exe, "-L", self.sock, "-f", "/dev/null", *args], capture_output=True,
+                              text=True, encoding="utf-8", env=self.env)
+
+    def test_a_prefix_name_never_matches_another_session(self):
+        self.assertEqual(self.tm("new-session", "-d", "-s", "x-w10", "-x", "80", "-y", "24").returncode, 0)
+        self.assertTrue(self.w.tmux_alive("x-w10"))
+        self.assertFalse(self.w.tmux_alive("x-w1"))
+        self.assertFalse(self.w.tmux_alive("x-w"))
+        self.assertEqual(self.w.pane_text("x-w1"), "")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.w.send_command("x-w1", "echo LEAK")
+        time.sleep(0.3)
+        self.assertNotIn("LEAK", self.w.pane_text("x-w10"))
+        self.w.send_command("x-w10", "echo MARK123")
+        for _ in range(30):
+            if "MARK123" in self.w.pane_text("x-w10").replace("echo MARK123", ""):
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("send_command did not reach the exact session")
+
+    def test_no_bare_session_targets_remain(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        for m in re.finditer(r'"-t",\s*([^,)\n]+)', src):
+            self.assertRegex(m.group(1).strip(), r"^(session_target|pane_target)\(", m.group(0))
+
+    def test_cli_launch_failure_exits_nonzero(self):
+        cfg, path = self.chain()
+        self.alive = False
+        self.ready = False
+        prompt = self.tmp / "p.md"
+        prompt.write_text("x", encoding="utf-8")
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            with self.assertRaises(SystemExit) as ctx:
+                wab.main(["wab.py", "launch", str(path), "W1", str(prompt)])
+        self.assertEqual(ctx.exception.code, 3)
+
+    def test_watch_that_ends_in_failure_exits_nonzero(self):
+        cfg, path = self.chain()
+        self.alive = False
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "RUNNING")
+        with mock.patch.object(wab, "bind_popup"):
+            with self.assertRaises(SystemExit) as ctx:
+                wab.main(["wab.py", "watch", str(path)])
+        self.assertEqual(ctx.exception.code, 3)
+
+
 class AtMostOnce(Base):
     def crash_then_tick(self, cfg, **extra):
         with mock.patch.object(wab, "notify", side_effect=KeyboardInterrupt):
@@ -1691,7 +1758,9 @@ class KeysAndRegistry(Base):
         script = WAVES / "wab-open"
         self.assertTrue(os.access(script, os.X_OK))
         text = script.read_text(encoding="utf-8")
-        self.assertIn("tmux -u attach", text)
+        self.assertIn("-u attach", text)
+        self.assertIn('has-session -t "=$name"', text)
+        self.assertIn('attach -f ignore-size -t "=$name"', text)
         self.assertIn("current-tmux", text)
         self.assertNotIn("python3 -c", text)
         self.assertNotIn("$1'", text)

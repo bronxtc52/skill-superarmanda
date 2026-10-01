@@ -212,7 +212,7 @@ def parse_tmux_version(text):
 
 def require_tmux():
     try:
-        r = sh("tmux", "-V", check=False)
+        r = tmux("-V", check=False)
     except OSError as e:
         raise SystemExit(f"tmux is required (>= 3.2) but could not be run: {e}")
     version = parse_tmux_version(r.stdout) if r.returncode == 0 else None
@@ -224,17 +224,39 @@ def require_tmux():
                          f"(new-session -e, display-popup, source-file -n)")
 
 
+TMUX_SOCKET = None  # tests point this at a private `-L` socket; None means the default server
+
+
+def tmux_argv(*args):
+    sock = TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET")
+    return ("tmux", *(("-L", sock) if sock else ()), *args)
+
+
+def tmux(*args, **kw):
+    return sh(*tmux_argv(*args), **kw)
+
+
+def session_target(name):
+    """Exact session match: a bare `wv-w1` would also hit `wv-w10`."""
+    return f"={name}"
+
+
+def pane_target(name):
+    """Exact session, its current window and pane (for send-keys, capture-pane, paste-buffer)."""
+    return f"={name}:"
+
+
 def sh(*args, check=True, **kw):
     return subprocess.run(args, check=check, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", **kw)
 
 
 def tmux_alive(name):
-    return sh("tmux", "has-session", "-t", name, check=False).returncode == 0
+    return tmux("has-session", "-t", session_target(name), check=False).returncode == 0
 
 
 def pane_text(name):
-    r = sh("tmux", "capture-pane", "-p", "-t", name, check=False)
+    r = tmux("capture-pane", "-p", "-t", pane_target(name), check=False)
     return r.stdout if r.returncode == 0 else ""
 
 
@@ -242,16 +264,16 @@ def send_text(name, text):
     """Paste text as one bracketed paste, then submit it. The buffer is private to this
     dispatcher and session: tmux buffers are global to the server."""
     buf = f"wab-{os.getpid()}-{name}"
-    sh("tmux", "load-buffer", "-b", buf, "-", input=text)
-    sh("tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", name)
+    tmux("load-buffer", "-b", buf, "-", input=text)
+    tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pane_target(name))
     time.sleep(1.5)
-    sh("tmux", "send-keys", "-t", name, "Enter")
+    tmux("send-keys", "-t", pane_target(name), "Enter")
 
 
 def send_command(name, cmd):
-    sh("tmux", "send-keys", "-t", name, "-l", cmd)
+    tmux("send-keys", "-t", pane_target(name), "-l", cmd)
     time.sleep(0.7)
-    sh("tmux", "send-keys", "-t", name, "Enter")
+    tmux("send-keys", "-t", pane_target(name), "Enter")
 
 
 def wait_ready(name, timeout=90):
@@ -261,9 +283,9 @@ def wait_ready(name, timeout=90):
         txt = pane_text(name)
         if any(m in txt for m in TRUST_MARKERS):
             # default option is "No, exit": move to "Yes, I trust this folder" first
-            sh("tmux", "send-keys", "-t", name, "Down")
+            tmux("send-keys", "-t", pane_target(name), "Down")
             time.sleep(0.5)
-            sh("tmux", "send-keys", "-t", name, "Enter")
+            tmux("send-keys", "-t", pane_target(name), "Enter")
             time.sleep(3)
             continue
         if any(m in txt for m in READY_MARKERS):
@@ -685,7 +707,7 @@ def start_session(cfg, st, wave):
            "--name", f"wab-{cfg['chain']}-{wave}", "--session-id", w["sessions"][0]]
     if cfg["model"]:
         cmd += ["--model", cfg["model"]]
-    sh("tmux", "new-session", "-d", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
+    tmux("new-session", "-d", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
        "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *cmd)
     w["phase"] = "starting"
     save_state(cfg, st)
@@ -873,8 +895,8 @@ def tick(cfg, st):
         notify(cfg, f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n"
                     f"Мердж и запуск следующей волны — за координатором.")
         if tmux_alive(name):
-            sh("tmux", "send-keys", "-t", name, "-l", "/exit", check=False)
-            sh("tmux", "send-keys", "-t", name, "Enter", check=False)
+            tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
+            tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
         return False
 
     if status == "DONE":
@@ -891,8 +913,8 @@ def tick(cfg, st):
             notify(cfg, f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
                         f"Целиком: {wdir}/result.md")
             if tmux_alive(name):
-                sh("tmux", "send-keys", "-t", name, "-l", "/exit", check=False)
-                sh("tmux", "send-keys", "-t", name, "Enter", check=False)
+                tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
+                tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
         if idx + 1 >= len(waves):
             st["current"] = None
             save_state(cfg, st)
@@ -1124,12 +1146,12 @@ def _bind_popup(cfg, path):
     os.replace(tmp, target)
     conf = cfg["run_dir"] / "keys.tmux"
     conf.write_text(keys_conf(reg), encoding="utf-8")
-    r = sh("tmux", "source-file", str(conf), check=False)
+    r = tmux("source-file", str(conf), check=False)
     event(cfg, "Ctrl+\\ toggles the wave popup" if r.returncode == 0
           else f"toggle key bind failed: {r.stderr.strip() or r.stdout.strip()}")
-    keys = sh("tmux", "list-keys", "-T", "root", "BTab", check=False)
+    keys = tmux("list-keys", "-T", "root", "BTab", check=False)
     if keys.returncode == 0 and stale_btab(keys.stdout):  # a foreign Shift+Tab binding stays
-        sh("tmux", "unbind-key", "-n", "BTab", check=False)
+        tmux("unbind-key", "-n", "BTab", check=False)
         event(cfg, "removed a stale wab binding of Shift+Tab")
 
 
@@ -1163,17 +1185,20 @@ def _stop_event(cfg, st, path):
         else:
             event(cfg, f"{wave}: handed to the coordinator; it is the last wave, nothing to launch after the merge")
         event(cfg, "watch stopped: handed to the coordinator")
+        return True
     elif wave and st["waves"].get(wave, {}).get("phase") == "not_ready":
         event(cfg, f"next wave {wave} not started: TUI not ready; chain stopped")
+        return False
     elif wave and st["waves"].get(wave, {}).get("phase") == "dead":
         event(cfg, f"{wave}: window is gone; chain stopped")
-    else:
-        event(cfg, "watch stopped: no current wave")
+        return False
+    event(cfg, "watch stopped: no current wave")
+    return True
 
 
 def watch(cfg, path, max_ticks=None):
     with _RunLock(cfg, "watch"):
-        _watch(cfg, path, max_ticks)
+        return _watch(cfg, path, max_ticks)
 
 
 def _watch(cfg, path, max_ticks=None):
@@ -1198,8 +1223,7 @@ def _watch(cfg, path, max_ticks=None):
             cfg = fresh
         st = _state_or_event(cfg)
         if not tick(cfg, st):
-            _stop_event(cfg, load_state(cfg), path)
-            return
+            return _stop_event(cfg, load_state(cfg), path)
         ticks += 1
         st = load_state(cfg)
         w = st["waves"].get(st.get("current") or "", {})
@@ -1233,9 +1257,13 @@ def main(argv):
     elif cmd == "status":
         status_cmd(load_chain(path, create=False))
     elif cmd == "launch" and len(argv) == 5:
-        launch(load_chain(path), argv[3], argv[4])
+        if not launch(load_chain(path), argv[3], argv[4]):
+            print(f"wab: wave {argv[3]} not started: TUI not ready (see events.log)", file=sys.stderr)
+            sys.exit(3)
     elif cmd == "watch":
-        watch(load_chain(path), path)
+        if watch(load_chain(path), path) is False:
+            print("wab: watch ended because the chain stopped (window gone or not started)", file=sys.stderr)
+            sys.exit(3)
     elif cmd == "notify":
         notify(load_chain(path), " ".join(argv[3:]))
     else:
