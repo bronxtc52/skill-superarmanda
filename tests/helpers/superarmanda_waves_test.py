@@ -7439,7 +7439,13 @@ class GateCommands(unittest.TestCase):
             self.assertIn(part, text)
         old = green_facts(threads=[{"id": "T", "isResolved": False, "body": "![P1 Badge](x) old"},
                                    {"id": "U", "isResolved": False, "body": "plain"}])
-        self.assertIn("незакрытых тредов: 2 (из них P0/P1 из прошлых коммитов: 1)", gate.alarm_text(5, HEAD, old))
+        self.assertIn("незакрытых тредов: 2 (из них с P0/P1: 1)", gate.alarm_text(5, HEAD, old))
+        # the alarm runs before any gate: an open P1 thread written on HEAD is not "from earlier commits"
+        on_head = green_facts(review_comments=[{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD,
+                                                "body": "![P1 Badge](x) now"}],
+                              threads=[{"id": "T", "isResolved": False, "body": "![P1 Badge](x) now"}])
+        self.assertNotIn("прошлых коммитов", gate.alarm_text(5, HEAD, on_head))
+        self.assertIn("незакрытых тредов: 1 (из них с P0/P1: 1)", gate.alarm_text(5, HEAD, on_head))
         self.assertIn("чисто", gate.alarm_text(5, HEAD, green_facts()))
 
     def test_alarm_ready_needs_completed_checks_and_codex(self):

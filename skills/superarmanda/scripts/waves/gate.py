@@ -410,6 +410,12 @@ def threads_note(old):
     return f" (из них P0/P1 из прошлых коммитов: {old})" if old else ""
 
 
+def alarm_p01_note(n):
+    """The alarm is sent before any gate, so an open P0/P1 thread may be one written on HEAD: count them
+    without claiming they come from earlier commits."""
+    return f" (из них с P0/P1: {n})" if n else ""
+
+
 def alarm_ready(facts, head):
     """Checks all completed (at least one) and Codex finished on `head`: time to wake the wave."""
     if facts.get("error") or (facts.get("pr") or {}).get("head") != head or "check_runs" not in facts:
@@ -426,4 +432,4 @@ def alarm_text(number, head, facts):
     open_threads = sum(1 for t in facts.get("threads") or [] if not t.get("isResolved"))
     return (f"[wab] Будильник: PR #{number} (HEAD {head[:12]}) — проверки завершены: "
             f"{runs['total'] - len(runs['failed'])} ok, неуспешные: {bad}; Codex: {verdict}; "
-            f"незакрытых тредов: {open_threads}{threads_note(old_p01(facts))}. Разбери и продолжай по протоколу.")
+            f"незакрытых тредов: {open_threads}{alarm_p01_note(old_p01(facts))}. Разбери и продолжай по протоколу.")
