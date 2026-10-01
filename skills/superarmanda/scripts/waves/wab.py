@@ -883,7 +883,7 @@ def _status(w):
 #   permission, idle, auto_off   window gone   # + SCREEN_EPISODE_ENDS: the prompt left the screen /
 #                                              #   the pane moved / auto mode is back
 #   handoff             the phase left awaiting_merge (the coordinator confirmed it); + ack
-#   merge_owner, merge_refused   the phase left merging (the PR is merged, or the wave goes on)
+#   merge_owner, merge_refused, merge_unknown   the phase left merging (the PR is merged, or the wave goes on)
 #   merge_stopped       the phase left awaiting_merge (the coordinator took over); + ack
 #   done, no_next, launch_refused   None: only the coordinator's confirmation (ack)
 #   chain_done          None and kept even on ack: the end of the chain must get through
@@ -903,6 +903,7 @@ NOTICE_EPISODE_ENDS = {
     "handoff": lambda w: w.get("phase") != "awaiting_merge",
     "merge_owner": lambda w: w.get("phase") != "merging",
     "merge_refused": lambda w: w.get("phase") != "merging",
+    "merge_unknown": lambda w: w.get("phase") != "merging",
     "merge_stopped": lambda w: w.get("phase") != "awaiting_merge",
     "done": None,
     "no_next": None,
@@ -2315,6 +2316,23 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         return _merge_stopped(cfg, st, wave, w, wdir, f"PR #{number} закрыт без мерджа", now)
     if state == "OPEN" and info.get("headRefOid") != sha:
         return _regate(cfg, st, wave, w, wdir, sha, info.get("headRefOid"))
+    if state == "OPEN" and "merge_rc" not in w and w.get("merge_called") == sha:
+        # the dispatcher died between the mark and the saved result of `gh pr merge`: never merged
+        # twice for one sha, so the owner gets the script (it gates again and merges); once (merge_rc)
+        try:
+            command = home_form(write_owner_script(cfg, wave, sha))
+        except (OSError, ValueError) as e:
+            command = f"(скрипт владельца не записан: {_one_line(e, 100)}; проверь PR #{number} вручную)"
+        w["merge_rc"] = None  # marker: handed to the owner
+        w["last_status"] = _write_status(
+            wdir, f"BLOCKED: merge gate passed; merge result unknown; owner runs {command}")
+        put_notice(w, "merge_unknown", sha,
+                   f"wave-autobot: волна {wave}: гейт пройден, но результат вызова мерджа PR #{number} "
+                   f"неизвестен (диспетчер прерывался). Сам повторно не мержу. Выполни: {command}")
+        save_state(cfg, st)
+        event(cfg, f"{wave}: PR #{number} merge result unknown; handed to the owner: {command}")
+        flush_notices(cfg, st, w)
+        return True
     if "merge_rc" not in w and once_per(w, "merge_unknown", sha):
         event(cfg, f"{wave}: PR #{number} is not merged and the result of the merge call is unknown; waiting")
     save_state(cfg, st)
@@ -2360,6 +2378,11 @@ def _alarm_tick(cfg, st, wave, w, now):
         return
     if isinstance(msg, dict) and msg.get("head") == head:
         if not msg.get("sent"):
+            if w.get("pending_enter") != "alarm":
+                # nothing is typed yet: the text is rebuilt from this tick's facts (Codex findings or a
+                # re-run check may have changed since the failed attempt); a typed one only gets Enter
+                msg["text"] = gate.alarm_text(pr["number"], head, facts)
+                save_state(cfg, st)
             _send_alarm(cfg, st, wave, w)  # the open PR is still at this head: the retry is safe
         return  # delivered: one message per head
     w["alarm_msg"] = {"head": head, "sent": False, "text": gate.alarm_text(pr["number"], head, facts)}

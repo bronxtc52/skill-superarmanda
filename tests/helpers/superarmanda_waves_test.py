@@ -7470,6 +7470,37 @@ class MergeGate(GateBase):
             wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
         self.assertEqual(self.merges(), [])
 
+    def test_an_interrupted_merge_is_handed_to_the_owner_once(self):
+        cfg = self.start()
+        real = wab.sh
+
+        def die_in_merge(*args, **kw):
+            if args[:3] == ("gh", "pr", "merge"):
+                raise KeyboardInterrupt
+            return real(*args, **kw)
+        with mock.patch.object(wab, "sh", side_effect=die_in_merge):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick()
+        self.assertEqual(self.rec()["merge_called"], HEAD)
+        self.assertNotIn("merge_rc", self.rec())
+        shown = f"~/.cache/wab/{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge"
+        with mock.patch.object(wab, "GATE_POLL_SECONDS", 0):
+            for _ in range(3):
+                self.tick()
+        self.assertEqual(self.merges(), [])  # never a second automatic merge
+        self.assertEqual(self.status(), f"BLOCKED: merge gate passed; merge result unknown; owner runs {shown}")
+        said = [t for t in self.tg if "неизвестен (диспетчер" in t]
+        self.assertEqual(len(said), 1)
+        self.assertIn(f"Выполни: {shown}", said[0])
+        self.assertTrue((self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge").is_file())
+        self.assertEqual(self.log().count("merge result unknown"), 1)
+        # the owner merges: the wave completes as usual
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        with mock.patch.object(wab, "GATE_POLL_SECONDS", 0):
+            self.tick()
+        self.assertEqual(self.rec()["phase"], "done")
+        self.assertEqual(self.merges(), [])
+
     def test_failed_check_blocks_with_the_reason_and_tells_the_window(self):  # acceptance 2
         self.start()
         self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
@@ -7770,7 +7801,7 @@ class MergeGate(GateBase):
         self.assertIn("repo", str(ctx.exception))
 
     def test_merge_notices_are_episodes(self):
-        for key in ("merge_owner", "merge_refused", "merge_stopped"):
+        for key in ("merge_owner", "merge_refused", "merge_unknown", "merge_stopped"):
             self.assertIn(key, wab.NOTICE_EPISODE_ENDS)
 
 
@@ -8532,6 +8563,21 @@ class Alarm(GateBase):
                 self.tick()
                 self.assertEqual(len(self.alarms()), 1, name)
                 self.assertTrue(self.rec()["alarm_msg"]["sent"])
+
+    def test_a_retry_before_the_paste_at_the_same_head_carries_the_fresh_verdict(self):  # r5c
+        self.running()
+        self.crash_tick(typed=False)  # intent saved with the green verdict, nothing typed
+        self.assertIn("чисто", self.rec()["alarm_msg"]["text"])
+        self.facts = green_facts(
+            check_runs=[{"name": "lint", "status": "completed", "conclusion": "failure"}],
+            review_comments=[{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) a"}])
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+        text = self.alarms()[0][2]
+        self.assertIn("lint (failure)", text)
+        self.assertNotIn("чисто", text)
+        self.assertEqual(self.rec()["alarm_msg"]["text"], text)
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
 
 
 class GateWrappers(Base):
