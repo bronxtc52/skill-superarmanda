@@ -6788,6 +6788,15 @@ def green_manifest(**task):
     return {"head": HEAD, "tasks": {"T1": entry}}
 
 
+def summary(status="✅ **Completed**", short=HEAD[:7], user=BOT, extra=""):
+    """A Codex review summary comment as GitHub shows it (table rows of the review)."""
+    body = ("<!-- codex-pull-request-review-summary -->\n## Codex Review Summary\n\n"
+            "| Task | Status | Commit | Trigger |\n|---|---|---|---|\n"
+            f"| 📝 **Code Review** | {status} <relative-time datetime=\"2026-10-01T17:21:42Z\">2026-10-01T17:21:42Z"
+            f"</relative-time> | `{short}` | Manual request |\n{extra}")
+    return {"id": 3, "user": user, "body": body}
+
+
 WORK = {"clean": True, "head": HEAD, "fingerprint": FP}
 
 
@@ -6821,41 +6830,37 @@ class GateVerdict(unittest.TestCase):
         facts = green_facts(reviews=[{"user": HUMAN, "commit_id": HEAD, "state": "COMMENTED"}])
         self.assertEqual(self.ev(facts)["verdict"], "wait")
 
-    def test_clean_comment_resolving_to_head_finishes(self):
+    def test_only_a_completed_summary_row_naming_head_finishes(self):  # D1
         short = HEAD[:7]
-        facts = green_facts(reviews=[], issue_comments=[{"user": BOT, "body": CLEAN_BODY.format(short=short)}],
-                            resolved={short: HEAD})
-        self.assertEqual(gate.codex_on_head(facts, HEAD)["how"], "clean comment")
-        facts["resolved"] = {short: OLD}
-        self.assertFalse(gate.codex_on_head(facts, HEAD)["done"])
-        facts["resolved"] = {}
-        self.assertFalse(gate.codex_on_head(facts, HEAD)["done"])
-
-    def test_thumbs_up_needs_the_marker_of_this_head_on_a_request_comment(self):  # F1
-        up = [{"id": 1, "content": "+1", "user": BOT, "created_at": "2026-10-01T09:00:00Z"}]
-        mark = lambda h: f"@codex review\n{gate.MARKER.format(head=h)}"  # noqa: E731
         cases = [
-            ("marker of this head", [{"id": 7, "body": mark(HEAD), "reactions": up}], True),
-            ("marker of another head", [{"id": 7, "body": mark(OLD), "reactions": up}], False),
-            ("no marker (date rule is gone)", [{"id": 7, "body": "@codex review", "reactions": up}], False),
-            ("human thumbs", [{"id": 7, "body": mark(HEAD), "reactions": [dict(up[0], user={"login": "x", "type": "User"})]}], False),
-            ("impostor", [{"id": 7, "body": mark(HEAD), "reactions": [dict(up[0], user=HUMAN)]}], False),
-            ("wrong emoji", [{"id": 7, "body": mark(HEAD), "reactions": [dict(up[0], content="eyes")]}], False),
-            ("older request of this head counts", [{"id": 6, "body": mark(HEAD), "reactions": up},
-                                                   {"id": 7, "body": mark(OLD), "reactions": []}], True),
+            ("completed, head", summary(), {short: HEAD}, True),
+            ("completed, old sha", summary(short=OLD[:7]), {OLD[:7]: OLD, short: HEAD}, False),
+            ("in progress, head", summary(status="⏳ **In progress**"), {short: HEAD}, False),
+            ("completed, sha unresolved", summary(), {}, False),
+            ("completed, human with the bot login", summary(user=HUMAN), {short: HEAD}, False),
+            ("completed, other author", summary(user={"login": "someone", "type": "User"}), {short: HEAD}, False),
+            ("sha not alone in its cell", summary(short=short + "` and `" + short), {short: HEAD}, False),
         ]
-        for name, triggers, want in cases:
+        for name, comment, resolved, want in cases:
             with self.subTest(case=name):
-                facts = green_facts(reviews=[], triggers=triggers)
+                facts = green_facts(reviews=[], issue_comments=[comment], resolved=resolved)
                 self.assertEqual(gate.codex_on_head(facts, HEAD)["done"], want)
+                self.assertEqual(self.ev(facts)["verdict"], "pass" if want else "wait")
 
-    def test_old_thumbs_on_the_pr_or_a_late_date_no_longer_finish_codex(self):  # F1
-        facts = green_facts(reviews=[], pr_reactions=[{"content": "+1", "user": BOT, "created_at": "2099-01-01T00:00:00Z"}],
-                            head_date="2000-01-01T00:00:00Z",
-                            triggers=[{"id": 7, "body": "@codex review", "created_at": "2099-01-01T00:00:00Z",
-                                       "reactions": [{"content": "+1", "user": BOT}]}])
+    def test_a_row_is_judged_alone_a_completed_one_does_not_vouch_for_another(self):
+        mixed = summary(status="⏳ **In progress**", extra="| other | ✅ **Completed** | `1234567` | x |\n")
+        facts = green_facts(reviews=[], issue_comments=[mixed], resolved={HEAD[:7]: HEAD, "1234567": OLD})
+        self.assertFalse(gate.codex_on_head(facts, HEAD)["done"])
+
+    def test_clean_comment_thumbs_and_edited_triggers_are_no_evidence(self):  # D1
+        clean = {"user": BOT, "body": CLEAN_BODY.format(short=HEAD[:7])}
+        trigger = {"id": 7, "user": {"login": "me", "type": "User"},
+                   "body": f"@codex review\n<!-- superarmanda:codex-review head={HEAD} -->"}
+        facts = green_facts(reviews=[], issue_comments=[clean, trigger], resolved={HEAD[:7]: HEAD},
+                            pr_reactions=[{"content": "+1", "user": BOT, "created_at": "2099-01-01T00:00:00Z"}],
+                            triggers=[{"id": 7, "body": trigger["body"], "reactions": [{"content": "+1", "user": BOT}]}])
+        self.assertFalse(gate.codex_on_head(facts, HEAD)["done"])
         self.assertEqual(self.ev(facts)["verdict"], "wait")
-
     def test_pending_check_waits_and_failed_check_fails_without_a_merge(self):  # acceptance 2
         pending = [{"name": "ci", "status": "completed", "conclusion": "success"},
                    {"name": "e2e", "status": "in_progress", "conclusion": None}]
@@ -7056,24 +7061,18 @@ class GateCollect(unittest.TestCase):
         self.assertEqual(list(facts), ["pr"])
         self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK)["verdict"], "wait")
 
-    def test_requests_naming_this_head_get_their_reactions_and_a_clean_comment_is_resolved(self):
+    def test_summary_commits_are_resolved_and_reactions_are_not_collected(self):  # D1
         short = HEAD[:7]
-        comments = [
-            {"id": 1, "body": f"@codex review\n{gate.MARKER.format(head=OLD)}", "user": {"login": "me"}},
-            {"id": 2, "body": f"@codex review\n{gate.MARKER.format(head=HEAD)}"},
-            {"id": 3, "body": CLEAN_BODY.format(short=short), "user": BOT},
-        ]
-        fake = FakeGitHub(routes_for(**{
-            "repos/o/r/issues/5/comments": comments,
-            "repos/o/r/issues/comments/2/reactions": [{"content": "+1", "user": BOT}],
-            f"repos/o/r/commits/{short}": {"sha": HEAD},
-            "repos/o/r/pulls/5/reviews": []}))
+        comments = [dict(summary(), id=3),
+                    {"id": 4, "body": f"@codex review\n<!-- superarmanda:codex-review head={HEAD} -->"}]
+        fake = FakeGitHub(routes_for(**{"repos/o/r/issues/5/comments": comments,
+                                        f"repos/o/r/commits/{short}": {"sha": HEAD},
+                                        "repos/o/r/pulls/5/reviews": []}))
         facts = self.collect(fake)
-        self.assertEqual([t["id"] for t in facts["triggers"]], [2])
         self.assertEqual(facts["resolved"], {short: HEAD})
-        self.assertFalse(any("comments/1/" in c for c in fake.calls if isinstance(c, str)))
+        self.assertNotIn("triggers", facts)
+        self.assertFalse(any("reactions" in c for c in fake.calls if isinstance(c, str)))
         self.assertTrue(gate.codex_on_head(facts, HEAD)["done"])
-
     def test_importing_gate_leaves_the_import_path_alone(self):
         before = list(sys.path)
         import importlib
@@ -7094,28 +7093,21 @@ class GateCommands(unittest.TestCase):
             with self.subTest(repo=repo, number=number, sha=sha):
                 with self.assertRaises(ValueError):
                     gate.merge_argv(repo, number, sha)
-                with self.assertRaises(ValueError):
-                    gate.owner_script(repo, number, sha, [])
-
-    def test_owner_script_is_valid_bash_and_does_the_steps_in_order(self):
-        script = gate.owner_script("o/r", 12, HEAD, ["PRRT_kwDOabc", "PRRT_kwDOdef"])
+    def test_owner_script_only_execs_owner_merge_with_quoted_paths(self):  # D3
+        script = gate.owner_script("/opt/my tools/wab.py", "/runs/it's/chain.json", "W1")
         self.assertTrue(script.startswith("#!/usr/bin/env bash\n"))
         self.assertIn("set -euo pipefail", script)
-        for needle in ("headRefOid", "isDraft", "gh pr ready 12 --repo o/r"):
-            self.assertIn(needle, script)
-        self.assertEqual(script.count("resolveReviewThread"), 2)
-        self.assertLess(script.index("headRefOid"), script.index("isDraft"))
-        self.assertLess(script.index("isDraft"), script.index("resolveReviewThread"))
-        self.assertTrue(script.rstrip().endswith(gate.merge_command("o/r", 12, HEAD)))
+        last = script.rstrip().splitlines()[-1]
+        self.assertEqual(shlex.split(last), ["exec", "python3", "/opt/my tools/wab.py", "owner-merge",
+                                             "/runs/it's/chain.json", "W1"])
+        self.assertNotIn("gh ", script)  # no merge of its own: everything is decided by the fresh gate
         done = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, encoding="utf-8")
         self.assertEqual(done.returncode, 0, done.stderr)
-
-    def test_a_thread_id_cannot_inject_shell(self):
+    def test_a_wave_name_cannot_inject_shell(self):
         for bad in ("x'; touch /tmp/x #", "a b", "$(id)", "", "x\ny"):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
-                    gate.owner_script("o/r", 1, HEAD, [bad])
-
+                    gate.owner_script("/w/wab.py", "/c/chain.json", bad)
     def test_alarm_text(self):
         facts = green_facts(
             check_runs=[{"name": "ci", "status": "completed", "conclusion": "success"},
@@ -7404,8 +7396,8 @@ class MergeGate(GateBase):
         self.assertEqual(script.stat().st_mode & 0o777, 0o700)
         self.assertTrue(os.access(script, os.X_OK))
         text = script.read_text(encoding="utf-8")
-        self.assertEqual(text.count("resolveReviewThread"), 2)
-        self.assertTrue(text.rstrip().endswith(gate.merge_command("o/r", 7, HEAD)))
+        self.assertIn("exec python3", text)
+        self.assertIn(" owner-merge ", text)
         done = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.status(), f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {script}")
@@ -7419,7 +7411,6 @@ class MergeGate(GateBase):
         self.tick()
         self.launch.assert_called_once()
         self.assertEqual(self.merges(), [])
-
     def test_refused_merge_sends_the_ready_command(self):  # acceptance 5
         self.start()
         self.merge_rc, self.merge_err = 1, "Pull request is not mergeable: required check missing"
@@ -7549,6 +7540,165 @@ class GateRecheck(GateBase):  # F2: a pass rests on two equal collections
                              ("draft", {"pr": {"state": "open", "merged": False, "draft": True, "head": HEAD}})):
             with self.subTest(change=name):
                 self.assertEqual(self.verdict(green_facts(), green_facts(**change))["verdict"], "wait")
+
+
+class Regate(GateBase):  # D2: the head moved while the wave sat in `merging`
+    NEW = "e" * 40
+
+    def moved(self):
+        self.pr = {**self.pr, "headRefOid": self.NEW}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": self.NEW},
+                                 reviews=[{"user": BOT, "commit_id": self.NEW, "state": "COMMENTED"}])
+        self.manifest = green_manifest()
+        self.manifest["head"] = self.NEW
+        for entry in self.manifest["tasks"].values():
+            for r in entry["results"].values():
+                r["head"] = self.NEW
+        self.work = {**WORK, "head": self.NEW}
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": self.NEW}
+
+    def regate(self):
+        self.start()
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "merging")
+        old_merges = len(self.merges())
+        self.moved()
+        self.assertTrue(self.tick())
+        rec = self.rec()
+        self.assertEqual(rec["phase"], "gate")
+        for key in ("gate_sha", "gate_pr", "merge_called", "merge_rc"):
+            self.assertNotIn(key, rec)
+        self.assertEqual(self.status(), "DONE")
+        self.assertIn(f"HEAD сменился после гейта: {HEAD[:12]}→{self.NEW[:12]}, гейт заново", self.log())
+        self.assertEqual(len(self.merges()), old_merges)  # the regate itself merges nothing
+        return old_merges
+
+    def test_after_a_refused_merge_a_new_head_is_gated_and_merged_by_its_own_pass(self):
+        self.merge_rc, self.merge_err = 1, "not mergeable"
+        old = self.regate()
+        self.merge_rc = 0
+        self.tick()
+        self.assertEqual(self.merges()[old:], [tuple(gate.merge_argv("o/r", 7, self.NEW))])
+        self.assertEqual(self.rec()["gate_sha"], self.NEW)
+
+    def test_while_an_owner_script_waits_a_new_head_is_gated_again(self):
+        self.facts = green_facts(threads=[{"id": "T", "isResolved": False}])
+        old = self.regate()
+        self.moved()
+        self.facts["threads"] = [{"id": "T", "isResolved": False}]
+        self.tick()
+        self.assertEqual(len(self.merges()), old)  # open threads again: owner script, no merge
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.rec()["gate_sha"], self.NEW)
+
+    def test_the_old_sha_is_never_merged_after_the_head_moved(self):
+        self.start()
+        self.merge_rc = 1
+        self.tick()
+        self.moved()
+        self.facts["check_runs"] = [{"name": "ci", "status": "in_progress", "conclusion": None}]
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(len(self.merges()), 1)  # only the refused call at the old sha
+        self.assertEqual(self.rec()["phase"], "gate")  # waiting on the new head's CI
+        self.facts = green_facts(pr=self.facts["pr"], reviews=self.facts["reviews"])
+        self.tick()
+        self.assertEqual(len(self.merges()), 2)
+        self.assertIn(self.NEW, self.merges()[1])
+
+
+class OwnerMerge(GateBase):  # D3
+    def setUp(self):
+        super().setUp()
+        self.graphql_calls = []
+        self.order = []
+        real = self.handle
+
+        def handle(args):
+            if args[:3] in (("gh", "pr", "ready"), ("gh", "pr", "merge")):
+                self.order.append(args[2])
+            return real(args)
+        self.gh_handler = handle
+
+        def graphql(query, variables):
+            self.graphql_calls.append(variables)
+            self.order.append("resolve")
+            return {"data": {}}
+        p = mock.patch.object(wab, "gh_graphql", side_effect=graphql)
+        p.start()
+        self.addCleanup(p.stop)
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False},
+                                          {"id": "PRRT_b", "isResolved": True},
+                                          {"id": "PRRT_c", "isResolved": False}])
+        self.pr["isDraft"] = True
+        self.facts["pr"]["draft"] = True
+        self.start()
+        self.tick()  # the gate passes with open threads: the owner script is written
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.snapshot = json.dumps(self.rec(), sort_keys=True)
+
+    def run_it(self):
+        return wab.owner_merge(wab.load_chain(self.path), "W1")
+
+    def refused(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertEqual(self.order, [])
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.graphql_calls, [])
+        self.assertEqual(json.dumps(self.rec(), sort_keys=True), self.snapshot)
+        return str(ctx.exception)
+
+    def test_unchanged_facts_resolve_ready_merge_in_that_order(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_it()
+        self.assertEqual(self.order, ["resolve", "resolve", "ready", "merge"])
+        self.assertEqual([v["id"] for v in self.graphql_calls], ["PRRT_a", "PRRT_c"])
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+        self.assertIn("PR #7", out.getvalue())
+        self.assertEqual(json.dumps(self.rec(), sort_keys=True), self.snapshot)  # the wave's record is untouched
+
+    def test_a_new_p1_on_the_same_sha_stops_it(self):
+        self.facts = green_facts(threads=self.facts["threads"], review_comments=[
+            {"id": 9, "user": BOT, "commit_id": HEAD, "body": "![P1 Badge](x) late", "html_url": "u"}])
+        self.assertIn("fail", self.refused())
+
+    def test_a_pending_check_stops_it(self):
+        self.facts = green_facts(threads=self.facts["threads"],
+                                 check_runs=[{"id": 1, "name": "ci", "status": "in_progress", "conclusion": None}])
+        self.assertIn("wait", self.refused())
+
+    def test_another_head_stops_it(self):
+        other = "e" * 40
+        self.pr = {**self.pr, "headRefOid": other}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": True, "head": other},
+                                 reviews=[{"user": BOT, "commit_id": other, "state": "COMMENTED"}])
+        self.manifest = {**green_manifest(), "head": other}
+        self.work = {**WORK, "head": other}
+        self.refused()
+
+    def test_it_needs_a_gated_wave_in_merging(self):
+        st = self.get_state(self.cfg)
+        st["waves"]["W1"]["phase"] = "running"
+        self.put_state(self.cfg, st)
+        self.snapshot = json.dumps(self.rec(), sort_keys=True)
+        self.assertIn("not in phase merging", self.refused())
+
+    def test_a_failing_merge_is_reported_with_rc(self):
+        self.merge_rc, self.merge_err = 1, "blocked by policy"
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("blocked by policy", str(ctx.exception))
+
+    def test_cli_command_and_exit_code(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab.main(["wab.py", "owner-merge", str(self.path), "W1"])
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "queued"}])
+        with self.assertRaises(SystemExit) as ctx:
+            wab.main(["wab.py", "owner-merge", str(self.path), "W1"])
+        self.assertNotEqual(ctx.exception.code, 0)
 
 
 class ExternalHandoffVerdict(GateBase):
@@ -7783,13 +7933,14 @@ class GateWrappers(Base):
 
     def test_owner_script_file_is_private_and_replaced_not_appended(self):
         cfg, _ = self.chain()
-        path = wab.write_owner_script(cfg, "W1", 7, HEAD, ["PRRT_a"])
+        path = wab.write_owner_script(cfg, "W1")
         self.assertEqual(path.stat().st_mode & 0o777, 0o700)
-        again = wab.write_owner_script(cfg, "W1", 7, HEAD, ["PRRT_a", "PRRT_b"])
+        again = wab.write_owner_script(cfg, "W1")
         self.assertEqual(again, path)
-        self.assertEqual(path.read_text(encoding="utf-8").count("resolveReviewThread"), 2)
         self.assertEqual([p for p in os.listdir(path.parent) if p.startswith(".merge.")], [])
-
+        last = path.read_text(encoding="utf-8").rstrip().splitlines()[-1]
+        self.assertEqual(shlex.split(last)[1:], ["python3", str(Path(wab.__file__).resolve()), "owner-merge",
+                                                 cfg["chain_file"], "W1"])
     def test_redact_keeps_the_merge_command_readable(self):
         command = gate.merge_command("o/r", 7, HEAD)
         self.assertIn(command, wab.redact(f"Выполни: {command}", wab.TG_MESSAGE_LIMIT))

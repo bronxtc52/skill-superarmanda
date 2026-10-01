@@ -24,8 +24,9 @@ P01 = re.compile(r"!\[P[01] Badge\]")
 SHA = re.compile(r"[0-9a-f]{40,64}")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 NODE_ID = re.compile(r"[A-Za-z0-9_=+/-]+")
-TRIGGER = "@codex review"
-MARKER = "<!-- superarmanda:codex-review head={head} -->"
+SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
+COMMIT_CELL = re.compile(r"`([0-9a-f]{7,40})`")
+WAVE = re.compile(r"[A-Za-z0-9_-]+")
 THREADS_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
     "{pullRequest(number:$number){reviewThreads(first:100){pageInfo{hasNextPage}"
@@ -110,6 +111,25 @@ def _threads(graphql, repo, number):
     return out
 
 
+def summary_commits(comment):
+    """Short commits of the COMPLETED rows of a Codex review summary comment (the comment carries
+    the summary marker; a table row counts when its status cell says **Completed** and a cell is
+    exactly one `short sha`). In progress and other rows are no evidence."""
+    body = pr_review.text(comment)
+    if SUMMARY_MARKER not in body:
+        return []
+    out = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if not any("**Completed**" in c for c in cells):
+            continue
+        out += [m.group(1) for c in cells for m in [COMMIT_CELL.fullmatch(c)] if m]
+    return out
+
+
 def collect(repo, number, head, api, graphql):
     """The facts of PR `number` at `head`. A PR that is not open, or whose head is not `head`,
     returns early with the `pr` fact only: nothing else is worth collecting then (evaluate
@@ -123,15 +143,11 @@ def collect(repo, number, head, api, graphql):
     facts["reviews"] = _paged(api, f"repos/{repo}/pulls/{number}/reviews")
     facts["review_comments"] = _paged(api, f"repos/{repo}/pulls/{number}/comments")
     facts["issue_comments"] = _paged(api, f"repos/{repo}/issues/{number}/comments")
-    marker = MARKER.format(head=head)  # a reaction counts only on a request that names THIS head
-    facts["triggers"] = [
-        {"id": c.get("id"), "body": c.get("body") or "",
-         "reactions": _paged(api, f"repos/{repo}/issues/comments/{c.get('id')}/reactions")}
-        for c in facts["issue_comments"] if marker in (c.get("body") or "")]
     resolved = {}
     for comment in facts["issue_comments"]:
-        short = pr_review.clean_commit(pr_review.text(comment)) if pr_review.trusted(comment, CODEX) else None
-        if short and short not in resolved:
+        for short in (summary_commits(comment) if pr_review.trusted(comment, CODEX) else []):
+            if short in resolved:
+                continue
             try:
                 resolved[short] = _object(api, f"repos/{repo}/commits/{short}").get("sha")
             except CollectError:
@@ -154,8 +170,6 @@ def critical(facts):
         "reviews": [(r.get("id"), r.get("state"), r.get("commit_id"), who(r)) for r in facts["reviews"]],
         "comments": [(c.get("id"), c.get("commit_id"), c.get("body"), who(c)) for c in facts["review_comments"]],
         "issue": [(c.get("id"), c.get("body"), who(c)) for c in facts["issue_comments"]],
-        "triggers": [(t["id"], [(r.get("id"), r.get("content"), who(r)) for r in t["reactions"]])
-                     for t in facts["triggers"]],
         "resolved": sorted((facts["resolved"] or {}).items()),
         "threads": [(t.get("id"), t.get("isResolved")) for t in facts["threads"]],
     }, sort_keys=True, default=str)
@@ -178,16 +192,10 @@ def codex_on_head(facts, head):
         if (pr_review.trusted(review, CODEX) and review.get("commit_id") == head
                 and (review.get("state") or "").upper() in OK_REVIEW_STATES):
             how.append("review")
-    for comment in facts.get("issue_comments") or []:
-        if pr_review.trusted(comment, CODEX):
-            short = pr_review.clean_commit(pr_review.text(comment))
-            if short and (facts.get("resolved") or {}).get(short) == head:
-                how.append("clean comment")
-    marker = MARKER.format(head=head)
-    for trigger in facts.get("triggers") or []:
-        if marker in (trigger.get("body") or "") and any(
-                r.get("content") == "+1" and pr_review.trusted(r, CODEX) for r in trigger.get("reactions") or []):
-            how.append("reaction on the review request")
+    for comment in facts.get("issue_comments") or []:  # only the review summary, never a "clean" comment or a thumb
+        if pr_review.trusted(comment, CODEX) and any(
+                (facts.get("resolved") or {}).get(short) == head for short in summary_commits(comment)):
+            how.append("review summary")
     inline = [c for c in facts.get("review_comments") or []
               if pr_review.trusted(c, CODEX) and c.get("commit_id") == head and pr_review.text(c)]
     p01 = [pr_review.url(c) or "" for c in inline if P01.search(c.get("body") or "")]
@@ -335,32 +343,17 @@ def ready_command(repo, number):
     return shlex.join(["gh", "pr", "ready", str(number), "--repo", repo])
 
 
-def owner_script(repo, number, sha, thread_ids):
-    """The bash script the owner runs when the gate passed but review threads are open: check the
-    head, un-draft, resolve the threads, merge. Every value is validated and quoted."""
-    _check(repo, number, sha)
-    ids = list(thread_ids)
-    for thread in ids:
-        if not (isinstance(thread, str) and NODE_ID.fullmatch(thread)):
-            raise ValueError(f"unsafe review thread id {thread!r}")
+def owner_script(wab_py, chain_file, wave):
+    """The script the owner runs when the gate passed but review threads are open: it only starts
+    `wab.py owner-merge`, which gates the PR AGAIN (a CI rerun or a new finding after the gate must
+    stop it) and then resolves the threads, un-drafts and merges. Paths are quoted."""
+    if not WAVE.fullmatch(str(wave)):
+        raise ValueError(f"wave must be [A-Za-z0-9_-]+, got {wave!r}")
     q = shlex.quote
-    lines = [
-        "#!/usr/bin/env bash",
-        f"# wab: merge of PR #{number} ({repo}) at {sha[:12]}; generated, run by the owner",
-        "set -euo pipefail",
-        f"actual=$(gh pr view {number} --repo {q(repo)} --json headRefOid -q .headRefOid)",
-        f"if [ \"$actual\" != {q(sha)} ]; then",
-        f"  echo \"HEAD PR изменился: $actual, а гейт проверял {sha}; мердж не выполнен\" >&2",
-        "  exit 1",
-        "fi",
-        f"if [ \"$(gh pr view {number} --repo {q(repo)} --json isDraft -q .isDraft)\" = true ]; then",
-        f"  {ready_command(repo, number)}",
-        "fi",
-    ]
-    for thread in ids:
-        lines.append(f"gh api graphql -f query={q(RESOLVE_MUTATION)} -f id={q(thread)}")
-    lines.append(merge_command(repo, number, sha))
-    return "\n".join(lines) + "\n"
+    return ("#!/usr/bin/env bash\n"
+            f"# wab: gated merge of the PR of wave {wave}; generated, run by the owner\n"
+            "set -euo pipefail\n"
+            f"exec python3 {q(str(wab_py))} owner-merge {q(str(chain_file))} {q(wave)}\n")
 
 
 def alarm_ready(facts, head):

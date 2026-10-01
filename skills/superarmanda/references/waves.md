@@ -228,12 +228,13 @@ ref не обновляет, а при merge queue вообще только с�
 появилось ревью или замечание, треды, draft), вердикт `wait` «факты изменились во время сбора».
 
 Успех проверки — только `status == completed` и `conclusion == success` (`skipped`/`neutral` гейт не пропускает).
-**Codex завершил на HEAD**, если есть любое из: ревью `chatgpt-codex-connector[bot]` (тип Bot) с `commit_id == HEAD` и
-состоянием `COMMENTED`/`APPROVED`/`CHANGES_REQUESTED` (`PENDING`, `DISMISSED` — нет); его комментарий
-`Reviewed commit: <sha>`, который API сводит к HEAD; `+1` бота на комментарии `@codex review` с маркером
-`<!-- superarmanda:codex-review head=<HEAD> -->` именно этого HEAD (ищется среди всех комментариев; дата коммита не
-используется: её можно подделать). `+1` на самом PR и на комментарии без маркера или с маркером другого HEAD не считаются.
-Ревью старого HEAD и реакции людей не считаются. P0/P1 — inline-комментарий бота на HEAD с бейджем
+**Codex завершил на HEAD** — только по (а) ревью `chatgpt-codex-connector[bot]` (тип Bot) с `commit_id == HEAD` и
+состоянием `COMMENTED`/`APPROVED`/`CHANGES_REQUESTED` (`PENDING`, `DISMISSED` — нет) или (б) комментарию этого бота с
+маркером `<!-- codex-pull-request-review-summary -->` («Codex Review Summary»): строка его таблицы со статусом
+`**Completed**` и коммитом в ячейке ровно `` `<sha7..40>` ``, который API (`repos/R/commits/<sha>`) сводит к HEAD
+(строки разбираются по одной; `In progress` и чужие строки не доказательство). 👍 и «clean»-комментарий
+(«Didn't find any major issues») **не считаются**: реакцию и текст комментария может поставить или отредактировать кто
+угодно, а ревью и сводка привязаны к коммиту самим GitHub. Ревью старого HEAD не считается. P0/P1 — inline-комментарий бота на HEAD с бейджем
 `![P0 Badge]`/`![P1 Badge]`.
 
 **Привязка к дереву.** Рабочая копия волны чистая (`git status --porcelain` пуст), её `HEAD` == `headRefOid`, и
@@ -248,16 +249,21 @@ ref не обновляет, а при merge queue вообще только с�
   `gh pr merge <N> --repo <repo> --squash --match-head-commit <sha>` (отметка о вызове сохраняется **до** него: ни
   перезапуск, ни повторный тик не мерджат тот же sha второй раз). Отказ (в том числе харнесса) — статус `BLOCKED`,
   в Telegram «гейт пройден, мердж отклонён: <причина>. Выполни: <готовая команда>»; волна остаётся в `merging`;
-- есть незакрытые треды — **ничего не мерджится**. Диспетчер пишет исполняемый скрипт владельца
-  `~/.cache/wab/<chain>-<волна>-merge` (`chmod 700`): проверяет, что `headRefOid` PR всё ещё `gate_sha`, снимает draft,
-  закрывает треды (`resolveReviewThread`), мерджит той же командой. Статус `BLOCKED: merge gate passed; N unresolved review
-  threads; owner runs <путь>`, в Telegram одна короткая команда — путь к скрипту.
+- есть незакрытые треды — **ничего не мерджится**. Диспетчер пишет короткий исполняемый скрипт владельца
+  `~/.cache/wab/<chain>-<волна>-merge` (`chmod 700`): `exec python3 <wab.py> owner-merge <chain.json> <волна>`.
+  `wab.py owner-merge` **заново** прогоняет гейт (двойной сбор): нужен `pass` на том же `gate_sha` и PR (иначе выход ≠ 0
+  с причиной, без действий); затем закрывает текущие незакрытые треды (`resolveReviewThread`), снимает draft и мерджит
+  той же командой с `--match-head-commit`. Запись волны он не меняет: `merging` подхватит `MERGED`. Статус
+  `BLOCKED: merge gate passed; N unresolved review threads; owner runs <путь>`, в Telegram одна короткая команда — путь к скрипту.
 
 **Фаза `merging`** (проверка раз в `GATE_POLL_SECONDS`, переживает перезапуск `watch`): `gh pr view <N> --json
 state,mergeCommit,headRefOid`. `MERGED` и `headRefOid == gate_sha` — окно закрывается, волна `done`, дальше запуск
 следующей волны от свежего `origin/<base>` (`refresh_workdir`, `verify_previous_merge`) либо конец цепочки у последней.
 `MERGED` с другим `headRefOid` (после гейта в PR докинули коммит) или `CLOSED` — статус `BLOCKED`, событие и уведомление,
-волна `awaiting_merge`, следующая **не запускается**: решает координатор. `OPEN` — ждать; ошибка чтения — событие один раз.
+волна `awaiting_merge`, следующая **не запускается**: решает координатор. `OPEN` с тем же head — ждать; `OPEN`, но `headRefOid` ≠ `gate_sha` (допушили после отказа мерджа или пока висит
+скрипт владельца) — волна возвращается в фазу `gate`: `gate_sha`, отметка вызова мерджа и прочее забываются, в статус
+снова пишется `DONE`, событие «HEAD сменился после гейта: <old>→<new>, гейт заново»; старый sha уже не мерджится, новый —
+только после нового `pass`. Ошибка чтения — событие один раз.
 
 ### Будильник
 
@@ -426,6 +432,7 @@ skill не ставится: `python3 -m pip install --user rich`. Без нег
   `state.json`, не запуская волну заново и не повторяя уведомления.
 - `wab.py status <chain>` — состояние одним экраном.
 - `wab.py done <chain> [<волна>]` — завершить цепочку после мерджа PR последней волны (см. ниже).
+- `wab.py owner-merge <chain> <волна>` — гейт заново и мердж по запросу владельца (вызывается скриптом `~/.cache/wab/<chain>-<волна>-merge`).
 - `wab.py notify <chain> <текст>` — сообщение в Telegram (текст проходит `redact()`).
   `redact()` — эвристика, а не гарантия. Правила по порядку:
   1. **По форме и ключу** (везде): PEM-ключи, токены с префиксом (`sk-`, `ghp_`/`github_pat_`,
