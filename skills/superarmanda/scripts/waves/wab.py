@@ -2001,7 +2001,8 @@ def gate_check(cfg, wave, w):
         if pr is None:
             return dict(base, verdict="fail", reasons=["PR ветки волны не найден"])
         facts = gate_facts(cfg, pr)
-        v = gate.evaluate(facts, pr["headRefOid"], read_manifest(cfg, wave), workdir_state(w["cwd"]))
+        v = gate.evaluate(facts, pr["headRefOid"], read_manifest(cfg, wave), workdir_state(w["cwd"]),
+                          base_branch_of(cfg, w["cwd"]))
         v["number"] = pr["number"]
         if v["verdict"] == "pass" and gate.critical(gate_facts(cfg, pr)) != gate.critical(facts):
             # a CI rerun or a new finding between the reads: the pass would rest on stale facts
@@ -2137,7 +2138,7 @@ def _send_gate_failure(cfg, st, wave, w):
 def _gate_passed(cfg, st, wave, w, wdir, v):
     repo, number, sha = cfg["repo"], v["number"], v["head"]
     try:
-        merge = gate.merge_command(repo, number, sha)
+        gate.merge_argv(repo, number, sha)  # validates repo/PR/sha
     except ValueError as e:
         return _gate_failed(cfg, st, wave, w, wdir, f"недопустимые repo/PR/sha: {e}")
     w["gate_sha"], w["gate_pr"] = sha, number

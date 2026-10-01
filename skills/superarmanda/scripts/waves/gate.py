@@ -137,7 +137,8 @@ def collect(repo, number, head, api, graphql):
     answers `wait`/`fail` from it)."""
     pr = _object(api, f"repos/{repo}/pulls/{number}")
     facts = {"pr": {"state": pr.get("state"), "merged": bool(pr.get("merged")),
-                    "draft": bool(pr.get("draft")), "head": (pr.get("head") or {}).get("sha")}}
+                    "draft": bool(pr.get("draft")), "head": (pr.get("head") or {}).get("sha"),
+                    "base": (pr.get("base") or {}).get("ref")}}
     if facts["pr"]["state"] != "open" or facts["pr"]["head"] != head:
         return facts
     facts["check_runs"] = _paged(api, f"repos/{repo}/commits/{head}/check-runs", "check_runs")
@@ -294,8 +295,9 @@ def _verdict(verdict, reasons, head, facts, **extra):
     return out
 
 
-def evaluate(facts, head, manifest, workdir_state):
-    """The merge gate. `workdir_state`: {clean, head, fingerprint} of the wave's working copy."""
+def evaluate(facts, head, manifest, workdir_state, base):
+    """The merge gate. `workdir_state`: {clean, head, fingerprint} of the wave's working copy;
+    `base`: the branch the chain expects the PR to merge into (unknown: wait, never pass)."""
     if facts.get("error"):
         return _verdict("wait", [f"сбор фактов: {facts['error']}"], head, facts)
     pr = facts.get("pr") or {}
@@ -303,6 +305,12 @@ def evaluate(facts, head, manifest, workdir_state):
         return _verdict("fail", ["PR уже смержен вне гейта"], head, facts)
     if pr.get("state") != "open":
         return _verdict("fail", [f"PR закрыт без мерджа (state={pr.get('state')})"], head, facts)
+    if not base:
+        return _verdict("wait", ["базовая ветка цепочки неизвестна"], head, facts)
+    if not pr.get("base"):
+        return _verdict("wait", ["в фактах PR нет базовой ветки"], head, facts)
+    if pr.get("base") != base:
+        return _verdict("fail", [f"PR перенаправлен на {pr.get('base')}, цепочка ждёт {base}"], head, facts)
     if pr.get("head") != head:
         return _verdict("wait", [f"HEAD PR {str(pr.get('head'))[:12]} ≠ {head[:12]}"], head, facts)
     runs = checks(facts.get("check_runs"))

@@ -6876,7 +6876,7 @@ CLEAN_BODY = "Codex Review: Didn't find any major issues. :rocket:\n\n**Reviewed
 
 def green_facts(**over):
     facts = {
-        "pr": {"state": "open", "merged": False, "draft": False, "head": HEAD},
+        "pr": {"state": "open", "merged": False, "draft": False, "head": HEAD, "base": "main"},
         "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}],
         "reviews": [{"user": BOT, "commit_id": HEAD, "state": "COMMENTED"}],
         "review_comments": [], "issue_comments": [], "triggers": [], "resolved": {}, "threads": [],
@@ -6911,7 +6911,8 @@ WORK = {"clean": True, "head": HEAD, "fingerprint": FP}
 class GateVerdict(unittest.TestCase):
     def ev(self, facts=None, manifest="green", work=None, head=HEAD):
         return gate.evaluate(green_facts() if facts is None else facts, head,
-                             green_manifest() if manifest == "green" else manifest, WORK if work is None else work)
+                             green_manifest() if manifest == "green" else manifest, WORK if work is None else work,
+                             "main")
 
     def test_everything_in_order_passes(self):
         v = self.ev()
@@ -7099,6 +7100,25 @@ class GateVerdict(unittest.TestCase):
         self.assertEqual(v["verdict"], "wait")
         self.assertIn("boom", v["reasons"][0])
 
+    def test_a_redirected_pr_fails(self):  # r8 HIGH
+        facts = green_facts()
+        facts["pr"]["base"] = "release"
+        v = self.ev(facts)
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn("release", v["reasons"][0])
+        self.assertIn("main", v["reasons"][0])
+
+    def test_an_unknown_base_waits_never_passes(self):
+        facts = green_facts()
+        del facts["pr"]["base"]
+        self.assertEqual(self.ev(facts)["verdict"], "wait")
+        self.assertEqual(gate.evaluate(green_facts(), HEAD, green_manifest(), WORK, None)["verdict"], "wait")
+
+    def test_the_base_is_critical(self):
+        other = green_facts()
+        other["pr"]["base"] = "release"
+        self.assertNotEqual(gate.critical(green_facts()), gate.critical(other))
+
     def test_unresolved_threads_and_draft_are_reported_on_a_pass(self):
         facts = green_facts(threads=[{"id": "T_1", "isResolved": False}, {"id": "T_2", "isResolved": True}])
         facts["pr"]["draft"] = True
@@ -7133,7 +7153,8 @@ class FakeGitHub:
 
 def routes_for(repo="o/r", number=5, **over):
     r = {
-        f"repos/{repo}/pulls/{number}": {"state": "open", "merged": False, "draft": False, "head": {"sha": HEAD}},
+        f"repos/{repo}/pulls/{number}": {"state": "open", "merged": False, "draft": False, "head": {"sha": HEAD},
+                                       "base": {"ref": "main"}},
         f"repos/{repo}/commits/{HEAD}/check-runs": {"check_runs": [
             {"name": "ci", "status": "completed", "conclusion": "success"}]},
         f"repos/{repo}/pulls/{number}/reviews": [{"user": BOT, "commit_id": HEAD, "state": "COMMENTED"}],
@@ -7151,7 +7172,7 @@ class GateCollect(unittest.TestCase):
     def test_collects_every_fact_and_evaluates_to_pass(self):
         fake = FakeGitHub(routes_for())
         facts = self.collect(fake)
-        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK)["verdict"], "pass")
+        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK, "main")["verdict"], "pass")
 
     def test_check_runs_are_read_page_by_page_and_a_pending_run_on_page_two_waits(self):
         runs = [{"name": f"c{i}", "status": "completed", "conclusion": "success"} for i in range(100)]
@@ -7160,7 +7181,7 @@ class GateCollect(unittest.TestCase):
         facts = self.collect(fake)
         self.assertEqual(len(facts["check_runs"]), 101)
         self.assertEqual(sum("check-runs" in c for c in fake.calls if isinstance(c, str)), 2)
-        v = gate.evaluate(facts, HEAD, green_manifest(), WORK)
+        v = gate.evaluate(facts, HEAD, green_manifest(), WORK, "main")
         self.assertEqual(v["verdict"], "wait")
         self.assertIn("late", v["reasons"][0])
 
@@ -7182,13 +7203,20 @@ class GateCollect(unittest.TestCase):
         fake = FakeGitHub(routes)
         facts = gate.gather("o/r", 5, HEAD, fake.api, fake.graphql)
         self.assertIn("error", facts)
-        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK)["verdict"], "wait")
+        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK, "main")["verdict"], "wait")
 
     def test_a_pr_with_another_head_returns_early(self):
-        fake = FakeGitHub(routes_for(**{"repos/o/r/pulls/5": {"state": "open", "head": {"sha": OLD}}}))
+        fake = FakeGitHub(routes_for(**{"repos/o/r/pulls/5": {"state": "open", "head": {"sha": OLD}, "base": {"ref": "main"}}}))
         facts = self.collect(fake)
         self.assertEqual(list(facts), ["pr"])
-        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK)["verdict"], "wait")
+        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK, "main")["verdict"], "wait")
+
+    def test_the_base_of_the_pr_is_collected_even_on_an_early_return(self):
+        facts = self.collect(FakeGitHub(routes_for()))
+        self.assertEqual(facts["pr"]["base"], "main")
+        early = self.collect(FakeGitHub(routes_for(**{"repos/o/r/pulls/5": {
+            "state": "open", "head": {"sha": OLD}, "base": {"ref": "release"}}})))
+        self.assertEqual(early["pr"]["base"], "release")
 
     def test_summary_commits_are_resolved_and_reactions_are_not_collected(self):  # D1
         short = HEAD[:7]
@@ -7297,6 +7325,7 @@ class GateBase(Base):
             self.addCleanup(p.stop)
             return started
         patch("find_pr", side_effect=find_pr)
+        patch("base_branch_of", return_value="main")
         patch("gate_facts", side_effect=lambda cfg, pr: self.facts)
         patch("read_manifest", side_effect=lambda cfg, wave: self.manifest)
         patch("workdir_state", side_effect=lambda cwd: self.work)
@@ -7565,7 +7594,7 @@ class MergeGate(GateBase):
             "no manifest": (green_facts(), None, WORK),
             "tester on another tree": (green_facts(), dirty_result, WORK),
             "dirty working copy": (green_facts(), green_manifest(), {**WORK, "clean": False}),
-            "closed PR": (green_facts(pr={"state": "closed", "merged": False, "draft": False, "head": HEAD}),
+            "closed PR": (green_facts(pr={"state": "closed", "merged": False, "draft": False, "head": HEAD, "base": "main"}),
                           green_manifest(), WORK),
         }
         for name, (facts, manifest, work) in cases.items():
@@ -7772,7 +7801,7 @@ class GateRecheck(GateBase):  # F2: a pass rests on two equal collections
     def test_other_changes_wait_too(self):
         for name, change in (("thread", {"threads": [{"id": "T", "isResolved": False}]}),
                              ("review", {"reviews": [{"id": 9, "user": BOT, "commit_id": HEAD, "state": "APPROVED"}]}),
-                             ("draft", {"pr": {"state": "open", "merged": False, "draft": True, "head": HEAD}})):
+                             ("draft", {"pr": {"state": "open", "merged": False, "draft": True, "head": HEAD, "base": "main"}})):
             with self.subTest(change=name):
                 self.assertEqual(self.verdict(green_facts(), green_facts(**change))["verdict"], "wait")
 
@@ -7782,7 +7811,7 @@ class Regate(GateBase):  # D2: the head moved while the wave sat in `merging`
 
     def moved(self):
         self.pr = {**self.pr, "headRefOid": self.NEW}
-        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": self.NEW},
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": self.NEW, "base": "main"},
                                  reviews=[{"user": BOT, "commit_id": self.NEW, "state": "COMMENTED"}])
         self.manifest = green_manifest()
         self.manifest["head"] = self.NEW
@@ -7909,7 +7938,7 @@ class OwnerMerge(GateBase):  # D3
     def test_another_head_stops_it(self):
         other = "e" * 40
         self.pr = {**self.pr, "headRefOid": other}
-        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": True, "head": other},
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": True, "head": other, "base": "main"},
                                  reviews=[{"user": BOT, "commit_id": other, "state": "COMMENTED"}])
         self.manifest = {**green_manifest(), "head": other}
         self.work = {**WORK, "head": other}
@@ -8047,6 +8076,47 @@ class OwnerMergeHarness(GateBase):
         self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": head}
 
 
+class GateBaseRedirect(OwnerMergeHarness):  # r8 HIGH: the PR base is checked at every collection
+    def redirected(self):
+        facts = green_facts()
+        facts["pr"]["base"] = "release"
+        return facts
+
+    def test_redirect_after_find_pr_fails_and_nothing_is_merged(self):
+        self.start()
+        self.facts = self.redirected()
+        v = wab.gate_check(self.cfg, "W1", self.rec())
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn("release", v["reasons"][0])
+        self.assertEqual(self.merges(), [])
+        self.tick()
+        self.assertEqual(self.merges(), [])
+
+    def test_a_base_change_between_two_collections_waits(self):
+        self.start()
+        seq = [green_facts(), self.redirected()]
+        with mock.patch.object(wab, "gate_facts", side_effect=lambda cfg, pr: seq.pop(0)):
+            v = wab.gate_check(self.cfg, "W1", self.rec())
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("факты изменились", v["reasons"][0])
+        self.assertEqual(self.merges(), [])
+
+    def test_owner_merge_of_a_redirected_pr_is_refused(self):
+        self.start(phase="merging")
+        w = self.get_state(self.cfg)
+        w["waves"]["W1"]["gate_sha"], w["waves"]["W1"]["gate_pr"] = HEAD, 7
+        self.put_state(self.cfg, w)
+        self.facts = self.redirected()
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_owner_merge()
+        self.assertIn("release", str(ctx.exception))
+        self.assertEqual((self.order, self.merges(), self.graphql_calls), ([], [], []))
+
+    def test_the_right_base_still_passes(self):
+        self.start()
+        self.assertEqual(wab.gate_check(self.cfg, "W1", self.rec())["verdict"], "pass")
+
+
 class ExternalOwnerMerge(OwnerMergeHarness):  # R1: the script offered by an external hand-off must work
     def handoff(self):
         self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
@@ -8078,7 +8148,7 @@ class ExternalOwnerMerge(OwnerMergeHarness):  # R1: the script offered by an ext
         self.handoff()
         other = "e" * 40
         self.pr = {**self.pr, "headRefOid": other}
-        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": True, "head": other},
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": True, "head": other, "base": "main"},
                                  reviews=[{"user": BOT, "commit_id": other, "state": "COMMENTED"}])
         self.manifest = {**green_manifest(), "head": other}
         self.work = {**WORK, "head": other}
@@ -8233,7 +8303,7 @@ class Alarm(GateBase):
         # a new head is a new alarm
         new = "e" * 40
         self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
-        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new},
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new, "base": "main"},
                                  reviews=[{"user": BOT, "commit_id": new, "state": "COMMENTED"}])
         for _ in range(3):
             self.tick()
@@ -8383,7 +8453,7 @@ class Alarm(GateBase):
         self.crash_tick(typed=True)
         new = "e" * 40
         self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
-        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new},
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new, "base": "main"},
                                  reviews=[{"user": BOT, "commit_id": new, "state": "COMMENTED"}])
         self.tick()
         self.assertEqual(len(self.alarms()), 1)  # only the new text is typed; the old one is not repeated
@@ -8408,7 +8478,7 @@ class Alarm(GateBase):
         self.crash_tick(typed=False)
         new = "e" * 40
         self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
-        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new},
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new, "base": "main"},
                                  reviews=[{"user": BOT, "commit_id": new, "state": "COMMENTED"}])
         self.tick()
         self.assertEqual(len(self.alarms()), 1)
@@ -8421,7 +8491,7 @@ class Alarm(GateBase):
         self.crash_tick(typed=False)
         new = "e" * 40
         self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
-        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new}, reviews=[])
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new, "base": "main"}, reviews=[])
         self.tick()
         self.assertEqual(self.alarms(), [])
         self.assertNotIn("alarm_msg", self.rec())
