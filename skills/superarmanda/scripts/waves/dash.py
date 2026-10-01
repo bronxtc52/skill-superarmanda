@@ -118,19 +118,24 @@ def _attempts(w):
 
 def _num(x):
     """A finite real number from state.json, else None (a bool, a string, NaN or inf is not one)."""
-    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
         return None
-    return x
+    try:
+        return x if math.isfinite(x) else None
+    except OverflowError:  # an int too big for a float (10**400) is not a number either
+        return None
 
 
 def wave_duration(w, now):
     """The wave's working time: the current try (until `finished`, else now) plus each earlier
     try. An earlier try ran until its own `finished`; one without it (dead, stopped) ran until the
-    next try with a known start began - the restart that archived it. A try whose start or end is
-    unknown, or whose end is before its start, adds nothing."""
+    nearest later known start among all the records (earlier tries and the current one) - the
+    restart that archived it, whatever the list order. A try whose start or end is unknown, or
+    whose end is before its start, adds nothing."""
     recs = [*_attempts(w), w]
+    starts = [s for s in (_num(r.get("started")) for r in recs) if s is not None]
     total = 0.0
-    for i, rec in enumerate(recs):
+    for rec in recs:
         start = _num(rec.get("started"))
         if start is None:
             continue
@@ -139,8 +144,7 @@ def wave_duration(w, now):
             if rec is w:
                 end = now
             else:
-                end = next((s for s in (_num(r.get("started")) for r in recs[i + 1:]) if s is not None),
-                           None)
+                end = min((s for s in starts if s > start), default=None)
         if end is not None and end > start:
             total += end - start
     return total
@@ -339,7 +343,9 @@ def events_panel(cfg, n=12):
 def header(cfg, st):
     waves = st["waves"]
     done = sum(1 for w in cfg["waves"] if wab.read(cfg["run_dir"] / w / "status") == "DONE")
-    started = min((w["started"] for w in waves.values()), default=time.time())
+    # a corrupt or missing `started` is skipped, not a crashed frame
+    started = min((s for s in (_num(w.get("started")) for w in waves.values()) if s is not None),
+                  default=time.time())
     restarts = sum(wave_restarts(w) for w in waves.values())
     turns = sum(wave_stats(w)["turns"] for w in waves.values())
     t = Text(justify="center")

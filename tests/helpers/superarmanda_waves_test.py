@@ -6342,9 +6342,9 @@ class W4Round42DashAttemptMetrics(Base):
                     {"started": now - 5_000, "finished": now - 4_000, "peak": 70_000, "restarts": 1}]
         w = self.wave_rec(started=now - 300, finished=now, peak=40_000, restarts=0, attempts=attempts)
         cells = self.row(dash, w)
-        # the record with started now-900 has no usable end of its own: the next record with a
-        # valid start is the attempt at now-5000, which is earlier - nothing known, nothing added
-        self.assertEqual(cells["Время"], dash.fmt_dur(300 + 1_000))
+        # the record with started now-900 has no usable end of its own: it ends at the nearest
+        # later valid start among all records - the current try at now-300 (round 43), +600
+        self.assertEqual(cells["Время"], dash.fmt_dur(300 + 1_000 + 600))
         self.assertEqual(cells["Пик"], dash.ktok(70_000))
         self.assertEqual(cells["↻"], "1")
         for bad in ("junk", None, 5, {"x": 1}):
@@ -6365,6 +6365,87 @@ class W4Round42DashAttemptMetrics(Base):
             con = Console(width=200, record=True)
             con.print(dash.header(cfg, st))
         self.assertIn("свежих голов 5", con.export_text())
+
+
+class W4Round43DashHugeAndOrder(Base):
+    """Round 43: an int too big for a float (10**400) in peak/started/finished is not a number
+    (math.isfinite would raise OverflowError and cost every frame); a dead attempt ends at the
+    nearest later start among all records, not at the next one in list order; the header's
+    «в работе» skips a corrupt or missing `started` instead of crashing the frame."""
+
+    dash = W4Round42DashAttemptMetrics.dash
+    row = W4Round42DashAttemptMetrics.row
+
+    def test_huge_int_is_not_a_number(self):
+        dash = self.dash()
+        for x in (10**400, -10**400):
+            self.assertIsNone(dash._num(x))
+        self.assertEqual(dash._num(10**20), 10**20)
+
+    def test_huge_int_fields_are_skipped_in_row_and_header(self):
+        dash = self.dash()
+        from rich.console import Console
+        now = time.time()
+        huge = 10**400
+        w = self.wave_rec(started=now - 300, finished=huge, peak=huge, tokens=1_000,
+                          attempts=[{"started": huge, "finished": huge, "peak": huge},
+                                    {"started": now - 2_000, "finished": now - 1_000, "peak": 30_000},
+                                    {"started": now - 5_000, "finished": huge, "peak": 20_000}])
+        self.assertEqual(dash.wave_peak(w), 30_000)
+        # current: no usable finished -> until now (300); attempt at now-2000: 1000; attempt at
+        # now-5000 without a usable end: until the nearest later start (now-2000) -> 3000
+        self.assertAlmostEqual(dash.wave_duration(w, now), 4_300, delta=1)
+        cells = self.row(dash, w)
+        self.assertEqual(cells["Пик"], dash.ktok(30_000))
+        self.assertEqual(cells["Время"], dash.fmt_dur(4_300))
+        cfg, _ = self.chain()
+        bad = self.wave_rec(started=huge, finished=huge, peak=huge,
+                            attempts=[{"started": huge, "peak": huge}])
+        self.assertEqual(dash.wave_peak(bad), 0)
+        self.assertEqual(dash.wave_duration(bad, now), 0)
+        st = {"current": "W1", "waves": {"W1": bad}}
+        zero = {k: 0 for k in ("turns", "tools", "agents", "out", "read")}
+        with mock.patch.object(dash, "wave_stats", return_value=zero), \
+                mock.patch.object(dash, "wave_commits", return_value=0), \
+                mock.patch.object(dash.wab, "tmux_alive", return_value=True):
+            con = Console(width=220, record=True)
+            con.print(dash.header(cfg, st))
+            con.print(dash.waves_table(cfg, st))
+        text = con.export_text()
+        self.assertIn("в работе", text)
+        self.assertNotIn("OverflowError", text)
+
+    def test_dead_attempt_ends_at_the_nearest_later_start(self):
+        dash = self.dash()
+        # list order is not time order: the dead try at 300 ends at the current start (500),
+        # not at the next entry (100, earlier); the dead try at 100 ends at 300
+        w = self.wave_rec(started=500, finished=600,
+                          attempts=[{"started": 300}, {"started": 100}])
+        self.assertEqual(dash.wave_duration(w, 10_000), 200 + 200 + 100)
+        w = self.wave_rec(started=500, finished=600,
+                          attempts=[{"started": 300}, {"started": 100, "finished": 150}])
+        self.assertEqual(dash.wave_duration(w, 10_000), 200 + 50 + 100)
+        # equal or unknown starts are not an end; nothing later known -> nothing added
+        w = self.wave_rec(started="x", finished=600,
+                          attempts=[{"started": 300}, {"started": 300}, {"started": 100}])
+        self.assertEqual(dash.wave_duration(w, 10_000), 200)
+
+    def test_header_skips_corrupt_or_missing_started(self):
+        dash = self.dash()
+        from rich.console import Console
+        cfg, _ = self.chain()
+        now = 1_000_000.0
+        good = self.wave_rec(name="W2", started=now - 125)
+        waves = {"W1": self.wave_rec(started="x"), "W2": good, "W3": self.wave_rec(name="W3")}
+        del waves["W3"]["started"]
+        for st_waves, expect in ((waves, dash.fmt_dur(125)),
+                                 ({"W1": self.wave_rec(started=None)}, dash.fmt_dur(0))):
+            with self.subTest(expect=expect), \
+                    mock.patch.object(dash, "wave_stats", return_value={"turns": 0}), \
+                    mock.patch.object(dash.time, "time", return_value=now):
+                con = Console(width=220, record=True)
+                con.print(dash.header(cfg, {"current": "W1", "waves": st_waves}))
+                self.assertIn(f"в работе {expect}", con.export_text())
 
 
 class Packaging(unittest.TestCase):
