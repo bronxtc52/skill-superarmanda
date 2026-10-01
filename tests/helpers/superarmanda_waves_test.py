@@ -643,6 +643,26 @@ class Admission(Base):
         subprocess.run(["git", "-C", str(co), "worktree", "add", "-q", "-b", "x", str(wt)], check=True)
         self.assertIsNone(wab.admitted_workdir(wt))
 
+    def test_relative_workdir_is_absolute_everywhere(self):
+        root = self.make_root()
+        cfg, path = self.chain(workdir="../cc-admission-abcd1234/checkout")
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        old = os.getcwd()
+        os.chdir(elsewhere)
+        self.addCleanup(os.chdir, old)
+        cfg = wab.load_chain(path)
+        self.assertTrue(os.path.isabs(cfg["workdir"]))
+        self.assertEqual(cfg["workdir"], str((root / "checkout").resolve()))
+        self.alive = False
+        prompt = self.tmp / "p.md"
+        prompt.write_text("x", encoding="utf-8")
+        self.assertTrue(wab.launch(cfg, "W1", prompt))
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["cwd"], cfg["workdir"])
+        self.transcript(w["sessions"][0], [asst(inp=1234)], cwd=w["cwd"])
+        self.assertEqual(wab.context_tokens(w), 1234)
+
     def test_launch_refuses_an_unadmitted_workdir(self):
         plain = self.tmp / "plain"
         plain.mkdir()
@@ -926,6 +946,77 @@ class LaunchIntent(Base):
         self.assertEqual(seen["phase"], "done")
 
 
+class DispatcherLock(Base):
+    def hold_elsewhere(self, cfg):
+        lock = cfg["run_dir"] / "dispatcher.lock"
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import fcntl,sys,time; f=open(sys.argv[1],'a'); "
+             "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(60)", str(lock)],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)  # cleanups run last-in first-out: kill, then wait
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        return lock
+
+    def test_second_watch_of_the_same_run_is_refused(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        lock = self.hold_elsewhere(cfg)
+        with mock.patch.object(wab, "bind_popup") as bind:
+            with self.assertRaises(SystemExit) as ctx:
+                wab.watch(cfg, path, max_ticks=1)
+        self.assertIn("another dispatcher holds", str(ctx.exception))
+        self.assertIn(str(lock), str(ctx.exception))
+        bind.assert_not_called()
+
+    def test_cli_launch_is_refused_while_a_dispatcher_holds_the_lock(self):
+        cfg, path = self.chain()
+        self.hold_elsewhere(cfg)
+        self.alive = False
+        with self.assertRaises(SystemExit) as ctx:
+            wab.launch(cfg, "W1", self.tmp / "p.md")
+        self.assertIn("another dispatcher holds", str(ctx.exception))
+        self.assertEqual(self.tmux_calls, [])
+
+    def test_lock_is_released_after_watch_and_launch(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "RUNNING")
+        with mock.patch.object(wab, "bind_popup"):
+            wab.watch(cfg, path, max_ticks=1)
+            wab.watch(cfg, path, max_ticks=1)  # would be refused if the lock leaked
+        import fcntl
+        with open(cfg["run_dir"] / "dispatcher.lock", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_launch_inside_watch_does_not_retake_the_lock(self):
+        cfg, path = self.chain()
+        self.alive = False
+        prompt = self.tmp / "p.md"
+        prompt.write_text("x", encoding="utf-8")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+
+        def tick_that_launches(c, st):
+            wab.launch(c, "W2", prompt)
+            return False
+        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd), \
+                mock.patch.object(wab, "tick", side_effect=tick_that_launches):
+            wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
+
+    def test_save_state_uses_a_unique_temp_file_and_leaves_none(self):
+        cfg, _ = self.chain()
+        real = tempfile_mkstemp = __import__("tempfile").mkstemp
+        with mock.patch("tempfile.mkstemp", wraps=real) as mk:
+            wab.save_state(cfg, {"waves": {}})
+            wab.save_state(cfg, {"waves": {}, "current": None})
+        self.assertEqual(mk.call_count, 2)
+        self.assertEqual([p.name for p in cfg["run_dir"].iterdir() if p.name.endswith(".tmp")], [])
+        (cfg["run_dir"] / "state.tmp").mkdir()  # the old shared name must not matter
+        wab.save_state(cfg, {"waves": {}})
+        self.assertEqual(self.get_state(cfg), {"waves": {}})
+
+
 class AtMostOnce(Base):
     def crash_then_tick(self, cfg, **extra):
         with mock.patch.object(wab, "notify", side_effect=KeyboardInterrupt):
@@ -1127,8 +1218,8 @@ class KeysAndRegistry(Base):
         self.assertIn("ignore-size", conf)
         self.assertEqual(len(re.findall(r"(?m)^bind-key\b", conf)), 1)
         self.assertNotRegex(conf, r"bind(-key)?\s[^\n]*\bW\b")
-        self.assertEqual(conf.splitlines()[0], "unbind-key -q -n BTab")
-        self.assertNotRegex(conf, r"(?m)^bind-key[^\n]*BTab")
+        self.assertNotIn("BTab", conf)
+        self.assertNotIn("unbind", conf)
 
     def test_unsafe_values_are_refused(self):
         opener = str(WAVES / "wab-open")
@@ -1191,6 +1282,38 @@ class KeysAndRegistry(Base):
         self.assertNotIn("gone-dash", conf)
         self.assertTrue([c for c in self.tmux_calls if c[1] == "source-file"])
         self.assertEqual(list(reg_path.parent.glob("*.tmp")), [])
+
+    def test_stale_btab_decision(self):
+        old = ('bind-key -T root BTab if-shell -F "#{m:*ignore-size*,#{client_flags}}" '
+               '{ send-keys BTab } { display-popup "wab-open /x/chain.json" }')
+        self.assertTrue(wab.stale_btab(old))
+        self.assertTrue(wab.stale_btab("bind-key -T root BTab run-shell /a/wab-open"))
+        self.assertFalse(wab.stale_btab("bind-key -T root BTab send-keys BTab"))
+        self.assertFalse(wab.stale_btab("bind-key -T root BTab select-pane -t :.-"))
+        self.assertFalse(wab.stale_btab(""))
+        self.assertFalse(wab.stale_btab("bind-key -T root C-x run-shell wab-open"))
+
+    def run_bind(self, list_keys_output):
+        cfg, path = self.chain()
+        calls = self.tmux_calls
+        inner = wab.sh.side_effect
+
+        def fake(*args, **kw):
+            r = inner(*args, **kw)
+            if args[:2] == ("tmux", "list-keys"):
+                return subprocess.CompletedProcess(args, 0, list_keys_output, "")
+            return r
+        wab.sh.side_effect = fake
+        wab.bind_popup(cfg, path)
+        return [c for c in calls if c[1] == "unbind-key"]
+
+    def test_bind_popup_removes_only_the_stale_wab_btab_binding(self):
+        stale = 'bind-key -T root BTab if-shell -F "#{m:*ignore-size*,#{client_flags}}" { send-keys BTab }'
+        self.assertEqual(len(self.run_bind(stale)), 1)
+
+    def test_bind_popup_leaves_a_foreign_btab_binding_alone(self):
+        self.assertEqual(self.run_bind("bind-key -T root BTab select-pane -t :.-"), [])
+        self.assertEqual(self.run_bind(""), [])
 
     def test_bind_popup_refuses_an_unsafe_path_without_touching_tmux(self):
         spaced = self.tmp / "my dir"

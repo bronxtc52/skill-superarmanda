@@ -18,6 +18,7 @@ Every contact with tmux, claude, Telegram and az goes through the module-level f
 `_send_telegram`, so tests can replace them. Paths that depend on $HOME are computed at call
 time, not at import.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -93,11 +95,48 @@ def load_chain(path, create=True):
     here = path.resolve().parent
     # a relative run_dir is relative to chain.json, never to the cwd of whoever runs us
     base = pathlib.Path(os.path.abspath(here / cfg["run_dir"])) if cfg.get("run_dir") else here / "runs"
+    if cfg.get("workdir"):  # absolute before admission, state and transcript lookup
+        cfg["workdir"] = str(pathlib.Path(os.path.abspath(here / cfg["workdir"])).resolve())
     cfg["chain_file"] = str(path.resolve())
     cfg["run_dir"] = base / chain / run_id
     if create:
         cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     return cfg
+
+
+_HELD = set()  # lock files held by THIS process (a flock is not re-entrant across descriptors)
+
+
+class _RunLock:
+    """One dispatcher per run: flock on <run_dir>/dispatcher.lock. Taken by `watch` for its
+    whole life and by the CLI `launch`; a launch inside a running watch reuses the held lock."""
+
+    def __init__(self, cfg, what):
+        self.path = cfg["run_dir"] / "dispatcher.lock"
+        self.what = what
+        self.fh = None
+
+    def __enter__(self):
+        if str(self.path) in _HELD:
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.path, "a", encoding="utf-8")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            raise SystemExit(f"wab: another dispatcher holds {self.path} ({self.what}); "
+                             f"запусти волну через watch или останови диспетчер")
+        self.fh = fh
+        _HELD.add(str(self.path))
+        return self
+
+    def __exit__(self, *exc):
+        if self.fh:
+            _HELD.discard(str(self.path))
+            self.fh.close()  # closing drops the flock
+            self.fh = None
+        return False
 
 
 def state_path(cfg):
@@ -122,9 +161,20 @@ def load_state(cfg):
 
 
 def save_state(cfg, st):
-    tmp = state_path(cfg).with_suffix(".tmp")
-    tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(state_path(cfg))
+    target = state_path(cfg)
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".state.", suffix=".tmp")  # unique per writer
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(st, indent=2, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def event(cfg, text):
@@ -545,6 +595,11 @@ def system_prompt(cfg):
 
 def launch(cfg, wave, prompt_file):
     """Start one wave. False when the Claude TUI never became ready: nothing is sent then."""
+    with _RunLock(cfg, "launch"):
+        return _launch(cfg, wave, prompt_file)
+
+
+def _launch(cfg, wave, prompt_file):
     require_tmux()
     if wave not in cfg["waves"]:
         raise SystemExit(f"unknown wave {wave}; chain.json waves: {cfg['waves']}")
@@ -923,9 +978,14 @@ def keys_conf(registry):
         cmd = (f'if-shell -F "#{{==:#{{session_name}},{dash}}}" '
                f'{{ display-popup -E -w 95% -h 90% -T " волна (назад: Ctrl+\\\\) " "{opener} {chain}" }} '
                f'{{ {cmd} }}')
-    # the first line drops a stale root binding of Shift+Tab (an old intermediate version let it
-    # through to the wave window and switched Claude out of auto mode); we never bind it
-    return f"unbind-key -q -n BTab\nbind-key -n {key} {cmd}\n"
+    return f"bind-key -n {key} {cmd}\n"  # Shift+Tab (BTab) is never bound here
+
+
+def stale_btab(list_keys_output):
+    """Is the root binding of Shift+Tab a leftover of an old wab version (it let the key
+    through to the wave window and switched Claude out of auto mode)? Only those are ours."""
+    return any("BTab" in line and ("wab-open" in line or "ignore-size" in line)
+               for line in (list_keys_output or "").splitlines())
 
 
 def bind_popup(cfg, path):
@@ -967,6 +1027,10 @@ def bind_popup(cfg, path):
     r = sh("tmux", "source-file", str(conf), check=False)
     event(cfg, "Ctrl+\\ toggles the wave popup" if r.returncode == 0
           else f"toggle key bind failed: {r.stderr.strip() or r.stdout.strip()}")
+    keys = sh("tmux", "list-keys", "-T", "root", "BTab", check=False)
+    if keys.returncode == 0 and stale_btab(keys.stdout):  # a foreign Shift+Tab binding stays
+        sh("tmux", "unbind-key", "-n", "BTab", check=False)
+        event(cfg, "removed a stale wab binding of Shift+Tab")
 
 
 def _state_or_event(cfg):
@@ -978,6 +1042,11 @@ def _state_or_event(cfg):
 
 
 def watch(cfg, path, max_ticks=None):
+    with _RunLock(cfg, "watch"):
+        _watch(cfg, path, max_ticks)
+
+
+def _watch(cfg, path, max_ticks=None):
     require_tmux()
     event(cfg, f"watch started, ctx_limit={cfg['ctx_limit']}")
     bind_popup(cfg, path)
