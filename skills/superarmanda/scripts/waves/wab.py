@@ -428,10 +428,20 @@ def _first_user_text(path):
     return ""
 
 
+def owned_sessions(st):
+    """Every session id that already belongs to some wave: current sessions AND those of all
+    earlier attempts (a restarted wave keeps its old transcripts, which carry the same marker)."""
+    owned = set()
+    for w in st["waves"].values():
+        for rec in [w, *(w.get("attempts") or [])]:
+            owned.update(rec.get("sessions") or [])
+    return owned
+
+
 def find_new_session(cfg, st, wave):
     """After /clear the wave continues in a new session file. Find it by the marker in its
     first message, among transcripts of this clone that no wave owns yet."""
-    owned = {s for w in st["waves"].values() for s in (w.get("sessions") or [])}
+    owned = owned_sessions(st)
     d = transcript_dir(st["waves"][wave]["cwd"])
     if not d.exists():
         return None
@@ -840,6 +850,8 @@ def tick(cfg, st):
     now = time.time()
     attach = f"tmux attach -t {name}  (выйти: Ctrl-b d)"
 
+    if not status.startswith("BLOCKED"):
+        w["notified"].pop("blocked", None)  # the episode is over: the next one notifies again
     if w.get("phase") == "awaiting_merge":
         return False  # handed to the coordinator: the watch ends and frees the run lock
     if w.get("phase") == "not_ready":
@@ -977,6 +989,8 @@ def tick(cfg, st):
             w["auto_off_ticks"] = 0
             w["auto_alerted"] = False
 
+    if not any(m in txt for m in PERMISSION_MARKERS):
+        w["notified"].pop("permission", None)
     if any(m in txt for m in PERMISSION_MARKERS):
         if once_per(w, "permission", hashlib.sha1(txt[-800:].encode("utf-8")).hexdigest()):
             save_state(cfg, st)
@@ -986,6 +1000,7 @@ def tick(cfg, st):
     digest = hashlib.sha1(txt.encode("utf-8")).hexdigest()
     if digest != w.get("pane_digest"):
         w["pane_digest"], w["pane_changed"] = digest, now
+        w["notified"].pop("idle", None)
     elif now - w.get("pane_changed", now) > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
             save_state(cfg, st)

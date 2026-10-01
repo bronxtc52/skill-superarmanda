@@ -314,6 +314,20 @@ class SessionBinding(Base):
                                       user([{"type": "tool_result", "content": "x"}, {"type": "text", "text": m}])])
         self.assertEqual(wab.find_new_session(cfg, st, "W1"), "pos-mixed")
 
+    def test_sessions_of_earlier_attempts_are_never_adopted(self):
+        cfg, _ = self.chain()
+        m = self.marker(cfg, "W1")
+        self.transcript("old1", [asst(inp=1)], marker=m)
+        self.transcript("old2", [asst(inp=1)], marker=m)
+        self.transcript("new0", [asst(inp=1)], marker=m)
+        w = self.wave_rec("W1", sessions=["new0"], await_session=True)
+        w["attempts"] = [{"phase": "dead", "sessions": ["old1", "old2"]}]
+        st = {"waves": {"W1": w}}
+        self.assertEqual(wab.owned_sessions(st), {"old1", "old2", "new0"})
+        self.assertIsNone(wab.find_new_session(cfg, st, "W1"))  # the new log is late: nothing to adopt
+        self.transcript("new1", [asst(inp=1)], marker=m)
+        self.assertEqual(wab.find_new_session(cfg, st, "W1"), "new1")
+
     def test_marker_of_a_different_run_does_not_match(self):
         cfg, _ = self.chain()
         self.transcript("n", [asst(inp=1)], marker=f"[wab:{CHAIN}/other-run/W1]")
@@ -1267,6 +1281,63 @@ class LaunchGuard(Base):
         log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
         self.assertIn("next wave W2 not started: TUI not ready", log)
         self.assertNotIn("no current wave", log)
+
+
+class Episodes(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg, _ = self.chain()
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+
+    def tick(self):
+        self.assertTrue(wab.tick(self.cfg, wab.load_state(self.cfg)))
+
+    def test_blocked_episodes(self):
+        self.set_status(self.cfg, "W1", "BLOCKED: same question")
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.tg), 1)
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.tick()
+        self.assertNotIn("blocked", self.get_state(self.cfg)["waves"]["W1"]["notified"])
+        self.set_status(self.cfg, "W1", "BLOCKED: same question")
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.tg), 2)
+
+    def test_permission_episodes(self):
+        self.set_status(self.cfg, "W1", "RUNNING")
+        prompt = "Do you want to proceed?\n❯ 1. Yes"
+        self.pane = prompt
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.tg), 1)
+        self.pane = "working..."
+        self.tick()
+        self.pane = prompt
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.tg), 2)
+
+    def test_idle_episodes(self):
+        self.cfg, _ = self.chain(idle_minutes=0)
+        self.set_status(self.cfg, "W1", "RUNNING")
+        t = [1000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            self.pane = "same screen"
+            self.tick()
+            t[0] += 5
+            self.tick()
+            self.tick()
+            self.assertEqual(len(self.tg), 1)
+            self.pane = "screen moved"
+            self.tick()
+            t[0] += 5
+            self.pane = "same screen"  # a digest seen before, a new episode
+            self.tick()
+            t[0] += 5
+            self.tick()
+        self.assertEqual(len(self.tg), 2)
 
 
 class AtMostOnce(Base):
