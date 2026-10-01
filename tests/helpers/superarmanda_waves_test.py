@@ -2164,6 +2164,48 @@ class ChainConfig(Base):
             with self.subTest(ok=ok):
                 self.chain(merge_gate=ok)
 
+    def _bad_doc(self, **over):
+        cfgdir = self.tmp / "badcfg"
+        cfgdir.mkdir(exist_ok=True)
+        path = cfgdir / "chain.json"
+        path.write_text(json.dumps({"chain": CHAIN, "run_id": RUN_ID, "waves": ["W1"], **over}), encoding="utf-8")
+        return path
+
+    def test_numeric_settings_are_validated_before_launch(self):
+        for field in ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds"):
+            for bad in ("12", True, False, None, -1, 0 if field != "idle_minutes" else -0.5, float("nan"), float("inf"), [1], {}):
+                with self.subTest(field=field, bad=bad):
+                    path = self._bad_doc(**{field: bad})
+                    with self.assertRaises(SystemExit) as ctx:
+                        wab.load_chain(path, create=False)
+                    self.assertIn(field, str(ctx.exception))
+            for ok in (1, 0.5, 600) + ((0,) if field == "idle_minutes" else ()):
+                with self.subTest(field=field, ok=ok):
+                    cfg, _ = self.chain(**{field: ok})
+                    self.assertEqual(cfg[field], ok)
+
+    def test_other_tunables_have_the_right_type(self):
+        for field, bad in (("model", 5), ("model", ["x"]), ("titles", "x"), ("titles", [1]),
+                           ("titles", {"W1": 3}), ("telegram", "x"), ("telegram", [1])):
+            with self.subTest(field=field, bad=bad):
+                path = self._bad_doc(**{field: bad})
+                with self.assertRaises(SystemExit) as ctx:
+                    wab.load_chain(path, create=False)
+                self.assertIn(field, str(ctx.exception))
+
+    def test_invalid_live_edit_keeps_old_settings_and_watch_survives(self):
+        cfg, path = self.chain()
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["tick_seconds"] = None
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        self.alive = True
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        with mock.patch.object(wab.time, "sleep"):
+            wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(cfg["tick_seconds"], 1)
+        self.assertIn("keeping the previous settings", "\n".join(
+            p.read_text(encoding="utf-8") for p in cfg["run_dir"].glob("*.log")))
+
     def test_attach_hint_names_the_private_socket(self):
         with mock.patch.object(wab, "TMUX_SOCKET", None), mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("WAB_TMUX_SOCKET", None)
@@ -2296,6 +2338,14 @@ class Dashboard(Base):
         text = self.render_text(cfg)
         self.assertIn("Ctrl+\\", text)
         self.assertIn("W1", text)
+
+    def test_attach_hint_in_dashboard_names_the_private_socket(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "RUNNING")
+        with mock.patch.object(wab, "TMUX_SOCKET", "sockd"):
+            text = self.render_text(cfg)
+        self.assertIn("-L sockd attach -t", text)
 
     def test_stats_per_session_with_subagents_and_incremental_reads(self):
         self.transcript("a1", [asst(inp=1, out=10, tools=1), asst(inp=2, out=5, tools=2)])

@@ -21,6 +21,7 @@ time, not at import.
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -80,6 +81,19 @@ def load_chain(path, create=True):
     cfg.setdefault("tick_seconds", 60)
     cfg.setdefault("model", None)
     cfg.setdefault("tmux_prefix", "wab-")
+    for key in ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds"):
+        v = cfg[key]  # an explicit null/string/bool/<=0/nan/inf would crash `watch` later
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) \
+                or v < 0 or (v == 0 and key != "idle_minutes"):  # idle 0 = flag idleness at once
+            raise SystemExit(f"chain.json: {key} must be a positive number, got {v!r}")
+    if cfg["model"] is not None and not isinstance(cfg["model"], str):
+        raise SystemExit(f"chain.json: model must be a string or null, got {cfg['model']!r}")
+    titles = cfg.get("titles")
+    if titles is not None and not (isinstance(titles, dict)
+                                   and all(isinstance(v, str) for v in titles.values())):
+        raise SystemExit("chain.json: titles must be an object of wave id -> string")
+    if cfg.get("telegram") and not isinstance(cfg["telegram"], dict):
+        raise SystemExit("chain.json: telegram must be an object")
     chain = str(cfg.get("chain") or "")
     run_id = str(cfg.get("run_id") or "")
     if not _plain_name(chain):
