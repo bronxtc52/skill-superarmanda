@@ -1134,7 +1134,7 @@ class LaunchIntent(Base):
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         seen = {}
 
-        def fake_launch(c, wave, prompt):
+        def fake_launch(c, wave, prompt, **kw):
             seen["phase"] = json.loads(wab.state_path(c).read_text(encoding="utf-8"))["waves"]["W1"]["phase"]
             return True
         with mock.patch.object(wab, "launch", side_effect=fake_launch):
@@ -1851,9 +1851,17 @@ class AtMostOnce(Base):
                 wab.launch(cfg, "W1", prompt)
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
         self.assertTrue(self.get_state(cfg)["waves"]["W1"]["notified"].get("started"))
-        with mock.patch.object(wab, "notify") as again, mock.patch.object(wab, "drop_stale_btab"):
+        # «стартовала» goes through the outbox: not confirmed by the transport -> sent once more
+        # (at least once), and never again after that
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["outbox"]["started"]["next_at"] = 0
+        self.put_state(cfg, st)
+        self.alive = True
+        with mock.patch.object(wab, "notify", return_value=True) as again, \
+                mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(cfg, cfg_path(cfg), max_ticks=1)
-        self.assertFalse([c for c in again.call_args_list if "стартовала" in c[0][1]])
+            wab.watch(cfg, cfg_path(cfg), max_ticks=1)
+        self.assertEqual(len([c for c in again.call_args_list if "стартовала" in c[0][1]]), 1)
 
 
 def cfg_path(cfg):
@@ -3354,6 +3362,188 @@ class W4Round26(Base):
                 w = self.wave_rec("W1", sessions=["cur1"], attempts=bad)
                 dash.CACHE = wab.TranscriptCache()
                 self.assertEqual(dash.wave_stats(w)["out"], want)
+
+
+class W4Round27(Base):
+    """Round 27: every notice about a wave goes through the outbox (not_ready and «стартовала» too),
+    and a wave confirmed by the coordinator (launch of the next wave, restart of this one, `done`)
+    loses all its undelivered notices about the past state except «цепочка завершена»."""
+
+    def setUp(self):
+        super().setUp()
+        self.down = False
+        self.fail_left = 0
+
+        def flaky(cfg, text):
+            if self.down or self.fail_left > 0:
+                self.fail_left = max(0, self.fail_left - 1)
+                raise OSError("telegram down")
+            self.tg.append(text)
+        p = mock.patch.object(wab, "_send_telegram", side_effect=flaky)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+
+    @staticmethod
+    def item(text):
+        return {"value": "1", "text": text, "next_at": 0}
+
+    def launch(self, cfg, wave, prompt):
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            return wab.launch(cfg, wave, prompt)
+
+    def prompt(self):
+        p = self.tmp / "p.md"
+        p.write_text("do it\n", encoding="utf-8")
+        return p
+
+    # ----- A: an undelivered «следующая волна не запущена» is stale once the next wave is launched -----
+    def test_launch_after_a_stop_without_next_drops_the_stale_no_next(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        self.down = True
+        self.assertFalse(wab.watch(cfg, path, max_ticks=3))
+        st = self.get_state(cfg)
+        self.assertIsNone(st["current"])
+        self.assertIn("no_next", st["waves"]["W1"].get("outbox", {}))
+        # the operator writes next-prompt.md and launches W2 by hand
+        nxt = wab.wave_dir(cfg, "W1") / "next-prompt.md"
+        nxt.write_text("go\n", encoding="utf-8")
+        self.alive = False
+        self.down = False
+        self.assertTrue(self.launch(cfg, "W2", nxt))
+        st = self.get_state(cfg)
+        self.assertNotIn("stopped", st)
+        self.assertFalse(st["waves"]["W1"].get("outbox"))
+        self.alive = True
+        self.set_status(cfg, "W2", "RUNNING")
+        wab.watch(cfg, path, max_ticks=1)
+        wab.drain_notices(cfg)
+        self.assertEqual([t for t in self.tg if "не запускаю" in t], [], self.tg)
+        self.assertEqual(len([t for t in self.tg if "стартовала волна W2" in t]), 1, self.tg)
+
+    # ----- B: not_ready goes through the outbox and is delivered exactly once after the failure -----
+    def test_not_ready_survives_a_telegram_failure(self):
+        cfg, _ = self.chain()
+        self.alive = False
+        self.ready = False
+        self.down = True
+        self.assertFalse(self.launch(cfg, "W1", self.prompt()))
+        box = self.get_state(cfg)["waves"]["W1"].get("outbox", {})
+        self.assertIn("not_ready", box)
+        self.assertEqual(self.tg, [])
+        self.down = False
+        wab.drain_notices(cfg)
+        wab.drain_notices(cfg)
+        self.assertEqual(len([t for t in self.tg if "не стало готовым" in t]), 1, self.tg)
+        self.assertFalse(self.get_state(cfg)["waves"]["W1"].get("outbox"))
+
+    def test_cli_launch_drains_before_it_exits_nonzero(self):
+        cfg, path = self.chain()
+        self.alive = False
+        self.ready = False
+        self.fail_left = 1  # the first attempt fails, the drain gets it through
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            with self.assertRaises(SystemExit) as cm:
+                wab.main(["wab.py", "launch", str(path), "W1", str(self.prompt())])
+        self.assertEqual(cm.exception.code, 3)
+        self.assertEqual(len([t for t in self.tg if "не стало готовым" in t]), 1, self.tg)
+        self.assertFalse(self.get_state(cfg)["waves"]["W1"].get("outbox"))
+
+    def test_start_notice_survives_a_telegram_failure(self):
+        cfg, path = self.chain()
+        self.alive = False
+        self.down = True
+        self.assertTrue(self.launch(cfg, "W1", self.prompt()))
+        self.assertIn("started", self.get_state(cfg)["waves"]["W1"].get("outbox", {}))
+        self.down = False
+        self.alive = True
+        self.set_status(cfg, "W1", "RUNNING")
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["outbox"]["started"]["next_at"] = 0
+        self.put_state(cfg, st)
+        wab.watch(cfg, path, max_ticks=2)
+        self.assertEqual(len([t for t in self.tg if "стартовала волна W1" in t]), 1, self.tg)
+
+    def test_only_flush_and_the_manual_command_call_notify(self):
+        import ast
+        tree = ast.parse((WAVES / "wab.py").read_text(encoding="utf-8"))
+        callers = set()
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "notify":
+                        callers.add(fn.name)
+        self.assertEqual(callers, {"flush_notices", "main"})
+
+    # ----- 2: a restart of the same wave acknowledges its old notices -----
+    def test_restart_drops_the_old_dead_and_not_ready_but_keeps_chain_done(self):
+        cfg, _ = self.chain()
+        box = {k: self.item(f"old {k}") for k in ("dead", "not_ready", "idle", "permission", "chain_done")}
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="dead", outbox=box)}})
+        self.alive = False
+        self.down = True
+        self.assertTrue(self.launch(cfg, "W1", self.prompt()))
+        st = self.get_state(cfg)
+        rec = st["waves"]["W1"]
+        self.assertEqual(set(rec.get("outbox", {})) - {"started"}, {"chain_done"})
+        for old in rec["attempts"]:
+            self.assertNotIn("outbox", old)  # an attempt is history, not a second outbox
+        self.down = False
+        wab.drain_notices(cfg)
+        self.assertEqual(sorted(t for t in self.tg if t.startswith("old")), ["old chain_done"])
+
+    # ----- 2: only the confirmed wave is acknowledged; another wave keeps its notices -----
+    def test_unconfirmed_waves_keep_their_notices(self):
+        cfg, _ = self.chain(waves=["W1", "W2", "W3"], merge_gate="external")
+        w1 = self.wave_rec("W1", phase="done", outbox={"idle": self.item("W1 idle")})
+        w2 = self.wave_rec("W2", phase="awaiting_merge",
+                           outbox={"handoff": self.item("W2 handoff"), "permission": self.item("W2 perm"),
+                                   "chain_done": self.item("W2 chain_done")})
+        self.put_state(cfg, {"current": "W2", "waves": {"W1": w1, "W2": w2}})
+        self.alive = False
+        self.down = True
+        self.assertTrue(self.launch(cfg, "W3", self.prompt()))
+        st = self.get_state(cfg)
+        self.assertEqual(set(st["waves"]["W1"].get("outbox", {})), {"idle"})
+        self.assertEqual(set(st["waves"]["W2"].get("outbox", {})), {"chain_done"})
+
+    def test_done_command_acknowledges_every_episode_but_chain_done(self):
+        cfg, path = self.chain(waves=["W1"], merge_gate="external")
+        box = {k: self.item(f"old {k}") for k in ("handoff", "idle", "permission", "checkpoint_timeout")}
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge", outbox=box)}})
+        self.down = True
+        wab.main(["wab.py", "done", str(path), "W1"])
+        self.assertEqual(set(self.get_state(cfg)["waves"]["W1"].get("outbox", {})), {"chain_done"})
+        self.down = False
+        wab.main(["wab.py", "done", str(path)])
+        self.assertEqual([t for t in self.tg if t.startswith("old")], [])
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1, self.tg)
+
+    def test_every_confirmation_point_uses_one_function(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        self.assertNotIn('drop_notice(st["waves"][prev], "handoff")', src)
+        self.assertNotIn('drop_notice(w, "handoff")', src)
+        self.assertGreaterEqual(src.count("ack_wave_notices("), 4)  # def + launch prev + restart + done
+
+    # ----- 3: a corrupt `attempts` does not break a restart -----
+    def test_restart_with_corrupt_attempts(self):
+        good = {"phase": "dead", "sessions": ["s0"]}
+        for bad, kept in (("junk", 0), (7, 0), ({"x": 1}, 0), ([None, "x", 3, good], 1)):
+            with self.subTest(attempts=bad):
+                cfg, _ = self.chain()
+                self.put_state(cfg, {"current": "W1",
+                                     "waves": {"W1": self.wave_rec(phase="dead", attempts=bad)}})
+                self.alive = False
+                self.assertTrue(self.launch(cfg, "W1", self.prompt()))
+                attempts = self.get_state(cfg)["waves"]["W1"]["attempts"]
+                self.assertIsInstance(attempts, list)
+                self.assertTrue(all(isinstance(a, dict) for a in attempts))
+                self.assertEqual(len(attempts), kept + 1)
+                (wab.wave_dir(cfg, "W1") / "status").unlink()
 
 
 class Utf8(Base):

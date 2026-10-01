@@ -669,6 +669,25 @@ def drop_notice(w, key):
     w.get("outbox", {}).pop(key, None)
 
 
+KEEP_ON_ACK = ("chain_done",)  # the end of the chain is never stale: it must get through
+
+
+def ack_wave_notices(w):
+    """The coordinator confirmed this wave (launched the next one, restarted this one, ran `done`):
+    every undelivered notice about its past state (handoff, no_next, dead, not_ready, blocked,
+    idle, permission, ...) is stale now and leaves the outbox; only «цепочка завершена» stays.
+    The one rule for every confirmation point; notices of other waves are not touched."""
+    box = w.get("outbox")
+    if not isinstance(box, dict):
+        w.pop("outbox", None)
+        return
+    for key in list(box):
+        if key not in KEEP_ON_ACK:
+            box.pop(key, None)
+    if not box:
+        w.pop("outbox", None)
+
+
 def flush_notices(cfg, st, w, force=False):
     """Send the queued notices that are due; one attempt per notice per NOTIFY_RETRY_SECONDS
     (also bounds the `telegram FAILED` events). `force` ignores the interval (the watch is leaving)."""
@@ -899,10 +918,15 @@ def system_prompt(cfg):
     return out
 
 
-def launch(cfg, wave, prompt_file):
-    """Start one wave. False when the Claude TUI never became ready: nothing is sent then."""
+def launch(cfg, wave, prompt_file, by_dispatcher=False, drain=False):
+    """Start one wave. False when the Claude TUI never became ready: nothing is sent then.
+    `by_dispatcher`: the watch itself goes on to the next wave (no coordinator confirmed anything).
+    `drain`: the CLI exits right after a failed launch, so the notices get a few more tries first."""
     with _RunLock(cfg, "launch"):
-        return _launch(cfg, wave, prompt_file)
+        ok = _launch(cfg, wave, prompt_file, by_dispatcher)
+        if not ok and drain:
+            drain_notices(cfg)  # what is still undelivered stays for the next watch/launch/done
+        return ok
 
 
 HANDED_OVER = ("awaiting_merge", "done")
@@ -937,7 +961,7 @@ def _check_launch_allowed(cfg, st, wave, name):
         raise SystemExit(f"wab: wave {wave} is already {records[wave]['phase']}; launch refused")
 
 
-def _launch(cfg, wave, prompt_file):
+def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     require_tmux()
     if wave not in cfg["waves"]:
         raise SystemExit(f"unknown wave {wave}; chain.json waves: {cfg['waves']}")
@@ -958,7 +982,10 @@ def _launch(cfg, wave, prompt_file):
     prev = st.get("current")
     if prev and prev != wave and st["waves"].get(prev, {}).get("phase") == "awaiting_merge":
         st["waves"][prev]["phase"] = "done"  # merged by the coordinator; saved with the launch intent
-        drop_notice(st["waves"][prev], "handoff")  # confirmed: an undelivered one would be stale
+    idx = cfg["waves"].index(wave)
+    before = cfg["waves"][idx - 1] if idx > 0 and not restart else None
+    if not by_dispatcher and before and isinstance(st["waves"].get(before), dict):
+        ack_wave_notices(st["waves"][before])  # the coordinator launched the next wave: confirmed
     sid = str(uuid.uuid4())  # known up front: the transcript is bound to the wave by session id
     (wdir / "status").write_text("STARTING\n", encoding="utf-8")  # the wave has not started yet
     system_prompt(cfg)
@@ -966,12 +993,20 @@ def _launch(cfg, wave, prompt_file):
     st["current"] = wave
     st.pop("stopped", None)
     old = st["waves"].get(wave)
-    attempts = (old.get("attempts", []) + [{k: v for k, v in old.items() if k != "attempts"}]) if old else []
+    attempts, carried = [], None
+    if isinstance(old, dict):
+        ack_wave_notices(old)  # a relaunch of this wave confirms its old episodes (dead, not_ready...)
+        carried = old.get("outbox")  # only what survives the acknowledgement (chain_done)
+        earlier = old.get("attempts")
+        attempts = [a for a in earlier if isinstance(a, dict)] if isinstance(earlier, list) else []
+        attempts.append({k: v for k, v in old.items() if k not in ("attempts", "outbox")})
     st["waves"][wave] = {"tmux": name, "cwd": cwd, "started": time.time(), "restarts": 0,
                          "phase": "launching", "notified": {}, "sessions": [sid],
                          "prompt_file": str(prompt_path)}
     if attempts:
         st["waves"][wave]["attempts"] = attempts  # the earlier try is kept, not overwritten
+    if carried:
+        st["waves"][wave]["outbox"] = carried
     save_state(cfg, st)
     start_session(cfg, st, wave)
     return deliver_first_prompt(cfg, st, wave)
@@ -1073,8 +1108,9 @@ def deliver_first_prompt(cfg, st, wave):
         w["phase"] = "not_ready"
         save_state(cfg, st)
         event(cfg, f"{wave}: Claude TUI not ready in {name}, prompt NOT sent")
-        notify(cfg, f"wave-autobot: окно волны {wave} не стало готовым за 90 с, задачу не отправил. "
-                    f"Цепочка стоит. Посмотри: {attach_cmd(name)}")
+        queue_notice(cfg, st, w, "not_ready", "1",
+                     f"wave-autobot: окно волны {wave} не стало готовым за 90 с, задачу не отправил. "
+                     f"Цепочка стоит. Посмотри: {attach_cmd(name)}")
         return False
     prompt = pathlib.Path(w["prompt_file"]).read_text(encoding="utf-8").strip()
     head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wdir} "
@@ -1089,10 +1125,12 @@ def deliver_first_prompt(cfg, st, wave):
     except _WindowGone:
         return False
     w["phase"] = "running"
-    once_per(w, "started", "1")  # saved before the notice: at most once
+    fresh = once_per(w, "started", "1")
     save_state(cfg, st)
     event(cfg, f"{wave}: launched in tmux {name}, cwd {cwd}")
-    notify(cfg, f"wave-autobot: стартовала волна {wave}.\nСмотреть: {attach_cmd(name)}\n(выйти: Ctrl-b d)")
+    if fresh:
+        queue_notice(cfg, st, w, "started", "1",
+                     f"wave-autobot: стартовала волна {wave}.\nСмотреть: {attach_cmd(name)}\n(выйти: Ctrl-b d)")
     return True
 
 
@@ -1323,7 +1361,7 @@ def _tick(cfg, st):
         if not nxt.exists():
             return _stop_without_next(cfg, st, w, wave, now)
         save_state(cfg, st)
-        started = launch(cfg, waves[idx + 1], nxt)
+        started = launch(cfg, waves[idx + 1], nxt, by_dispatcher=True)
         fresh_st = load_state(cfg)  # launch saved a newer snapshot (new current, new record):
         st.clear()                  # the caller's dict must not be written back over it
         st.update(fresh_st)
@@ -1683,13 +1721,15 @@ def done_cmd(cfg, wave=None):
         if w.get("phase") == "awaiting_merge":
             w["phase"] = "done"
             w.setdefault("finished", time.time())
-            drop_notice(w, "handoff")  # confirmed by this call; chain_done below must still get through
+            ack_wave_notices(w)  # confirmed by this call; chain_done below must still get through
             if st.get("current") == wave:
                 st["current"] = None
             save_state(cfg, st)
             event(cfg, "chain finished")
             queue_notice(cfg, st, w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
         else:
+            ack_wave_notices(w)  # a repeat call confirms too: only chain_done may still be owed
+            save_state(cfg, st)
             flush_notices(cfg, st, w, force=True)  # a repeat call sends what was not delivered
 
 
@@ -1714,7 +1754,7 @@ def main(argv):
     elif cmd == "status":
         status_cmd(load_chain(path, create=False))
     elif cmd == "launch" and len(argv) == 5:
-        if not launch(load_chain(path), argv[3], argv[4]):
+        if not launch(load_chain(path), argv[3], argv[4], drain=True):
             print(f"wab: wave {argv[3]} not started (see events.log)", file=sys.stderr)
             sys.exit(3)
     elif cmd == "watch":
