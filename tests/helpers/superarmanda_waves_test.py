@@ -1567,7 +1567,7 @@ class ExactTargets(Base):
     def test_no_bare_session_targets_remain(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
         for m in re.finditer(r'"-t",\s*([^,)\n]+)', src):
-            self.assertRegex(m.group(1).strip(), r"^(session_target|pane_target)\(", m.group(0))
+            self.assertRegex(m.group(1).strip(), r"^(session_target\(|pane_target\(|pane$)", m.group(0))
 
     def test_cli_launch_failure_exits_nonzero(self):
         cfg, path = self.chain()
@@ -1798,7 +1798,16 @@ class AtMostOnce(Base):
         with mock.patch.object(wab, "notify", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 wab.tick(cfg, wab.load_state(cfg))
-        with mock.patch.object(wab, "notify") as again, mock.patch.object(wab, "launch", return_value=True):
+        # a notice not confirmed by the transport is retried once (at least once), never twice
+        with mock.patch.object(wab, "notify", return_value=True) as retry, \
+                mock.patch.object(wab, "launch", return_value=True):
+            try:
+                wab.tick(cfg, wab.load_state(cfg))
+            except Exception:
+                pass
+        self.assertLessEqual(len(retry.call_args_list), 1)
+        with mock.patch.object(wab, "notify", return_value=True) as again, \
+                mock.patch.object(wab, "launch", return_value=True):
             try:
                 wab.tick(cfg, wab.load_state(cfg))
             except Exception:
@@ -2019,15 +2028,15 @@ class KeysAndRegistry(Base):
         with mock.patch.dict(os.environ, env), mock.patch.object(
                 dash.subprocess, "run",
                 return_value=subprocess.CompletedProcess([], 0, "my-work\n", "")) as run:
-            self.assertEqual(dash.own_session(), ("my-work", "sockZ"))
+            self.assertEqual(dash.own_session(), ("my-work", "sockZ", "%3"))
         self.assertIn("%3", run.call_args[0][0])
         with mock.patch.dict(os.environ, {"TMUX": f"{sockdir}/default,1,0", "TMUX_PANE": "%1"}), \
                 mock.patch.object(dash.subprocess, "run",
                                   return_value=subprocess.CompletedProcess([], 0, "s\n", "")):
-            self.assertEqual(dash.own_session(), ("s", ""))
+            self.assertEqual(dash.own_session(), ("s", "", "%1"))
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TMUX", None)
-            self.assertEqual(dash.own_session(), (None, ""))
+            self.assertEqual(dash.own_session(), (None, "", None))
 
     def test_socket_path_means_dash_S_and_a_name_means_dash_L(self):
         with mock.patch.object(wab, "TMUX_SOCKET", "/tmp/w/waves.sock"):
@@ -2046,7 +2055,7 @@ class KeysAndRegistry(Base):
         done = subprocess.CompletedProcess([], 0, "w\n", "")
         with mock.patch.dict(os.environ, {"TMUX": "/tmp/waves.sock,5,0", "TMUX_PANE": "%1"}), \
                 mock.patch.object(dash.subprocess, "run", return_value=done):
-            self.assertEqual(dash.own_session(), ("w", "/tmp/waves.sock"))
+            self.assertEqual(dash.own_session(), ("w", "/tmp/waves.sock", "%1"))
 
     def test_own_session_name_only_for_the_socket_dir_this_process_looks_at(self):
         try:
@@ -2065,15 +2074,15 @@ class KeysAndRegistry(Base):
                     os.environ["TMUX_TMPDIR"] = tmpdir
                 return dash.own_session()
         # same directory `-L` reads here: the short name
-        self.assertEqual(own(f"/x/y/tmux-{uid}/r18a,1,0", "/x/y"), ("w", "r18a"))
-        self.assertEqual(own(f"/x/y/tmux-{uid}/default,1,0", "/x/y"), ("w", ""))
-        self.assertEqual(own(f"/tmp/tmux-{uid}/r18a,1,0", None), ("w", "r18a"))
+        self.assertEqual(own(f"/x/y/tmux-{uid}/r18a,1,0", "/x/y"), ("w", "r18a", "%1"))
+        self.assertEqual(own(f"/x/y/tmux-{uid}/default,1,0", "/x/y"), ("w", "", "%1"))
+        self.assertEqual(own(f"/tmp/tmux-{uid}/r18a,1,0", None), ("w", "r18a", "%1"))
         # a tmux-<uid> directory elsewhere (another TMUX_TMPDIR): `-L` would name ANOTHER server
         self.assertEqual(own(f"/tmp/claude-1000/xyz/tmux-{uid}/r18a,1,0", "/other"),
-                         ("w", f"/tmp/claude-1000/xyz/tmux-{uid}/r18a"))
+                         ("w", f"/tmp/claude-1000/xyz/tmux-{uid}/r18a", "%1"))
         self.assertEqual(own(f"/tmp/claude-1000/xyz/tmux-{uid}/r18a,1,0", None),
-                         ("w", f"/tmp/claude-1000/xyz/tmux-{uid}/r18a"))
-        self.assertEqual(own(f"/x/y/tmux-{uid}/default,1,0", "/z"), ("w", f"/x/y/tmux-{uid}/default"))
+                         ("w", f"/tmp/claude-1000/xyz/tmux-{uid}/r18a", "%1"))
+        self.assertEqual(own(f"/x/y/tmux-{uid}/default,1,0", "/z"), ("w", f"/x/y/tmux-{uid}/default", "%1"))
 
     def test_wab_open_uses_dash_S_for_a_socket_path(self):
         cfg, path = self.chain()
@@ -2197,21 +2206,80 @@ class KeysAndRegistry(Base):
                     os.environ.pop("WAB_TMUX_SOCKET", None)
                     env = {} if env_sock is None else {"WAB_TMUX_SOCKET": env_sock}
                     with mock.patch.object(wab, "TMUX_SOCKET", None), mock.patch.dict(os.environ, env):
-                        self.assertTrue(wab.register_dash(cfg, path, "my-work", sock))
+                        self.assertTrue(wab.register_dash(cfg, path, "my-work", sock, "%7"))
                     n = len(flag)
                     setc = [c for c in self.tmux_calls if c[1 + n] == "set-option"]
                     self.assertEqual(len(setc), 1)
-                    self.assertEqual(list(setc[0][2 + n:5 + n]), ["-t", "=my-work:", "@wab_open"])
-                    self.assertEqual(setc[0][5 + n], f"{WAVES / 'wab-open'} {path.resolve()}")
+                    self.assertEqual(list(setc[0][2 + n:6 + n]), ["-p", "-t", "%7", "@wab_open"])
+                    self.assertEqual(setc[0][6 + n], f"{WAVES / 'wab-open'} {path.resolve()}")
                     self.assertIn("source-file", {c[1 + n] for c in self.tmux_calls})
                     for call in self.tmux_calls:
                         self.assertEqual(list(call[1:1 + n]), flag, call)
                         self.assertNotIn(call[1 + n], ("-L", "-S"), call)
 
     def test_unregister_unsets_the_option_on_the_same_server(self):
-        wab.unregister_dash("my-work", "/p/x.sock")
+        wab.unregister_dash("my-work", "/p/x.sock", "%7")
+        self.assertEqual(self.tmux_calls[-1],
+                         ("tmux", "-S", "/p/x.sock", "set-option", "-p", "-u", "-t", "%7", "@wab_open"))
+        wab.unregister_dash("my-work", "/p/x.sock")  # no pane known: the session option, as before
         self.assertEqual(self.tmux_calls[-1],
                          ("tmux", "-S", "/p/x.sock", "set-option", "-u", "-t", "=my-work:", "@wab_open"))
+
+    def test_foreign_binding_refusal_does_not_claim_the_key_toggles_the_popup(self):
+        cfg, path = self.chain()
+        self.listing('bind-key -T root C-\\\\ send-keys foo')
+        self.assertFalse(wab.register_dash(cfg, path, "s", "", "%1"))
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("foreign binding", log)
+        self.assertNotIn("toggles the wave popup", log)
+        self.listing('bind-key -T root C-\\\\ if-shell -F "#{@wab_open}" { x }')
+        self.assertTrue(wab.register_dash(cfg, path, "s", "", "%1"))
+        self.assertIn("toggles the wave popup", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_unsafe_path_refusal_also_goes_to_stderr_in_one_line(self):
+        import contextlib
+        import io
+        cfg, path = self.chain()
+        d = self.tmp / "my dir"
+        d.mkdir()
+        bad = d / "chain.json"
+        bad.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(wab.register_dash(cfg, bad, "s", "", "%1"))
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("unsafe path", lines[0])
+
+    def test_two_dashboards_in_one_session_keep_their_own_pane_option(self):
+        exe = self.tmux3()
+        cfg, path = self.chain()
+        sock = self.tmp / "p.sock"
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        run = lambda *a: subprocess.run([exe, "-S", str(sock), "-f", "/dev/null", *a],  # noqa: E731
+                                        capture_output=True, text=True, encoding="utf-8", env=env)
+        try:
+            self.assertEqual(run("new-session", "-d", "-s", "s", "sleep 60").returncode, 0)
+            p1 = run("display", "-p", "-t", "=s:", "#{pane_id}").stdout.strip()
+            p2 = run("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", "=s:", "sleep 60").stdout.strip()
+            cfg2, path2 = self.chain(waves=["W1"])
+            path2 = path2.with_name("chain2.json")
+            path2.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            with mock.patch.object(wab, "sh", REAL_SH):
+                self.assertTrue(wab.register_dash(cfg, path, "s", str(sock), p1))
+                self.assertTrue(wab.register_dash(cfg, path2, "s", str(sock), p2))
+                val = lambda pane: run("display", "-p", "-t", pane, "#{@wab_open}").stdout.strip()  # noqa: E731
+                self.assertTrue(val(p1).endswith(str(path.resolve())), val(p1))
+                self.assertTrue(val(p2).endswith(str(path2.resolve())), val(p2))
+                # the binding's if-shell -F format sees the pane option of the active pane
+                run("select-pane", "-t", p2)
+                run("if-shell", "-F", "-t", p2, "#{@wab_open}", "set -g @r yes", "set -g @r no")
+                self.assertEqual(run("show-options", "-gv", "@r").stdout.strip(), "yes")
+                wab.unregister_dash("s", str(sock), p1)
+                self.assertEqual(val(p1), "")
+                self.assertTrue(val(p2).endswith(str(path2.resolve())), val(p2))
+        finally:
+            run("kill-server")
 
     def test_unsafe_chain_path_is_refused_without_touching_tmux(self):
         cfg, path = self.chain()
@@ -2320,7 +2388,7 @@ class KeysAndRegistry(Base):
         out.isatty.return_value = True
         with mock.patch.object(dash, "Live", FakeLive), mock.patch.object(dash, "safe_render", return_value=""), \
                 mock.patch.object(dash.wab, "load_chain", return_value=cfg), \
-                mock.patch.object(dash, "own_session", return_value=(None, "")), \
+                mock.patch.object(dash, "own_session", return_value=(None, "", None)), \
                 mock.patch.object(sys, "argv", ["dash.py", str(path)]), mock.patch.object(sys, "stdout", out):
             with self.assertRaises(Boom):
                 dash.main()
@@ -2708,6 +2776,134 @@ class W4Round20(Base):
         self.assertEqual(cfg["telegram"]["token_secret"], "tok")
         self.assertIn("keeping the previous settings", "\n".join(
             p.read_text(encoding="utf-8") for p in cfg["run_dir"].glob("*.log")))
+
+
+class W4Round23Notices(Base):
+    """A notice about a standing status is marked delivered only after the transport took it."""
+
+    def setUp(self):
+        super().setUp()
+        self.down = True
+        self.attempts = 0
+
+        def flaky(cfg, text):
+            self.attempts += 1
+            if self.down:
+                raise OSError("telegram down")
+            self.tg.append(text)
+        p = mock.patch.object(wab, "_send_telegram", side_effect=flaky)
+        p.start()
+        self.addCleanup(p.stop)
+        self.cfg, _ = self.chain()
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+
+    def tick(self):
+        wab.tick(self.cfg, wab.load_state(self.cfg))
+
+    def rec(self):
+        return self.get_state(self.cfg)["waves"]["W1"]
+
+    def due(self):
+        """The retry interval has passed."""
+        st = self.get_state(self.cfg)
+        for item in st["waves"]["W1"].get("outbox", {}).values():
+            item["next_at"] = 0
+        self.put_state(self.cfg, st)
+
+    def failed_events(self):
+        log = (self.cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        return log.count("telegram FAILED")
+
+    def test_notify_reports_whether_it_is_done(self):
+        self.assertFalse(wab.notify(self.cfg, "x"))
+        self.down = False
+        self.assertTrue(wab.notify(self.cfg, "x"))
+        cfg, _ = self.chain(telegram=False)
+        self.assertTrue(wab.notify(cfg, "x"))  # not configured: nothing to repeat
+
+    def test_blocked_failed_send_is_retried_then_stops(self):
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        self.assertEqual(self.attempts, 1)
+        self.assertIn("blocked", self.rec().get("outbox", {}))
+        self.down = False
+        self.tick()  # interval has not passed
+        self.assertEqual(self.attempts, 1)
+        self.due()
+        self.tick()
+        self.assertEqual(len(self.tg), 1)
+        self.assertFalse(self.rec().get("outbox"))
+        self.due()
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.tg), 1)
+
+    def test_permanent_failure_is_throttled_in_sends_and_events(self):
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        for _ in range(6):
+            self.tick()
+        self.assertEqual(self.attempts, 1)
+        self.assertEqual(self.failed_events(), 1)
+        self.due()
+        self.tick()
+        self.tick()
+        self.assertEqual(self.attempts, 2)
+        self.assertEqual(self.failed_events(), 2)
+        self.assertGreater(self.rec()["outbox"]["blocked"]["next_at"], time.time())
+
+    def test_supervision_goes_on_while_the_notice_fails(self):
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "running")
+        self.assertEqual(self.rec()["last_status"], "BLOCKED: q")
+
+    def test_episode_over_before_delivery_drops_the_stale_notice(self):
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.down = False
+        self.due()
+        self.tick()
+        self.assertEqual(self.tg, [])
+        self.assertFalse(self.rec().get("outbox"))
+
+    def test_other_episodes_use_the_same_retry(self):
+        cases = {
+            "dead": dict(alive=False, status="RUNNING", pane=""),
+            "permission": dict(alive=True, status="RUNNING", pane="Do you want to proceed?\n"),
+            "auto_off": dict(alive=True, status="RUNNING", pane=AutoGuard.OFF),
+        }
+        for key, c in cases.items():
+            with self.subTest(key=key):
+                self.down = True
+                self.attempts = 0
+                self.tg.clear()
+                self.alive, self.pane = c["alive"], c["pane"]
+                self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                self.set_status(self.cfg, "W1", c["status"])
+                for _ in range(3):
+                    self.tick()
+                self.assertIn(key, self.rec().get("outbox", {}))
+                self.down = False
+                self.due()
+                self.tick()
+                self.assertEqual(len(self.tg), 1, self.tg)
+                self.due()
+                self.tick()
+                self.tick()
+                self.assertEqual(len(self.tg), 1)
+
+    def test_stopped_chain_without_next_prompt_retries_too(self):
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(self.cfg, "W1", "DONE")
+        (wab.wave_dir(self.cfg, "W1") / "result.md").write_text("r\n", encoding="utf-8")
+        with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", False):
+            self.tick()  # chain stops: current is None afterwards
+        self.assertIn("no_next", self.rec().get("outbox", {}))
+        self.down = False
+        self.due()
+        self.tick()
+        self.assertTrue(any("next-prompt" in t for t in self.tg), self.tg)
 
 
 class Utf8(Base):

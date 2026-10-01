@@ -228,11 +228,11 @@ def safe_render(cfg):
 
 
 def own_session():
-    """(session name, tmux socket id) of the tmux session this process runs in, else (None, "").
+    """(session name, tmux socket id, pane id) of the tmux pane this process runs in, else (None, "", None).
     The server is the one in $TMUX (its socket file name; `default` is the default server)."""
     tmux_env, pane = os.environ.get("TMUX"), os.environ.get("TMUX_PANE")
     if not tmux_env or not pane:
-        return None, ""
+        return None, "", None
     path = tmux_env.split(",")[0]
     # `-L name` looks into $TMUX_TMPDIR (or /tmp) + tmux-<uid>: the short name is valid only for a
     # socket in exactly that directory, else it would name another server in this process
@@ -246,9 +246,9 @@ def own_session():
         r = subprocess.run(["tmux", "-S", path, "display-message", "-p", "-t", pane,
                             "#{session_name}"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return None, ""
+        return None, "", None
     name = r.stdout.strip()
-    return (name if r.returncode == 0 and name else None), sock
+    return (name if r.returncode == 0 and name else None), sock, pane
 
 
 def main():
@@ -260,14 +260,14 @@ def main():
     # Ctrl+\ on a session without the binding sends SIGQUIT to the pane process: it must not kill us
     signal.signal(signal.SIGQUIT, signal.SIG_IGN)
     cfg = wab.load_chain(sys.argv[1], create=False)
-    session, sock = own_session()
+    session, sock, pane = own_session()
     if session:  # tmux calls of this process must hit the server we run in, not an env override
         if sock:
             os.environ["WAB_TMUX_SOCKET"] = sock
         else:
             os.environ.pop("WAB_TMUX_SOCKET", None)
     if session:  # Ctrl+\ works in the session the dashboard really runs in: it carries @wab_open
-        wab.register_dash(cfg, sys.argv[1], session, sock)
+        wab.register_dash(cfg, sys.argv[1], session, sock, pane)
     for sig in (signal.SIGTERM, signal.SIGHUP):  # the finally below must run on these too
         signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
     try:
@@ -277,7 +277,7 @@ def main():
                 live.update(safe_render(cfg))
     finally:
         if session:  # a session that no longer shows the dashboard must not open the popup on Ctrl+\
-            wab.unregister_dash(session, sock)
+            wab.unregister_dash(session, sock, pane)
 
 
 if __name__ == "__main__":

@@ -614,12 +614,57 @@ def notify(cfg, text):
     first = redact(lines[0], 120) if lines else ""
     if not (isinstance(tg, dict) and all(tg.get(k) for k in ("keyvault", "token_secret", "chat_secret"))):
         event(cfg, f"notify(skipped): {first}")
-        return
+        return True  # Telegram is not configured: there is nothing to repeat
     try:
         _send_telegram(cfg, redact(text, TG_MESSAGE_LIMIT))
         event(cfg, f"telegram: {first}")
+        return True
     except Exception as e:  # notification must never stop supervision
         event(cfg, f"telegram FAILED ({type(e).__name__}): {first[:80]}")
+        return False
+
+
+NOTIFY_RETRY_SECONDS = 300  # a standing notice that failed is repeated no more often than this
+
+
+def queue_notice(cfg, st, w, key, value, text):
+    """A notice about a standing episode (`key`, `value`). It is written to the state BEFORE the
+    send and removed only after the transport took it, so a transient Telegram failure is
+    retried by later ticks (flush_notices) instead of being lost; supervision never waits for it."""
+    box = w.setdefault("outbox", {})
+    cur = box.get(key)
+    if cur is None or cur.get("value") != value:
+        box[key] = {"value": value, "text": text, "next_at": 0}
+    save_state(cfg, st)
+    flush_notices(cfg, st, w)
+
+
+def drop_notice(w, key):
+    """The episode is over: forget it, and a notice not yet delivered is stale."""
+    w.get("notified", {}).pop(key, None)
+    w.get("outbox", {}).pop(key, None)
+
+
+def flush_notices(cfg, st, w):
+    """Send the queued notices that are due; one attempt per notice per NOTIFY_RETRY_SECONDS
+    (also bounds the `telegram FAILED` events)."""
+    box = w.get("outbox")
+    if not box:
+        return
+    now = time.time()
+    tried = False
+    for key, item in list(box.items()):
+        if item.get("next_at", 0) > now:
+            continue
+        tried = True
+        if notify(cfg, item["text"]):
+            box.pop(key, None)
+        else:
+            item["next_at"] = now + NOTIFY_RETRY_SECONDS
+    if not box:
+        w.pop("outbox", None)
+    if tried:
+        save_state(cfg, st)
 
 
 # ---------- launch ----------
@@ -837,7 +882,8 @@ def _mark_dead(cfg, st, wave, status=""):
     save_state(cfg, st)
     if fresh:
         event(cfg, f"{wave}: tmux session {w['tmux']} is gone (status={status})")
-        notify(cfg, f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
+        queue_notice(cfg, st, w, "dead", "1",
+                     f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
 
 
 def _act(cfg, st, wave, what, fn, *args, **kw):
@@ -855,10 +901,11 @@ def _act(cfg, st, wave, what, fn, *args, **kw):
         save_state(cfg, st)
         event(cfg, f"{wave}: tmux action '{what}' failed ({type(e).__name__}); the window is alive")
         if fresh:
-            notify(cfg, f"wave-autobot: не удалось выполнить «{what}» в окне волны {wave} "
-                        f"({type(e).__name__}). Окно живо: {attach_cmd(w['tmux'])}")
+            queue_notice(cfg, st, w, "tmux_failed", what,
+                         f"wave-autobot: не удалось выполнить «{what}» в окне волны {wave} "
+                         f"({type(e).__name__}). Окно живо: {attach_cmd(w['tmux'])}")
         return False
-    w.get("notified", {}).pop("tmux_failed", None)
+    drop_notice(w, "tmux_failed")
     return True
 
 
@@ -951,8 +998,9 @@ def advance_pending(cfg, st):
             fresh = once_per(w, "no_prompt", "1")
             save_state(cfg, st)
             if fresh:
-                notify(cfg, f"wave-autobot: волна {wave} запущена, но файла с задачей уже нет, "
-                            f"задачу не отправил. Посмотри: {attach_cmd(name)}")
+                queue_notice(cfg, st, w, "no_prompt", "1",
+                             f"wave-autobot: волна {wave} запущена, но файла с задачей уже нет, "
+                             f"задачу не отправил. Посмотри: {attach_cmd(name)}")
     elif phase == "sending" and w.get("pending_enter") == "first prompt":
         event(cfg, f"{wave}: resumed in phase 'sending': the text is typed, pressing only Enter")
         if _deliver(cfg, st, wave, "first prompt", send_text, ""):
@@ -965,13 +1013,14 @@ def advance_pending(cfg, st):
         w["phase"] = "running"
         save_state(cfg, st)
         if fresh:
-            notify(cfg, f"wave-autobot: диспетчер перезапустился при отправке задачи волне {wave}; "
-                        f"неизвестно, дошла ли она, повторно не слал. Проверь окно: {attach_cmd(name)}")
+            queue_notice(cfg, st, w, "sending", "1",
+                         f"wave-autobot: диспетчер перезапустился при отправке задачи волне {wave}; "
+                         f"неизвестно, дошла ли она, повторно не слал. Проверь окно: {attach_cmd(name)}")
     elif phase == "updating":
         recover_update(cfg, st, wave)
     elif phase == "dead" and tmux_alive(name):
         w["phase"] = "running"
-        w.get("notified", {}).pop("dead", None)
+        drop_notice(w, "dead")
         save_state(cfg, st)
         event(cfg, f"{wave}: window is back, supervision resumed")
 
@@ -1028,8 +1077,9 @@ def recover_update(cfg, st, wave):
                f"{'/update evidently arrived' if arrived else 'unknown whether /update arrived'}, NOT resent")
     finish_update(cfg, st, wave)
     if fresh and not arrived and not informed:
-        notify(cfg, f"wave-autobot: диспетчер перезапустился при передаче /update волне {wave}; "
-                    f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: {attach_cmd(w['tmux'])}")
+        queue_notice(cfg, st, w, "updating", str(w.get("restarts", 0)),
+                     f"wave-autobot: диспетчер перезапустился при передаче /update волне {wave}; "
+                     f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: {attach_cmd(w['tmux'])}")
 
 
 def _stop_without_next(cfg, st, w, wave, now):
@@ -1042,15 +1092,20 @@ def _stop_without_next(cfg, st, w, wave, now):
     save_state(cfg, st)
     if fresh_stop:
         event(cfg, f"{wave}: DONE without next-prompt.md; chain stopped")
-        notify(cfg, f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
+        queue_notice(cfg, st, w, "no_next", "1",
+                     f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
     return False
 
 
 def tick(cfg, st):
     try:
-        return _tick(cfg, st)
+        alive = _tick(cfg, st)
     except _WindowGone:
-        return False  # already recorded as dead
+        alive = False  # already recorded as dead
+    # after the tick: an episode that ended in it has dropped its notice, which is stale now
+    for rec in st.get("waves", {}).values():
+        flush_notices(cfg, st, rec)
+    return alive
 
 
 def _tick(cfg, st):
@@ -1073,7 +1128,7 @@ def _tick(cfg, st):
     attach = f"{attach_cmd(name)}  (выйти: Ctrl-b d)"
 
     if not status.startswith("BLOCKED"):
-        w["notified"].pop("blocked", None)  # the episode is over: the next one notifies again
+        drop_notice(w, "blocked")  # the episode is over: the next one notifies again
     if w.get("phase") == "awaiting_merge":
         return False  # handed to the coordinator: the watch ends and frees the run lock
     if w.get("phase") == "not_ready":
@@ -1115,8 +1170,9 @@ def _tick(cfg, st):
         save_state(cfg, st)
         if fresh:
             event(cfg, f"{wave}: DONE")
-            notify(cfg, f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
-                        f"Целиком: {wdir}/result.md")
+            queue_notice(cfg, st, w, "done", "1",
+                         f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
+                         f"Целиком: {wdir}/result.md")
             if tmux_alive(name):
                 tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
                 tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
@@ -1144,7 +1200,8 @@ def _tick(cfg, st):
         save_state(cfg, st)
         if fresh:
             event(cfg, f"{wave}: {status[:200]}")
-            notify(cfg, f"wave-autobot: волна {wave} ждёт тебя.\n\n{redact(status)}\n\nОтветить: {attach}")
+            queue_notice(cfg, st, w, "blocked", status,
+                         f"wave-autobot: волна {wave} ждёт тебя.\n\n{redact(status)}\n\nОтветить: {attach}")
         return True
 
     if w.get("phase") == "updating":
@@ -1202,8 +1259,9 @@ def _tick(cfg, st):
     elif w.get("phase") == "checkpoint" and now - (w.get("checkpoint_at") or now) > cfg["handoff_timeout_minutes"] * 60:
         if once_per(w, "checkpoint_timeout", str(w.get("checkpoint_at"))):
             save_state(cfg, st)
-            notify(cfg, f"wave-autobot: {wave} не записала handoff за {cfg['handoff_timeout_minutes']} мин "
-                        f"после запроса. Посмотри: {attach}")
+            queue_notice(cfg, st, w, "checkpoint_timeout", str(w.get("checkpoint_at")),
+                         f"wave-autobot: {wave} не записала handoff за {cfg['handoff_timeout_minutes']} мин "
+                         f"после запроса. Посмотри: {attach}")
 
     if w.get("phase") == "running":  # a wave out of auto mode asks for every step
         off = auto_mode_off(txt)
@@ -1213,32 +1271,36 @@ def _tick(cfg, st):
                 w["auto_alerted"] = True
                 save_state(cfg, st)
                 event(cfg, f"{wave}: window is not in auto mode")
-                notify(cfg, f"wave-autobot: волна {wave} вышла из режима auto и будет спрашивать "
-                            f"подтверждения. Вернуть: {attach}, Shift+Tab до «auto mode on».")
+                queue_notice(cfg, st, w, "auto_off", "1",
+                             f"wave-autobot: волна {wave} вышла из режима auto и будет спрашивать "
+                             f"подтверждения. Вернуть: {attach}, Shift+Tab до «auto mode on».")
         elif off is False:
             w["auto_off_ticks"] = 0
             w["auto_alerted"] = False
+            drop_notice(w, "auto_off")
 
     if not any(m in txt for m in PERMISSION_MARKERS):
-        w["notified"].pop("permission", None)
+        drop_notice(w, "permission")
     if any(m in txt for m in PERMISSION_MARKERS):
         if once_per(w, "permission", "visible"):  # one episode while the prompt stays on screen
             save_state(cfg, st)
             event(cfg, f"{wave}: permission prompt on screen")
-            notify(cfg, f"wave-autobot: волна {wave} ждёт подтверждения на экране.\n{attach}")
+            queue_notice(cfg, st, w, "permission", "visible",
+                         f"wave-autobot: волна {wave} ждёт подтверждения на экране.\n{attach}")
 
     # idleness is judged without the last two non-empty lines (spinner, timer, footer)
     body = [l for l in txt.splitlines() if l.strip()][:-2]
     digest = hashlib.sha1("\n".join(body).encode("utf-8")).hexdigest()
     if digest != w.get("pane_digest"):
         w["pane_digest"], w["pane_changed"] = digest, now
-        w["notified"].pop("idle", None)
+        drop_notice(w, "idle")
     elif now - w.get("pane_changed", now) > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
             save_state(cfg, st)
             event(cfg, f"{wave}: pane idle {cfg['idle_minutes']}+ min, status={status}")
-            notify(cfg, f"wave-autobot: волна {wave} молчит {cfg['idle_minutes']}+ мин "
-                        f"(статус «{status}»). Возможно, ждёт тебя: {attach}")
+            queue_notice(cfg, st, w, "idle", digest,
+                         f"wave-autobot: волна {wave} молчит {cfg['idle_minutes']}+ мин "
+                         f"(статус «{status}»). Возможно, ждёт тебя: {attach}")
     save_state(cfg, st)
     return True
 
@@ -1300,46 +1362,61 @@ def _root_cstar(list_keys_output):
 
 
 def _ensure_binding(cfg, sock):
-    """Install the global Ctrl+\\ binding unless one of the @wab_open scheme is already there.
+    """True when a binding of the @wab_open scheme is in place (found or installed).
+    Install the global Ctrl+\\ binding unless one of the @wab_open scheme is already there.
     A binding that is neither ours nor an old wab one is somebody else's: left alone, with an event."""
     r = tmux_on(sock, "list-keys", "-T", "root", check=False)
     if r.returncode != 0:
         event(cfg, f"Ctrl+\\ binding skipped: list-keys failed: {r.stderr.strip() or r.stdout.strip()}")
-        return
+        return False
     cur = _root_cstar(r.stdout)
     if any("#{@wab_open}" in line for line in cur):
-        return
+        return True
     if cur and not any("wab-open" in line for line in cur):
         event(cfg, "Ctrl+\\ binding skipped: a foreign binding is in place")
-        return
+        return False
     conf = cfg["run_dir"] / "keys.tmux"
     conf.write_text(keys_conf(), encoding="utf-8")
     r = tmux_on(sock, "source-file", str(conf), check=False)
     if r.returncode != 0:
         event(cfg, f"toggle key bind failed: {r.stderr.strip() or r.stdout.strip()}")
+        return False
+    return True
 
 
-# `set-option -t =name` fails ("no such session"): an option target is a pane, pane_target() = `=name:`.
-def register_dash(cfg, path, session, sock=""):
-    """Called by dash.py inside tmux: mark its own session with @wab_open (and make sure the global
-    binding exists). `sock` names the server the dashboard runs in."""
+# `set-option -t =name` fails ("no such session"): a session option target is a pane, pane_target() = `=name:`.
+# The dashboard marks ITS PANE (`set-option -p`): two dashboards in windows of one session must not
+# overwrite or unset each other's value. The binding's format `#{@wab_open}` looks pane -> window ->
+# session, so chains that still set the session option stay compatible.
+def register_dash(cfg, path, session, sock="", pane=None):
+    """Called by dash.py inside tmux: mark its own pane (else session) with @wab_open and make sure
+    the global binding exists. `sock` names the server the dashboard runs in."""
     try:
         value = wab_open_value(path)
     except ValueError as e:
         event(cfg, f"Ctrl+\\ binding refused: {e}")
+        print(f"wab: Ctrl+\\ binding refused: {e}", file=sys.stderr)
         return False
-    r = tmux_on(sock, "set-option", "-t", pane_target(session), "@wab_open", value, check=False)
+    if pane:  # a pane id (%N) is itself exact
+        r = tmux_on(sock, "set-option", "-p", "-t", pane, "@wab_open", value, check=False)
+    else:
+        r = tmux_on(sock, "set-option", "-t", pane_target(session), "@wab_open", value, check=False)
     if r.returncode != 0:
         event(cfg, f"@wab_open not set: {r.stderr.strip() or r.stdout.strip()}")
         return False
-    _ensure_binding(cfg, sock)
+    if not _ensure_binding(cfg, sock):
+        return False
     event(cfg, "Ctrl+\\ toggles the wave popup")
     return True
 
 
-def unregister_dash(session, sock=""):
-    """Unset @wab_open of the dashboard's session (exit, SIGTERM/SIGHUP). A killed session needs no cleanup."""
-    tmux_on(sock, "set-option", "-u", "-t", pane_target(session), "@wab_open", check=False)
+def unregister_dash(session, sock="", pane=None):
+    """Unset @wab_open of the dashboard's pane (else session) on exit, SIGTERM/SIGHUP.
+    A killed pane or session needs no cleanup."""
+    if pane:
+        tmux_on(sock, "set-option", "-p", "-u", "-t", pane, "@wab_open", check=False)
+    else:
+        tmux_on(sock, "set-option", "-u", "-t", pane_target(session), "@wab_open", check=False)
 
 
 def drop_stale_btab(cfg, sock=""):
