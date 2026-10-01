@@ -7538,7 +7538,8 @@ class MergeGate(GateBase):
                                           {"id": "PRRT_c", "isResolved": True}])
         self.assertTrue(self.tick())
         self.assertEqual(self.merges(), [])
-        script = self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-merge"
+        script = self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge"
+        shown = f"~/.cache/wab/{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge"  # people see the `~` form
         self.assertTrue(script.is_file())
         self.assertEqual(script.stat().st_mode & 0o777, 0o700)
         self.assertTrue(os.access(script, os.X_OK))
@@ -7548,11 +7549,11 @@ class MergeGate(GateBase):
         self.assertTrue(text.rstrip().endswith(f"W1 {RUN_ID} {HEAD}"))
         done = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.status(), f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {script}")
+        self.assertEqual(self.status(), f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {shown}")
         self.assertEqual(self.rec()["phase"], "merging")
         said = [t for t in self.tg if "незакрытые треды" in t]
         self.assertEqual(len(said), 1)
-        self.assertIn(f"Выполни: {script}", said[0])
+        self.assertIn(f"Выполни: {shown}", said[0])
         self.assertNotIn("gh pr merge", said[0])
         # the owner runs it: MERGED at the gated head -> the next wave starts
         self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
@@ -8008,6 +8009,23 @@ class ExternalOwnerMerge(OwnerMergeHarness):  # R1: the script offered by an ext
             self.run_owner_merge()
         self.assertEqual((self.order, self.merges()), ([], []))
 
+    def test_a_regate_on_another_sha_keeps_the_old_script_and_it_refuses_to_merge(self):  # (c)
+        rec = self.handoff()
+        cfg = wab.load_chain(self.path)
+        other = "e" * 40
+        a = wab.write_owner_script(cfg, "W1", HEAD)  # what the hand-off wrote
+        b = wab.write_owner_script(cfg, "W1", other)  # the re-gate
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.is_file() and b.is_file())
+        self.assertTrue(a.read_text(encoding="utf-8").rstrip().endswith(f"W1 {RUN_ID} {HEAD}"))
+        self.assertTrue(b.read_text(encoding="utf-8").rstrip().endswith(f"W1 {RUN_ID} {other}"))
+        st = wab.load_state(cfg)
+        st["waves"]["W1"]["gate_sha"] = other
+        wab.save_state(cfg, st)
+        with self.assertRaises(SystemExit):
+            self.run_owner_merge()  # the script of the old sha
+        self.assertEqual((self.order, self.merges()), ([], []))
+
 
 class MergedByHand(OwnerMergeHarness):  # R2: a manual merge must not strand the chain
     def refuse_then_merge_by_hand(self, **chain):
@@ -8095,7 +8113,7 @@ class ExternalHandoffVerdict(GateBase):
     def test_pass_with_open_threads_carries_the_owner_script(self):
         self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
         text = self.handoff()
-        self.assertIn(str(self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-merge"), text)
+        self.assertIn(f"Выполни: ~/.cache/wab/{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge", text)
 
     def test_fail_and_wait_and_error_are_said_plainly(self):
         self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
@@ -8206,6 +8224,79 @@ class Alarm(GateBase):
         self.tick()
         self.assertEqual(len(self.alarms()), 1)
 
+    def crashing_send(self, *, typed):
+        def send(name, text, on_typed=None):
+            if typed and on_typed:
+                on_typed()  # the text is in the window, Enter has not been pressed
+            raise KeyboardInterrupt  # the process dies here: nothing after this line runs
+        return send
+
+    def crash_tick(self, *, typed):
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = self.crashing_send(typed=typed)
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick()
+        wab.send_text.side_effect = real
+
+    def restart(self):
+        wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+
+    def test_a_crash_after_saving_the_intent_before_the_paste_is_delivered_after_restart(self):  # (a) 1
+        self.running()
+        self.crash_tick(typed=False)
+        msg = self.rec()["alarm_msg"]
+        self.assertEqual((msg["head"], msg["sent"]), (HEAD, False))
+        self.assertEqual(self.alarms(), [])
+        self.restart()
+        self.assertEqual(len(self.alarms()), 1)
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
+
+    def test_a_crash_after_the_paste_before_enter_restarts_with_enter_only(self):  # (a) 2
+        self.running()
+        self.crash_tick(typed=True)
+        self.assertEqual(self.rec()["pending_enter"], "alarm")
+        self.restart()
+        self.assertEqual(self.alarms(), [])  # the text is not typed a second time
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
+        self.assertNotIn("pending_enter", self.rec())
+
+    def test_a_delivered_alarm_is_never_repeated_even_after_restarts(self):  # (a) 3
+        self.running()
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
+        for _ in range(3):
+            self.tick()
+            self.restart()
+        self.assertEqual(len(self.alarms()), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_a_new_head_drops_the_undelivered_old_alarm_and_types_the_new_one(self):  # (a)
+        self.running()
+        self.crash_tick(typed=True)
+        new = "e" * 40
+        self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new},
+                                 reviews=[{"user": BOT, "commit_id": new, "state": "COMMENTED"}])
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)  # only the new text is typed; the old one is not repeated
+        self.assertIn(new[:12], self.alarms()[0][2])
+        self.assertEqual(self.rec()["alarm_msg"]["head"], new)
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
+        self.assertNotIn("pending_enter", self.rec())
+
+    def test_a_wave_that_left_running_gets_no_undelivered_alarm(self):  # (a)
+        self.running()
+        self.crash_tick(typed=True)
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        self.restart()
+        self.assertEqual(self.alarms(), [])
+        self.assertEqual(self.enters, [])
+        self.assertNotIn("alarm_msg", self.rec())
+        self.assertNotIn("pending_enter", self.rec())
+
 
 class GateWrappers(Base):
     """gh_api, gh_graphql, find_pr, workdir_state, read_manifest, write_owner_script: the thin layer
@@ -8304,10 +8395,18 @@ class GateWrappers(Base):
         (folder / "manifest.json").write_text('{"head": "x", "tasks": {}}', encoding="utf-8")
         self.assertEqual(wab.read_manifest(cfg, "W1")["head"], "x")
 
+    def test_home_form_shows_the_tilde_and_redact_keeps_it(self):  # (b)
+        home = Path.home()
+        p = home / ".cache" / "wab" / "c-r-W1-abc-merge"
+        self.assertEqual(wab.home_form(p), "~/.cache/wab/c-r-W1-abc-merge")
+        self.assertEqual(wab.home_form("/etc/x"), "/etc/x")
+        self.assertEqual(wab.redact("Выполни: ~/.cache/wab/chain-2026-10-01-W1-" + HEAD[:12] + "-merge"),
+                         "Выполни: ~/.cache/wab/chain-2026-10-01-W1-" + HEAD[:12] + "-merge")
+
     def test_owner_script_file_is_private_and_replaced_not_appended(self):
         cfg, _ = self.chain()
         path = wab.write_owner_script(cfg, "W1", HEAD)
-        self.assertEqual(path.name, f"{CHAIN}-{RUN_ID}-W1-merge")
+        self.assertEqual(path.name, f"{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge")
         self.assertEqual(path.stat().st_mode & 0o777, 0o700)
         again = wab.write_owner_script(cfg, "W1", HEAD)
         self.assertEqual(again, path)

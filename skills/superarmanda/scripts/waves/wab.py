@@ -2020,13 +2020,24 @@ def _write_status(wdir, text):
     return _one_line(text)
 
 
+def home_form(path):
+    """The path as the owner types it: the home directory becomes `~` (it also survives `redact`,
+    which masks a long temporary path)."""
+    p = pathlib.Path(path)
+    try:
+        return "~/" + p.relative_to(pathlib.Path.home()).as_posix()
+    except ValueError:
+        return str(path)
+
+
 def write_owner_script(cfg, wave, sha):
-    """~/.cache/wab/<chain>-<run_id>-<wave>-merge: executable by the owner only, bound to this run
-    and to the gated sha; it runs `owner-merge` (which gates the PR again). Returns its path."""
+    """~/.cache/wab/<chain>-<run_id>-<wave>-<sha12>-merge: executable by the owner only, bound to this
+    run and to the gated sha (a re-gate on another sha writes another file: the old notice keeps its
+    script, which refuses once the head moved); it runs `owner-merge` (which gates the PR again)."""
     text = gate.owner_script(pathlib.Path(__file__).resolve(), cfg["chain_file"], wave, cfg["run_id"], sha)
     folder = pathlib.Path.home() / ".cache" / "wab"
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = folder / f"{cfg['chain']}-{cfg['run_id']}-{wave}-merge"
+    path = folder / f"{cfg['chain']}-{cfg['run_id']}-{wave}-{sha[:12]}-merge"
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".merge.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2057,7 +2068,7 @@ def handoff_gate_line(cfg, wave, w):
             path = write_owner_script(cfg, wave, sha)
             return (f"Гейт мерджа пройден, но есть незакрытые треды ({len(v['unresolved'])}"
                     f"{gate.threads_note(v['old_p01'])}). "
-                    f"Выполни: {path}")
+                    f"Выполни: {home_form(path)}")
         command = gate.merge_command(cfg["repo"], number, sha)
         if v["draft"]:
             command = f"{gate.ready_command(cfg['repo'], number)} && {command}"
@@ -2128,13 +2139,13 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
         except (OSError, ValueError) as e:
             return _gate_failed(cfg, st, wave, w, wdir, f"скрипт владельца не записан: {e}")
         w["last_status"] = _write_status(
-            wdir, f"BLOCKED: merge gate passed; {len(unresolved)} unresolved review threads; owner runs {path}")
+            wdir, f"BLOCKED: merge gate passed; {len(unresolved)} unresolved review threads; owner runs {home_form(path)}")
         put_notice(w, "merge_owner", sha,
                    f"wave-autobot: волна {wave}: гейт мерджа пройден (PR #{number}, {sha[:12]}), но есть "
-                   f"незакрытые треды ревью: {len(unresolved)}{gate.threads_note(v['old_p01'])}. Сам не мержу.\nВыполни: {path}\n"
+                   f"незакрытые треды ревью: {len(unresolved)}{gate.threads_note(v['old_p01'])}. Сам не мержу.\nВыполни: {home_form(path)}\n"
                    f"Скрипт заново проверит гейт на этом HEAD, закроет треды и смержит PR.")
         save_state(cfg, st)
-        event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {path}")
+        event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}")
         flush_notices(cfg, st, w)
         return True
     if w.get("merge_called") == sha:  # never twice for one sha
@@ -2297,7 +2308,10 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
 
 def _alarm_tick(cfg, st, wave, w, now):
     """A RUNNING wave with an open PR whose checks are all completed and on which Codex has finished
-    gets ONE message per head with the results (so it need not poll them itself)."""
+    gets ONE message per head with the results (so it need not poll them itself). The intent
+    (`alarm_msg`, saved first) outlives a crash: an undelivered message is retried by the next tick or
+    a restarted watch (after a paste, with Enter only); `sent` is saved after the delivery."""
+    _send_alarm(cfg, st, wave, w)  # a retry of a delivery that failed or was cut short
     if now - (w.get("alarm_at") or 0) < ALARM_POLL_SECONDS:
         return
     w["alarm_at"] = now
@@ -2316,13 +2330,33 @@ def _alarm_tick(cfg, st, wave, w, now):
         if once_per(w, "alarm_error", str(facts["error"])[:150]):
             event(cfg, f"{wave}: alarm: PR facts not collected: {facts['error']}")
         return
+    msg = w.get("alarm_msg")
+    if isinstance(msg, dict) and msg.get("head") != head and not msg.get("sent"):
+        w.pop("alarm_msg")  # outdated: the head moved before it was delivered
+        if w.get("pending_enter") == "alarm":
+            w.pop("pending_enter")
+        msg = None
     if not gate.alarm_ready(facts, head):
+        save_state(cfg, st)
         return
-    if once_per(w, "alarm", head):
-        save_state(cfg, st)  # the mark first: one message per head, even across a restart
-        event(cfg, f"{wave}: alarm: PR #{pr['number']} checks completed and Codex finished at {head[:12]}")
-        if not _deliver(cfg, st, wave, "alarm", send_text, gate.alarm_text(pr["number"], head, facts)):
-            w.get("notified", {}).pop("alarm", None)  # not delivered: the next poll tries again
+    if isinstance(msg, dict) and msg.get("head") == head:
+        return  # delivered, or being retried above: one message per head
+    w["alarm_msg"] = {"head": head, "sent": False, "text": gate.alarm_text(pr["number"], head, facts)}
+    if w.get("pending_enter") == "alarm":
+        w.pop("pending_enter")  # a new message: typed afresh
+    save_state(cfg, st)  # the intent first: a crash before the paste does not lose it
+    event(cfg, f"{wave}: alarm: PR #{pr['number']} checks completed and Codex finished at {head[:12]}")
+    _send_alarm(cfg, st, wave, w)
+
+
+def _send_alarm(cfg, st, wave, w):
+    """Deliver the saved alarm text (once: `sent` is saved after Enter)."""
+    msg = w.get("alarm_msg")
+    if not isinstance(msg, dict) or msg.get("sent"):
+        return
+    if _deliver(cfg, st, wave, "alarm", send_text, str(msg.get("text") or "")):
+        msg["sent"] = True
+    save_state(cfg, st)
 
 
 def _complete_wave(cfg, st, wave, w, wdir, now):
@@ -2479,6 +2513,12 @@ def _tick(cfg, st):
             w.pop("gate_fail_msg")
             if w.get("pending_enter") == "gate failure":
                 w.pop("pending_enter")
+
+    if isinstance(w.get("alarm_msg"), dict) and not w["alarm_msg"].get("sent") and status != "RUNNING":
+        w.pop("alarm_msg")  # the wave left RUNNING: an undelivered alarm is outdated
+        if w.get("pending_enter") == "alarm":
+            w.pop("pending_enter")
+        save_state(cfg, st)
 
     if status.startswith("BLOCKED"):
         fresh = once_per(w, "blocked", status)
