@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -497,6 +498,18 @@ class Supervision(Base):
 
 # ---------------------------------------------------------------- A4
 class Redaction(Base):
+    def test_bare_long_hex_is_masked_but_labelled_shas_survive(self):
+        key = "ab12" * 16  # 64 hex chars, no label: a key
+        self.assertEqual(wab.redact(key), "[скрыто]")
+        self.assertEqual(wab.redact("key " + key), "key [скрыто]")
+        self.assertEqual(wab.redact("40 " + "c" * 40), "40 [скрыто]")
+        sha = "3c71c34b" + "0" * 32
+        for text in (f"commit {sha}", f"SHA={sha}", f"head: {sha}", f"HEAD {sha}", f"reviewed_head={sha}",
+                     f"base {sha}", f"packet_hash: {sha}", f"sha256:{key}", f"Commit {sha}"):
+            with self.subTest(text=text):
+                self.assertEqual(wab.redact(text), text)
+        self.assertEqual(wab.redact("short 3c71c34 and 3c71c34b0a12"), "short 3c71c34 and 3c71c34b0a12")
+
     SECRETS = [
         "-----BEGIN RSA PRIVATE KEY-----\nMIIEabcdef\n-----END RSA PRIVATE KEY-----",
         "sk-abcdefghijklmnop1234",
@@ -560,7 +573,7 @@ class Redaction(Base):
                 self.assertNotIn(original, wab.redact(text, 1200))
 
     def test_ordinary_text_is_kept(self):
-        keep = ["commit 3f2a9c1 and 3f2a9c1d4e5b6a7988776655443322110099aabb", "see PR #12 and #345",
+        keep = ["commit 3f2a9c1 and sha 3f2a9c1d4e5b6a7988776655443322110099aabb", "see PR #12 and #345",
                 "date 2026-10-01 at 12:34:56", "wave W4 ctx 300000 tokens", "tokenizer notes; session closed",
                 "version 3.4.1 build 20261001"]
         for text in keep:
@@ -1196,6 +1209,18 @@ class CoordinatorHandoff(Base):
         self.assertIn("handed to the coordinator", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
         self.lock_is_free(cfg)
 
+    def test_handoff_command_is_runnable(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge")}})
+        wab._stop_event(cfg, wab.load_state(cfg), path)
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        m = re.search(r"run: python3 (\S+) launch ", log)
+        self.assertIsNotNone(m, log)
+        self.assertTrue(Path(shlex.split(m.group(1))[0]).is_absolute())
+        self.assertTrue(Path(shlex.split(m.group(1))[0]).exists())
+        self.assertIn("&& python3 ", log)
+        self.assertNotRegex(log, r"run: wab\.py|&& wab\.py")
+
     def test_last_wave_ends_the_watch_in_both_modes(self):
         for gate in (None, "external"):
             with self.subTest(gate=gate):
@@ -1417,8 +1442,12 @@ class ExactTargets(Base):
             self.w.send_command("x-w1", "echo LEAK")
         time.sleep(0.3)
         self.assertNotIn("LEAK", self.w.pane_text("x-w10"))
+        for _ in range(100):  # a slow runner: wait until the shell has printed something
+            if self.w.pane_text("x-w10").strip():
+                break
+            time.sleep(0.1)
         self.w.send_command("x-w10", "echo MARK123")
-        for _ in range(30):
+        for _ in range(100):
             if "MARK123" in self.w.pane_text("x-w10").replace("echo MARK123", ""):
                 break
             time.sleep(0.1)
@@ -2084,9 +2113,38 @@ class Mandate(Base):
 
 
 class ChainConfig(Base):
+    def test_unknown_merge_gate_fails_closed(self):
+        for bad in ("externl", "EXTERNAL", "auto", 1, True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.chain(merge_gate=bad)
+                self.assertIn("merge_gate", str(ctx.exception))
+        for ok in (None, "", "external"):
+            with self.subTest(ok=ok):
+                self.chain(merge_gate=ok)
+
+    def test_attach_hint_names_the_private_socket(self):
+        with mock.patch.object(wab, "TMUX_SOCKET", None), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WAB_TMUX_SOCKET", None)
+            self.assertEqual(wab.attach_cmd("wv-w1"), "tmux attach -t wv-w1")
+        with mock.patch.object(wab, "TMUX_SOCKET", "my sock"):
+            self.assertEqual(wab.attach_cmd("wv-w1"), "tmux -L 'my sock' attach -t wv-w1")
+        with mock.patch.object(wab, "TMUX_SOCKET", None), mock.patch.dict(os.environ, {"WAB_TMUX_SOCKET": "s1"}):
+            self.assertEqual(wab.attach_cmd("wv-w1"), "tmux -L s1 attach -t wv-w1")
+
+    def test_notices_carry_the_socket_in_the_attach_command(self):
+        cfg, _ = self.chain()
+        self.alive = True
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "BLOCKED: need you")
+        with mock.patch.object(wab, "TMUX_SOCKET", "sockz"):
+            wab.tick(cfg, wab.load_state(cfg))
+        self.assertTrue(self.tg)
+        self.assertIn("-L sockz attach", self.tg[-1])
+
     def test_run_directory_layout(self):
         cfg, path = self.chain()
-        self.assertEqual(cfg["run_dir"], path.parent / "runs" / CHAIN / RUN_ID)
+        self.assertEqual(cfg["run_dir"], path.parent.resolve() / "runs" / CHAIN / RUN_ID)
         base = self.tmp / "elsewhere"
         cfg, _ = self.chain(run_dir=str(base))
         self.assertEqual(cfg["run_dir"], base / CHAIN / RUN_ID)

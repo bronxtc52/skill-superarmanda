@@ -24,6 +24,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -88,6 +89,8 @@ def load_chain(path, create=True):
                          "one per approved run")
     if not PREFIX.fullmatch(str(cfg["tmux_prefix"])):
         raise SystemExit("chain.json: tmux_prefix must match [A-Za-z0-9_-]+")
+    if cfg.get("merge_gate") not in (None, "", "external"):
+        raise SystemExit(f"chain.json: merge_gate must be absent or \"external\", got {cfg['merge_gate']!r}")
     waves = cfg.get("waves")
     if (not isinstance(waves, list) or not waves
             or not all(isinstance(w, str) and WAVE_NAME.fullmatch(w) for w in waves)):
@@ -230,6 +233,11 @@ TMUX_SOCKET = None  # tests point this at a private `-L` socket; None means the 
 def tmux_argv(*args):
     sock = TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET")
     return ("tmux", *(("-L", sock) if sock else ()), *args)
+
+
+def attach_cmd(name):
+    """The attach command to show a human: same socket choice as tmux_argv()."""
+    return " ".join(shlex.quote(a) for a in tmux_argv()) + f" attach -t {shlex.quote(name)}"
 
 
 def tmux(*args, **kw):
@@ -524,10 +532,20 @@ _REDACT = [
 ]
 
 
+_SHA_LABEL = re.compile(r"(?i)(?:\b(?:commit|sha|head|reviewed_head|base|packet_hash)(?:\s+|\s*[=:]\s*)"
+                        r"|sha256\s*[:=]\s*)$")
+
+
+def _keep_match(m):
+    """A bare 40-64 hex string is a key; only one right after an explicit SHA/hash label is a commit id."""
+    return bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", m.group(0))
+                and _SHA_LABEL.search(m.string[:m.start()]))
+
+
 def redact(text, limit=TG_LIMIT):
     for rx in _REDACT:
         text = rx.sub(lambda m: (m.group(1) + m.group(2) + "[скрыто]") if rx.groups >= 2 and m.group(2)
-                      else m.group(0) if re.fullmatch(r"[0-9a-fA-F]{40,64}", m.group(0)) else "[скрыто]", text)
+                      else m.group(0) if _keep_match(m) else "[скрыто]", text)
     return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
 
 
@@ -768,7 +786,7 @@ def _act(cfg, st, wave, what, fn, *args, **kw):
         event(cfg, f"{wave}: tmux action '{what}' failed ({type(e).__name__}); the window is alive")
         if fresh:
             notify(cfg, f"wave-autobot: не удалось выполнить «{what}» в окне волны {wave} "
-                        f"({type(e).__name__}). Окно живо: tmux attach -t {w['tmux']}")
+                        f"({type(e).__name__}). Окно живо: {attach_cmd(w['tmux'])}")
         return False
     w.get("notified", {}).pop("tmux_failed", None)
     return True
@@ -803,7 +821,7 @@ def deliver_first_prompt(cfg, st, wave):
         save_state(cfg, st)
         event(cfg, f"{wave}: Claude TUI not ready in {name}, prompt NOT sent")
         notify(cfg, f"wave-autobot: окно волны {wave} не стало готовым за 90 с, задачу не отправил. "
-                    f"Цепочка стоит. Посмотри: tmux attach -t {name}")
+                    f"Цепочка стоит. Посмотри: {attach_cmd(name)}")
         return False
     prompt = pathlib.Path(w["prompt_file"]).read_text(encoding="utf-8").strip()
     head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wdir} "
@@ -821,7 +839,7 @@ def deliver_first_prompt(cfg, st, wave):
     once_per(w, "started", "1")  # saved before the notice: at most once
     save_state(cfg, st)
     event(cfg, f"{wave}: launched in tmux {name}, cwd {cwd}")
-    notify(cfg, f"wave-autobot: стартовала волна {wave}.\nСмотреть: tmux attach -t {name}\n(выйти: Ctrl-b d)")
+    notify(cfg, f"wave-autobot: стартовала волна {wave}.\nСмотреть: {attach_cmd(name)}\n(выйти: Ctrl-b d)")
     return True
 
 
@@ -864,7 +882,7 @@ def advance_pending(cfg, st):
             save_state(cfg, st)
             if fresh:
                 notify(cfg, f"wave-autobot: волна {wave} запущена, но файла с задачей уже нет, "
-                            f"задачу не отправил. Посмотри: tmux attach -t {name}")
+                            f"задачу не отправил. Посмотри: {attach_cmd(name)}")
     elif phase == "sending" and w.get("pending_enter") == "first prompt":
         event(cfg, f"{wave}: resumed in phase 'sending': the text is typed, pressing only Enter")
         if _deliver(cfg, st, wave, "first prompt", send_text, ""):
@@ -878,7 +896,7 @@ def advance_pending(cfg, st):
         save_state(cfg, st)
         if fresh:
             notify(cfg, f"wave-autobot: диспетчер перезапустился при отправке задачи волне {wave}; "
-                        f"неизвестно, дошла ли она, повторно не слал. Проверь окно: tmux attach -t {name}")
+                        f"неизвестно, дошла ли она, повторно не слал. Проверь окно: {attach_cmd(name)}")
     elif phase == "updating":
         recover_update(cfg, st, wave)
     elif phase == "dead" and tmux_alive(name):
@@ -941,7 +959,7 @@ def recover_update(cfg, st, wave):
     finish_update(cfg, st, wave)
     if fresh and not arrived and not informed:
         notify(cfg, f"wave-autobot: диспетчер перезапустился при передаче /update волне {wave}; "
-                    f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: tmux attach -t {w['tmux']}")
+                    f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: {attach_cmd(w['tmux'])}")
 
 
 def tick(cfg, st):
@@ -968,7 +986,7 @@ def _tick(cfg, st):
     else:  # an empty read is the wave mid-rewrite: decide on the last real status
         status = w.get("last_status", "")
     now = time.time()
-    attach = f"tmux attach -t {name}  (выйти: Ctrl-b d)"
+    attach = f"{attach_cmd(name)}  (выйти: Ctrl-b d)"
 
     if not status.startswith("BLOCKED"):
         w["notified"].pop("blocked", None)  # the episode is over: the next one notifies again
@@ -1276,8 +1294,11 @@ def _stop_event(cfg, st, path):
         chain_file = cfg.get("chain_file", path)
         if idx + 1 < len(waves):
             nxt = waves[idx + 1]
-            event(cfg, f"{wave}: handed to the coordinator; after merge run: wab.py launch {chain_file} "
-                       f"{nxt} {cfg['run_dir'] / wave / 'next-prompt.md'} && wab.py watch {chain_file}")
+            wab_py = f"python3 {shlex.quote(str(pathlib.Path(__file__).resolve()))}"
+            event(cfg, f"{wave}: handed to the coordinator; after merge run: {wab_py} launch "
+                       f"{shlex.quote(str(chain_file))} {nxt} "
+                       f"{shlex.quote(str(cfg['run_dir'] / wave / 'next-prompt.md'))} "
+                       f"&& {wab_py} watch {shlex.quote(str(chain_file))}")
         else:
             event(cfg, f"{wave}: handed to the coordinator; it is the last wave, nothing to launch after the merge")
         event(cfg, "watch stopped: handed to the coordinator")
