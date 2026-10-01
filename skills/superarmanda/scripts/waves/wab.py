@@ -346,6 +346,36 @@ def session_marker(cfg, wave):
     return f"[wab:{cfg['chain']}/{cfg['run_id']}/{wave}]"
 
 
+def _first_user_text(path):
+    """Text of the first main-thread user message in the first 256 KB of a transcript
+    (a string, or the text blocks of a content list; tool_result blocks do not count)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(FIRST_MESSAGE_BYTES)
+    except OSError:
+        return ""
+    lines = head.split(b"\n")
+    if len(head) >= FIRST_MESSAGE_BYTES:
+        lines.pop()  # cut mid-line
+    for raw in lines:
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("type") != "user" or d.get("isSidechain"):
+            continue
+        msg = d.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [c.get("text", "") for c in content
+                     if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str)]
+            if texts:
+                return "\n".join(texts)
+    return ""
+
+
 def find_new_session(cfg, st, wave):
     """After /clear the wave continues in a new session file. Find it by the marker in its
     first message, among transcripts of this clone that no wave owns yet."""
@@ -353,7 +383,7 @@ def find_new_session(cfg, st, wave):
     d = transcript_dir(st["waves"][wave]["cwd"])
     if not d.exists():
         return None
-    marker = session_marker(cfg, wave).encode("utf-8")
+    marker = session_marker(cfg, wave)
     files = []
     for f in d.glob("*.jsonl"):
         try:
@@ -363,12 +393,7 @@ def find_new_session(cfg, st, wave):
     for _, f in sorted(files, key=lambda t: t[0], reverse=True):
         if f.stem in owned:
             continue
-        try:
-            with open(f, "rb") as fh:
-                head = fh.read(FIRST_MESSAGE_BYTES)
-        except OSError:
-            continue
-        if marker in head:
+        if marker in _first_user_text(f):
             return f.stem
     return None
 
@@ -533,20 +558,45 @@ def launch(cfg, wave, prompt_file):
     if not prompt_path.is_file():
         raise SystemExit(f"prompt file {prompt_file} not found")
     sid = str(uuid.uuid4())  # known up front: the transcript is bound to the wave by session id
-    (wdir / "status").write_text("STARTING\n", encoding="utf-8")
-    cmd = ["claude", "--permission-mode", "auto", "--append-system-prompt-file", str(system_prompt(cfg)),
-           "--name", f"wab-{cfg['chain']}-{wave}", "--session-id", sid]
-    if cfg["model"]:
-        cmd += ["--model", cfg["model"]]
-    sh("tmux", "new-session", "-d", "-s", name, "-c", cwd, "-x", "220", "-y", "60",
-       "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *cmd)
-    # publish the wave before waiting: a dispatcher that dies here must not lose the session
+    (wdir / "status").write_text("STARTING\n", encoding="utf-8")  # the wave has not started yet
+    system_prompt(cfg)
+    # the intent is saved BEFORE tmux is touched: a restart finds the wave and its session id
     st["current"] = wave
     st["waves"][wave] = {"tmux": name, "cwd": cwd, "started": time.time(), "restarts": 0,
-                         "phase": "starting", "notified": {}, "sessions": [sid],
+                         "phase": "launching", "notified": {}, "sessions": [sid],
                          "prompt_file": str(prompt_path)}
     save_state(cfg, st)
+    start_session(cfg, st, wave)
     return deliver_first_prompt(cfg, st, wave)
+
+
+def start_session(cfg, st, wave):
+    """launching -> starting: create the tmux window (same session id on a repeat)."""
+    w = st["waves"][wave]
+    wdir = wave_dir(cfg, wave)
+    cmd = ["claude", "--permission-mode", "auto", "--append-system-prompt-file", str(system_prompt(cfg)),
+           "--name", f"wab-{cfg['chain']}-{wave}", "--session-id", w["sessions"][0]]
+    if cfg["model"]:
+        cmd += ["--model", cfg["model"]]
+    sh("tmux", "new-session", "-d", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
+       "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *cmd)
+    w["phase"] = "starting"
+    save_state(cfg, st)
+
+
+def recover_launch(cfg, st, wave):
+    """Dispatcher died around `tmux new-session`: a live window means it was started,
+    otherwise start it again with the same session id. Then carry on as `starting`."""
+    w = st["waves"][wave]
+    if tmux_alive(w["tmux"]):
+        event(cfg, f"{wave}: resumed in phase 'launching': window exists, not starting another")
+        w["phase"] = "starting"
+        save_state(cfg, st)
+    else:
+        event(cfg, f"{wave}: resumed in phase 'launching': window missing, starting it")
+        start_session(cfg, st, wave)
+    if w.get("prompt_file") and pathlib.Path(w["prompt_file"]).is_file():
+        deliver_first_prompt(cfg, st, wave)
 
 
 def deliver_first_prompt(cfg, st, wave):
@@ -597,7 +647,9 @@ def resume(cfg, st):
         return
     w = st["waves"][wave]
     name, phase = w["tmux"], w.get("phase")
-    if phase == "starting" and tmux_alive(name):
+    if phase == "launching":
+        recover_launch(cfg, st, wave)
+    elif phase == "starting" and tmux_alive(name):
         event(cfg, f"{wave}: resumed in phase 'starting': waiting for the TUI, then sending the task")
         if w.get("prompt_file") and pathlib.Path(w["prompt_file"]).is_file():
             deliver_first_prompt(cfg, st, wave)
@@ -626,13 +678,37 @@ def resume(cfg, st):
         event(cfg, f"{wave}: window is back, supervision resumed")
 
 
+def _status_mtime(cfg, wave):
+    try:
+        return (cfg["run_dir"] / wave / "status").stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def handoff_ready(cfg, w, wave, status):
+    """A HANDOFF_READY that the wave wrote AFTER the last transition. The transition leaves
+    the old status file in place (it is the wave's), so an unchanged mtime means stale."""
+    if status != "HANDOFF_READY":
+        w.pop("resuming", None)
+        w.pop("resuming_mtime", None)
+        return False
+    if w.get("resuming"):
+        if _status_mtime(cfg, wave) == w.get("resuming_mtime"):
+            return False
+        w.pop("resuming", None)
+        w.pop("resuming_mtime", None)
+    return True
+
+
 def finish_update(cfg, st, wave):
-    """Last step of the /clear + /update transition: one restart counted, status RESUMING."""
+    """Last step of the /clear + /update transition: one restart counted. `status` belongs to
+    the wave and is not written; the stale HANDOFF_READY on disk is remembered by its mtime."""
     w = st["waves"][wave]
     w["restarts"] = w.get("restarts", 0) + 1
     w["phase"] = "running"
     w["checkpoint_at"] = None
-    (wave_dir(cfg, wave) / "status").write_text("RESUMING\n", encoding="utf-8")
+    w["resuming"] = True
+    w["resuming_mtime"] = _status_mtime(cfg, wave)
     save_state(cfg, st)
 
 
@@ -642,9 +718,12 @@ def recover_update(cfg, st, wave):
     w = st["waves"][wave]
     fresh = once_per(w, "updating", str(w.get("restarts", 0)))
     w["await_session"] = True
-    event(cfg, f"{wave}: resumed in phase 'updating': unknown whether /update arrived, NOT resent")
+    # the wave already wrote something new (RUNNING, BLOCKED, DONE...): /update did arrive
+    arrived = read(cfg["run_dir"] / wave / "status") not in ("HANDOFF_READY", "", "STARTING")
+    event(cfg, f"{wave}: resumed in phase 'updating': "
+               f"{'/update evidently arrived' if arrived else 'unknown whether /update arrived'}, NOT resent")
     finish_update(cfg, st, wave)
-    if fresh:
+    if fresh and not arrived:
         notify(cfg, f"wave-autobot: диспетчер перезапустился при передаче /update волне {wave}; "
                     f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: tmux attach -t {w['tmux']}")
 
@@ -668,6 +747,9 @@ def tick(cfg, st):
         return True  # the coordinator merges the PR and runs `launch` for the next wave
     if w.get("phase") == "not_ready":
         return False
+    if w.get("phase") == "launching":
+        recover_launch(cfg, st, wave)
+        return True
 
     # DONE first: a wave may finish and close its window between two ticks
     if status == "DONE" and cfg.get("merge_gate") == "external":
@@ -733,7 +815,8 @@ def tick(cfg, st):
         recover_update(cfg, st, wave)
         return True
 
-    if (status == "HANDOFF_READY" and w.get("phase") == "checkpoint") or w.get("phase") == "clearing":
+    ready = handoff_ready(cfg, w, wave, status)
+    if (ready and w.get("phase") == "checkpoint") or w.get("phase") == "clearing":
         event(cfg, f"{wave}: handoff ready, /clear + /update (restart #{w.get('restarts', 0) + 1})")
         w["phase"] = "clearing"  # saved before each outside action; a repeated /clear is safe
         save_state(cfg, st)

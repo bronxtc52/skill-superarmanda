@@ -290,6 +290,30 @@ class SessionBinding(Base):
         st = {"waves": {"W1": self.wave_rec("W1", sessions=[])}}
         self.assertIsNone(wab.find_new_session(cfg, st, "W1"))
 
+    def test_marker_must_sit_in_the_first_user_message(self):
+        cfg, _ = self.chain()
+        m = self.marker(cfg, "W1")
+        user = lambda c: json.dumps({"type": "user", "message": {"content": c}})  # noqa: E731
+        cases = {
+            "assistant_only": [json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": m}]}})],
+            "tool_result_only": [user([{"type": "tool_result", "tool_use_id": "x", "content": m}])],
+            "second_user_message": [user("plain first message"), user(f"{m} second")],
+            "sidechain_user": [json.dumps({"type": "user", "isSidechain": True, "message": {"content": m}}),
+                               user("plain")],
+        }
+        for name, lines in cases.items():
+            with self.subTest(case=name):
+                self.transcript(f"neg-{name}", lines)
+        st = {"waves": {"W1": self.wave_rec("W1", sessions=[])}}
+        self.assertIsNone(wab.find_new_session(cfg, st, "W1"))
+        # positives: plain string, text block, text block after a tool_result block
+        self.transcript("pos-block", [user([{"type": "text", "text": f"hi {m}"}])])
+        self.assertEqual(wab.find_new_session(cfg, st, "W1"), "pos-block")
+        st["waves"]["W1"]["sessions"] = ["pos-block"]
+        self.transcript("pos-mixed", [json.dumps({"type": "summary"}),
+                                      user([{"type": "tool_result", "content": "x"}, {"type": "text", "text": m}])])
+        self.assertEqual(wab.find_new_session(cfg, st, "W1"), "pos-mixed")
+
     def test_marker_of_a_different_run_does_not_match(self):
         cfg, _ = self.chain()
         self.transcript("n", [asst(inp=1)], marker=f"[wab:{CHAIN}/other-run/W1]")
@@ -737,6 +761,169 @@ class CheckpointTransition(Base):
         with mock.patch.object(wab, "bind_popup"):
             wab.watch(self.cfg, self.path, max_ticks=1)
         self.assertEqual((self.kinds(), self.w()["restarts"]), ((1, 1), 1))
+
+
+class WaveOwnsStatus(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg, self.path = self.chain()
+        w = self.wave_rec(phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time(),
+                          sessions=["s1"])
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": w}})
+        self.set_status(self.cfg, "W1", "HANDOFF_READY")
+        (wab.wave_dir(self.cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        rec = wab.send_text.side_effect
+
+        def delivered_then_died(name, text):
+            rec(name, text)
+            raise RuntimeError("died after delivery")
+        wab.send_text.side_effect = delivered_then_died
+        with self.assertRaises(RuntimeError):
+            wab.tick(self.cfg, wab.load_state(self.cfg))
+        wab.send_text.side_effect = rec
+        self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["phase"], "updating")
+
+    def status(self):
+        return (wab.wave_dir(self.cfg, "W1") / "status").read_text(encoding="utf-8").strip()
+
+    def restart(self, **kw):
+        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "launch", return_value=True) as ln:
+            wab.watch(self.cfg, self.path, max_ticks=1)
+        return ln
+
+    def test_done_after_a_crashed_transition_is_done(self):
+        self.set_status(self.cfg, "W1", "DONE")
+        ln = self.restart()
+        self.assertEqual(self.status(), "DONE")
+        ln.assert_called_once()
+        self.assertEqual(ln.call_args[0][1], "W2")
+
+    def test_done_with_external_gate_waits_for_merge(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.set_status(self.cfg, "W1", "DONE")
+        ln = self.restart()  # reloads chain.json: merge_gate external
+        self.assertEqual(self.status(), "DONE")
+        ln.assert_not_called()
+        self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+
+    def test_blocked_after_a_crashed_transition_notifies_once(self):
+        self.set_status(self.cfg, "W1", "BLOCKED: need you")
+        self.restart()
+        self.assertEqual(self.status(), "BLOCKED: need you")
+        self.assertEqual(len(self.tg), 1)
+        self.assertIn("need you", self.tg[0])
+
+    def test_dispatcher_never_writes_status_during_the_transition(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+            phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time(), sessions=["s1"])}})
+        self.set_status(cfg, "W1", "HANDOFF_READY")
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual((wab.wave_dir(cfg, "W1") / "status").read_text(encoding="utf-8").strip(),
+                         "HANDOFF_READY")
+
+    def test_stale_handoff_ready_does_not_start_a_second_transition(self):
+        cfg, _ = self.chain()
+        w = self.wave_rec(phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time(), sessions=["s1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
+        self.set_status(cfg, "W1", "HANDOFF_READY")
+        self.sent.clear()  # setUp already ran one crashed transition
+        clears = lambda: len([x for x in self.sent if x[2] == "/clear"])  # noqa: E731
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual(clears(), 1)
+        self.transcript("s2", [asst(inp=400000)], marker=f"[wab:{CHAIN}/{RUN_ID}/W1]")
+        wab.tick(cfg, wab.load_state(cfg))   # adopts s2, context is high: checkpoint requested
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "checkpoint")
+        wab.tick(cfg, wab.load_state(cfg))   # the status file is still the OLD handoff: ignored
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual(clears(), 1)
+        sp = wab.wave_dir(cfg, "W1") / "status"
+        future = time.time() + 10
+        sp.write_text("HANDOFF_READY\n", encoding="utf-8")  # the wave writes a fresh handoff
+        os.utime(sp, (future, future))
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual(clears(), 2)
+
+
+class LaunchIntent(Base):
+    def prompt(self):
+        p = self.tmp / "p.md"
+        p.write_text("task\n", encoding="utf-8")
+        return p
+
+    def new_sessions(self):
+        return [c for c in self.tmux_calls if c[1] == "new-session"]
+
+    def wrap_sh(self, before=False):
+        orig = wab.sh.side_effect
+
+        def crashing(*args, **kw):
+            if args and args[0] == "tmux" and args[1] == "new-session":
+                if before:
+                    raise KeyboardInterrupt
+                orig(*args, **kw)
+                raise KeyboardInterrupt
+            return orig(*args, **kw)
+        wab.sh.side_effect = crashing
+        return orig
+
+    def test_crash_right_after_new_session_does_not_start_a_second_one(self):
+        cfg, path = self.chain()
+        self.alive = False
+        orig = self.wrap_sh()
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            with self.assertRaises(KeyboardInterrupt):
+                wab.launch(cfg, "W1", self.prompt())
+        wab.sh.side_effect = orig
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "launching")
+        self.assertEqual(self.get_state(cfg)["current"], "W1")
+        self.alive = True  # the tmux session exists now
+        with mock.patch.object(wab, "bind_popup"):
+            wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(len(self.new_sessions()), 1)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
+        self.assertEqual(len([s for s in self.sent if s[0] == "text"]), 1)
+
+    def test_crash_before_new_session_starts_exactly_one_with_the_same_id(self):
+        cfg, path = self.chain()
+        self.alive = False
+        orig = self.wrap_sh(before=True)
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            with self.assertRaises(KeyboardInterrupt):
+                wab.launch(cfg, "W1", self.prompt())
+        wab.sh.side_effect = orig
+        self.assertEqual(self.new_sessions(), [])
+        inner = wab.sh.side_effect
+
+        def window_appears(*args, **kw):
+            r = inner(*args, **kw)
+            if args and args[0] == "tmux" and args[1] == "new-session":
+                self.alive = True
+            return r
+        wab.sh.side_effect = window_appears
+        sid = self.get_state(cfg)["waves"]["W1"]["sessions"][0]
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "launching")
+        with mock.patch.object(wab, "bind_popup"):
+            wab.watch(cfg, path, max_ticks=1)
+        started = self.new_sessions()
+        self.assertEqual(len(started), 1)
+        self.assertEqual(list(started[0])[list(started[0]).index("--session-id") + 1], sid)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
+
+    def test_previous_wave_is_saved_done_before_the_next_launch(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        seen = {}
+
+        def fake_launch(c, wave, prompt):
+            seen["phase"] = json.loads(wab.state_path(c).read_text(encoding="utf-8"))["waves"]["W1"]["phase"]
+            return True
+        with mock.patch.object(wab, "launch", side_effect=fake_launch):
+            wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual(seen["phase"], "done")
 
 
 class AtMostOnce(Base):
