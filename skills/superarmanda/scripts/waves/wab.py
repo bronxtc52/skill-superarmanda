@@ -1493,7 +1493,7 @@ def start_session(cfg, st, wave):
     save_state(cfg, st)
 
 
-def _plan_pin_refused(cfg, st, wave):
+def _plan_pin_refused(cfg, st, wave, drop_pending=False):
     """A pinned plan that changed while the launch was half done (the dispatcher died after the
     intent was saved): no session, no prompt. Phase not_ready (the chain stops, a `launch`
     retries through _launch, which checks the pin again), the reason in status, event, notice."""
@@ -1504,6 +1504,8 @@ def _plan_pin_refused(cfg, st, wave):
         w = st["waves"][wave]
         (wave_dir(cfg, wave) / "status").write_text(why + "\n", encoding="utf-8")
         w["phase"] = "not_ready"
+        if drop_pending:
+            w.pop("pending_enter", None)
         if once_per(w, "not_ready", "plan_pin"):
             put_notice(w, "not_ready", "plan_pin",
                        f"wave-autobot: волна {wave} не запущена: {redact(why)}. Цепочка стоит.")
@@ -1746,6 +1748,8 @@ def advance_pending(cfg, st):
             save_state(cfg, st)
             flush_notices(cfg, st, w)
     elif phase == "sending" and w.get("pending_enter") == "first prompt":
+        if _plan_pin_refused(cfg, st, wave, drop_pending=True):  # typed text must not start the wave
+            return
         event(cfg, f"{wave}: resumed in phase 'sending': the text is typed, pressing only Enter")
         if _deliver(cfg, st, wave, "first prompt", send_text, ""):
             _started(cfg, st, wave)

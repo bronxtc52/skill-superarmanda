@@ -6749,6 +6749,42 @@ class PlanPin(Base):
         self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
         self.assertEqual(len(self.sent), 1)
 
+    # ----- the typed first prompt waits for Enter when the dispatcher dies -----
+    def typed_first_prompt(self, cfg):
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+            phase="sending", sessions=["sid-1"], pending_enter="first prompt")}})
+
+    def test_pending_enter_of_first_prompt_is_not_pressed_on_changed_plan(self):
+        cfg, path = self.pinned()
+        self.typed_first_prompt(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.enters.clear()
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(self.enters, [])
+        self.assertEqual(self.sent, [])
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "not_ready")
+        self.assertNotIn("pending_enter", w)
+        self.assertIn("BLOCKED: plan changed since approval",
+                      (wab.wave_dir(cfg, "W1") / "status").read_text(encoding="utf-8"))
+        self.assertIn("BLOCKED: plan changed since approval",
+                      (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_pending_enter_of_first_prompt_is_pressed_when_plan_unchanged(self):
+        cfg, path = self.pinned()
+        self.typed_first_prompt(cfg)
+        self.enters.clear()
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
+
+    def test_pending_enter_of_first_prompt_is_pressed_without_pin(self):
+        cfg, path = self.chain()
+        self.typed_first_prompt(cfg)
+        self.enters.clear()
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(self.enters, ["wv-w1"])
+
     def test_plan_pin_is_tunable(self):
         cfg, _ = self.pinned()
         other = dict(cfg, plan_sha256="1" * 64)
