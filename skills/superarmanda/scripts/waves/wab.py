@@ -59,6 +59,11 @@ def registry_path():
 
 # ---------- config and state ----------
 
+# Upper bounds: a day of minutes, an hour between ticks, ten million tokens are already absurd.
+NUM_LIMITS = {"ctx_limit": 10_000_000, "idle_minutes": 1440, "handoff_timeout_minutes": 1440,
+              "tick_seconds": 3600}
+
+
 def _plain_name(value):
     return bool(NAME.fullmatch(value)) and set(value) != {"."}
 
@@ -81,11 +86,13 @@ def load_chain(path, create=True):
     cfg.setdefault("tick_seconds", 60)
     cfg.setdefault("model", None)
     cfg.setdefault("tmux_prefix", "wab-")
-    for key in ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds"):
+    for key in NUM_LIMITS:
         v = cfg[key]  # an explicit null/string/bool/<=0/nan/inf would crash `watch` later
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) \
                 or v < 0 or (v == 0 and key != "idle_minutes"):  # idle 0 = flag idleness at once
             raise SystemExit(f"chain.json: {key} must be a positive number, got {v!r}")
+        if v > NUM_LIMITS[key]:  # time.sleep(1e10) raises OverflowError and kills `watch`
+            raise SystemExit(f"chain.json: {key} must be at most {NUM_LIMITS[key]}, got {v!r}")
     if cfg["model"] is not None and not isinstance(cfg["model"], str):
         raise SystemExit(f"chain.json: model must be a string or null, got {cfg['model']!r}")
     titles = cfg.get("titles")
@@ -351,6 +358,9 @@ def _num(v):
     return v if isinstance(v, int) and not isinstance(v, bool) else 0
 
 
+READ_CHUNK = 1 << 20  # bytes per read() of a transcript
+
+
 class TranscriptCache:
     """Incremental reader of session transcripts. Per file it keeps (dev, inode, offset,
     the unfinished last line, counters): a new call reads only what was appended, a
@@ -393,18 +403,21 @@ class TranscriptCache:
                         e["discard_first"] = True
                     e["offset"] = start
                 f.seek(e["offset"])
-                data = f.read()
+                while True:  # in chunks: a transcript can be hundreds of MB
+                    data = f.read(READ_CHUNK)
+                    if not data:
+                        break
+                    self.bytes_read += len(data)
+                    e["offset"] += len(data)
+                    lines = (e["partial"] + data).split(b"\n")
+                    e["partial"] = lines.pop()
+                    for raw in lines:
+                        if e["discard_first"]:
+                            e["discard_first"] = False
+                            continue
+                        self._count(e, raw)
         except OSError:
-            return self._summary(e)
-        self.bytes_read += len(data)
-        e["offset"] += len(data)
-        lines = (e["partial"] + data).split(b"\n")
-        e["partial"] = lines.pop()
-        for raw in lines:
-            if e["discard_first"]:
-                e["discard_first"] = False
-                continue
-            self._count(e, raw)
+            pass
         return self._summary(e)
 
     @staticmethod
@@ -563,9 +576,12 @@ def redact(text, limit=TG_LIMIT):
     return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
 
 
+AZ_TIMEOUT = 30  # seconds: a hung `az` must not block the watch loop
+
+
 def _secret(vault, name):
     return sh("az", "keyvault", "secret", "show", "--vault-name", vault, "--name", name,
-              "--query", "value", "-o", "tsv").stdout.strip()
+              "--query", "value", "-o", "tsv", timeout=AZ_TIMEOUT).stdout.strip()
 
 
 def _send_telegram(cfg, text):
@@ -1236,22 +1252,44 @@ def stale_btab(list_keys_output):
                for line in (list_keys_output or "").splitlines())
 
 
-def bind_popup(cfg, path):
-    """Register this chain's dashboard and (re)generate keys.tmux for every registered chain.
-    tmux key bindings are global to the server, so one binding serves all chains. The whole
-    read-update-write-source sequence runs under the registry lock."""
+def sock_id(sock=None):
+    """Identity of the tmux server in the registry: the -L name, "" for the default server."""
+    if sock is not None:
+        return sock
+    return TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET") or ""
+
+
+def reg_key(sock, name):
+    """Registry key. The default server keeps the bare session name (old entries have no
+    socket and mean exactly that); another server is `<socket>|<session>`."""
+    return f"{sock}|{name}" if sock else name
+
+
+def split_key(key):
+    sock, _, name = key.rpartition("|")
+    return sock, name
+
+
+def bind_popup(cfg, path, session=None, sock=None, remove=False):
+    """Register a dashboard session of this chain (default `<prefix>dash`; dash.py passes the
+    session it really runs in) and (re)generate keys.tmux for the registered chains of THIS
+    tmux server. tmux key bindings are global to a server, so one binding serves all its
+    chains; chains on other servers stay in the registry untouched. `remove` drops the entry.
+    The whole read-update-write-source sequence runs under the registry lock."""
     try:
         with _RegistryLock():
-            _bind_popup(cfg, path)
+            _bind_popup(cfg, path, session, sock, remove)
     except (TimeoutError, OSError) as e:
         event(cfg, f"Ctrl+\\ binding skipped: registry lock unavailable ({type(e).__name__}: {e})")
 
 
-def _bind_popup(cfg, path):
-    dash = f"{cfg['tmux_prefix']}dash"
+def _bind_popup(cfg, path, session=None, sock=None, remove=False):
+    dash = session or f"{cfg['tmux_prefix']}dash"
+    sock = sock_id(sock)
+    mine = reg_key(sock, dash)
     entry = [str(HERE / "wab-open"), str(pathlib.Path(path).resolve())]
     try:
-        keys_conf({dash: entry})
+        keys_conf({dash: entry}, sock or None)
     except ValueError as e:
         event(cfg, f"Ctrl+\\ binding refused: {e}")
         return
@@ -1262,10 +1300,10 @@ def _bind_popup(cfg, path):
         old = {}
     reg = {}
     for name, val in old.items():
-        if name == dash:
+        if name == mine:
             continue
         try:
-            keys_conf({name: val})
+            keys_conf({split_key(name)[1]: val}, split_key(name)[0] or None)
         except ValueError:
             event(cfg, f"registry entry {name!r} dropped: unsafe")
             continue
@@ -1273,7 +1311,8 @@ def _bind_popup(cfg, path):
             event(cfg, f"registry entry {name!r} dropped: chain file is gone")
             continue
         reg[name] = val
-    reg[dash] = entry
+    if not remove:
+        reg[mine] = entry
     target = registry_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".dashes.", suffix=".tmp")
@@ -1281,9 +1320,9 @@ def _bind_popup(cfg, path):
         f.write(json.dumps(reg, indent=1, ensure_ascii=False))
     os.replace(tmp, target)
     conf = cfg["run_dir"] / "keys.tmux"
-    sock = TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET") or None
-    try:
-        text = keys_conf(reg, sock)
+    try:  # only this server's sessions: the file is sourced into this server alone
+        text = keys_conf({split_key(k)[1]: v for k, v in reg.items() if split_key(k)[0] == sock},
+                         sock or None)
     except ValueError as e:
         event(cfg, f"Ctrl+\\ binding refused: {e}")
         return

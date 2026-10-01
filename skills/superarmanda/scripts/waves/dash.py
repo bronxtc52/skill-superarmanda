@@ -4,6 +4,7 @@
 Needs a terminal: `rich` draws nothing when stdout is a file or a pipe, so without a tty the
 command refuses to start. Transcripts are bound to a wave by the session ids in state.json
 and read incrementally (wab.TranscriptCache), so a frame costs only what was appended."""
+import os
 import pathlib
 import subprocess
 import sys
@@ -224,6 +225,23 @@ def safe_render(cfg):
                           style="yellow"), title="dash", border_style="yellow")
 
 
+def own_session():
+    """(session name, tmux socket id) of the tmux session this process runs in, else (None, "").
+    The server is the one in $TMUX (its socket file name; `default` is the default server)."""
+    tmux_env, pane = os.environ.get("TMUX"), os.environ.get("TMUX_PANE")
+    if not tmux_env or not pane:
+        return None, ""
+    sock = os.path.basename(tmux_env.split(",")[0])
+    sock = "" if sock == "default" else sock
+    try:
+        r = subprocess.run(["tmux", "-S", tmux_env.split(",")[0], "display-message", "-p", "-t", pane,
+                            "#{session_name}"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    name = r.stdout.strip()
+    return (name if r.returncode == 0 and name else None), sock
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: dash.py <chain.json>")
@@ -231,10 +249,22 @@ def main():
         raise SystemExit("dash.py needs a terminal (tty): run it inside tmux, not redirected "
                          "to a file or a pipe - rich draws nothing there")
     cfg = wab.load_chain(sys.argv[1], create=False)
-    with Live(safe_render(cfg), refresh_per_second=1, screen=True) as live:
-        while True:
-            time.sleep(3)
-            live.update(safe_render(cfg))
+    session, sock = own_session()
+    if session:  # tmux calls of this process must hit the server we run in, not an env override
+        if sock:
+            os.environ["WAB_TMUX_SOCKET"] = sock
+        else:
+            os.environ.pop("WAB_TMUX_SOCKET", None)
+    if session:  # Ctrl+\ is bound to the session the dashboard really runs in
+        wab.bind_popup(cfg, sys.argv[1], session=session, sock=sock)
+    try:
+        with Live(safe_render(cfg), refresh_per_second=1, screen=True) as live:
+            while True:
+                time.sleep(3)
+                live.update(safe_render(cfg))
+    finally:
+        if session:  # do not keep hijacking Ctrl+\ in a session that no longer shows the dashboard
+            wab.bind_popup(cfg, sys.argv[1], session=session, sock=sock, remove=True)
 
 
 if __name__ == "__main__":

@@ -206,6 +206,21 @@ class TranscriptCacheTests(Base):
         self.assertEqual(third["turns"], 2)
         self.assertEqual(cache.bytes_read, before + len(extra.encode()))
 
+    def test_chunked_read_equals_whole_read_when_a_line_crosses_a_chunk(self):
+        lines = [asst(inp=i + 1, out=i, tools=i % 3) for i in range(8)]
+        p = self.tmp / "big.jsonl"
+        p.write_text("\n".join(lines) + "\n" + lines[0][:15], encoding="utf-8")
+        whole = wab.TranscriptCache().read(p)
+        for chunk in (1, 7, 50):
+            with self.subTest(chunk=chunk), mock.patch.object(wab, "READ_CHUNK", chunk):
+                cache = wab.TranscriptCache()
+                self.assertEqual(cache.read(p), whole)
+                self.assertEqual(cache.bytes_read, p.stat().st_size)
+                with open(p, "a", encoding="utf-8") as f:  # the cut line is completed later
+                    f.write(lines[0][15:] + "\n")
+                self.assertEqual(cache.read(p)["turns"], whole["turns"] + 1)
+                p.write_text("\n".join(lines) + "\n" + lines[0][:15], encoding="utf-8")
+
     def test_incomplete_last_line_is_kept_and_not_parsed_twice(self):
         p = self.tmp / "t.jsonl"
         line = asst(inp=3, out=9)
@@ -637,8 +652,11 @@ class Redaction(Base):
         cfg, _ = self.chain()
         seen = []
 
+        seen_kw = []
+
         def fake(*args, **kw):
             seen.append(args)
+            seen_kw.append(kw)
             return subprocess.CompletedProcess(args, 0, "value\n", "")
 
         orig = load_orig("wab_orig")
@@ -649,6 +667,7 @@ class Redaction(Base):
         self.assertTrue(all("kv-test" in f for f in flat), flat)
         self.assertTrue(any("tok" in f for f in flat) and any("chat" in f for f in flat))
         urlopen.assert_called_once()
+        self.assertTrue(all(0 < kw.get("timeout", 0) <= 60 for kw in seen_kw), seen_kw)
         source = (WAVES / "wab.py").read_text(encoding="utf-8")
         self.assertNotIn("kv-bronxtc", source)
         self.assertNotIn("curl", source)
@@ -1990,6 +2009,72 @@ class KeysAndRegistry(Base):
         self.assertTrue([c for c in self.tmux_calls if c[1] == "source-file"])
         self.assertEqual(list(reg_path.parent.glob("*.tmp")), [])
 
+    def test_hung_az_makes_the_notice_fail_fast_and_not_raise(self):
+        cfg, _ = self.chain()
+        orig = load_orig("wab_orig_to")
+        orig.event = lambda c, t: self.events.append(t)
+        self.events = []
+
+        def hang(*args, **kw):
+            raise subprocess.TimeoutExpired(args, kw["timeout"])
+        with mock.patch.object(orig, "sh", side_effect=hang):
+            orig.notify(cfg, "hello")  # must not raise
+        self.assertTrue(any("FAILED (TimeoutExpired)" in e for e in self.events), self.events)
+
+    def test_registry_keeps_servers_apart_and_old_entries_are_the_default_server(self):
+        cfg, path = self.chain()
+        reg_path = wab.registry_path()
+        reg_path.parent.mkdir(parents=True)
+        other = self.tmp / "other.json"
+        other.write_text("{}", encoding="utf-8")
+        opener = str(WAVES / "wab-open")
+        reg_path.write_text(json.dumps({"old-dash": [opener, str(other)],
+                                        "sockB|wv-dash": [opener, str(other)]}), encoding="utf-8")
+        wab.bind_popup(cfg, path, sock="sockA")
+        reg = json.loads(reg_path.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(reg), ["old-dash", "sockA|wv-dash", "sockB|wv-dash"])
+        conf = (cfg["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
+        self.assertIn("wv-dash", conf)
+        self.assertNotIn("old-dash", conf)  # default-server entry is not sourced into sockA
+        self.assertEqual(conf.count("WAB_TMUX_SOCKET=sockA "), 1)
+        self.assertNotIn("sockB", conf)
+        wab.bind_popup(cfg, path, sock="")  # default server: old entry and new one, nothing of A/B
+        conf = (cfg["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
+        self.assertIn("old-dash", conf)
+        self.assertNotIn("sockA", conf)
+        self.assertNotIn("sockB", conf)
+        reg = json.loads(reg_path.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(reg), ["old-dash", "sockA|wv-dash", "sockB|wv-dash", "wv-dash"])
+
+    def test_dash_registers_its_real_session_and_unregisters_on_exit(self):
+        cfg, path = self.chain()
+        wab.bind_popup(cfg, path, session="my-work", sock="")
+        conf = (cfg["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
+        self.assertIn("#{session_name},my-work}", conf)
+        self.assertNotIn("wv-dash", conf)  # no binding for a name nobody runs in
+        wab.bind_popup(cfg, path, session="my-work", sock="", remove=True)
+        reg = json.loads(wab.registry_path().read_text(encoding="utf-8"))
+        self.assertNotIn("my-work", reg)
+
+    def test_dash_own_session_reads_the_server_and_pane_from_tmux_env(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        env = {"TMUX": "/tmp/tmux-1000/sockZ,123,0", "TMUX_PANE": "%3"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(
+                dash.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, "my-work\n", "")) as run:
+            self.assertEqual(dash.own_session(), ("my-work", "sockZ"))
+        self.assertIn("%3", run.call_args[0][0])
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-1000/default,1,0", "TMUX_PANE": "%1"}), \
+                mock.patch.object(dash.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 0, "s\n", "")):
+            self.assertEqual(dash.own_session(), ("s", ""))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TMUX", None)
+            self.assertEqual(dash.own_session(), (None, ""))
+
     def test_stale_btab_decision(self):
         old = ('bind-key -T root BTab if-shell -F "#{m:*ignore-size*,#{client_flags}}" '
                '{ send-keys BTab } { display-popup "wab-open /x/chain.json" }')
@@ -2183,6 +2268,17 @@ class ChainConfig(Base):
                 with self.subTest(field=field, ok=ok):
                     cfg, _ = self.chain(**{field: ok})
                     self.assertEqual(cfg[field], ok)
+
+    def test_numeric_settings_have_upper_bounds(self):
+        for field, big in (("tick_seconds", 3601), ("tick_seconds", 1e10), ("tick_seconds", 1e308),
+                           ("idle_minutes", 1441), ("handoff_timeout_minutes", 1e9),
+                           ("ctx_limit", 10_000_001)):
+            with self.subTest(field=field, big=big):
+                with self.assertRaises(SystemExit) as ctx:
+                    wab.load_chain(self._bad_doc(**{field: big}), create=False)
+                self.assertIn(field, str(ctx.exception))
+        cfg, _ = self.chain(tick_seconds=3600, idle_minutes=1440, ctx_limit=10_000_000)
+        self.assertEqual(cfg["tick_seconds"], 3600)
 
     def test_other_tunables_have_the_right_type(self):
         for field, bad in (("model", 5), ("model", ["x"]), ("titles", "x"), ("titles", [1]),
