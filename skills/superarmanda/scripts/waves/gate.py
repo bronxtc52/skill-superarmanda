@@ -252,6 +252,11 @@ def manifest_problems(manifest, head, cwd_fingerprint):
         status = entry.get("status")
         if status in ("needs_decision", "blocked"):
             problems.append(f"задача {name}: статус {status}")
+        coder = results.get("coder")
+        if not (isinstance(coder, dict) and coder.get("status") == "pass" and coder.get("head") == head):
+            problems.append(f"задача {name}: нет coder pass на HEAD")
+        elif not _bound(coder, head, cwd_fingerprint):
+            problems.append(f"задача {name}: coder pass получен на другом дереве, чем рабочая копия")
         tester = results.get("tester")
         if not (isinstance(tester, dict) and tester.get("status") == "pass" and tester.get("head") == head):
             problems.append(f"задача {name}: нет tester pass на HEAD PR")
@@ -365,7 +370,7 @@ def ready_command(repo, number):
 def owner_script(wab_py, chain_file, wave, run_id, sha):
     """The script the owner runs when the gate passed but review threads are open. It only starts
     `wab.py owner-merge <chain.json> <wave> <run_id> <sha>`, which refuses another run or another
-    gated sha, gates the PR AGAIN and only then resolves the threads, un-drafts and merges."""
+    gated sha, gates the PR AGAIN and only then resolves the threads and, for a draft, makes it ready and stops (the next run gates again and merges)."""
     for name, value, rx in (("wave", wave, WAVE), ("run_id", run_id, RUN_ID), ("sha", sha, SHA)):
         if not (isinstance(value, str) and rx.fullmatch(value)):
             raise ValueError(f"{name} is not valid: {value!r}")

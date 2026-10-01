@@ -2085,7 +2085,7 @@ def handoff_gate_line(cfg, wave, w):
                     f"{gate.threads_note(v['old_p01'])}). "
                     f"Выполни: {home_form(path)}")
         path = write_owner_script(cfg, wave, sha)  # never the raw `gh pr merge`: the script gates again
-        return f"Гейт мерджа пройден. Выполни: {home_form(path)} (заново проверит гейт на этом HEAD и смержит)"
+        return f"Гейт мерджа пройден. Выполни: {home_form(path)} (заново проверит гейт на этом HEAD; draft PR сперва переведёт в ready и остановится, потом запусти ещё раз, чтобы смержить)"
     except Exception as e:  # noqa: BLE001
         return f"Гейт мерджа не проверен: {type(e).__name__}: {_one_line(e, 200)}"
 
@@ -2143,9 +2143,11 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
     except ValueError as e:
         return _gate_failed(cfg, st, wave, w, wdir, f"недопустимые repo/PR/sha: {e}")
     w["gate_sha"], w["gate_pr"] = sha, number
+    unresolved = v["unresolved"]
+    if v["draft"] and not unresolved:
+        return _gate_ready(cfg, st, wave, w, wdir, number, sha)
     w["phase"] = "merging"
     w["merge_poll_at"] = time.time()
-    unresolved = v["unresolved"]
     if unresolved:  # the owner closes the threads and merges; nothing is merged here
         try:
             path = write_owner_script(cfg, wave, sha)
@@ -2156,7 +2158,7 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
         put_notice(w, "merge_owner", sha,
                    f"wave-autobot: волна {wave}: гейт мерджа пройден (PR #{number}, {sha[:12]}), но есть "
                    f"незакрытые треды ревью: {len(unresolved)}{gate.threads_note(v['old_p01'])}. Сам не мержу.\nВыполни: {home_form(path)}\n"
-                   f"Скрипт заново проверит гейт на этом HEAD, закроет треды и смержит PR.")
+                   f"Скрипт заново проверит гейт на этом HEAD и закроет треды; если PR draft, переведёт его в ready и остановится: дождись проверок и запусти скрипт ещё раз, он смержит.")
         save_state(cfg, st)
         event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}")
         flush_notices(cfg, st, w)
@@ -2166,31 +2168,60 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
         return True
     w["merge_called"] = sha  # saved BEFORE the call: a crash in it must not merge again
     save_state(cfg, st)
-    steps = ([["gh", "pr", "ready", str(number), "--repo", repo]] if v["draft"] else []) + [gate.merge_argv(repo, number, sha)]
-    refused = None
-    for argv in steps:
-        try:
-            r = sh(*argv, check=False, timeout=120)
-        except (OSError, subprocess.SubprocessError) as e:
-            refused = type(e).__name__
-            break
-        if r.returncode != 0:
-            refused = _one_line(r.stderr or r.stdout or f"rc={r.returncode}", 200)
-            break
+    refused = _run_gh_step(gate.merge_argv(repo, number, sha))
     w["merge_rc"] = 0 if refused is None else 1
     if refused is None:
         save_state(cfg, st)
         event(cfg, f"{wave}: merge gate passed, merge of PR #{number} requested at {sha[:12]}")
         return True
-    try:  # the owner gets the script (it gates again, readies a draft, merges pinned to the sha), not the raw command
+    return _hand_to_owner(cfg, st, wave, w, wdir, number, sha, f"гейт пройден, мердж отклонён: {refused}",
+                          f"merge refused: {refused}")
+
+
+def _run_gh_step(argv):
+    """One gh call; None on success, else a short reason."""
+    try:
+        r = sh(*argv, check=False, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        return type(e).__name__
+    if r.returncode != 0:
+        return _one_line(r.stderr or r.stdout or f"rc={r.returncode}", 200)
+    return None
+
+
+def _gate_ready(cfg, st, wave, w, wdir, number, sha):
+    """A draft PR that passed the gate is only made ready here; the merge waits for the NEXT gate on a
+    non-draft PR (`ready_for_review` may start new checks). Once per sha: a PR GitHub keeps showing
+    as draft goes to the owner instead of a loop of `gh pr ready`."""
+    if w.get("ready_called") == sha:
+        w["phase"] = "merging"
+        w["merge_poll_at"] = time.time()
+        return _hand_to_owner(cfg, st, wave, w, wdir, number, sha,
+                              f"PR #{number} после gh pr ready всё ещё draft", "PR still draft after ready")
+    w["ready_called"] = sha  # saved BEFORE the call: ready is asked once per sha
+    save_state(cfg, st)
+    refused = _run_gh_step(["gh", "pr", "ready", str(number), "--repo", cfg["repo"]])
+    if refused is not None:
+        w["phase"] = "merging"
+        w["merge_poll_at"] = time.time()
+        return _hand_to_owner(cfg, st, wave, w, wdir, number, sha,
+                              f"гейт пройден, перевод в ready отклонён: {refused}", f"ready refused: {refused}")
+    w["phase"] = "gate"  # the new checks must register before the next collection
+    w["gate_at"] = time.time()
+    save_state(cfg, st)
+    event(cfg, f"{wave}: PR #{number} переведён в ready, жду проверки")
+    return True
+
+
+def _hand_to_owner(cfg, st, wave, w, wdir, number, sha, text, log_text):
+    try:  # the owner gets the script (it gates again, readies a draft and stops, then merges pinned to the sha), not the raw command
         command = home_form(write_owner_script(cfg, wave, sha))
     except (OSError, ValueError) as e:
         command = f"(скрипт владельца не записан: {_one_line(e, 100)}; проверь PR #{number} вручную)"
-    w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate passed; merge refused: {refused}")
-    put_notice(w, "merge_refused", sha,
-               f"wave-autobot: волна {wave}: гейт пройден, мердж отклонён: {refused}. Выполни: {command}")
+    w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate passed; {log_text}")
+    put_notice(w, "merge_refused", sha, f"wave-autobot: волна {wave}: {text}. Выполни: {command}")
     save_state(cfg, st)
-    event(cfg, f"{wave}: merge gate passed, merge refused: {refused}")
+    event(cfg, f"{wave}: merge gate passed, {log_text}")
     flush_notices(cfg, st, w)
     return True
 
@@ -2216,7 +2247,7 @@ def _regate(cfg, st, wave, w, wdir, old, new):
     """The PR is still open but its head moved after the gate passed (a push after a refused merge,
     or while the owner's script waits): the verdict was about another commit, so the wave goes back
     to the gate with everything the pass left behind forgotten."""
-    for key in ("gate_sha", "gate_pr", "merge_called", "merge_rc", "merge_poll_at", "gate_at"):
+    for key in ("gate_sha", "gate_pr", "merge_called", "ready_called", "merge_rc", "merge_poll_at", "gate_at"):
         w.pop(key, None)
     for key in ("merge_unknown", "gate_wait"):
         w.get("notified", {}).pop(key, None)
@@ -2277,12 +2308,19 @@ def owner_merge(cfg, wave, run_id, sha):
         if resolved is not True:  # null, no field, false, errors: the thread is NOT closed
             why = str(out.get("errors"))[:200] if isinstance(out, dict) and out.get("errors") else "isResolved is not true"
             raise SystemExit(f"wab: owner-merge: thread {thread} not resolved: {why}; nothing merged")
-    steps = ([["gh", "pr", "ready", str(number), "--repo", repo]] if v["draft"] else []) + [merge]
-    for argv in steps:
+    if v["draft"]:  # ready may start new checks: stop here, the next run gates again on a non-draft PR
+        argv = ["gh", "pr", "ready", str(number), "--repo", repo]
         r = sh(*argv, check=False, timeout=120)
         if r.returncode != 0:
-            raise SystemExit(f"wab: owner-merge: `{' '.join(argv[:3])}` failed: "
+            raise SystemExit(f"wab: owner-merge: `gh pr ready` failed: "
                              f"{_one_line(r.stderr or r.stdout or r.returncode, 200)}")
+        print(f"wab: owner-merge: PR #{number} переведён в ready; дождись завершения проверок "
+              f"и запусти скрипт ещё раз ({len(v['unresolved'])} threads resolved)", flush=True)
+        return
+    r = sh(*merge, check=False, timeout=120)
+    if r.returncode != 0:
+        raise SystemExit(f"wab: owner-merge: `{' '.join(merge[:3])}` failed: "
+                         f"{_one_line(r.stderr or r.stdout or r.returncode, 200)}")
     print(f"wab: owner-merge: PR #{number} merge requested at {sha[:12]} "
           f"({len(v['unresolved'])} threads resolved)", flush=True)
 

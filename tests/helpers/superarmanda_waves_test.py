@@ -6891,7 +6891,7 @@ def result(status="pass", head=HEAD, fp=FP, at="2026-10-01T10:05:00Z"):
 
 def green_manifest(**task):
     entry = {"status": "ready_for_pr_review", "decisions": [],
-             "results": {"tester": result(), "cross_provider_reviewer": result()}}
+             "results": {"coder": result(), "tester": result(), "cross_provider_reviewer": result()}}
     entry.update(task)
     return {"head": HEAD, "tasks": {"T1": entry}}
 
@@ -7025,6 +7025,22 @@ class GateVerdict(unittest.TestCase):
         a = green_facts(review_comments=[{"id": 1, "user": BOT, "commit_id": HEAD, "original_commit_id": OLD, "body": "x"}])
         b = green_facts(review_comments=[{"id": 1, "user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "x"}])
         self.assertNotEqual(gate.critical(a), gate.critical(b))
+
+    def test_manifest_without_a_coder_pass_on_head_fails(self):  # Codex P1: roles may be recorded out of order
+        no_coder = green_manifest()
+        del no_coder["tasks"]["T1"]["results"]["coder"]
+        v = self.ev(manifest=no_coder)
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn("нет coder pass на HEAD", "; ".join(v["reasons"]))
+        coder_findings = green_manifest()
+        coder_findings["tasks"]["T1"]["results"]["coder"] = result("findings")
+        self.assertEqual(self.ev(manifest=coder_findings)["verdict"], "fail")
+        coder_old = green_manifest()
+        coder_old["tasks"]["T1"]["results"]["coder"] = result(head=OLD)
+        self.assertEqual(self.ev(manifest=coder_old)["verdict"], "fail")
+        coder_tree = green_manifest()
+        coder_tree["tasks"]["T1"]["results"]["coder"] = result(fp="0" * 64)
+        self.assertEqual(self.ev(manifest=coder_tree)["verdict"], "fail")
 
     def test_manifest_without_tester_pass_or_with_another_head_fails(self):  # acceptance 4
         no_tester = green_manifest()
@@ -7724,23 +7740,59 @@ class MergeGate(GateBase):
         self.tick()
         self.launch.assert_called_once()
 
-    def test_a_draft_pr_is_made_ready_before_the_merge(self):
-        self.start()
+    def make_draft(self):
         self.pr["isDraft"] = True
         self.facts["pr"]["draft"] = True
-        self.merge_it()
-        kinds = [c[:3] for c in self.gh_calls if c[:3] in (("gh", "pr", "ready"), ("gh", "pr", "merge"))]
-        self.assertEqual(kinds, [("gh", "pr", "ready"), ("gh", "pr", "merge")])
-        self.assertIn(("gh", "pr", "ready", "7", "--repo", "o/r"), self.gh_calls)
 
-    def test_a_failed_ready_is_a_refused_merge(self):
+    def undraft(self):
+        self.pr["isDraft"] = False
+        self.facts["pr"]["draft"] = False
+
+    def readies(self):
+        return [c for c in self.gh_calls if c[:3] == ("gh", "pr", "ready")]
+
+    def test_a_draft_pr_is_only_made_ready_then_gated_again_before_the_merge(self):  # r6 HIGH
+        self.start()
+        self.make_draft()
+        self.assertTrue(self.tick())
+        self.assertEqual(self.readies(), [("gh", "pr", "ready", "7", "--repo", "o/r")])
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.rec()["phase"], "gate")
+        self.assertNotIn("merge_called", self.rec())
+        self.assertIn("переведён в ready", self.log())
+        # ready started new checks: a pending run is a wait, nothing is merged
+        self.undraft()
+        self.facts["check_runs"] = [{"name": "ci", "status": "in_progress", "conclusion": None}]
+        self.tick()
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.rec()["phase"], "gate")
+        # all green on a non-draft PR: the merge, and ready is not asked again
+        self.facts = green_facts()
+        self.tick()
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(len(self.readies()), 1)
+        self.assertEqual(self.rec()["phase"], "merging")
+
+    def test_a_pr_that_stays_draft_after_ready_does_not_loop(self):  # r6 HIGH
+        self.start()
+        self.make_draft()
+        for _ in range(5):
+            self.tick()
+        self.assertEqual(len(self.readies()), 1)
+        self.assertEqual(self.merges(), [])
+        sent = [t for t in self.tg if "draft" in t]
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Выполни: ~/.cache/wab/", sent[0])
+        self.assertEqual(self.rec()["phase"], "merging")
+
+    def test_a_failed_ready_goes_to_the_owner_script(self):
         self.start()
         self.pr["isDraft"] = True
         self.facts["pr"]["draft"] = True
         self.ready_rc = 1
         self.tick()
         self.assertEqual(self.merges(), [])
-        sent = [t for t in self.tg if "мердж отклонён" in t]
+        sent = [t for t in self.tg if "перевод в ready отклонён" in t]
         self.assertEqual(len(sent), 1)
         self.assertNotIn("gh pr merge", sent[0])
         self.assertNotIn("gh pr ready", sent[0])
@@ -7937,6 +7989,10 @@ class OwnerMerge(GateBase):  # D3
     def run_it(self):
         return wab.owner_merge(wab.load_chain(self.path), "W1", RUN_ID, self.gated)
 
+    def not_draft(self):  # the owner made it ready earlier: the run that merges sees a non-draft PR
+        self.pr["isDraft"] = False
+        self.facts["pr"]["draft"] = False
+
     def refused(self):
         with self.assertRaises(SystemExit) as ctx:
             self.run_it()
@@ -7946,14 +8002,23 @@ class OwnerMerge(GateBase):  # D3
         self.assertEqual(json.dumps(self.rec(), sort_keys=True), self.snapshot)
         return str(ctx.exception)
 
-    def test_unchanged_facts_resolve_ready_merge_in_that_order(self):
+    def test_a_draft_is_resolved_and_made_ready_then_the_script_stops(self):  # r6 HIGH
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.run_it()
-        self.assertEqual(self.order, ["resolve", "resolve", "ready", "merge"])
+        self.assertEqual(self.order, ["resolve", "resolve", "ready"])
         self.assertEqual([v["id"] for v in self.graphql_calls], ["PRRT_a", "PRRT_c"])
+        self.assertEqual(self.merges(), [])
+        self.assertIn("PR #7 переведён в ready; дождись завершения проверок и запусти скрипт ещё раз", out.getvalue())
+        self.assertEqual(json.dumps(self.rec(), sort_keys=True), self.snapshot)  # the wave's record is untouched
+        # the second run: the PR is not draft any more, the gate passes again, the merge is pinned
+        self.pr["isDraft"] = False
+        self.facts = green_facts()
+        self.order.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.run_it()
+        self.assertEqual(self.order, ["merge"])
         self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
-        self.assertIn("PR #7", out.getvalue())
         self.assertEqual(json.dumps(self.rec(), sort_keys=True), self.snapshot)  # the wave's record is untouched
 
     def test_a_new_p1_on_the_same_sha_stops_it(self):
@@ -7984,6 +8049,7 @@ class OwnerMerge(GateBase):  # D3
 
     def test_a_failing_merge_is_reported_with_rc(self):
         self.merge_rc, self.merge_err = 1, "blocked by policy"
+        self.not_draft()
         with self.assertRaises(SystemExit) as ctx:
             self.run_it()
         self.assertIn("blocked by policy", str(ctx.exception))
@@ -8027,6 +8093,7 @@ class OwnerMerge(GateBase):  # D3
         self.assertNotIn("identity", self.get_state(self.cfg))  # owner-merge writes no pin
 
     def test_an_unchanged_identity_works_as_before(self):  # H1
+        self.not_draft()
         self.run_it()
         self.assertEqual(self.order[-1], "merge")
 
@@ -8067,6 +8134,7 @@ class OwnerMerge(GateBase):  # D3
                 self.assertNotIn("merge", self.order)
 
     def test_cli_command_and_exit_code(self):
+        self.not_draft()
         with contextlib.redirect_stdout(io.StringIO()):
             wab.main(["wab.py", "owner-merge", str(self.path), "W1", RUN_ID, HEAD])
         self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
@@ -8168,11 +8236,11 @@ class ExternalOwnerMerge(OwnerMergeHarness):  # R1: the script offered by an ext
         rec = self.handoff()
         self.assertEqual((rec["gate_sha"], rec["gate_pr"]), (HEAD, 7))
 
-    def test_owner_merge_after_an_external_handoff_resolves_readies_merges(self):
+    def test_owner_merge_after_an_external_handoff_resolves_and_readies(self):
         self.handoff()
         self.run_owner_merge()
-        self.assertEqual(self.order, ["resolve", "ready", "merge"])
-        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+        self.assertEqual(self.order, ["resolve", "ready"])
+        self.assertEqual(self.merges(), [])
         self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["phase"], "awaiting_merge")
 
     def test_owner_merge_after_an_external_handoff_refuses_a_moved_head(self):
