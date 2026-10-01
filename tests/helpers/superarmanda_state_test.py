@@ -6,10 +6,13 @@ CLI as an outside client, so this verifies the public command contract rather
 than internal helper functions.
 """
 
+import copy
 import json
 import importlib.util
 import os
 import hashlib
+import itertools
+import re
 import stat
 import subprocess
 import tempfile
@@ -2001,6 +2004,1193 @@ class StateContract(unittest.TestCase):
         )
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertFalse(lock.exists() or lock.is_symlink())
+
+
+V060_KEYS = {
+    "version",
+    "run_id",
+    "repo",
+    "base",
+    "head",
+    "tree_fingerprint",
+    "tasks",
+    "created_at",
+    "updated_at",
+}
+
+
+def canonical_sha(obj):
+    blob = json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def wave(wave_id, depends_on=(), **overrides):
+    value = {
+        "id": wave_id,
+        "title": f"Title {wave_id}",
+        "goal": f"Goal {wave_id}",
+        "requirements": f"Requirements {wave_id}",
+        "acceptance": [f"Acceptance {wave_id}"],
+        "risk": "medium",
+        "checks": [{"name": "unit", "cmd": "bash tests/run.sh"}],
+        "depends_on": list(depends_on),
+    }
+    value.update(overrides)
+    return value
+
+
+def plan_doc(waves=None):
+    return {
+        "version": 1,
+        "chain": "chain-one",
+        "repo": "owner/name",
+        "base_branch": "main",
+        "waves": waves if waves is not None else [wave("w1"), wave("w2", ["w1"]), wave("w3")],
+    }
+
+
+class WavesContract(unittest.TestCase):
+    """init --from-plan, mark and where (spec 5.1-5.3)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name) / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q")
+        self.git("checkout", "-q", "-b", "main")
+        self.git("config", "user.email", "tester@example.invalid")
+        self.git("config", "user.name", "State Tester")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        self.git("commit", "-qm", "base")
+        self.base = self.head()
+        self.manifest = Path(self.tmp.name) / "run.json"
+        self.plan = Path(self.tmp.name) / "waves.json"
+
+    def git(self, *args, check=True):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *map(str, args)],
+            text=True,
+            capture_output=True,
+            check=check,
+        )
+
+    def head(self):
+        return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def write_plan(self, doc=None, raw=None):
+        if raw is None:
+            raw = json.dumps(doc if doc is not None else plan_doc(), indent=2)
+        data = raw if isinstance(raw, bytes) else raw.encode("utf-8")
+        self.plan.write_bytes(data)
+        return data
+
+    def run_state(self, command, *args, manifest=True):
+        argv = ["python3", str(STATE), command]
+        if manifest:
+            argv += ["--manifest", str(self.manifest)]
+        return subprocess.run(
+            [*argv, *map(str, args)], text=True, capture_output=True
+        )
+
+    def cli(self, command, *args):
+        proc = self.run_state(command, *args)
+        if proc.returncode:
+            self.fail(f"{command} failed rc={proc.returncode}: {proc.stderr}")
+        return proc
+
+    def init_args(self, selector):
+        return [
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+            "--run-id",
+            "wave-run",
+            "--from-plan",
+            selector,
+        ]
+
+    def init_wave(self, wave_id="w1", doc=None):
+        self.write_plan(doc)
+        return self.cli("init", *self.init_args(f"{self.plan}#{wave_id}"))
+
+    def init_wave_raw(self, selector):
+        return self.run_state("init", *self.init_args(selector))
+
+    def manifest_data(self):
+        return json.loads(self.manifest.read_text(encoding="utf-8"))
+
+    def where(self):
+        proc = self.cli("where")
+        return json.loads(proc.stdout)
+
+    def record(self, role, status="pass", task="implement", artifact="evidence"):
+        return self.cli(
+            "task-result",
+            "--task",
+            task,
+            "--role",
+            role,
+            "--status",
+            status,
+            "--session-id",
+            f"{role}-{task}-session",
+            "--head",
+            self.head(),
+            "--artifact",
+            artifact,
+        )
+
+    def mark(self, task="implement", step=4, safe="false"):
+        return self.run_state(
+            "mark", "--task", task, "--step", step, "--safe-point", safe
+        )
+
+    def resume(self):
+        return self.cli(
+            "resume",
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+        )
+
+    # R2: init --from-plan
+    def test_init_from_plan_records_plan_and_wave_copy(self):
+        raw = self.write_plan()
+        self.cli("init", *self.init_args(f"{self.plan}#w2"))
+        data = self.manifest_data()
+        selected = plan_doc()["waves"][1]
+        self.assertEqual(data["wave"], selected)
+        sha = hashlib.sha256(raw).hexdigest()
+        self.assertEqual(
+            data["plan"],
+            {
+                "path": str(self.plan.resolve()),
+                "sha256": sha,
+                "wave": "w2",
+                "approved_by": f"plan@{sha}",
+                "wave_sha256": canonical_sha(selected),
+            },
+        )
+        self.assertEqual(data["version"], 1)
+        self.assertEqual(data["base"], self.base)
+
+    def test_init_without_from_plan_has_exactly_the_v060_keys(self):
+        self.cli(
+            "init",
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+            "--run-id",
+            "legacy",
+        )
+        self.assertEqual(set(self.manifest_data()), V060_KEYS)
+
+    def assert_init_rejected(self, selector):
+        proc = self.init_wave_raw(selector)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(self.manifest.exists())
+        self.assertFalse(
+            Path(self.tmp.name, ".run.json.lock").exists()
+            and self.manifest.exists()
+        )
+
+    def test_init_from_plan_unknown_wave_id_rejected(self):
+        self.write_plan()
+        self.assert_init_rejected(f"{self.plan}#nope")
+
+    def test_init_from_plan_hash_without_id_rejected(self):
+        self.write_plan()
+        self.assert_init_rejected(f"{self.plan}#")
+        self.assert_init_rejected(str(self.plan))
+
+    def test_init_from_plan_missing_file_rejected(self):
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_duplicate_json_key_rejected(self):
+        raw = json.dumps(plan_doc())
+        raw = raw.replace('"chain": "chain-one"', '"chain": "a", "chain": "b"')
+        self.write_plan(raw=raw)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_duplicate_key_in_nested_wave_rejected(self):
+        raw = json.dumps(plan_doc()).replace('"risk": "medium"', '"risk": "low", "risk": "high"', 1)
+        self.write_plan(raw=raw)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_unknown_top_level_key_rejected(self):
+        doc = plan_doc()
+        doc["extra"] = 1
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_unknown_wave_key_rejected(self):
+        doc = plan_doc([wave("w1", extra="x")])
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_missing_key_rejected(self):
+        doc = plan_doc()
+        del doc["waves"][0]["goal"]
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_bad_risk_rejected(self):
+        self.write_plan(plan_doc([wave("w1", risk="extreme")]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_wrong_version_rejected(self):
+        doc = plan_doc()
+        doc["version"] = 2
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_bool_version_rejected(self):
+        doc = plan_doc()
+        doc["version"] = True
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_empty_required_strings_rejected(self):
+        for field in ("title", "goal", "requirements"):
+            with self.subTest(field=field):
+                self.write_plan(plan_doc([wave("w1", **{field: ""})]))
+                self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_empty_waves_or_acceptance_rejected(self):
+        self.write_plan(plan_doc([]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+        self.write_plan(plan_doc([wave("w1", acceptance=[])]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_bad_checks_rejected(self):
+        bad = [
+            [{"name": "n"}],
+            [{"name": "n", "cmd": "c", "x": 1}],
+            [{"name": 1, "cmd": "c"}],
+            "bash",
+        ]
+        for checks in bad:
+            with self.subTest(checks=checks):
+                self.write_plan(plan_doc([wave("w1", checks=checks)]))
+                self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_bad_wave_ids_rejected(self):
+        for bad in (".", "..", "a/b", "a b", ""):
+            with self.subTest(bad=bad):
+                self.write_plan(plan_doc([wave(bad)]))
+                self.assert_init_rejected(f"{self.plan}#{bad or 'x'}")
+
+    def test_init_from_plan_duplicate_wave_id_rejected(self):
+        self.write_plan(plan_doc([wave("w1"), wave("w1")]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_self_and_forward_dependency_rejected(self):
+        self.write_plan(plan_doc([wave("w1", ["w1"])]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+        self.write_plan(plan_doc([wave("w1", ["w2"]), wave("w2")]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+        self.write_plan(plan_doc([wave("w1", ["ghost"])]))
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_symlinked_plan_rejected(self):
+        real = Path(self.tmp.name) / "real-plan.json"
+        real.write_text(json.dumps(plan_doc()), encoding="utf-8")
+        self.plan.symlink_to(real)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_non_regular_file_rejected(self):
+        self.plan.mkdir()
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_over_one_mib_rejected(self):
+        doc = plan_doc([wave("w1", goal="x" * (1024 * 1024 + 1))])
+        self.write_plan(doc)
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_invalid_utf8_rejected(self):
+        self.write_plan(raw=b'{"version": 1, "chain": "\xff"}')
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_not_an_object_rejected(self):
+        self.write_plan(raw="[1, 2]")
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    # R3: mark
+    def test_mark_creates_task_and_records_position(self):
+        self.init_wave()
+        before = self.manifest_data()
+        self.cli("mark", "--task", "impl", "--step", 4, "--safe-point", "true")
+        data = self.manifest_data()
+        position = data["position"]
+        self.assertEqual(
+            set(position),
+            {"task", "step", "safe_point", "head", "tree_fingerprint", "recorded_at"},
+        )
+        self.assertEqual(position["task"], "impl")
+        self.assertEqual(position["step"], 4)
+        self.assertIs(position["safe_point"], True)
+        self.assertEqual(position["head"], self.head())
+        self.assertEqual(position["tree_fingerprint"], before["tree_fingerprint"])
+        self.assertEqual(data["tasks"]["impl"]["status"], "pending")
+        self.assertEqual(data["tasks"]["impl"]["results"], {})
+
+    def test_mark_does_not_change_existing_task_status(self):
+        self.init_wave()
+        self.record("coder")
+        self.record("tester")
+        before = self.manifest_data()["tasks"]["implement"]
+        self.cli("mark", "--task", "implement", "--step", 5, "--safe-point", "false")
+        after = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(before["status"], after["status"])
+        self.assertEqual(before["results"], after["results"])
+
+    def test_mark_safe_point_false_is_boolean_false(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 6, "--safe-point", "false")
+        self.assertIs(self.manifest_data()["position"]["safe_point"], False)
+
+    def test_mark_rejects_bad_arguments_and_leaves_manifest(self):
+        self.init_wave()
+        before = self.manifest.read_bytes()
+        cases = [
+            ("impl", 0, "true"),
+            ("impl", 8, "true"),
+            ("impl", "x", "true"),
+            ("impl", 4, "maybe"),
+            ("bad/task", 4, "true"),
+            ("..", 4, "true"),
+            ("", 4, "true"),
+        ]
+        for task, step, safe in cases:
+            with self.subTest(task=task, step=step, safe=safe):
+                proc = self.mark(task, step, safe)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_mark_after_uncommitted_change_rejected_and_manifest_unchanged(self):
+        self.init_wave()
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        before = self.manifest.read_bytes()
+        proc = self.mark()
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_mark_after_new_commit_rejected_until_resume(self):
+        self.init_wave()
+        self.git("commit", "--allow-empty", "-qm", "next")
+        before = self.manifest.read_bytes()
+        proc = self.mark()
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.manifest.read_bytes(), before)
+        self.resume()
+        self.assertEqual(self.mark().returncode, 0)
+
+    def test_mark_works_on_legacy_manifest_without_wave_keys(self):
+        self.cli(
+            "init",
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+        )
+        self.assertEqual(self.mark().returncode, 0)
+        self.assertIn("position", self.manifest_data())
+
+    # R4: where
+    def test_where_fresh_marked_task_has_all_fields_defined(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 4, "--safe-point", "false")
+        info = self.where()
+        self.assertEqual(info["task"], "impl")
+        self.assertEqual(info["task_status"], "pending")
+        self.assertEqual(info["step"], 4)
+        self.assertEqual(info["role"], "coder")
+        self.assertEqual(info["verdicts"], {})
+        self.assertEqual(info["open_findings"], [])
+        self.assertIsNone(info["decision_required_for"])
+        self.assertIs(info["tree_matches"], True)
+        self.assertIs(info["safe_point"], False)
+        self.assertEqual(info["plan_check"], "match")
+        self.assertEqual(
+            info["fix_round"]["total"], "0/3"
+        )
+        self.assertIsInstance(info["next_action"], str)
+        self.assertNotIn("\n", info["next_action"])
+        for key in (
+            "tree_matches",
+            "plan_check",
+            "task",
+            "task_status",
+            "step",
+            "role",
+            "fix_round",
+            "verdicts",
+            "open_findings",
+            "decision_required_for",
+            "safe_point",
+            "next_action",
+        ):
+            self.assertIn(key, info)
+
+    def test_where_is_read_only(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 4, "--safe-point", "true")
+        before = self.manifest.read_bytes()
+        self.where()
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_where_read_only_even_when_tree_is_stale(self):
+        self.init_wave()
+        self.git("commit", "--allow-empty", "-qm", "next")
+        before = self.manifest.read_bytes()
+        info = self.where()
+        self.assertIs(info["tree_matches"], False)
+        self.assertTrue(info["next_action"].startswith("run resume"))
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_where_on_legacy_manifest_without_new_keys(self):
+        self.cli(
+            "init",
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+        )
+        before = self.manifest.read_bytes()
+        info = self.where()
+        self.assertIsNone(info["plan_check"])
+        self.assertIsNone(info["task"])
+        self.assertIsNone(info["task_status"])
+        self.assertIsNone(info["safe_point"])
+        self.assertEqual(info["step"], 4)
+        self.assertEqual(info["role"], "coder")
+        self.assertEqual(self.manifest.read_bytes(), before)
+
+    def test_where_no_position_picks_first_unfinished_task(self):
+        self.init_wave()
+        self.record("coder", task="b-task")
+        self.record("coder", task="a-task")
+        info = self.where()
+        self.assertEqual(info["task"], "a-task")
+        self.assertEqual(info["role"], "tester")
+        self.assertEqual(info["step"], 5)
+
+    def test_where_position_task_wins_over_first_task(self):
+        self.init_wave()
+        self.record("coder", task="a-task")
+        self.cli("mark", "--task", "z-task", "--step", 4, "--safe-point", "false")
+        self.assertEqual(self.where()["task"], "z-task")
+
+    def test_where_derives_roles_through_the_review_chain(self):
+        self.init_wave()
+        self.record("coder")
+        self.assertEqual(self.where()["role"], "tester")
+        self.record("tester")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (5, "cross_provider_reviewer"))
+        self.cli(
+            "task-result",
+            "--task",
+            "implement",
+            "--role",
+            "cross_provider_reviewer",
+            "--status",
+            "pass",
+            "--session-id",
+            "xp-session",
+            "--head",
+            self.head(),
+            "--artifact",
+            "evidence",
+            "--reviewed-head",
+            self.head(),
+            "--packet-hash",
+            "sha256:" + "a" * 64,
+        )
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (7, "github_codex_review"))
+        self.assertEqual(info["task_status"], "ready_for_pr_review")
+        self.assertEqual(
+            info["verdicts"],
+            {
+                "coder": "pass",
+                "tester": "pass",
+                "cross_provider_reviewer": "pass",
+            },
+        )
+        self.cli(
+            "task-result",
+            "--task",
+            "implement",
+            "--role",
+            "github_codex_review",
+            "--status",
+            "pass",
+            "--session-id",
+            "gh-session",
+            "--head",
+            self.head(),
+            "--artifact",
+            "https://example.invalid/review",
+            "--reviewed-head",
+            self.head(),
+        )
+        info = self.where()
+        self.assertEqual(info["step"], 7)
+        self.assertIsNone(info["role"])
+        self.assertTrue(info["next_action"].startswith("done"))
+
+    def test_where_open_findings_and_needs_fix(self):
+        self.init_wave()
+        self.record("coder")
+        self.record("tester", status="findings", artifact="https://x.invalid/t")
+        self.cli("fix-loop", "--task", "implement", "--outcome", "failed", "--source", "tester")
+        info = self.where()
+        self.assertEqual(info["task_status"], "needs_fix")
+        self.assertEqual((info["step"], info["role"]), (6, "coder"))
+        self.assertEqual(
+            info["open_findings"],
+            [{"role": "tester", "status": "findings", "artifact": "https://x.invalid/t"}],
+        )
+        self.assertEqual(info["fix_round"]["tester"], "1/2")
+        self.assertEqual(info["fix_round"]["total"], "1/3")
+
+    def test_where_needs_decision_names_the_call(self):
+        self.init_wave()
+        self.record("coder")
+        for _ in range(2):
+            self.cli(
+                "fix-loop", "--task", "implement", "--outcome", "failed",
+                "--source", "tester",
+            )
+        info = self.where()
+        self.assertEqual(info["task_status"], "needs_decision")
+        self.assertEqual(info["decision_required_for"], "tester")
+        self.assertEqual((info["step"], info["role"]), (6, "coordinator"))
+        self.assertIn("fix-loop --decision", info["next_action"])
+        self.assertIn("tester", info["next_action"])
+        self.assertEqual(info["fix_round"]["tester"], "2/2")
+
+    def test_where_blocked_task(self):
+        self.init_wave()
+        self.record("coder")
+        for source in ("tester", "tester", "coderabbit"):
+            proc = self.run_state(
+                "fix-loop", "--task", "implement", "--outcome", "failed",
+                "--source", source,
+            )
+            if proc.returncode:
+                self.cli(
+                    "fix-loop", "--task", "implement", "--decision", "invariant",
+                    "--note", "n",
+                )
+                self.cli(
+                    "fix-loop", "--task", "implement", "--outcome", "failed",
+                    "--source", source,
+                )
+        info = self.where()
+        self.assertEqual(info["task_status"], "blocked")
+        self.assertIsNone(info["step"])
+        self.assertTrue(info["next_action"].startswith("BLOCKED"))
+
+    def test_where_plan_unchanged_is_match(self):
+        self.init_wave("w2")
+        self.assertEqual(self.where()["plan_check"], "match")
+
+    def test_where_selected_wave_edited_is_changed_and_blocked(self):
+        self.init_wave("w2")
+        doc = plan_doc()
+        doc["waves"][1]["goal"] = "Changed goal"
+        self.write_plan(doc)
+        info = self.where()
+        self.assertEqual(info["plan_check"], "changed")
+        self.assertTrue(info["next_action"].startswith("BLOCKED: plan changed"))
+
+    def test_where_changed_plan_takes_precedence_over_stale_tree(self):
+        self.init_wave("w2")
+        doc = plan_doc()
+        doc["waves"][1]["goal"] = "Changed goal"
+        self.write_plan(doc)
+        self.git("commit", "--allow-empty", "-qm", "next")
+        info = self.where()
+        self.assertTrue(info["next_action"].startswith("BLOCKED: plan changed"))
+
+    def test_where_other_wave_edited_is_still_match(self):
+        self.init_wave("w2")
+        doc = plan_doc()
+        doc["waves"][2]["goal"] = "Changed goal of another wave"
+        self.write_plan(doc)
+        info = self.where()
+        self.assertEqual(info["plan_check"], "match")
+        self.assertFalse(info["next_action"].startswith("BLOCKED"))
+
+    def test_where_selected_wave_removed_or_plan_invalid_is_changed(self):
+        self.init_wave("w2")
+        self.write_plan(plan_doc([wave("w1"), wave("w3")]))
+        self.assertEqual(self.where()["plan_check"], "changed")
+        self.write_plan(raw="{not json")
+        info = self.where()
+        self.assertEqual(info["plan_check"], "changed")
+        self.assertTrue(info["next_action"].startswith("BLOCKED: plan changed"))
+
+    def test_where_plan_deleted_is_missing_and_not_blocked(self):
+        self.init_wave("w2")
+        self.plan.unlink()
+        info = self.where()
+        self.assertEqual(info["plan_check"], "missing")
+        self.assertFalse(info["next_action"].startswith("BLOCKED"))
+        self.assertEqual(info["role"], "coder")
+
+    def test_where_plan_becomes_symlink_is_changed(self):
+        self.init_wave("w2")
+        real = Path(self.tmp.name) / "real.json"
+        real.write_text(self.plan.read_text(encoding="utf-8"), encoding="utf-8")
+        self.plan.unlink()
+        self.plan.symlink_to(real)
+        self.assertEqual(self.where()["plan_check"], "changed")
+
+    def test_where_step_and_role_follow_results_not_mark(self):
+        self.init_wave()
+        self.cli("mark", "--task", "t", "--step", 4, "--safe-point", "false")
+        self.record("coder", task="t")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (5, "tester"))
+        self.assertEqual(info["marked_step"], 4)
+        self.assertIn("step 5", info["next_action"])
+        self.assertIn("tester", info["next_action"])
+
+    def test_where_marked_step_null_without_position_or_other_task(self):
+        self.init_wave()
+        self.assertIsNone(self.where()["marked_step"])
+        self.record("coder", task="a")
+        self.cli("mark", "--task", "b", "--step", 4, "--safe-point", "false")
+        self.assertEqual(self.where()["marked_step"], 4)
+
+    def test_init_from_plan_exactly_one_mib_accepted_and_one_more_rejected(self):
+        base = json.dumps(plan_doc([wave("w1", goal="")]), indent=2)
+        pad = 1024 * 1024 - len(base.encode("utf-8"))
+        self.assertGreater(pad, 0)
+        raw = base.replace('"goal": ""', '"goal": "' + "x" * pad + '"')
+        self.assertEqual(len(raw.encode("utf-8")), 1024 * 1024)
+        self.write_plan(raw=raw)
+        self.assertEqual(self.init_wave_raw(f"{self.plan}#w1").returncode, 0)
+        self.manifest.unlink()
+        self.write_plan(raw=raw.replace('"x', '"xx', 1))
+        self.assert_init_rejected(f"{self.plan}#w1")
+
+    def test_init_from_plan_directory_and_fifo_give_clean_message(self):
+        self.plan.mkdir()
+        proc = self.init_wave_raw(f"{self.plan}#w1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("Errno", proc.stderr)
+        self.assertIn("regular file", proc.stderr)
+        self.assertFalse(self.manifest.exists())
+        self.plan.rmdir()
+        os.mkfifo(self.plan)
+        proc = self.init_wave_raw(f"{self.plan}#w1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("Errno", proc.stderr)
+        self.assertIn("regular file", proc.stderr)
+        self.assertFalse(self.manifest.exists())
+
+    PROPERTY_VALUES = [
+        None, True, 0, 1.5, "", [], {}, [[]], {"a": 1}, "\ud800", "\udfff"
+    ]
+
+    def property_cases(self):
+        """Every (path, value) that makes plan_doc() invalid, selected wave = w2."""
+        doc = plan_doc()
+        paths = [(key,) for key in doc if key != "waves"] + [("waves",)]
+        paths += [("waves", 1, key) for key in doc["waves"][1]]
+        paths += [
+            ("waves", 1, "acceptance", 0),
+            ("waves", 1, "checks", 0, "name"),
+            ("waves", 1, "checks", 0, "cmd"),
+            ("waves", 1, "depends_on", 0),
+        ]
+        valid = {("waves", 1, "checks"), ("waves", 1, "depends_on")}
+        for key_path in (("\ud800",), ("waves", 1, "\udfff"), ("waves", 1, "a\ud800b")):
+            mutated = copy.deepcopy(doc)
+            target = mutated
+            for key in key_path[:-1]:
+                target = target[key]
+            target[key_path[-1]] = 1
+            yield key_path, "surrogate key", mutated
+        for path in paths:
+            for value in self.PROPERTY_VALUES:
+                if path in valid and value == []:
+                    continue
+                mutated = copy.deepcopy(doc)
+                target = mutated
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                yield path, value, mutated
+
+    def test_property_init_rejects_every_bad_value_cleanly(self):
+        for path, value, mutated in self.property_cases():
+            with self.subTest(path=path, value=value):
+                if self.manifest.exists():
+                    self.manifest.unlink()
+                self.write_plan(mutated)
+                proc = self.init_wave_raw(f"{self.plan}#w2")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertTrue(proc.stderr.startswith("state:"), proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertFalse(self.manifest.exists())
+
+    def test_property_where_marks_every_bad_value_as_changed(self):
+        self.init_wave("w2")
+        for path, value, mutated in self.property_cases():
+            with self.subTest(path=path, value=value):
+                self.write_plan(mutated)
+                proc = self.run_state("where")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                info = json.loads(proc.stdout)
+                self.assertEqual(info["plan_check"], "changed")
+                self.assertTrue(
+                    info["next_action"].startswith("BLOCKED: plan changed")
+                )
+
+    def test_init_from_plan_repo_format_enforced(self):
+        for bad in ("noslash", "a/b/c", "/b", "a/", "a b/c", "a/b\n"):
+            with self.subTest(bad=bad):
+                doc = plan_doc()
+                doc["repo"] = bad
+                self.write_plan(doc)
+                self.assert_init_rejected(f"{self.plan}#w1")
+
+    def record_any(self, role, status, task="implement"):
+        extra = []
+        artifact = "evidence"
+        if status == "pass" and role == "cross_provider_reviewer":
+            extra = ["--reviewed-head", self.head(), "--packet-hash", "sha256:" + "a" * 64]
+        if status == "pass" and role == "github_codex_review":
+            artifact = "https://example.invalid/review"
+            extra = ["--reviewed-head", self.head()]
+        return self.cli(
+            "task-result", "--task", task, "--role", role, "--status", status,
+            "--session-id", f"{role}-{task}-session", "--head", self.head(),
+            "--artifact", artifact, *extra,
+        )
+
+    def passes(self, *roles):
+        for role in roles:
+            self.record_any(role, "pass")
+
+    def test_where_non_pass_findings_route_to_disposition(self):
+        cases = [
+            (("coder",), "tester", "findings"),
+            (("coder", "tester"), "cross_provider_reviewer", "findings"),
+            (("coder", "tester", "cross_provider_reviewer"), "github_codex_review", "findings"),
+            (("coder", "tester", "cross_provider_reviewer", "github_codex_review"), "coderabbit", "findings"),
+        ]
+        for before, role, status in cases:
+            with self.subTest(role=role, status=status, before=len(before)):
+                if self.manifest.exists():
+                    self.manifest.unlink()
+                self.init_wave()
+                self.passes(*before)
+                self.record_any(role, status)
+                info = self.where()
+                self.assertEqual((info["step"], info["role"]), (6, "coordinator"))
+                self.assertIn(f"fix-loop", info["next_action"])
+                self.assertIn(f"--outcome failed --source {role}", info["next_action"])
+                self.assertFalse(info["next_action"].startswith("done"))
+
+    def test_where_error_or_unavailable_is_blocked_at_that_role(self):
+        steps = {"tester": 5, "cross_provider_reviewer": 5, "github_codex_review": 7}
+        chain = ("coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        for role, step in steps.items():
+            for status in ("error", "unavailable"):
+                with self.subTest(role=role, status=status):
+                    if self.manifest.exists():
+                        self.manifest.unlink()
+                    self.init_wave()
+                    self.passes(*chain[: chain.index(role)] if role in chain else chain)
+                    self.record_any(role, status)
+                    info = self.where()
+                    self.assertEqual((info["step"], info["role"]), (step, role))
+                    self.assertTrue(
+                        info["next_action"].startswith(f"BLOCKED: {role} {status}"),
+                        info["next_action"],
+                    )
+
+    def test_where_coder_non_pass_routes_to_coder(self):
+        for status in ("findings", "incomplete", "error", "unavailable"):
+            with self.subTest(status=status):
+                if self.manifest.exists():
+                    self.manifest.unlink()
+                self.init_wave()
+                self.record_any("coder", status)
+                info = self.where()
+                self.assertEqual((info["step"], info["role"]), (4, "coder"))
+                self.assertIn("coder", info["next_action"])
+                self.assertFalse(info["next_action"].startswith("done"))
+
+    def test_where_done_only_when_no_current_result_is_non_pass(self):
+        self.init_wave()
+        self.passes("coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        self.assertTrue(self.where()["next_action"].startswith("done"))
+        self.record_any("coderabbit", "pass")
+        self.assertTrue(self.where()["next_action"].startswith("done"))
+
+    def test_where_precedence_disposition_before_coder_progression(self):
+        self.init_wave()
+        self.record_any("coder", "incomplete")
+        self.record_any("tester", "findings")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (6, "coordinator"))
+        self.assertIn("--outcome failed --source tester", info["next_action"])
+
+    def test_where_precedence_blocked_before_missing_coder(self):
+        self.init_wave()
+        self.record_any("cross_provider_reviewer", "unavailable")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (5, "cross_provider_reviewer"))
+        self.assertTrue(
+            info["next_action"].startswith("BLOCKED: cross_provider_reviewer unavailable")
+        )
+
+    def test_where_coder_findings_alone_text(self):
+        self.init_wave()
+        self.record_any("coder", "findings")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (4, "coder"))
+        self.assertEqual(
+            info["next_action"],
+            "step 4 coder: coder must finish or fix before tester (task implement)",
+        )
+
+    # Run 3 fix 2: A (fresh pre-code marks), B (task selection), C (one line)
+    def test_where_fresh_precode_mark_sets_coordinator_step(self):
+        self.init_wave()
+        self.cli("mark", "--task", "t", "--step", 2, "--safe-point", "true")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (2, "coordinator"))
+        self.assertEqual(
+            info["next_action"], "continue step 2 (requirements/plan) for task t"
+        )
+
+    def test_where_stale_precode_mark_does_not_drive_step(self):
+        self.init_wave()
+        self.cli("mark", "--task", "t", "--step", 2, "--safe-point", "true")
+        self.git("commit", "--allow-empty", "-qm", "next")
+        self.cli(
+            "resume", "--repo", self.repo, "--base", self.base, "--head", self.head()
+        )
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (4, "coder"))
+
+    def test_where_precode_mark_with_results_is_derived_not_marked(self):
+        self.init_wave()
+        self.cli("mark", "--task", "t", "--step", 2, "--safe-point", "true")
+        self.record_any("coder", "pass", task="t")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (5, "tester"))
+
+    def test_where_step_4_plus_marks_stay_informational(self):
+        self.init_wave()
+        self.cli("mark", "--task", "t", "--step", 5, "--safe-point", "true")
+        info = self.where()
+        self.assertEqual((info["step"], info["role"]), (4, "coder"))
+        self.assertEqual(info["marked_step"], 5)
+
+    def test_where_positioned_done_task_not_selected_while_another_is_open(self):
+        self.init_wave()
+        self.passes_for(
+            "a", "coder", "tester", "cross_provider_reviewer", "github_codex_review"
+        )
+        self.cli("mark", "--task", "a", "--step", 7, "--safe-point", "true")
+        self.record_any("coder", "pass", task="b")
+        info = self.where()
+        self.assertEqual(info["task"], "b")
+        self.assertEqual((info["step"], info["role"]), (5, "tester"))
+
+    def test_where_positioned_nonexistent_or_all_complete_selection(self):
+        self.init_wave()
+        full = ("coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        self.passes_for("a", *full)
+        self.passes_for("b", *full)
+        self.cli("mark", "--task", "b", "--step", 7, "--safe-point", "true")
+        info = self.where()
+        self.assertEqual(info["task"], "b")
+        self.assertTrue(info["next_action"].startswith("done"))
+
+    def test_where_selects_task_with_fresh_codex_or_coderabbit_findings(self):
+        full = ("coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        for role in ("github_codex_review", "coderabbit"):
+            with self.subTest(role=role):
+                if self.manifest.exists():
+                    self.manifest.unlink()
+                self.init_wave()
+                self.passes_for("a", "coder", "tester", "cross_provider_reviewer")
+                if role == "coderabbit":
+                    self.record_any("github_codex_review", "pass", task="a")
+                self.record_any(role, "findings", task="a")
+                self.passes_for("b", *full)
+                self.cli("mark", "--task", "b", "--step", 7, "--safe-point", "true")
+                info = self.where()
+                self.assertEqual(info["task"], "a")
+                self.assertEqual((info["step"], info["role"]), (6, "coordinator"))
+                self.assertIn(f"--source {role}", info["next_action"])
+
+    def test_where_ready_task_without_codex_result_is_not_complete(self):
+        self.init_wave()
+        self.passes_for("a", "coder", "tester", "cross_provider_reviewer")
+        self.passes_for("b", "coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        self.cli("mark", "--task", "b", "--step", 7, "--safe-point", "true")
+        info = self.where()
+        self.assertEqual(info["task"], "a")
+        self.assertEqual((info["step"], info["role"]), (7, "github_codex_review"))
+
+    def test_where_escapes_nel_in_next_action(self):
+        self.init_wave()
+        data = self.manifest_data()
+        data["tasks"]["a\x85b"] = {
+            "status": "blocked", "fix_cycles": 3, "results": {}, "session_roles": {},
+        }
+        self.manifest.write_text(json.dumps(data), encoding="utf-8")
+        action = self.where()["next_action"]
+        self.assertEqual(len(action.splitlines()), 1)
+        self.assertNotIn("\x85", action)
+
+    def test_where_safe_point_is_null_for_a_task_other_than_the_marked_one(self):
+        self.init_wave()
+        full = ("coder", "tester", "cross_provider_reviewer", "github_codex_review")
+        self.passes_for("b", *full)
+        self.record_any("coder", "pass", task="a")
+        self.cli("mark", "--task", "b", "--step", 7, "--safe-point", "true")
+        info = self.where()
+        self.assertEqual(info["task"], "a")
+        self.assertIsNone(info["safe_point"])
+        self.assertIsNone(info["marked_step"])
+
+    def passes_for(self, task, *roles):
+        for role in roles:
+            self.record_any(role, "pass", task=task)
+
+    def assert_one_line(self, text):
+        for ch in text:
+            self.assertFalse(
+                ch < " " or ch in "\x7f\u2028\u2029", repr(text)
+            )
+
+    def test_where_next_action_is_one_line_for_hostile_path_and_task(self):
+        for hostile in ("a\nb c", "x\u2028y", "p\u2029q", "t\x01u"):
+            with self.subTest(hostile=repr(hostile)):
+                self.manifest = Path(self.tmp.name) / f"run {hostile}.json"
+                self.init_wave()
+                data = self.manifest_data()
+                data["tasks"][f"task {hostile}"] = {
+                    "status": "blocked", "fix_cycles": 3, "results": {},
+                    "session_roles": {},
+                }
+                self.manifest.write_text(json.dumps(data), encoding="utf-8")
+                info = self.where()
+                self.assert_one_line(info["next_action"])
+                self.assertTrue(info["next_action"].startswith("BLOCKED"))
+                # stale tree path quotes the manifest path too
+                self.git("commit", "--allow-empty", "-qm", f"n{len(hostile)}{ord(hostile[1])}")
+                info = self.where()
+                self.assert_one_line(info["next_action"])
+                self.assertTrue(info["next_action"].startswith("run resume"))
+
+    # A4: safe-point staleness
+    def test_safe_point_true_then_commit_is_stale_false(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 6, "--safe-point", "true")
+        self.assertIs(self.where()["safe_point"], True)
+        self.git("commit", "--allow-empty", "-qm", "moved on")
+        self.assertIs(self.where()["safe_point"], False)
+
+    def test_safe_point_true_then_dirty_tree_is_false(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 6, "--safe-point", "true")
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        self.assertIs(self.where()["safe_point"], False)
+
+    def test_safe_point_null_without_position(self):
+        self.init_wave()
+        self.assertIsNone(self.where()["safe_point"])
+
+    # R5
+    def test_read_accepts_manifests_without_new_keys(self):
+        self.cli(
+            "init",
+            "--repo",
+            self.repo,
+            "--base",
+            self.base,
+            "--head",
+            self.head(),
+        )
+        self.assertEqual(self.cli("status").returncode, 0)
+        self.assertNotIn("position", self.manifest_data())
+        self.assertNotIn("plan", self.manifest_data())
+
+
+class WhereDerivationExhaustive(unittest.TestCase):
+    """derive_step against an independent reference of the normative order."""
+
+    ROLE_ORDER = (
+        "coder",
+        "tester",
+        "cross_provider_reviewer",
+        "github_codex_review",
+        "coderabbit",
+    )
+    VALUES = (None, "pass", "findings", "incomplete", "error", "unavailable")
+
+    @staticmethod
+    def reference(task_status, verdict):
+        """Returns (step, role, blocked, source) per the normative order 1-5."""
+        if task_status == "blocked":
+            return (None, None, False, None)
+        if task_status == "needs_decision":
+            return (6, "coordinator", False, None)
+        if task_status == "needs_fix":
+            return (6, "coder", False, None)
+        reviewers = [
+            ("tester", 5),
+            ("cross_provider_reviewer", 5),
+            ("github_codex_review", 7),
+        ]
+        for name, _ in reviewers:
+            if verdict.get(name) == "findings":
+                return (6, "coordinator", False, name)
+        if verdict.get("coderabbit") == "findings":
+            return (6, "coordinator", False, "coderabbit")
+        for name, step in reviewers:
+            if verdict.get(name) in ("error", "unavailable"):
+                return (step, name, True, None)
+        for name, step in reviewers:
+            if verdict.get(name) == "incomplete":
+                return (step, name, False, None)
+        if verdict.get("coder") != "pass":
+            return (4, "coder", False, None)
+        for name, step in reviewers:
+            if verdict.get(name) != "pass":
+                return (step, name, False, None)
+        return (7, None, False, None)
+
+    @staticmethod
+    def observed(module, task_status, verdict):
+        step, role, note = module.derive_step({"status": task_status}, verdict)
+        note = note or ""
+        match = re.search(r"--source (\S+)", note)
+        return (step, role, note.startswith("BLOCKED"), match and match.group(1))
+
+    def load(self):
+        spec = importlib.util.spec_from_file_location("state_precedence", STATE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_all_combinations_match_reference(self):
+        module = self.load()
+        count = 0
+        for task_status in ("in_progress", "needs_fix", "needs_decision", "blocked"):
+            for combo in itertools.product(self.VALUES, repeat=len(self.ROLE_ORDER)):
+                verdict = {
+                    role: value
+                    for role, value in zip(self.ROLE_ORDER, combo)
+                    if value is not None
+                }
+                expected = self.reference(task_status, verdict)
+                actual = self.observed(module, task_status, verdict)
+                if actual != expected:
+                    self.fail(f"{task_status} {verdict}: {actual} != {expected}")
+                count += 1
+        self.assertEqual(count, 4 * 6**5)
+
+    def test_named_coderabbit_cases(self):
+        module = self.load()
+        required = {
+            "coder": "pass",
+            "tester": "pass",
+            "cross_provider_reviewer": "pass",
+            "github_codex_review": "pass",
+        }
+        for status in ("unavailable", "error", "incomplete", "pass"):
+            with self.subTest(status=status):
+                verdict = dict(required, coderabbit=status)
+                self.assertEqual(
+                    self.observed(module, "in_progress", verdict),
+                    (7, None, False, None),
+                )
+        verdict = dict(required, coderabbit="findings")
+        self.assertEqual(
+            self.observed(module, "in_progress", verdict),
+            (6, "coordinator", False, "coderabbit"),
+        )
+        # coderabbit noise never masks a required-role problem
+        verdict = dict(required, tester="error", coderabbit="findings")
+        self.assertEqual(
+            self.observed(module, "in_progress", verdict),
+            (6, "coordinator", False, "coderabbit"),
+        )
+
+    def test_named_incomplete_cases(self):
+        module = self.load()
+        full = {
+            "coder": "pass",
+            "tester": "pass",
+            "cross_provider_reviewer": "pass",
+            "github_codex_review": "pass",
+        }
+        cases = [
+            ({"coder": "pass", "tester": "incomplete"}, (5, "tester", False, None)),
+            (
+                {"coder": "pass", "cross_provider_reviewer": "incomplete", "tester": "findings"},
+                (6, "coordinator", False, "tester"),
+            ),
+            (
+                {"coder": "pass", "github_codex_review": "incomplete",
+                 "cross_provider_reviewer": "error"},
+                (5, "cross_provider_reviewer", True, None),
+            ),
+            (dict(full, github_codex_review="incomplete"), (7, "github_codex_review", False, None)),
+        ]
+        for verdict, expected in cases:
+            with self.subTest(verdict=verdict):
+                self.assertEqual(
+                    self.observed(module, "in_progress", verdict), expected
+                )
+        step, role, note = module.derive_step(
+            {"status": "in_progress"}, {"coder": "pass", "tester": "incomplete"}
+        )
+        self.assertIn("re-run tester with the missing context", note)
+        self.assertIn("do not record fix-loop", note)
+
+    def test_named_case_findings_beat_error(self):
+        module = self.load()
+        verdict = {
+            "coder": "pass",
+            "tester": "findings",
+            "cross_provider_reviewer": "error",
+        }
+        self.assertEqual(
+            self.observed(module, "in_progress", verdict),
+            (6, "coordinator", False, "tester"),
+        )
 
 
 if __name__ == "__main__":
