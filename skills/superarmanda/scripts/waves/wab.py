@@ -116,6 +116,8 @@ def load_chain(path, create=True):
     for key in OPTIONAL_STRINGS + ("tmux_prefix",):
         if key in cfg and cfg[key] is None:
             del cfg[key]  # an explicit null is the same as leaving the field out (the default)
+    if "titles" in cfg and cfg["titles"] is None:
+        del cfg["titles"]  # no titles, like leaving it out (dash reads cfg.get("titles", {}))
     _check_types(cfg)
     cfg.setdefault("ctx_limit", 300_000)
     cfg.setdefault("idle_minutes", 12)
@@ -647,8 +649,14 @@ _HEURISTIC = [
     _HEX_KEY,                                                           # UUID, hex keys
     _OPAQUE,                                                            # long opaque blobs
 ]
-# The host and path of a github.com URL (scheme optional); the query and fragment are not part of it.
-_GITHUB_PATH = re.compile(r"(?i)(?<![\w.-])github\.com/[^\s?#]*")
+# A URL token that may be on github.com: it starts a token (start, whitespace, quote, bracket,
+# backtick, comma) and is either `http(s)://<host>/...` or a bare `[www.]github.com/...`. It ends
+# at the query/fragment or at a token boundary (whitespace, comma, brackets, quotes, <>). Whether
+# the host IS github.com is decided by _github_host on the parsed URL, never by a substring.
+_TOKEN_END = "\\s?#,()\\[\\]<>\"'`"
+_GITHUB_PATH = re.compile(r"(?i)(?<![^\s\"'`(\[<,])(?:https?://[^/" + _TOKEN_END + r"]+|(?:www\.)?github\.com)"
+                          r"/[^" + _TOKEN_END + r"]*")
+_GITHUB_HOSTS = ("github.com", "www.github.com")
 _GITHUB_SHA = re.compile(r"/(?:commit|commits|tree)/$")
 
 
@@ -675,6 +683,16 @@ def _labelled_sha(m):
                 and _SHA_LABEL.search(m.string[:m.start()]))
 
 
+def _github_host(url):
+    """True when the URL token's parsed hostname is github.com (or www.github.com)."""
+    if not re.match(r"(?i)https?://", url):
+        url = "https://" + url
+    try:
+        return (urllib.parse.urlsplit(url).hostname or "") in _GITHUB_HOSTS
+    except ValueError:
+        return False
+
+
 def _mask_structured(m):
     if m.re.groups >= 2 and m.group(2):  # `key: value` -> the key and separator stay
         return m.group(1) + m.group(2) + "[скрыто]"
@@ -687,7 +705,7 @@ def redact(text, limit=TG_LIMIT):
     for rx in _STRUCTURED:
         text = rx.sub(_mask_structured, text)
     for rx in _HEURISTIC:
-        spans = [m.span() for m in _GITHUB_PATH.finditer(text)]
+        spans = [m.span() for m in _GITHUB_PATH.finditer(text) if _github_host(m.group(0))]
 
         def keep(m, rx=rx, spans=spans):
             if _labelled_sha(m):
@@ -915,31 +933,16 @@ def drain_notices(cfg):
 
 # ---------- launch ----------
 
-ADMISSION_ROOT = re.compile(r"cc-admission-[a-z0-9_]{8}")
-ADMISSION_SIGNATURE = {"empty-template", "checkout"}
-
-
-def admitted_workdir(path):
-    """`workdir` must belong to a clone returned by `cc-autonomy prepare`: the clone itself
-    or a worktree derived from it (rules/autonomy-allowlist.md). Return the reason it is not."""
-    r = sh("git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir",
-           check=False)
-    if r.returncode != 0:
-        return f"not a git checkout: {r.stderr.strip()}"
-    common = pathlib.Path(r.stdout.strip()).resolve()
-    checkout, root = common.parent, common.parent.parent
-    if common.name != ".git" or checkout.name != "checkout" or not ADMISSION_ROOT.fullmatch(root.name):
-        return f"git dir {common} is not inside a cc-admission-*/checkout clone"
-    try:
-        if set(os.listdir(root)) != ADMISSION_SIGNATURE or root.stat().st_uid != os.getuid():
-            return f"{root} does not carry the admission signature"
-    except OSError as e:
-        return f"{root}: {e}"
-    return None
-
-
 def host_helper():
     return pathlib.Path.home() / ".claude" / "bin" / "cc-autonomy.py"
+
+
+def host_policy_signals():
+    """Signs that the host has an admission policy (rules/autonomy-allowlist.md of the host):
+    its helper or its rule. Any one of them makes the host managed; only none means unmanaged.
+    A dangling symlink is still a signal (lexists)."""
+    rule = pathlib.Path.home() / ".claude" / "rules" / "autonomy-allowlist.md"
+    return [str(p) for p in (host_helper(), rule) if os.path.lexists(p)]
 
 
 def isolated_workdir(path):
@@ -956,32 +959,66 @@ def isolated_workdir(path):
     return None
 
 
-def prepare_clone(cfg):
-    helper = host_helper()
-    if not helper.is_file():  # standalone install: no host policy, so no admission to satisfy
+def _same_path(a, b):
+    try:
+        return pathlib.Path(a).resolve() == pathlib.Path(b).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def admit(cfg, st=None):
+    """(working copy, reused). Admission belongs to the host: this runtime never judges a clone
+    by its own rules.
+    Unmanaged host (no policy signal): chain.json `workdir`, any isolated git worktree.
+    Managed host (any signal): the helper must be a file, else refused (fail-closed). The clone
+    comes only from `cc-autonomy prepare <repo>`; the first wave saves its admitted_path in the
+    state and the next waves reuse it. chain.json `workdir` is accepted only when it is that
+    saved clone; otherwise (including before the first prepare) it is refused."""
+    signals = host_policy_signals()
+    if not signals:  # standalone install: no host policy, so no admission to satisfy
         if not cfg.get("workdir"):
-            raise SystemExit("admission: no host policy (~/.claude/bin/cc-autonomy.py not found): "
+            raise SystemExit("admission: no host policy (~/.claude/bin/cc-autonomy.py and "
+                             "~/.claude/rules/autonomy-allowlist.md not found): "
                              "set workdir in chain.json to an isolated git worktree")
         why = isolated_workdir(cfg["workdir"])
         if why:
             raise SystemExit(f"workdir {cfg['workdir']} refused: {why}")
         event(cfg, f"admission: unmanaged host (no host policy), isolated git worktree {cfg['workdir']}")
-        return cfg["workdir"]
-    if cfg.get("workdir"):
-        why = admitted_workdir(cfg["workdir"])
-        if why:
-            raise SystemExit(f"admission refused for workdir {cfg['workdir']}: {why}")
-        event(cfg, f"admission: host policy, cc-admission clone {cfg['workdir']}")
-        return cfg["workdir"]
+        return cfg["workdir"], True
+    helper = host_helper()
+    if not helper.is_file():
+        raise SystemExit(f"admission refused: host policy present ({', '.join(signals)}) but its helper "
+                         f"{helper} is not a runnable file; fix the host install (fail-closed, "
+                         f"not treated as an unmanaged host)")
+    saved = (st or {}).get("admitted_path")
+    if not isinstance(saved, str) or not saved:
+        saved = None
+    if cfg.get("workdir") and not (saved and _same_path(cfg["workdir"], saved)):
+        raise SystemExit(f"admission refused for workdir {cfg['workdir']}: on a managed host workdir comes "
+                         f"from cc-autonomy prepare (saved clone: {saved or 'none yet'}); remove workdir "
+                         f"from chain.json")
+    if saved and os.path.isdir(saved):
+        event(cfg, f"admission: host policy, clone of cc-autonomy prepare kept for the chain: {saved}")
+        return saved, True
+    if saved:
+        event(cfg, f"admission: saved clone {saved} is gone; cc-autonomy prepare again")
     r = sh("python3", str(helper), "prepare", str(cfg.get("repo") or ""), check=False)
     try:
         out = json.loads(r.stdout)
     except ValueError:
         out = {}
-    if r.returncode != 0 or not out.get("ok"):
+    path = out.get("admitted_path") if isinstance(out, dict) else None
+    if r.returncode != 0 or not out.get("ok") or not isinstance(path, str) or not path:
         raise SystemExit(f"admission refused: rc={r.returncode} {r.stdout.strip()} {r.stderr.strip()}")
-    event(cfg, "admission: host policy, cc-autonomy prepare")
-    return out["admitted_path"]
+    event(cfg, f"admission: host policy, cc-autonomy prepare -> {path}")
+    if st is not None:
+        st["admitted_path"] = path
+        save_state(cfg, st)  # at once: a later refusal must not make the next try prepare a new clone
+    return path, False
+
+
+def prepare_clone(cfg, st=None):
+    return admit(cfg, st)[0]  # the working copy only; `launch` tells a reused one by the state
 
 
 GIT_TIMEOUT = 120
@@ -1143,7 +1180,7 @@ def _check_launch_allowed(cfg, st, wave, name):
 
 # Visible = a letter, digit, punctuation or symbol (categories L*, N*, P*, S*) that is not a filler
 # drawn as blank: combining marks, variation selectors, controls, format and separators alone are empty.
-_BLANK_FILLERS = frozenset("\u3164\u2800\u115f\u1160\uffa0")
+_BLANK_FILLERS = frozenset("\u3164\u2800\u115f\u1160\uffa0\ufffc\ufffd\U0001d159")
 
 
 def _visible(c):
@@ -1192,10 +1229,14 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     if tmux_alive(name):
         raise SystemExit(f"tmux session {name} already exists")
     wdir = wave_dir(cfg, wave)
-    cwd = prepare_clone(cfg)
+    saved = st.get("admitted_path")
+    cwd = prepare_clone(cfg, st)
+    # a working copy the chain already used (chain.json workdir, or the clone prepare gave the
+    # first wave) still sits on the previous wave's branch: refresh it below; a fresh clone does not
+    reused = bool(cfg.get("workdir")) or (bool(saved) and cwd == saved)
     cur = st.get("current")
     restart = cur == wave and st["waves"].get(cur, {}).get("phase") in STOPPED
-    if cfg.get("workdir") and cfg["waves"].index(wave) > 0 and not restart:
+    if reused and cfg["waves"].index(wave) > 0 and not restart:
         refresh_workdir(cfg, wave, cwd)
     prev = st.get("current")
     if prev and prev != wave and st["waves"].get(prev, {}).get("phase") == "awaiting_merge":
@@ -1495,19 +1536,33 @@ def recover_update(cfg, st, wave):
     flush_notices(cfg, st, w)
 
 
-def _stop_without_next(cfg, st, w, wave, now):
-    """A non-last wave wrote DONE without next-prompt.md: one event, one notice, the chain stops."""
+def next_prompt_problem(path):
+    """Why the next wave could not start from this next-prompt.md (the same read_prompt check as
+    its launch), or None when it can."""
+    try:
+        read_prompt(path)
+    except SystemExit as e:
+        return str(e)
+    return None
+
+
+def _stop_without_next(cfg, st, w, wave, now, why=None):
+    """A non-last wave wrote DONE without a usable next-prompt.md (missing, or `why`: refused by
+    read_prompt): one event, one notice, the chain stops."""
     w.setdefault("finished", now)
     w["phase"] = "done"
     st["current"] = None
-    st["stopped"] = f"{wave}: DONE without next-prompt.md"
+    st["stopped"] = f"{wave}: DONE with an unusable next-prompt.md" if why else f"{wave}: DONE without next-prompt.md"
     fresh_stop = once_per(w, "no_next", "1")
     if fresh_stop:
         put_notice(w, "no_next", "1",
+                   f"wave-autobot: {wave} готова, но next-prompt.md непригоден ({redact(why)}) — "
+                   f"следующую волну не запускаю." if why else
                    f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
     save_state(cfg, st)
     if fresh_stop:
-        event(cfg, f"{wave}: DONE without next-prompt.md; chain stopped")
+        event(cfg, f"{wave}: DONE with an unusable next-prompt.md ({why}); chain stopped" if why else
+              f"{wave}: DONE without next-prompt.md; chain stopped")
     flush_notices(cfg, st, w)
     return False
 
@@ -1564,6 +1619,9 @@ def _tick(cfg, st):
         nxt = wdir / "next-prompt.md"
         if not is_last and not nxt.exists():  # the coordinator's launch would fail: stop loudly now
             return _stop_without_next(cfg, st, w, wave, now)
+        why = None if is_last else next_prompt_problem(nxt)
+        if why:  # present but refused by the same check as the launch: not handed over either
+            return _stop_without_next(cfg, st, w, wave, now, why)
         # the phase and its notice in ONE save: a crash after it still owes the notice (at least once),
         # and the phase stops a second hand-off, so a restart does not queue it twice
         w["phase"] = "awaiting_merge"
@@ -1610,6 +1668,9 @@ def _tick(cfg, st):
             return False
         if not nxt.exists():
             return _stop_without_next(cfg, st, w, wave, now)
+        why = next_prompt_problem(nxt)
+        if why:
+            return _stop_without_next(cfg, st, w, wave, now, why)
         flush_notices(cfg, st, w)  # «волна завершена» goes out before the next wave starts
         started = launch(cfg, waves[idx + 1], nxt, by_dispatcher=True)
         fresh_st = load_state(cfg)  # launch saved a newer snapshot (new current, new record):

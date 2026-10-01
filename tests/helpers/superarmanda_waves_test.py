@@ -770,32 +770,6 @@ class Admission(Base):
             (root / extra).write_text("x", encoding="utf-8")
         return root
 
-    def test_arbitrary_git_directory_is_refused(self):
-        plain = self.tmp / "plain"
-        plain.mkdir()
-        subprocess.run(["git", "init", "-q", str(plain)], check=True)
-        self.assertIsNotNone(wab.admitted_workdir(plain))
-        self.assertIsNotNone(wab.admitted_workdir(self.tmp / "not-a-repo"))
-
-    def test_extra_entry_in_the_root_is_refused(self):
-        root = self.make_root(extra="stray")
-        self.assertIsNotNone(wab.admitted_workdir(root / "checkout"))
-
-    def test_correct_signature_is_accepted(self):
-        root = self.make_root()
-        self.assertIsNone(wab.admitted_workdir(root / "checkout"))
-
-    def test_derived_worktree_is_accepted(self):
-        root = self.make_root()
-        co = root / "checkout"
-        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e.invalid",
-               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e.invalid"}
-        subprocess.run(["git", "-C", str(co), "commit", "-q", "--allow-empty", "-m", "i"],
-                       check=True, env={**os.environ, **env})
-        wt = self.tmp / "wt"
-        subprocess.run(["git", "-C", str(co), "worktree", "add", "-q", "-b", "x", str(wt)], check=True)
-        self.assertIsNone(wab.admitted_workdir(wt))
-
     def test_relative_workdir_is_absolute_everywhere(self):
         root = self.make_root()
         cfg, path = self.chain(workdir="../cc-admission-abcd1234/checkout")
@@ -840,23 +814,19 @@ class Admission(Base):
         with self.assertRaises(SystemExit):
             wab.prepare_clone(cfg)
 
-    def test_host_policy_keeps_the_signature_check_and_prepare(self):
+    def test_host_policy_takes_only_the_clone_of_prepare(self):
         self.host_policy()
-        plain = self.tmp / "plain"
-        plain.mkdir()
-        subprocess.run(["git", "init", "-q", str(plain)], check=True)
-        cfg, _ = self.chain(workdir=str(plain))
-        with self.assertRaises(SystemExit):
-            wab.prepare_clone(cfg)
-        root = self.make_root()
+        root = self.make_root()  # the old signature means nothing to this runtime any more
         cfg, _ = self.chain(workdir=str(root / "checkout"))
-        self.assertEqual(wab.prepare_clone(cfg), str((root / "checkout").resolve()))
-        self.assertIn("host policy", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_clone(cfg)
+        self.assertIn("cc-autonomy prepare", str(cm.exception))
         cfg, _ = self.chain()
         out = json.dumps({"ok": True, "admitted_path": "/x/y"})
         with mock.patch.object(wab, "sh", return_value=subprocess.CompletedProcess([], 0, out, "")) as m:
             self.assertEqual(wab.prepare_clone(cfg), "/x/y")
         self.assertIn("prepare", m.call_args[0])
+        self.assertIn("host policy", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
     def test_launch_refuses_an_unadmitted_workdir(self):
         self.host_policy()
@@ -4869,6 +4839,275 @@ class W4Round31PromptVisible(Base):
                 p = self.tmp / "p.md"
                 p.write_text(text, encoding="utf-8")
                 self.assertTrue(wab.read_prompt(p))
+
+
+class W4Round32Admission(Base):
+    """Round 32 (P1): admission belongs to the host. No local copy of its signature rules: on a
+    managed host (any policy signal: the helper or rules/autonomy-allowlist.md) the clone comes
+    only from `cc-autonomy prepare`, saved in the state and reused by the next waves; a signal
+    without a working helper is a refusal, never «unmanaged»."""
+
+    def git_repo(self, name="admitted"):
+        p = self.tmp / name
+        p.mkdir()
+        subprocess.run(["git", "init", "-q", str(p)], check=True)
+        return p
+
+    def helper(self, admitted=None, rc=0, ok=True):
+        """A fake host helper in the temporary HOME: counts its calls, prints the JSON of prepare."""
+        h = self.home / ".claude" / "bin" / "cc-autonomy.py"
+        h.parent.mkdir(parents=True, exist_ok=True)
+        calls = self.tmp / "prepare-calls"
+        out = json.dumps({"ok": ok, "admitted_path": str(admitted) if admitted else None})
+        h.write_text("import sys\n"
+                     f"open({str(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                     f"print({out!r})\n"
+                     f"sys.exit({rc})\n", encoding="utf-8")
+        return calls
+
+    def rules(self):
+        r = self.home / ".claude" / "rules" / "autonomy-allowlist.md"
+        r.parent.mkdir(parents=True, exist_ok=True)
+        r.write_text("# host policy\n", encoding="utf-8")
+
+    def ncalls(self, calls):
+        return len(calls.read_text(encoding="utf-8").splitlines()) if calls.exists() else 0
+
+    def test_no_local_copy_of_the_signature_rules(self):
+        for name in ("admitted_workdir", "ADMISSION_ROOT", "ADMISSION_SIGNATURE"):
+            self.assertFalse(hasattr(wab, name), name)
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        self.assertNotIn("cc-admission-", src)
+        self.assertNotIn("empty-template", src)
+
+    def test_rules_signal_without_helper_is_a_refusal_not_unmanaged(self):
+        self.rules()
+        cfg, _ = self.chain(workdir=str(self.git_repo("plain")))
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_clone(cfg)
+        self.assertIn("host policy", str(cm.exception))
+        self.assertIn("autonomy-allowlist.md", str(cm.exception))
+
+    def test_helper_that_is_not_a_file_is_a_refusal(self):
+        h = self.home / ".claude" / "bin" / "cc-autonomy.py"
+        h.mkdir(parents=True)  # present, but not a runnable file
+        cfg, _ = self.chain(workdir=str(self.git_repo("plain")))
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_clone(cfg)
+        self.assertIn("host policy", str(cm.exception))
+
+    def test_dangling_helper_symlink_is_a_signal_and_a_refusal(self):
+        h = self.home / ".claude" / "bin" / "cc-autonomy.py"
+        h.parent.mkdir(parents=True)
+        h.symlink_to(self.tmp / "gone.py")
+        cfg, _ = self.chain(workdir=str(self.git_repo("plain")))
+        with self.assertRaises(SystemExit):
+            wab.prepare_clone(cfg)
+
+    def test_failing_helper_is_a_refusal(self):
+        self.rules()
+        self.helper(admitted=self.git_repo(), rc=3, ok=False)
+        cfg, _ = self.chain()
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_clone(cfg)
+        self.assertIn("admission refused", str(cm.exception))
+
+    def test_managed_host_refuses_workdir_from_chain_json_even_with_the_old_signature(self):
+        root = self.tmp / "cc-admission-abcd1234"
+        (root / "empty-template").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(root / "checkout")], check=True)
+        calls = self.helper(admitted=self.git_repo())
+        cfg, _ = self.chain(workdir=str(root / "checkout"))
+        self.alive = False
+        p = self.tmp / "p.md"
+        p.write_text("go", encoding="utf-8")
+        with self.assertRaises(SystemExit) as cm:
+            wab.launch(cfg, "W1", p)
+        self.assertIn("cc-autonomy prepare", str(cm.exception))
+        self.assertFalse([c for c in self.tmux_calls if c[1] == "new-session"])
+        self.assertEqual(self.ncalls(calls), 0)
+
+    def test_managed_chain_keeps_the_prepared_clone_for_the_next_waves(self):
+        clone = self.git_repo()
+        calls = self.helper(admitted=clone)
+        self.rules()
+        cfg, _ = self.chain()
+        self.alive = False
+        p = self.tmp / "p.md"
+        p.write_text("go", encoding="utf-8")
+        self.assertTrue(wab.launch(cfg, "W1", p))
+        st = self.get_state(cfg)
+        self.assertEqual(st["admitted_path"], str(clone))
+        self.assertEqual(st["waves"]["W1"]["cwd"], str(clone))
+        self.assertEqual(self.ncalls(calls), 1)
+        self.assertIn("prepare o/r", calls.read_text(encoding="utf-8"))
+        st["waves"]["W1"]["phase"] = "awaiting_merge"
+        self.put_state(cfg, st)
+        refreshed = []
+        with mock.patch.object(wab, "refresh_workdir", side_effect=lambda c, w, cwd: refreshed.append((w, cwd))):
+            self.assertTrue(wab.launch(cfg, "W2", p))
+        self.assertEqual(self.ncalls(calls), 1)  # not prepared again: the same clone
+        self.assertEqual(refreshed, [("W2", str(clone))])
+        self.assertEqual(self.get_state(cfg)["waves"]["W2"]["cwd"], str(clone))
+
+    def test_managed_workdir_equal_to_the_saved_clone_is_accepted_other_refused(self):
+        clone = self.git_repo()
+        calls = self.helper(admitted=clone)
+        cfg, _ = self.chain(workdir=str(clone))
+        st = {"waves": {}, "admitted_path": str(clone)}
+        self.assertEqual(wab.prepare_clone(cfg, st), str(clone))
+        cfg, _ = self.chain(workdir=str(self.git_repo("other")))
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_clone(cfg, st)
+        self.assertIn("cc-autonomy prepare", str(cm.exception))
+        self.assertEqual(self.ncalls(calls), 0)
+
+    def test_unmanaged_only_without_any_signal(self):
+        plain = self.git_repo("plain")
+        cfg, _ = self.chain(workdir=str(plain))
+        self.assertEqual(wab.prepare_clone(cfg), str(plain.resolve()))
+        self.assertIn("unmanaged host", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+
+class W4Round32NextPrompt(Base):
+    """Round 32 (P2): a non-last wave's DONE is handed over only with a next-prompt.md that the
+    coordinator's launch will accept (read_prompt); an unusable one stops like a missing one."""
+
+    def test_unusable_next_prompt_is_not_handed_over(self):
+        for gate, impl in (("external", True), (None, False), (None, True)):
+            for content in (b"", b"  \n\t", b"\xff\xfe bad", "\u200b\u3164".encode()):
+                with self.subTest(gate=gate, impl=impl, content=content):
+                    self.tg.clear()
+                    cfg, _ = self.chain(merge_gate=gate)
+                    (cfg["run_dir"] / "events.log").unlink(missing_ok=True)
+                    self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                    self.set_status(cfg, "W1", "DONE")
+                    (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_bytes(content)
+                    with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", impl, create=True), \
+                            mock.patch.object(wab, "launch") as launch:
+                        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+                    launch.assert_not_called()
+                    st = self.get_state(cfg)
+                    self.assertEqual(st["waves"]["W1"]["phase"], "done")
+                    self.assertIsNone(st["current"])
+                    self.assertIn("next-prompt.md", st["stopped"])
+                    log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+                    self.assertIn("unusable next-prompt.md", log)
+                    self.assertNotIn("awaiting merge", log)
+                    self.assertEqual(len([t for t in self.tg if "next-prompt.md" in t]), 1)
+
+    def test_valid_next_prompt_is_still_handed_over(self):
+        cfg, _ = self.chain(merge_gate="external")
+        self.alive = False
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+
+
+class W4Round32GithubHost(Base):
+    """Round 32: the github.com exemption is decided by the parsed host of the URL, not by a
+    `github.com/` substring anywhere."""
+
+    SECRET = "Qw7" + "Er8Ty9Ui0Op1As2Df3Gh4Jk5Lz6Xc7Vb8Nm9Qa1Ws2"  # synthetic, 45 chars
+
+    def test_github_lookalikes_are_not_exempt(self):
+        s = self.SECRET
+        for text in (f"https://example.org/github.com/o/r/{s}",
+                     f"https://example.org/x?u=github.com/o/r/{s}",
+                     f"https://example.org/x?next=https://github.com/o/r/{s}",
+                     f"https://github.com.evil.example/o/r/{s}",
+                     f"github.com.evil.example/o/r/{s}",
+                     f"https://github.com@evil.example/o/r/{s}",
+                     f"https://evil.example/github.com/{s}",
+                     f"see example.org/github.com/o/{s}",
+                     f"xgithub.com/o/r/{s}"):
+            with self.subTest(text=text):
+                out = wab.redact(text, 1200)
+                self.assertNotIn(s, out)
+                self.assertIn("[скрыто]", out)
+
+    def test_real_github_urls_stay_readable(self):
+        for url in ("https://github.com/o/r/pull/12",
+                    "https://www.github.com/o/r/actions/runs/18234567890",
+                    "http://github.com/o/wave-autobot-superarmanda-dispatcher/issues/345",
+                    "github.com/o/wave-autobot-superarmanda-dispatcher/issues/345",
+                    "HTTPS://GitHub.com/o/r/pull/12/files"):
+            for text in (url, f"PR: {url} ok", f"({url})", f"`{url}`", f"<{url}>"):
+                with self.subTest(text=text):
+                    self.assertEqual(wab.redact(text, 1200), text)
+
+
+class W4Round32DashTitlesNull(Base):
+    """Round 32: `titles: null` is the same as leaving it out; the dashboard frame renders."""
+
+    def test_titles_null_loads_and_renders(self):
+        doc = {"chain": CHAIN, "run_id": RUN_ID, "repo": "o/r", "waves": ["W1", "W2"], "titles": None}
+        cfgdir = self.tmp / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        path = cfgdir / "chain.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        cfg = wab.load_chain(path)
+        self.assertEqual(cfg.get("titles") or {}, {})
+        try:
+            import dash
+            from rich.console import Console
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "RUNNING")
+        buf = io.StringIO()
+        Console(file=buf, width=200, force_terminal=False).print(dash.safe_render(cfg))
+        text = buf.getvalue()
+        self.assertNotIn("кадр не отрисован", text)
+        self.assertIn("W1", text)
+        cfg["titles"] = None  # a cfg built by hand: dash itself must not crash on it
+        buf = io.StringIO()
+        Console(file=buf, width=200, force_terminal=False).print(dash.safe_render(cfg))
+        self.assertNotIn("кадр не отрисован", buf.getvalue())
+
+
+class W4Round32TesterP3(Base):
+    """Round 32, tester-r31 P3: the github exemption ends with the URL token; an unreadable status
+    keeps the last known one on the dashboard; U+FFFC, U+FFFD and U+1D159 are not visible."""
+
+    BLOB = "aB3_xY7-Qz9" + "Kp2Lm5Nv8Rt1Ws4Hd6Jf0Gc3Vb7Ne9Mu2Xi5Yo8Pq1Zr4St7U"  # synthetic, 60 chars
+
+    def test_github_exemption_stops_at_the_url_token(self):
+        b = self.BLOB
+        self.assertEqual(len(b), 60)
+        for text in (f"https://github.com/o/r/pull/3,{b}",
+                     f"(https://github.com/o/r/pull/3){b}",
+                     f"https://github.com/o/r/pull/3\"{b}",
+                     f"<https://github.com/o/r/pull/3>{b}",
+                     f"https://x.io/go?u=github.com/{b}"):
+            with self.subTest(text=text):
+                out = wab.redact(text, 1200)
+                self.assertNotIn(b, out)
+                self.assertIn("[скрыто]", out)
+        self.assertEqual(wab.redact("https://github.com/o/r/pull/3, ok", 1200), "https://github.com/o/r/pull/3, ok")
+
+    def test_dashboard_keeps_the_last_status_when_status_is_unreadable(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        cfg, _ = self.chain()
+        st = {"current": "W1", "waves": {"W1": self.wave_rec(last_status="RUNNING")}}
+        sp = wab.wave_dir(cfg, "W1") / "status"
+        sp.unlink(missing_ok=True)
+        sp.mkdir()  # exists, cannot be read as a file
+        self.assertEqual(dash.wave_state(cfg, st, "W1")[0], "RUNNING")
+
+    def test_object_replacement_and_null_notehead_are_not_visible(self):
+        for text in ("￼", "�", "\U0001d159", " ￼�\U0001d159\n"):
+            with self.subTest(text=ascii(text)):
+                p = self.tmp / "p.md"
+                p.write_text(text, encoding="utf-8")
+                with self.assertRaises(SystemExit) as cm:
+                    wab.read_prompt(p)
+                self.assertIn("empty", str(cm.exception))
 
 
 class TmuxGuard(unittest.TestCase):

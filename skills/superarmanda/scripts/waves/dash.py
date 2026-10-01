@@ -114,7 +114,10 @@ def wave_state(cfg, st, wave):
     w = st["waves"].get(wave)
     if not w:
         return "pending", w
-    status = wab.read(cfg["run_dir"] / wave / "status")
+    status = wab.read(cfg["run_dir"] / wave / "status", on_error=None)
+    if not status:  # unreadable or mid-rewrite: the last known status, as the watch decides
+        status = w.get("last_status") or ""
+        status = status if isinstance(status, str) else ""
     if status.startswith("BLOCKED"):
         return "BLOCKED", w
     if w.get("phase") == "awaiting_merge":
@@ -136,7 +139,7 @@ def pipeline(cfg, st):
         if i < len(cfg["waves"]) - 1:
             done = key in ("DONE", "awaiting_merge")
             t.append(" ━━▶ " if done else " ──▷ ", style="green" if done else "grey42")
-    titles = cfg.get("titles", {})
+    titles = cfg.get("titles") or {}
     sub = Text("  ·  ".join(f"{w}: {titles[w]}" for w in cfg["waves"] if w in titles),
                style="grey62", justify="center")
     return Group(t, sub)
