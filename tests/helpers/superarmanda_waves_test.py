@@ -75,6 +75,7 @@ class Base(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop("TMUX", None)
+        os.environ.pop("TMUX_PANE", None)
         self.tmux_calls = []
         self.sent = []  # (kind, name, text)
         self.alive = True
@@ -104,6 +105,8 @@ class Base(unittest.TestCase):
         patch("press_enter", side_effect=lambda n: self.enters.append(n))
         patch("wait_ready", side_effect=lambda name, timeout=90: self.ready)
         patch("require_tmux")
+        # the auto-merge branch is W5; legacy launch tests exercise it, the fail-closed ones turn it off
+        patch("MERGE_GATE_IMPLEMENTED", new=True, create=True)
         patch("_send_telegram", side_effect=lambda cfg, text: self.tg.append(text))
         sleeper = mock.patch("time.sleep")
         sleeper.start()
@@ -1981,7 +1984,7 @@ class KeysAndRegistry(Base):
     def test_socket_travels_into_the_popup_command(self):
         conf = wab.keys_conf(self.reg(), "my.sock")
         self.assertEqual(conf.count('"WAB_TMUX_SOCKET=my.sock '), 2)
-        self.assertNotIn("WAB_TMUX_SOCKET", wab.keys_conf(self.reg()))
+        self.assertNotIn("WAB_TMUX_SOCKET=", wab.keys_conf(self.reg()))  # default server: reset, not set
         for bad in ("a b", 'a"b', "a;b", "a$(x)", "a\nb", "", "a{b", "a#b"):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
@@ -2514,6 +2517,129 @@ class ChainConfig(Base):
         shutil.rmtree(cfg["run_dir"])
         wab.load_chain(path, create=False)
         self.assertFalse(cfg["run_dir"].exists())
+
+
+class W4Round20(Base):
+    def _doc(self, **over):
+        d = self.tmp / "r20"
+        d.mkdir(exist_ok=True)
+        p = d / "chain.json"
+        p.write_text(json.dumps({"chain": CHAIN, "run_id": RUN_ID, "waves": ["W1"], **over}), encoding="utf-8")
+        return p
+
+    def test_huge_int_settings_are_a_clean_refusal(self):
+        for field in ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds"):
+            with self.subTest(field=field):
+                path = self._doc()
+                path.write_text('{"chain": "%s", "run_id": "%s", "waves": ["W1"], "%s": %s}'
+                                % (CHAIN, RUN_ID, field, "9" * 400), encoding="utf-8")
+                with self.assertRaises(SystemExit) as ctx:
+                    wab.load_chain(path, create=False)
+                self.assertIn(field, str(ctx.exception))
+
+    def test_huge_int_on_a_live_edit_keeps_the_previous_settings(self):
+        cfg, path = self.chain()
+        text = path.read_text(encoding="utf-8").replace('"tick_seconds": 1,', '"tick_seconds": %s,' % ("9" * 400))
+        path.write_text(text, encoding="utf-8")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        with mock.patch.object(wab.time, "sleep"):
+            wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(cfg["tick_seconds"], 1)
+        self.assertIn("keeping the previous settings", "\n".join(
+            p.read_text(encoding="utf-8") for p in cfg["run_dir"].glob("*.log")))
+
+    def test_default_server_popup_resets_the_inherited_socket(self):
+        opener = str(WAVES / "wab-open")
+        reg = {"wv-dash": [opener, "/srv/a/chain.json"]}
+        conf = wab.keys_conf(reg)
+        self.assertIn("env -u WAB_TMUX_SOCKET " + opener, conf)
+        self.assertNotIn("env -u", wab.keys_conf(reg, "my.sock"))
+
+    def test_wab_open_with_an_empty_socket_is_the_default_server(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W2", "waves": {"W2": self.wave_rec("W2")}})
+        bindir = self.tmp / "fakebin2"
+        bindir.mkdir()
+        log = self.tmp / "tmux2.log"
+        fake = bindir / "tmux"
+        fake.write_text(f'#!/bin/sh\necho "$*" >> {log}\nexit 0\n', encoding="utf-8")
+        fake.chmod(0o755)
+        env = dict(os.environ, WAB_TMUX_SOCKET="", PATH=f"{bindir}:{os.environ['PATH']}")
+        subprocess.run([str(WAVES / "wab-open"), str(path)], stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, encoding="utf-8", env=env)
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(lines), 2)
+        for line in lines:
+            self.assertNotRegex(line, r"(^|\s)-[LS]\s")
+
+    def test_without_merge_gate_done_hands_off_until_w5_exists(self):
+        cfg, path = self.chain()
+        self.alive = False
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        nxt = wab.wave_dir(cfg, "W1") / "next-prompt.md"
+        nxt.write_text("go\n", encoding="utf-8")
+        with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", False, create=True), \
+                mock.patch.object(wab, "launch") as launch, mock.patch.object(wab, "bind_popup"):
+            wab.watch(cfg, path, max_ticks=5)
+        launch.assert_not_called()
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("merge gate not implemented yet (W5); handing off to coordinator", log)
+        self.assertIn(f"wab.py launch {path.resolve()} W2 {nxt}", log)
+
+    def test_last_wave_without_merge_gate_finishes_as_before(self):
+        cfg, _ = self.chain(waves=["W1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", False, create=True):
+            self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertIsNone(self.get_state(cfg)["current"])
+        self.assertIn("chain finished", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_external_done_without_next_prompt_stops_loudly(self):
+        for gate, impl in (("external", True), (None, False)):
+            with self.subTest(gate=gate):
+                self.tg.clear()
+                cfg, path = self.chain(merge_gate=gate)
+                (cfg["run_dir"] / "events.log").unlink(missing_ok=True)  # shared run dir between subtests
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                self.set_status(cfg, "W1", "DONE")
+                with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", impl, create=True):
+                    self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+                    self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+                    log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+                    self.assertEqual(log.count("W1: DONE without next-prompt.md; chain stopped"), 1)
+                    self.assertNotIn("handed to the coordinator", log)
+                    self.assertEqual(len([t for t in self.tg if "next-prompt.md" in t]), 1)
+                    with mock.patch.object(wab, "time") as t, mock.patch.object(wab, "bind_popup"), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        t.time.return_value = 0.0
+                        with self.assertRaises(SystemExit) as ctx:
+                            wab.main(["wab.py", "watch", str(path)])
+                    self.assertEqual(ctx.exception.code, 3)
+
+    def test_enabled_telegram_needs_all_three_fields_as_strings(self):
+        full = {"keyvault": "kv", "token_secret": "t", "chat_secret": "c"}
+        for bad in ({"keyvault": "kv"}, {**full, "chat_secret": ""}, {**full, "token_secret": 5},
+                    {**full, "keyvault": None}, {"x": 1}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as ctx:
+                    wab.load_chain(self._doc(telegram=bad), create=False)
+                self.assertIn("telegram", str(ctx.exception))
+        wab.load_chain(self._doc(telegram=full), create=False)
+
+    def test_partial_telegram_on_a_live_edit_keeps_the_previous_settings(self):
+        cfg, path = self.chain()
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["telegram"] = {"keyvault": "kv"}
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        with mock.patch.object(wab.time, "sleep"):
+            wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(cfg["telegram"]["token_secret"], "tok")
+        self.assertIn("keeping the previous settings", "\n".join(
+            p.read_text(encoding="utf-8") for p in cfg["run_dir"].glob("*.log")))
 
 
 class Utf8(Base):

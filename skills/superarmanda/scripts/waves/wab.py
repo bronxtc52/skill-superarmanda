@@ -60,6 +60,10 @@ def registry_path():
 # ---------- config and state ----------
 
 # Upper bounds: a day of minutes, an hour between ticks, ten million tokens are already absurd.
+# The merge gate (wait for MERGED, fetch the base, ancestor check) is W5. Until it exists a DONE of a
+# non-last wave never launches the next one by itself: it is handed to the coordinator like `external`.
+MERGE_GATE_IMPLEMENTED = False
+
 NUM_LIMITS = {"ctx_limit": 10_000_000, "idle_minutes": 1440, "handoff_timeout_minutes": 1440,
               "tick_seconds": 3600}
 
@@ -88,7 +92,8 @@ def load_chain(path, create=True):
     cfg.setdefault("tmux_prefix", "wab-")
     for key in NUM_LIMITS:
         v = cfg[key]  # an explicit null/string/bool/<=0/nan/inf would crash `watch` later
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) \
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or (isinstance(v, float) and not math.isfinite(v))  \
                 or v < 0 or (v == 0 and key != "idle_minutes"):  # idle 0 = flag idleness at once
             raise SystemExit(f"chain.json: {key} must be a positive number, got {v!r}")
         if v > NUM_LIMITS[key]:  # time.sleep(1e10) raises OverflowError and kills `watch`
@@ -99,8 +104,13 @@ def load_chain(path, create=True):
     if titles is not None and not (isinstance(titles, dict)
                                    and all(isinstance(v, str) for v in titles.values())):
         raise SystemExit("chain.json: titles must be an object of wave id -> string")
-    if cfg.get("telegram") and not isinstance(cfg["telegram"], dict):
+    tg = cfg.get("telegram")
+    if tg and not isinstance(tg, dict):
         raise SystemExit("chain.json: telegram must be an object")
+    if tg and not all(isinstance(tg.get(k), str) and tg[k] for k in ("keyvault", "token_secret", "chat_secret")):
+        # an enabled block with a hole would silently turn every notice into a local event
+        raise SystemExit("chain.json: telegram needs non-empty string keyvault, token_secret and chat_secret "
+                         "(or leave it out / empty to disable)")
     chain = str(cfg.get("chain") or "")
     run_id = str(cfg.get("run_id") or "")
     if not _plain_name(chain):
@@ -1026,6 +1036,20 @@ def recover_update(cfg, st, wave):
                     f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: {attach_cmd(w['tmux'])}")
 
 
+def _stop_without_next(cfg, st, w, wave, now):
+    """A non-last wave wrote DONE without next-prompt.md: one event, one notice, the chain stops."""
+    w.setdefault("finished", now)
+    w["phase"] = "done"
+    st["current"] = None
+    st["stopped"] = f"{wave}: DONE without next-prompt.md"
+    fresh_stop = once_per(w, "no_next", "1")
+    save_state(cfg, st)
+    if fresh_stop:
+        event(cfg, f"{wave}: DONE without next-prompt.md; chain stopped")
+        notify(cfg, f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
+    return False
+
+
 def tick(cfg, st):
     try:
         return _tick(cfg, st)
@@ -1063,11 +1087,20 @@ def _tick(cfg, st):
         return True
 
     # DONE first: a wave may finish and close its window between two ticks
-    if status == "DONE" and cfg.get("merge_gate") == "external":
+    external = cfg.get("merge_gate") == "external"
+    waves = cfg["waves"]
+    is_last = waves.index(wave) + 1 >= len(waves)
+    if status == "DONE" and (external or (not MERGE_GATE_IMPLEMENTED and not is_last)):
+        nxt = wdir / "next-prompt.md"
+        if not is_last and not nxt.exists():  # the coordinator's launch would fail: stop loudly now
+            return _stop_without_next(cfg, st, w, wave, now)
         w["phase"] = "awaiting_merge"  # saved before any notice: at most once
         w["finished"] = now
         save_state(cfg, st)
-        event(cfg, f"{wave}: DONE, awaiting merge by the coordinator")
+        if external:
+            event(cfg, f"{wave}: DONE, awaiting merge by the coordinator")
+        else:
+            event(cfg, f"{wave}: DONE, merge gate not implemented yet (W5); handing off to coordinator")
         notify(cfg, f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n"
                     f"Мердж и запуск следующей волны — за координатором.")
         if tmux_alive(name):
@@ -1098,14 +1131,7 @@ def _tick(cfg, st):
             notify(cfg, "wave-autobot: цепочка завершена, все волны готовы.")
             return False
         if not nxt.exists():
-            st["current"] = None
-            st["stopped"] = f"{wave}: DONE without next-prompt.md"
-            fresh_stop = once_per(w, "no_next", "1")
-            save_state(cfg, st)
-            if fresh_stop:
-                event(cfg, f"{wave}: DONE without next-prompt.md; chain stopped")
-                notify(cfg, f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
-            return False
+            return _stop_without_next(cfg, st, w, wave, now)
         save_state(cfg, st)
         return launch(cfg, waves[idx + 1], nxt)
 
@@ -1240,7 +1266,9 @@ def keys_conf(registry, socket=None):
     server's own environment need not carry it."""
     if socket is not None and not (isinstance(socket, str) and SAFE_SOCKET.fullmatch(socket)):
         raise ValueError(f"unsafe tmux socket {socket!r}: [A-Za-z0-9_./+-]")
-    env = f"WAB_TMUX_SOCKET={socket} " if socket else ""
+    # the popup inherits the tmux SERVER's environment, which may still hold another server's socket:
+    # the default server clears it explicitly
+    env = f"WAB_TMUX_SOCKET={socket} " if socket else "env -u WAB_TMUX_SOCKET "
     key = '"C-\\\\"'
     cmd = (f'if-shell -F "#{{m:*ignore-size*,#{{client_flags}}}}" '
            f'{{ detach-client }} {{ send-keys {key} }}')
