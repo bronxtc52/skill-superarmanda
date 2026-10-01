@@ -317,7 +317,7 @@ severity проходят через `fix-loop`, отсутствия P0/P1 ма
 | `run_dir` | база каталога прогона (по умолчанию `runs/` рядом с `chain.json`) |
 | `repo` | `owner/repo`; клон выдаёт `cc-autonomy prepare` |
 | `waves`, `titles` | идентификаторы волн по порядку и подписи для дашборда |
-| `tmux_prefix` | префикс имён tmux-сессий, `[A-Za-z0-9_-]+` |
+| `tmux_prefix` | префикс имён tmux-сессий, `[A-Za-z0-9_-]+`; должен быть уникален на tmux-сервере (реестр `Ctrl+\` ключится по `<prefix>dash`) |
 | `merge_gate` | `external`: после `DONE` волна ждёт мерджа от координатора (`awaiting_merge`) |
 | `ctx_limit` | порог контекста в токенах для `WAB-CHECKPOINT` (300000) |
 | `idle_minutes` | через сколько минут тишины предупредить (12) |
@@ -327,3 +327,5 @@ severity проходят через `fix-loop`, отсутствия P0/P1 ма
 | `workdir` | готовый клон вместо `cc-autonomy prepare`; принимается только клон `cc-admission-*/checkout` или его worktree |
 | `mandate_sha256` | SHA-256 файла `<run_dir>/mandate.md`, одобренного владельцем; не совпал — запуск отказывает |
 | `telegram` | `{"keyvault": …, "token_secret": …, "chat_secret": …}`; нет или `false` — сообщения только в журнал событий |
+
+Путь установки с пробелом или другим символом вне `[A-Za-z0-9_./+-]` отключает `Ctrl+\` (событие в журнале, запасного биндинга нет).

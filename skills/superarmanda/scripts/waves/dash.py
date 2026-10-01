@@ -219,7 +219,7 @@ def safe_render(cfg):
     a half-written file or a missing key must cost one frame, not the whole view."""
     try:
         return render(cfg)
-    except Exception as e:  # noqa: BLE001 - any read race; the next frame retries
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - any read race; the next frame retries
         return Panel(Text(f"кадр не отрисован: {type(e).__name__}: {e}\nповтор через 3 с",
                           style="yellow"), title="dash", border_style="yellow")
 

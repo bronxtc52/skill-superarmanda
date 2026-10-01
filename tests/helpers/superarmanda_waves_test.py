@@ -231,6 +231,18 @@ class TranscriptCacheTests(Base):
         got = cache.read(p)
         self.assertEqual((got["turns"], got["ctx"]), (3, 6))
 
+    def test_in_place_rewrite_with_same_inode_and_larger_size_resets(self):
+        p = self.tmp / "t.jsonl"
+        p.write_text(asst(inp=1, out=5) + "\n", encoding="utf-8")
+        cache = wab.TranscriptCache()
+        self.assertEqual(cache.read(p)["ctx"], 1)
+        ino = p.stat().st_ino
+        with open(p, "r+", encoding="utf-8") as f:  # same inode, different head, longer
+            f.write(asst(inp=2, out=60000) + "\n" + asst(inp=3, out=7) + "\n")
+        self.assertEqual(p.stat().st_ino, ino)
+        got = cache.read(p)
+        self.assertEqual((got["turns"], got["ctx"]), (2, 3))
+
     def test_vanished_file_is_zero_not_an_exception(self):
         got = wab.TranscriptCache().read(self.tmp / "gone.jsonl")
         self.assertEqual((got["turns"], got["ctx"]), (0, 0))
@@ -476,6 +488,39 @@ class Redaction(Base):
                 self.assertNotIn(original, out)
                 self.assertIn("[скрыто]", out)
 
+    EXTRA = [
+        ('{"api_key": "AbCdEf123456"}', "AbCdEf123456"),
+        ('{"token":"Zz9Yy8Xx7Ww6"}', "Zz9Yy8Xx7Ww6"),
+        ("{'secret': 'hush-hush-42'}", "hush-hush-42"),
+        ("client_secret=Qq1Ww2Ee3Rr", "Qq1Ww2Ee3Rr"),
+        ("access_token=Aa1Ss2Dd3Ff", "Aa1Ss2Dd3Ff"),
+        ('"refresh_token": "Rr4Tt5Yy6Uu"', "Rr4Tt5Yy6Uu"),
+        ("private_key: Pk7Pk8Pk9Pk0", "Pk7Pk8Pk9Pk0"),
+        ("x-api-key: Xk1Xk2Xk3Xk4", "Xk1Xk2Xk3Xk4"),
+        ("Cookie: sid=abc123; theme=dark; uid=77", "abc123"),
+        ("Set-Cookie: session=Ss9Ss8; Path=/; HttpOnly", "Ss9Ss8"),
+        ("https://x.blob.core.windows.net/c?sv=2020&sig=Zm9vYmFy%2Bq1&se=2030", "Zm9vYmFy%2Bq1"),
+        ("звони 8 916 123 45 67", "123 45 67"),
+        ("тел 8(916)1234567", "1234567"),
+        ("phone 916-123-45-67 ok", "123-45-67"),
+        ("тел +79161234567", "79161234567"),
+        ("session_id=Se55Se55Se55", "Se55Se55Se55"),
+        ("credential=Cr3dCr3d", "Cr3dCr3d"),
+    ]
+
+    def test_extra_classes_are_scrubbed(self):
+        for text, original in self.EXTRA:
+            with self.subTest(text=text):
+                self.assertNotIn(original, wab.redact(text, 1200))
+
+    def test_ordinary_text_is_kept(self):
+        keep = ["commit 3f2a9c1 and 3f2a9c1d4e5b6a7988776655443322110099aabb", "see PR #12 and #345",
+                "date 2026-10-01 at 12:34:56", "wave W4 ctx 300000 tokens", "tokenizer notes; session closed",
+                "version 3.4.1 build 20261001"]
+        for text in keep:
+            with self.subTest(text=text):
+                self.assertEqual(wab.redact(text, 1200), text)
+
     def test_limits(self):
         long = "слово " * 400
         self.assertLessEqual(len(wab.redact(long)), 602)
@@ -580,6 +625,85 @@ class Admission(Base):
 
 
 # ---------------------------------------------------------------- A7, A8
+class CorruptState(Base):
+    def test_status_and_current_tmux_report_a_clean_error(self):
+        cfg, path = self.chain()
+        wab.state_path(cfg).write_text("{broken", encoding="utf-8")
+        for cmd in ("status", "current-tmux"):
+            with self.subTest(cmd=cmd):
+                with self.assertRaises(SystemExit) as ctx:
+                    wab.main(["wab.py", cmd, str(path)])
+                self.assertIn("wab: cannot read state.json", str(ctx.exception))
+
+    def test_watch_logs_an_event_and_stops(self):
+        cfg, path = self.chain()
+        wab.state_path(cfg).write_text("{broken", encoding="utf-8")
+        with mock.patch.object(wab, "bind_popup"):
+            with self.assertRaises(SystemExit) as ctx:
+                wab.watch(cfg, path, max_ticks=1)
+        self.assertIn("cannot read state.json", str(ctx.exception))
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("cannot read state.json", log)
+
+
+class AtMostOnce(Base):
+    def crash_then_tick(self, cfg, **extra):
+        with mock.patch.object(wab, "notify", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                wab.tick(cfg, wab.load_state(cfg))
+        with mock.patch.object(wab, "notify") as again, mock.patch.object(wab, "launch", return_value=True):
+            try:
+                wab.tick(cfg, wab.load_state(cfg))
+            except Exception:
+                pass
+        return again
+
+    def test_awaiting_merge(self):
+        cfg, _ = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        again = self.crash_then_tick(cfg)
+        again.assert_not_called()
+
+    def test_done(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        again = self.crash_then_tick(cfg)
+        again.assert_not_called()
+
+    def test_blocked_dead_and_permission(self):
+        for status, alive, pane in (("BLOCKED: q", True, ""), ("RUNNING", False, ""),
+                                    ("RUNNING", True, "Do you want to proceed")):
+            with self.subTest(status=status, alive=alive):
+                self.alive, self.pane = alive, pane
+                cfg, _ = self.chain()
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                self.set_status(cfg, "W1", status)
+                again = self.crash_then_tick(cfg)
+                again.assert_not_called()
+
+    def test_launch_start_notice(self):
+        cfg, _ = self.chain()
+        self.alive = False
+        prompt = self.tmp / "p.md"
+        prompt.write_text("x", encoding="utf-8")
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd), \
+                mock.patch.object(wab, "notify", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                wab.launch(cfg, "W1", prompt)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
+        self.assertTrue(self.get_state(cfg)["waves"]["W1"]["notified"].get("started"))
+        with mock.patch.object(wab, "notify") as again, mock.patch.object(wab, "bind_popup"):
+            wab.watch(cfg, cfg_path(cfg), max_ticks=1)
+        self.assertFalse([c for c in again.call_args_list if "стартовала" in c[0][1]])
+
+
+def cfg_path(cfg):
+    return cfg["chain_file"]
+
+
 class Resume(Base):
     def run_watch(self, cfg, path, ticks=1):
         with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "launch") as launch:
@@ -723,8 +847,8 @@ class KeysAndRegistry(Base):
         self.assertIn("ignore-size", conf)
         self.assertEqual(len(re.findall(r"(?m)^bind-key\b", conf)), 1)
         self.assertNotRegex(conf, r"bind(-key)?\s[^\n]*\bW\b")
-        self.assertNotIn("BTab", conf)
-        self.assertNotIn("unbind", conf)
+        self.assertEqual(conf.splitlines()[0], "unbind-key -q -n BTab")
+        self.assertNotRegex(conf, r"(?m)^bind-key[^\n]*BTab")
 
     def test_unsafe_values_are_refused(self):
         opener = str(WAVES / "wab-open")

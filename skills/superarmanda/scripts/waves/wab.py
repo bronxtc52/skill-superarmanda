@@ -42,6 +42,7 @@ WAVE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 PREFIX = re.compile(r"[A-Za-z0-9_-]+")
 TAIL_BYTES = 4_000_000       # context is measured from the last 4 MB of a transcript
 FIRST_MESSAGE_BYTES = 256 * 1024
+HEAD_BYTES = 4096            # transcript identity check: hash of the first 4 KB
 
 
 def projects_dir():
@@ -103,9 +104,12 @@ def state_path(cfg):
 
 def load_state(cfg):
     p = state_path(cfg)
-    st = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-    if not isinstance(st, dict):
-        raise ValueError("state.json is not an object")
+    try:
+        st = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+        if not isinstance(st, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"wab: cannot read state.json: {e}")
     st.setdefault("waves", {})
     return st
 
@@ -248,7 +252,7 @@ class TranscriptCache:
 
     @staticmethod
     def _blank(key):
-        return {"key": key, "offset": None, "partial": b"", "discard_first": False,
+        return {"key": key, "offset": None, "partial": b"", "discard_first": False, "head": None,
                 "turns": 0, "tools": 0, "out": 0, "read": 0, "ctx": 0}
 
     def read(self, path):
@@ -264,7 +268,13 @@ class TranscriptCache:
             e = self.entries[path] = self._blank(key)
         try:
             with open(path, "rb") as f:
+                if e["head"] is not None:  # same inode and not shorter, but rewritten in place?
+                    length, digest = e["head"]
+                    if hashlib.sha1(f.read(length)).hexdigest() != digest:
+                        e = self.entries[path] = self._blank(key)
                 if e["offset"] is None:
+                    head = f.read(min(HEAD_BYTES, stt.st_size)) if f.seek(0) == 0 else b""
+                    e["head"] = (len(head), hashlib.sha1(head).hexdigest())
                     start = 0
                     if self.tail_bytes and stt.st_size > self.tail_bytes:
                         start = stt.st_size - self.tail_bytes
@@ -373,14 +383,18 @@ _REDACT = [
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
     re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"),                      # Telegram bot token
-    re.compile(r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|dsn|"
-               r"connection[_-]?string|accountkey|sharedaccesskey)\b(\s*[:=]\s*)"
-               r"(?:\"[^\"]*\"?|'[^']*'?|\S+)"),                             # quoted value as a whole
+    re.compile(r"(?i)\b(set-cookie|cookie)(\s*:\s*)[^\r\n]*"),                 # whole header value
+    re.compile(r"(?i)(?<![\w-])([\"']?(?:[\w.-]*(?:secret|token|password|passwd|pwd|api[_-]?key|"
+               r"private[_-]?key|dsn|cookie|session|credential|connection[_-]?string|accountkey|"
+               r"sharedaccesskey|signature)[\w.-]*|sig)[\"']?)(\s*[:=]\s*)"
+               r"(?:\"[^\"]*\"?|'[^']*'?|[^\s,;&}\]]+)"),                        # key as a word, value as a whole
     re.compile(r"(?i)\b((?:proxy-)?authorization)(\s*:\s*)(?:(?:bearer|basic|token|digest)\s+)?\S+"),
     re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"),                    # userinfo in URLs
     re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),                      # e-mail addresses
     re.compile(r"\+\d[\d ()-]{8,}\d"),                                  # phone numbers (+7 ...)
+    re.compile(r"(?<![\w+])(?:\+?7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)"),  # RU, no plus
+    re.compile(r"(?<!\d)\d{3}[-\s]\d{3}[-\s]\d{2}[-\s]\d{2}(?!\d)"),             # 10 digits, separated
     re.compile(r"\b[A-Za-z0-9+/_]{40,}={0,2}"),                          # long opaque blobs
 ]
 
@@ -388,7 +402,7 @@ _REDACT = [
 def redact(text, limit=TG_LIMIT):
     for rx in _REDACT:
         text = rx.sub(lambda m: (m.group(1) + m.group(2) + "[скрыто]") if rx.groups >= 2 and m.group(2)
-                      else "[скрыто]", text)
+                      else m.group(0) if re.fullmatch(r"[0-9a-fA-F]{40,64}", m.group(0)) else "[скрыто]", text)
     return text if len(text) <= limit else text[:limit].rstrip() + " …"
 
 
@@ -551,6 +565,7 @@ def deliver_first_prompt(cfg, st, wave):
     save_state(cfg, st)
     send_text(name, head + prompt)
     w["phase"] = "running"
+    once_per(w, "started", "1")  # saved before the notice: at most once
     save_state(cfg, st)
     event(cfg, f"{wave}: launched in tmux {name}, cwd {cwd}")
     notify(cfg, f"wave-autobot: стартовала волна {wave}.\nСмотреть: tmux attach -t {name}\n(выйти: Ctrl-b d)")
@@ -581,18 +596,20 @@ def resume(cfg, st):
             deliver_first_prompt(cfg, st, wave)
         else:
             event(cfg, f"{wave}: prompt file is gone, task NOT sent")
-            if once_per(w, "no_prompt", "1"):
+            fresh = once_per(w, "no_prompt", "1")
+            save_state(cfg, st)
+            if fresh:
                 notify(cfg, f"wave-autobot: волна {wave} запущена, но файла с задачей уже нет, "
                             f"задачу не отправил. Посмотри: tmux attach -t {name}")
-            save_state(cfg, st)
     elif phase == "sending":
         event(cfg, f"{wave}: resumed in phase 'sending': unknown whether the task was delivered, "
                    f"NOT resent")
-        if once_per(w, "sending", "1"):
-            notify(cfg, f"wave-autobot: диспетчер перезапустился при отправке задачи волне {wave}; "
-                        f"неизвестно, дошла ли она, повторно не слал. Проверь окно: tmux attach -t {name}")
+        fresh = once_per(w, "sending", "1")
         w["phase"] = "running"
         save_state(cfg, st)
+        if fresh:
+            notify(cfg, f"wave-autobot: диспетчер перезапустился при отправке задачи волне {wave}; "
+                        f"неизвестно, дошла ли она, повторно не слал. Проверь окно: tmux attach -t {name}")
     elif phase == "dead" and tmux_alive(name):
         w["phase"] = "running"
         w.get("notified", {}).pop("dead", None)
@@ -622,30 +639,33 @@ def tick(cfg, st):
 
     # DONE first: a wave may finish and close its window between two ticks
     if status == "DONE" and cfg.get("merge_gate") == "external":
+        w["phase"] = "awaiting_merge"  # saved before any notice: at most once
+        w["finished"] = now
+        save_state(cfg, st)
         event(cfg, f"{wave}: DONE, awaiting merge by the coordinator")
         notify(cfg, f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n"
                     f"Мердж и запуск следующей волны — за координатором.")
         if tmux_alive(name):
             sh("tmux", "send-keys", "-t", name, "-l", "/exit", check=False)
             sh("tmux", "send-keys", "-t", name, "Enter", check=False)
-        w["phase"] = "awaiting_merge"
-        w["finished"] = now
-        save_state(cfg, st)
         return True
 
     if status == "DONE":
         waves = cfg["waves"]
         idx = waves.index(wave)
         nxt = wdir / "next-prompt.md"
-        if once_per(w, "done", "1"):  # a restart between this and the next launch must not repeat it
+        fresh = once_per(w, "done", "1")  # a restart between this and the next launch must not repeat it
+        if fresh:
+            w["finished"] = now
+        w["phase"] = "done"
+        save_state(cfg, st)
+        if fresh:
             event(cfg, f"{wave}: DONE")
             notify(cfg, f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
                         f"Целиком: {wdir}/result.md")
             if tmux_alive(name):
                 sh("tmux", "send-keys", "-t", name, "-l", "/exit", check=False)
                 sh("tmux", "send-keys", "-t", name, "Enter", check=False)
-            w["finished"] = now
-        w["phase"] = "done"
         if idx + 1 >= len(waves):
             st["current"] = None
             save_state(cfg, st)
@@ -661,18 +681,20 @@ def tick(cfg, st):
         return launch(cfg, waves[idx + 1], nxt)
 
     if not tmux_alive(name):
-        if once_per(w, "dead", "1"):
-            event(cfg, f"{wave}: tmux session {name} is gone (status={status})")
-            notify(cfg, f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
+        fresh = once_per(w, "dead", "1")
         w["phase"] = "dead"
         save_state(cfg, st)
+        if fresh:
+            event(cfg, f"{wave}: tmux session {name} is gone (status={status})")
+            notify(cfg, f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
         return False  # the chain stops; restart the wave by hand, then run watch again
 
     if status.startswith("BLOCKED"):
-        if once_per(w, "blocked", status):
+        fresh = once_per(w, "blocked", status)
+        save_state(cfg, st)
+        if fresh:
             event(cfg, f"{wave}: {status[:200]}")
             notify(cfg, f"wave-autobot: волна {wave} ждёт тебя.\n\n{redact(status)}\n\nОтветить: {attach}")
-        save_state(cfg, st)
         return True
 
     if status == "HANDOFF_READY" and w.get("phase") == "checkpoint":
@@ -721,6 +743,7 @@ def tick(cfg, st):
         save_state(cfg, st)
     elif w.get("phase") == "checkpoint" and now - (w.get("checkpoint_at") or now) > cfg["handoff_timeout_minutes"] * 60:
         if once_per(w, "checkpoint_timeout", str(w.get("checkpoint_at"))):
+            save_state(cfg, st)
             notify(cfg, f"wave-autobot: {wave} не записала handoff за {cfg['handoff_timeout_minutes']} мин "
                         f"после запроса. Посмотри: {attach}")
 
@@ -730,6 +753,7 @@ def tick(cfg, st):
             w["auto_off_ticks"] = w.get("auto_off_ticks", 0) + 1
             if w["auto_off_ticks"] >= 2 and not w.get("auto_alerted"):
                 w["auto_alerted"] = True
+                save_state(cfg, st)
                 event(cfg, f"{wave}: window is not in auto mode")
                 notify(cfg, f"wave-autobot: волна {wave} вышла из режима auto и будет спрашивать "
                             f"подтверждения. Вернуть: {attach}, Shift+Tab до «auto mode on».")
@@ -739,6 +763,7 @@ def tick(cfg, st):
 
     if any(m in txt for m in PERMISSION_MARKERS):
         if once_per(w, "permission", hashlib.sha1(txt[-800:].encode("utf-8")).hexdigest()):
+            save_state(cfg, st)
             event(cfg, f"{wave}: permission prompt on screen")
             notify(cfg, f"wave-autobot: волна {wave} ждёт подтверждения на экране.\n{attach}")
 
@@ -747,6 +772,7 @@ def tick(cfg, st):
         w["pane_digest"], w["pane_changed"] = digest, now
     elif now - w.get("pane_changed", now) > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
+            save_state(cfg, st)
             event(cfg, f"{wave}: pane idle {cfg['idle_minutes']}+ min, status={status}")
             notify(cfg, f"wave-autobot: волна {wave} молчит {cfg['idle_minutes']}+ мин "
                         f"(статус «{status}»). Возможно, ждёт тебя: {attach}")
@@ -778,7 +804,9 @@ def keys_conf(registry):
         cmd = (f'if-shell -F "#{{==:#{{session_name}},{dash}}}" '
                f'{{ display-popup -E -w 95% -h 90% -T " волна (назад: Ctrl+\\\\) " "{opener} {chain}" }} '
                f'{{ {cmd} }}')
-    return f"bind-key -n {key} {cmd}\n"
+    # the first line drops a stale root binding of Shift+Tab (an old intermediate version let it
+    # through to the wave window and switched Claude out of auto mode); we never bind it
+    return f"unbind-key -q -n BTab\nbind-key -n {key} {cmd}\n"
 
 
 def bind_popup(cfg, path):
@@ -822,16 +850,24 @@ def bind_popup(cfg, path):
           else f"toggle key bind failed: {r.stderr.strip() or r.stdout.strip()}")
 
 
+def _state_or_event(cfg):
+    try:
+        return load_state(cfg)
+    except SystemExit as e:
+        event(cfg, str(e))
+        raise
+
+
 def watch(cfg, path, max_ticks=None):
     require_tmux()
     event(cfg, f"watch started, ctx_limit={cfg['ctx_limit']}")
     bind_popup(cfg, path)
-    resume(cfg, load_state(cfg))
+    resume(cfg, _state_or_event(cfg))
     last = 0.0
     ticks = 0
     while True:
         cfg = load_chain(path)  # thresholds can be tuned live
-        st = load_state(cfg)
+        st = _state_or_event(cfg)
         if not tick(cfg, st):
             event(cfg, "watch stopped: no current wave")
             return
