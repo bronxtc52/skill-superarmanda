@@ -1355,6 +1355,8 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
         st["waves"][wave]["start_rev"] = start_rev
     if attempts:
         st["waves"][wave]["attempts"] = attempts  # the earlier try is kept, not overwritten
+    if restart:  # saved with the intent: the first prompt (and its recovery) says «continue»
+        st["waves"][wave]["restart"] = len(attempts) + 1
     if carried:
         st["waves"][wave]["outbox"] = carried
     save_state(cfg, st)
@@ -1363,6 +1365,19 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
 
 
 ATTEMPT_FILES = ("next-prompt.md", "result.md")  # file results a DONE of the wave is judged by
+
+# The first message of a restarted wave (dead / not_ready) starts with this: the restart is a
+# continuation. The manifest, handoff.md and the branch of the failed try are kept (only
+# ATTEMPT_FILES are archived), and the unchanged task in prompt.md would lead to `state.py init`,
+# which refuses an existing manifest. The note is added on delivery from the `restart` field of
+# the wave record, so prompt.md stays the checked copy and a recovery sends the same text.
+RESTART_NOTE = ("ПЕРЕЗАПУСК волны {wave} (попытка {n}): прошлая сессия волны остановилась. "
+                "Это продолжение, а не новый старт. Если есть $WAB_DIR/handoff.md или manifest "
+                "волны — иди путём «Продолжение» (handoff.md → путь к manifest → state.py where; "
+                "при tree_matches: false — state.py resume; дальше next_action), state.py init "
+                "НЕ вызывай, даже если задача ниже говорит «--plan». Только если ни handoff.md, "
+                "ни manifest нет — начинай со «Старт». next-prompt.md и result.md прошлой попытки "
+                "убраны в attempts/: свои пиши заново.")
 
 
 def archive_attempt_files(wdir, n):
@@ -1491,6 +1506,9 @@ def deliver_first_prompt(cfg, st, wave):
     head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wdir} "
             f"(он же $WAB_DIR). Рабочая копия (admitted clone): {cwd}. "
             f"Протокол — в системной инструкции.\n\n")
+    n = w.get("restart")
+    if isinstance(n, int) and not isinstance(n, bool) and n > 1:
+        head += RESTART_NOTE.format(wave=wave, n=n) + "\n\n"
     (wdir / "first-prompt.md").write_text(head + prompt + "\n", encoding="utf-8")
     w["phase"] = "sending"
     save_state(cfg, st)

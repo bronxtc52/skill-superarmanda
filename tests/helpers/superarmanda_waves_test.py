@@ -6015,6 +6015,113 @@ class W4Round39(Base):
             self.assertEqual(dash.wave_commits(w), 0)
 
 
+class W4Round40RestartContinues(Base):
+    """Round 40 (Codex P2): a restart of a stopped wave is a continuation. The manifest, handoff.md
+    and the branch of the failed try stay where they are; the first message of the new session says
+    so before the unchanged task (which leads to `state.py init`, refused on an existing manifest).
+    prompt.md stays the checked copy; a crash recovery on the restart sends the same message."""
+
+    def setUp(self):
+        super().setUp()
+        self.prompt = self.tmp / "p.md"
+        self.prompt.write_text("--wave W1 --plan /run/waves.json: start the wave\n", encoding="utf-8")
+
+    def launch(self, cfg, wave="W1"):
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            return wab.launch(cfg, wave, self.prompt)
+
+    def first_texts(self):
+        return [s[2] for s in self.sent if s[0] == "text" and s[2]]
+
+    def dead_with_work(self, cfg):
+        wdir = wab.wave_dir(cfg, "W1")
+        man = wdir / "superarmanda" / "manifest.json"
+        man.parent.mkdir(parents=True, exist_ok=True)
+        man.write_text('{"wave": "W1"}\n', encoding="utf-8")
+        (wdir / "handoff.md").write_text(f"manifest: {man}\n", encoding="utf-8")
+        (wdir / "next-prompt.md").write_text("stale\n", encoding="utf-8")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="dead")}})
+        self.alive = False  # the failed try's window is gone
+        return wdir, man
+
+    def test_restart_first_message_says_continue_and_keeps_manifest_and_handoff(self):
+        cfg, _ = self.chain()
+        wdir, man = self.dead_with_work(cfg)
+        self.assertTrue(self.launch(cfg))
+        texts = self.first_texts()
+        self.assertEqual(len(texts), 1)
+        text = texts[0]
+        note = text.index("ПЕРЕЗАПУСК волны W1")
+        self.assertLess(note, text.index("--wave W1 --plan"))  # before the unchanged task
+        self.assertIn("«Продолжение»", text)
+        self.assertIn("state.py where", text)
+        self.assertIn("tree_matches: false", text)
+        self.assertIn("state.py init НЕ вызывай", text)
+        self.assertIn("(попытка 2)", text)
+        # the work of the failed try stays in place; only the file results are archived
+        self.assertEqual(man.read_text(encoding="utf-8"), '{"wave": "W1"}\n')
+        self.assertEqual((wdir / "handoff.md").read_text(encoding="utf-8"), f"manifest: {man}\n")
+        self.assertFalse((wdir / "next-prompt.md").exists())
+        # prompt.md is the unchanged checked copy; first-prompt.md is what was sent
+        self.assertEqual((wdir / "prompt.md").read_text(encoding="utf-8"),
+                         "--wave W1 --plan /run/waves.json: start the wave\n")
+        self.assertEqual((wdir / "first-prompt.md").read_text(encoding="utf-8"), text + "\n")
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["restart"], 2)
+
+    def test_not_ready_restart_says_continue_too(self):
+        cfg, _ = self.chain()
+        self.dead_with_work(cfg)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="not_ready")}})
+        self.assertTrue(self.launch(cfg))
+        self.assertIn("ПЕРЕЗАПУСК волны W1", self.first_texts()[0])
+
+    def test_second_restart_counts_the_attempt(self):
+        cfg, _ = self.chain()
+        self.dead_with_work(cfg)
+        self.assertTrue(self.launch(cfg))
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "dead"
+        self.put_state(cfg, st)
+        self.sent.clear()
+        self.assertTrue(self.launch(cfg))
+        self.assertIn("(попытка 3)", self.first_texts()[0])
+
+    def test_ordinary_start_has_no_restart_note(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": None, "waves": {}})
+        self.alive = False
+        self.assertTrue(self.launch(cfg))
+        text = self.first_texts()[0]
+        self.assertNotIn("ПЕРЕЗАПУСК", text)
+        self.assertTrue(text.endswith("Протокол — в системной инструкции.\n\n"
+                                      "--wave W1 --plan /run/waves.json: start the wave"), text)
+        self.assertNotIn("restart", self.get_state(cfg)["waves"]["W1"])
+        # the next wave launched after a hand-over is an ordinary start too
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "awaiting_merge"
+        self.put_state(cfg, st)
+        self.sent.clear()
+        self.assertTrue(self.launch(cfg, "W2"))
+        self.assertNotIn("ПЕРЕЗАПУСК", self.first_texts()[0])
+
+    def test_crash_recovery_of_a_restart_sends_the_same_message(self):
+        cfg, _ = self.chain()
+        wdir, man = self.dead_with_work(cfg)
+        with mock.patch.object(wab, "start_session", side_effect=_Crash):
+            with self.assertRaises(_Crash):
+                self.launch(cfg)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "launching")
+        self.assertEqual(self.sent, [])
+        self.alive = True
+        with mock.patch.object(wab, "drop_stale_btab"):
+            wab.resume(cfg, wab.load_state(cfg))
+        texts = self.first_texts()
+        self.assertEqual(len(texts), 1)
+        self.assertIn("ПЕРЕЗАПУСК волны W1 (попытка 2)", texts[0])
+        self.assertLess(texts[0].index("ПЕРЕЗАПУСК"), texts[0].index("--wave W1 --plan"))
+        self.assertTrue(man.exists() and (wdir / "handoff.md").exists())
+
+
 class TmuxGuard(unittest.TestCase):
     """The guard itself: a socketless tmux must fail loudly, a private one passes the guard."""
 
