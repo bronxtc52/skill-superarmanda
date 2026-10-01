@@ -260,20 +260,29 @@ def pane_text(name):
     return r.stdout if r.returncode == 0 else ""
 
 
-def send_text(name, text):
+def press_enter(name):
+    tmux("send-keys", "-t", pane_target(name), "Enter")
+
+
+def send_text(name, text, on_typed=None):
     """Paste text as one bracketed paste, then submit it. The buffer is private to this
-    dispatcher and session: tmux buffers are global to the server."""
+    dispatcher and session: tmux buffers are global to the server. `on_typed` runs once the
+    text is in the window and Enter is still to come (the caller records that step)."""
     buf = f"wab-{os.getpid()}-{name}"
     tmux("load-buffer", "-b", buf, "-", input=text)
     tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pane_target(name))
+    if on_typed:
+        on_typed()
     time.sleep(1.5)
-    tmux("send-keys", "-t", pane_target(name), "Enter")
+    press_enter(name)
 
 
-def send_command(name, cmd):
+def send_command(name, cmd, on_typed=None):
     tmux("send-keys", "-t", pane_target(name), "-l", cmd)
+    if on_typed:
+        on_typed()
     time.sleep(0.7)
-    tmux("send-keys", "-t", pane_target(name), "Enter")
+    press_enter(name)
 
 
 def wait_ready(name, timeout=90):
@@ -743,13 +752,13 @@ def _mark_dead(cfg, st, wave, status=""):
         notify(cfg, f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
 
 
-def _act(cfg, st, wave, what, fn, *args):
+def _act(cfg, st, wave, what, fn, *args, **kw):
     """Run one outside tmux action. True when done. Window gone -> phase dead and
     _WindowGone. Window alive but the command failed -> one event and one notice, False;
     the intent phase is already on disk, so the next tick (or a restart) decides."""
     w = st["waves"][wave]
     try:
-        fn(*args)
+        fn(*args, **kw)
     except (subprocess.CalledProcessError, OSError) as e:
         if not tmux_alive(w["tmux"]):
             _mark_dead(cfg, st, wave, read(cfg["run_dir"] / wave / "status"))
@@ -763,6 +772,23 @@ def _act(cfg, st, wave, what, fn, *args):
         return False
     w.get("notified", {}).pop("tmux_failed", None)
     return True
+
+
+def _deliver(cfg, st, wave, what, send, text):
+    """Two-step send (text, then Enter) without duplicates: once the text is in the window
+    that fact is saved (`pending_enter`), and a retry after a failed Enter presses only Enter."""
+    w = st["waves"][wave]
+    name = w["tmux"]
+    if w.get("pending_enter") == what:
+        ok = _act(cfg, st, wave, f"{what} (Enter)", press_enter, name)
+    else:
+        def typed():
+            w["pending_enter"] = what
+            save_state(cfg, st)
+        ok = _act(cfg, st, wave, what, send, name, text, on_typed=typed)
+    if ok:
+        w.pop("pending_enter", None)
+    return ok
 
 
 def deliver_first_prompt(cfg, st, wave):
@@ -787,7 +813,7 @@ def deliver_first_prompt(cfg, st, wave):
     w["phase"] = "sending"
     save_state(cfg, st)
     try:
-        if not _act(cfg, st, wave, "первая задача", send_text, name, head + prompt):
+        if not _deliver(cfg, st, wave, "first prompt", send_text, head + prompt):
             return False  # phase `sending` stays on disk; a restart will not resend blindly
     except _WindowGone:
         return False
@@ -837,6 +863,11 @@ def _resume(cfg, st):
             if fresh:
                 notify(cfg, f"wave-autobot: волна {wave} запущена, но файла с задачей уже нет, "
                             f"задачу не отправил. Посмотри: tmux attach -t {name}")
+    elif phase == "sending" and w.get("pending_enter") == "first prompt":
+        event(cfg, f"{wave}: resumed in phase 'sending': the text is typed, pressing only Enter")
+        if _deliver(cfg, st, wave, "first prompt", send_text, ""):
+            w["phase"] = "running"
+            save_state(cfg, st)
     elif phase == "sending":
         event(cfg, f"{wave}: resumed in phase 'sending': unknown whether the task was delivered, "
                    f"NOT resent")
@@ -893,14 +924,20 @@ def recover_update(cfg, st, wave):
     """The dispatcher died while /update was in flight: whether it arrived is unknown, so it
     is NOT resent. The wave goes on with await_session set; the owner is told once."""
     w = st["waves"][wave]
+    if w.get("pending_enter") == "/update":  # typed, only Enter is missing: finish it, nothing is unknown
+        if _deliver(cfg, st, wave, "/update", send_text, ""):
+            w["await_session"] = True
+            finish_update(cfg, st, wave)
+        return
     fresh = once_per(w, "updating", str(w.get("restarts", 0)))
+    informed = bool(w.get("notified", {}).get("tmux_failed"))  # the owner already got the failure notice
     w["await_session"] = True
     # the wave already wrote something new (RUNNING, BLOCKED, DONE...): /update did arrive
     arrived = read(cfg["run_dir"] / wave / "status") not in ("HANDOFF_READY", "", "STARTING")
     event(cfg, f"{wave}: resumed in phase 'updating': "
                f"{'/update evidently arrived' if arrived else 'unknown whether /update arrived'}, NOT resent")
     finish_update(cfg, st, wave)
-    if fresh and not arrived:
+    if fresh and not arrived and not informed:
         notify(cfg, f"wave-autobot: диспетчер перезапустился при передаче /update волне {wave}; "
                     f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: tmux attach -t {w['tmux']}")
 
@@ -1005,7 +1042,7 @@ def _tick(cfg, st):
         event(cfg, f"{wave}: handoff ready, /clear + /update (restart #{w.get('restarts', 0) + 1})")
         w["phase"] = "clearing"  # saved before each outside action; a repeated /clear is safe
         save_state(cfg, st)
-        if not _act(cfg, st, wave, "/clear", send_command, name, "/clear"):
+        if not _deliver(cfg, st, wave, "/clear", send_command, "/clear"):
             return True  # phase `clearing` is on disk: retried next tick
         w["phase"] = "updating"  # from here /update is never resent blindly
         w["await_session"] = True  # the next session is found by its marker, not by guesswork
@@ -1013,7 +1050,7 @@ def _tick(cfg, st):
         time.sleep(6)
         update = (f"/update {session_marker(cfg, wave)} Продолжаем волну {wave} wave-autobot. "
                   f"Каталог волны: {wdir}. Прочитай {wdir}/handoff.md и продолжи с шага «Следующий шаг».")
-        if not _act(cfg, st, wave, "/update", send_text, name, update):
+        if not _deliver(cfg, st, wave, "/update", send_text, update):
             return True  # phase `updating` is on disk: recover_update decides, nothing is resent
         finish_update(cfg, st, wave)
         return True
@@ -1045,7 +1082,7 @@ def _tick(cfg, st):
         request = (f"WAB-CHECKPOINT: контекст {tokens // 1000}k токенов. По протоколу: доведи "
                    f"шаг, закоммить и запушь WIP, перепиши {wdir}/handoff.md, запиши "
                    f"HANDOFF_READY в {wdir}/status и остановись.")
-        if _act(cfg, st, wave, "запрос чекпоинта", send_text, name, request):
+        if _deliver(cfg, st, wave, "checkpoint request", send_text, request):
             w["checkpoint_sent"] = True
         save_state(cfg, st)
     elif w.get("phase") == "checkpoint" and now - (w.get("checkpoint_at") or now) > cfg["handoff_timeout_minutes"] * 60:
@@ -1244,6 +1281,9 @@ def _stop_event(cfg, st, path):
         return False
     elif wave and st["waves"].get(wave, {}).get("phase") == "dead":
         event(cfg, f"{wave}: window is gone; chain stopped")
+        return False
+    if wave and st["waves"].get(wave, {}).get("phase") not in ("done", None):
+        event(cfg, f"{wave}: stopped in phase {st['waves'][wave].get('phase')}; chain stopped")
         return False
     event(cfg, "watch stopped: no current wave")
     return True

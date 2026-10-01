@@ -97,8 +97,10 @@ class Base(unittest.TestCase):
         patch("sh", side_effect=fake_sh)
         patch("tmux_alive", side_effect=lambda name: self.alive)
         patch("pane_text", side_effect=lambda name: self.pane)
-        patch("send_text", side_effect=lambda n, t: self.sent.append(("text", n, t)))
-        patch("send_command", side_effect=lambda n, t: self.sent.append(("cmd", n, t)))
+        patch("send_text", side_effect=lambda n, t, **kw: self.sent.append(("text", n, t)))
+        patch("send_command", side_effect=lambda n, t, **kw: self.sent.append(("cmd", n, t)))
+        self.enters = []
+        patch("press_enter", side_effect=lambda n: self.enters.append(n))
         patch("wait_ready", side_effect=lambda name, timeout=90: self.ready)
         patch("require_tmux")
         patch("_send_telegram", side_effect=lambda cfg, text: self.tg.append(text))
@@ -732,7 +734,7 @@ class CheckpointTransition(Base):
         self.rec_cmd = wab.send_command.side_effect
         self.rec_text = wab.send_text.side_effect
 
-    def boom_cmd(self, *a):
+    def boom_cmd(self, *a, **kw):
         raise RuntimeError("dispatcher died")
 
     def heal(self):
@@ -762,7 +764,7 @@ class CheckpointTransition(Base):
         self.assertEqual((self.kinds(), self.w()["restarts"]), ((1, 1), 1))
 
     def test_crash_while_updating_is_not_resent_and_notifies_once(self):
-        def boom_text(name, text):
+        def boom_text(name, text, **kw):
             raise RuntimeError("dispatcher died")
         wab.send_text.side_effect = boom_text
         with self.assertRaises(RuntimeError):
@@ -808,7 +810,7 @@ class WaveOwnsStatus(Base):
         (wab.wave_dir(self.cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         rec = wab.send_text.side_effect
 
-        def delivered_then_died(name, text):
+        def delivered_then_died(name, text, **kw):
             rec(name, text)
             raise RuntimeError("died after delivery")
         wab.send_text.side_effect = delivered_then_died
@@ -1446,7 +1448,7 @@ class ExactTargets(Base):
 
 class WindowVanishesMidAction(Base):
     def failing(self, kill_window):
-        def boom(*args):
+        def boom(*args, **kw):
             if kill_window:
                 self.alive = False
             raise subprocess.CalledProcessError(1, ["tmux"], stderr="can't find session")
@@ -1501,6 +1503,104 @@ class WindowVanishesMidAction(Base):
             self.assertFalse(wab.launch(cfg, "W1", prompt))
         self.assertEqual(self.w(cfg)["phase"], "dead")
         self.assertEqual(len(self.tg), 1)
+
+
+class TwoStepSend(Base):
+    def typed_then_enter_fails(self, kind):
+        def fn(name, text, on_typed=None):
+            if on_typed:
+                on_typed()  # the text is in the window; Enter is what failed
+            raise subprocess.CalledProcessError(1, ["tmux", "send-keys"], stderr="boom")
+        getattr(wab, kind).side_effect = fn
+
+    def w(self, cfg):
+        return self.get_state(cfg)["waves"]["W1"]
+
+    def test_clear_enter_failure_resends_only_enter(self):
+        cfg, _ = self.chain()
+        w = self.wave_rec(phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time(), sessions=["s1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
+        self.set_status(cfg, "W1", "HANDOFF_READY")
+        rec = wab.send_command.side_effect
+        self.typed_then_enter_fails("send_command")
+        self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(self.w(cfg)["pending_enter"], "/clear")
+        wab.send_command.side_effect = rec
+        self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertEqual([x for x in self.sent if x[:3] == ("cmd", "wv-w1", "/clear")], [])  # not typed twice
+        self.assertEqual((self.w(cfg)["phase"], self.w(cfg)["restarts"]), ("running", 1))
+        self.assertNotIn("pending_enter", self.w(cfg))
+
+    def test_checkpoint_request_enter_failure_resends_only_enter(self):
+        cfg, _ = self.chain()
+        self.transcript("s1", [asst(inp=400000)])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(sessions=["s1"])}})
+        self.set_status(cfg, "W1", "RUNNING")
+        rec = wab.send_text.side_effect
+        self.typed_then_enter_fails("send_text")
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertFalse(self.w(cfg)["checkpoint_sent"])
+        wab.send_text.side_effect = rec
+        wab.tick(cfg, wab.load_state(cfg))
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertEqual([x for x in self.sent if "WAB-CHECKPOINT" in x[2]], [])
+        self.assertTrue(self.w(cfg)["checkpoint_sent"])
+
+    def test_update_failure_in_a_live_window_notifies_once(self):
+        cfg, _ = self.chain()
+        w = self.wave_rec(phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time(), sessions=["s1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
+        self.set_status(cfg, "W1", "HANDOFF_READY")
+
+        def fail(name, text, on_typed=None):
+            raise subprocess.CalledProcessError(1, ["tmux"], stderr="boom")  # not even typed
+        wab.send_text.side_effect = fail
+        self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(self.w(cfg)["phase"], "updating")
+        wab.tick(cfg, wab.load_state(cfg))  # recover_update: the owner decides, but no second notice
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual(len(self.tg), 1)
+
+    def test_update_enter_failure_is_finished_with_enter_only(self):
+        cfg, _ = self.chain()
+        w = self.wave_rec(phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time(), sessions=["s1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
+        self.set_status(cfg, "W1", "HANDOFF_READY")
+        rec = wab.send_text.side_effect
+        self.typed_then_enter_fails("send_text")
+        wab.tick(cfg, wab.load_state(cfg))
+        wab.send_text.side_effect = rec
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertEqual([x for x in self.sent if x[2].startswith("/update")], [])
+        self.assertEqual((self.w(cfg)["phase"], self.w(cfg)["restarts"]), ("running", 1))
+
+    def test_watch_exits_nonzero_when_the_next_wave_does_not_reach_running(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        calls = {"wv-w2": 0}
+
+        def alive(name):
+            if name in calls:
+                calls[name] += 1
+                return calls[name] > 1  # absent for the pre-launch check, alive afterwards
+            return False
+        wab.tmux_alive.side_effect = alive
+
+        def fail(name, text, on_typed=None):
+            raise subprocess.CalledProcessError(1, ["tmux"], stderr="boom")
+        wab.send_text.side_effect = fail
+        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            with self.assertRaises(SystemExit) as ctx:
+                wab.main(["wab.py", "watch", str(path)])
+        self.assertEqual(ctx.exception.code, 3)
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("W2: stopped in phase sending", log)
+        self.assertNotIn("no current wave", log)
 
 
 class AtMostOnce(Base):
