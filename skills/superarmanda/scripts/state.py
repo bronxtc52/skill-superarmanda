@@ -50,6 +50,22 @@ def now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def check_position(position):
+    """`position` is optional; when present it must have the shape `mark` writes."""
+    if position is None:
+        return
+    text_keys = ("task", "head", "tree_fingerprint", "recorded_at")
+    step = position.get("step") if isinstance(position, dict) else None
+    if not (
+        isinstance(position, dict)
+        and all(isinstance(position.get(key), str) for key in text_keys)
+        and type(step) is int
+        and 1 <= step <= 7
+        and type(position.get("safe_point")) is bool
+    ):
+        fail("malformed position in manifest")
+
+
 def read(path):
     try:
         value = json.loads(path.read_text())
@@ -57,6 +73,7 @@ def read(path):
         fail(f"cannot read manifest: {exc}")
     if value.get("version") != 1 or not isinstance(value.get("tasks"), dict):
         fail("unsupported or malformed manifest")
+    check_position(value.get("position"))
     session_owners(value)
     return value
 

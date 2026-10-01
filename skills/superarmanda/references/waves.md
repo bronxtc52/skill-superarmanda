@@ -286,3 +286,44 @@ Coder и tester — субагенты координатора, их отчёт
 severity проходят через `fix-loop`, отсутствия P0/P1 мало); Codex на текущем
 `headRefOid`; PR не draft; все check runs `completed` и `success` (реализация — п.5). Если гейт пройден, а диспетчеру отказали в мердже, владельцу уходит
 готовая команда `gh pr merge <N> --repo <owner/repo> --squash --match-head-commit <sha>`.
+
+## Диспетчер: `scripts/waves/`
+
+Диспетчер ведёт цепочку волн, по одной сессии Claude на волну в tmux (нужен tmux 3.2 или
+новее, проверяется до запуска). Только стандартная библиотека; `rich` нужен лишь дашборду.
+Протокол волны, который диспетчер кладёт в системную инструкцию, — `scripts/waves/PROTOCOL.md`.
+
+Команды (`<chain>` — путь к `chain.json`):
+
+- `wab.py launch <chain> <волна> <файл-промпта>` — запустить волну: admission клона,
+  `claude --session-id <uuid>`, ожидание готовности окна, отправка задачи.
+- `wab.py watch <chain>` — вести цепочку до конца; после падения продолжает с фазы из
+  `state.json`, не запуская волну заново и не повторяя уведомления.
+- `wab.py status <chain>` — состояние одним экраном.
+- `wab.py notify <chain> <текст>` — сообщение в Telegram (текст проходит `redact()`).
+- `wab.py current-tmux <chain>` — имя tmux-сессии текущей волны (его читает `wab-open`).
+- `dash.py <chain>` — дашборд на `rich`, только в терминале (без tty отказывается);
+  `Ctrl+\` на дашборде открывает текущую волну, внутри окна закрывает.
+
+Каталог прогона: `<база>/<chain>/<run_id>`, где база — `run_dir` из `chain.json` или
+`<каталог chain.json>/runs`. Журнал волны находится по `session_id`, а после `/clear` — по
+метке `[wab:<chain>/<run_id>/<волна>]` в первом сообщении.
+
+Поля `chain.json`:
+
+| Поле | Смысл |
+|---|---|
+| `chain`, `run_id` | имя цепочки и прогона, `[A-Za-z0-9._-]+`, не точечный сегмент; `run_id` обязателен |
+| `run_dir` | база каталога прогона (по умолчанию `runs/` рядом с `chain.json`) |
+| `repo` | `owner/repo`; клон выдаёт `cc-autonomy prepare` |
+| `waves`, `titles` | идентификаторы волн по порядку и подписи для дашборда |
+| `tmux_prefix` | префикс имён tmux-сессий, `[A-Za-z0-9_-]+` |
+| `merge_gate` | `external`: после `DONE` волна ждёт мерджа от координатора (`awaiting_merge`) |
+| `ctx_limit` | порог контекста в токенах для `WAB-CHECKPOINT` (300000) |
+| `idle_minutes` | через сколько минут тишины предупредить (12) |
+| `handoff_timeout_minutes` | сколько ждать `HANDOFF_READY` после запроса (25) |
+| `tick_seconds` | период опроса (60) |
+| `model` | модель Claude для волн (необязательно) |
+| `workdir` | готовый клон вместо `cc-autonomy prepare`; принимается только клон `cc-admission-*/checkout` или его worktree |
+| `mandate_sha256` | SHA-256 файла `<run_dir>/mandate.md`, одобренного владельцем; не совпал — запуск отказывает |
+| `telegram` | `{"keyvault": …, "token_secret": …, "chat_secret": …}`; нет или `false` — сообщения только в журнал событий |

@@ -1,0 +1,881 @@
+#!/usr/bin/env python3
+"""wave-autobot dispatcher: run plan waves one per tmux Claude session.
+
+Commands:
+  wab.py launch <chain.json> <wave> <prompt-file>   start one wave in tmux
+  wab.py watch  <chain.json>                        supervise until the chain ends
+  wab.py status <chain.json>                        one-screen status
+  wab.py notify <chain.json> <text>                 Telegram message to the owner
+  wab.py current-tmux <chain.json>                  tmux session name of the current wave
+
+Per wave the session writes $WAB_DIR/status (RUNNING | HANDOFF_READY | BLOCKED: ... | DONE),
+handoff.md, result.md, next-prompt.md - see PROTOCOL.md next to this file.
+Needs tmux >= 3.2 (checked before launch/watch): new-session takes the command as an argv
+list and -e (3.2+). Standard library only; the dashboard (dash.py) is the only user of `rich`.
+
+Every contact with tmux, claude, Telegram and az goes through the module-level functions
+`sh`, `tmux_alive`, `pane_text`, `send_text`, `send_command`, `wait_ready` and
+`_send_telegram`, so tests can replace them. Paths that depend on $HOME are computed at call
+time, not at import.
+"""
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import uuid
+
+HERE = pathlib.Path(__file__).resolve().parent
+PROTOCOL = HERE / "PROTOCOL.md"
+MIN_TMUX = (3, 2)
+PERMISSION_MARKERS = ("Do you want to proceed", "Do you want to make this edit",
+                      "Do you want to create", "❯ 1. Yes")
+READY_MARKERS = ("? for shortcuts", "shift+tab to cycle", "for agents")
+TRUST_MARKERS = ("Yes, I trust this folder", "Do you trust the files")
+NAME = re.compile(r"[A-Za-z0-9._-]+")
+WAVE_NAME = re.compile(r"[A-Za-z0-9_-]+")
+PREFIX = re.compile(r"[A-Za-z0-9_-]+")
+TAIL_BYTES = 4_000_000       # context is measured from the last 4 MB of a transcript
+FIRST_MESSAGE_BYTES = 256 * 1024
+
+
+def projects_dir():
+    return pathlib.Path.home() / ".claude" / "projects"
+
+
+def registry_path():
+    return pathlib.Path.home() / ".cache" / "wab" / "dashes.json"
+
+
+# ---------- config and state ----------
+
+def _plain_name(value):
+    return bool(NAME.fullmatch(value)) and set(value) != {"."}
+
+
+def load_chain(path, create=True):
+    """Read chain.json. The run directory is <base>/<chain>/<run_id>, where base is
+    `run_dir` from chain.json or <directory of chain.json>/runs. run_id is mandatory and is
+    always the last path segment: a reused chain name must never pick up an older run's
+    mandate.md."""
+    path = pathlib.Path(path)
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"chain.json: cannot read {path}: {e}")
+    if not isinstance(cfg, dict):
+        raise SystemExit("chain.json: must be a JSON object")
+    cfg.setdefault("ctx_limit", 300_000)
+    cfg.setdefault("idle_minutes", 12)
+    cfg.setdefault("handoff_timeout_minutes", 25)
+    cfg.setdefault("tick_seconds", 60)
+    cfg.setdefault("model", None)
+    cfg.setdefault("tmux_prefix", "wab-")
+    chain = str(cfg.get("chain") or "")
+    run_id = str(cfg.get("run_id") or "")
+    if not _plain_name(chain):
+        raise SystemExit("chain.json: chain is required ([A-Za-z0-9._-]+, not a dot segment)")
+    if not _plain_name(run_id):
+        raise SystemExit("chain.json: run_id is required ([A-Za-z0-9._-]+, not a dot segment), "
+                         "one per approved run")
+    if not PREFIX.fullmatch(str(cfg["tmux_prefix"])):
+        raise SystemExit("chain.json: tmux_prefix must match [A-Za-z0-9_-]+")
+    waves = cfg.get("waves")
+    if (not isinstance(waves, list) or not waves
+            or not all(isinstance(w, str) and WAVE_NAME.fullmatch(w) for w in waves)):
+        raise SystemExit("chain.json: waves must be a non-empty list of [A-Za-z0-9_-]+ names")
+    base = pathlib.Path(cfg["run_dir"]) if cfg.get("run_dir") else path.resolve().parent / "runs"
+    cfg["chain_file"] = str(path.resolve())
+    cfg["run_dir"] = base / chain / run_id
+    if create:
+        cfg["run_dir"].mkdir(parents=True, exist_ok=True)
+    return cfg
+
+
+def state_path(cfg):
+    return cfg["run_dir"] / "state.json"
+
+
+def load_state(cfg):
+    p = state_path(cfg)
+    st = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    if not isinstance(st, dict):
+        raise ValueError("state.json is not an object")
+    st.setdefault("waves", {})
+    return st
+
+
+def save_state(cfg, st):
+    tmp = state_path(cfg).with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(state_path(cfg))
+
+
+def event(cfg, text):
+    text = " ⏎ ".join(l for l in text.splitlines() if l.strip())
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}Z {text}"
+    cfg["run_dir"].mkdir(parents=True, exist_ok=True)
+    with open(cfg["run_dir"] / "events.log", "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    print(line, flush=True)
+
+
+def wave_dir(cfg, wave):
+    d = cfg["run_dir"] / wave
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def read(p):
+    p = pathlib.Path(p)
+    return p.read_text(encoding="utf-8", errors="replace").strip() if p.exists() else ""
+
+
+# ---------- tmux ----------
+
+def parse_tmux_version(text):
+    """`tmux 3.4` -> (3, 4); `3.2a` -> (3, 2); `next-3.5` -> (3, 5); `master` -> newest."""
+    text = (text or "").strip()
+    if re.search(r"\bmaster\b", text):
+        return (99, 0)
+    m = re.search(r"(\d+)\.(\d+)", text)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def require_tmux():
+    try:
+        r = sh("tmux", "-V", check=False)
+    except OSError as e:
+        raise SystemExit(f"tmux is required (>= 3.2) but could not be run: {e}")
+    version = parse_tmux_version(r.stdout) if r.returncode == 0 else None
+    if version is None:
+        raise SystemExit(f"cannot determine the tmux version (tmux -V gave rc={r.returncode} "
+                         f"{r.stdout.strip()!r}); tmux >= 3.2 is required")
+    if version < MIN_TMUX:
+        raise SystemExit(f"tmux {version[0]}.{version[1]} is too old: tmux >= 3.2 is required "
+                         f"(new-session -e, display-popup, source-file -n)")
+
+
+def sh(*args, check=True, **kw):
+    return subprocess.run(args, check=check, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", **kw)
+
+
+def tmux_alive(name):
+    return sh("tmux", "has-session", "-t", name, check=False).returncode == 0
+
+
+def pane_text(name):
+    r = sh("tmux", "capture-pane", "-p", "-t", name, check=False)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def send_text(name, text):
+    """Paste text as one bracketed paste, then submit it. The buffer is private to this
+    dispatcher and session: tmux buffers are global to the server."""
+    buf = f"wab-{os.getpid()}-{name}"
+    sh("tmux", "load-buffer", "-b", buf, "-", input=text)
+    sh("tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", name)
+    time.sleep(1.5)
+    sh("tmux", "send-keys", "-t", name, "Enter")
+
+
+def send_command(name, cmd):
+    sh("tmux", "send-keys", "-t", name, "-l", cmd)
+    time.sleep(0.7)
+    sh("tmux", "send-keys", "-t", name, "Enter")
+
+
+def wait_ready(name, timeout=90):
+    """Wait for the Claude TUI input box; accept the folder-trust dialog for our own clone."""
+    end = time.time() + timeout
+    while time.time() < end:
+        txt = pane_text(name)
+        if any(m in txt for m in TRUST_MARKERS):
+            # default option is "No, exit": move to "Yes, I trust this folder" first
+            sh("tmux", "send-keys", "-t", name, "Down")
+            time.sleep(0.5)
+            sh("tmux", "send-keys", "-t", name, "Enter")
+            time.sleep(3)
+            continue
+        if any(m in txt for m in READY_MARKERS):
+            return True
+        time.sleep(2)
+    return False
+
+
+def auto_mode_off(text):
+    """Is the session out of auto mode? True / False, or None when the TUI is not drawn
+    (no footer on screen: no verdict). `switch to auto mode` anywhere on the screen, or no
+    `auto mode on` among the last six non-empty lines, means off."""
+    if not any(m in text for m in READY_MARKERS):
+        return None
+    if "switch to auto mode" in text.lower():
+        return True
+    tail = [l for l in text.splitlines() if l.strip()][-6:]
+    return not any("auto mode on" in l.lower() for l in tail)
+
+
+# ---------- transcripts ----------
+
+def transcript_dir(cwd):
+    return projects_dir() / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
+def transcript_path(cwd, session_id):
+    return transcript_dir(cwd) / f"{session_id}.jsonl"
+
+
+def _num(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+class TranscriptCache:
+    """Incremental reader of session transcripts. Per file it keeps (dev, inode, offset,
+    the unfinished last line, counters): a new call reads only what was appended, a
+    truncated or replaced file starts over. With `tail_bytes` the first read starts that
+    far from the end and drops the cut line (a transcript can be hundreds of MB)."""
+
+    def __init__(self, tail_bytes=None):
+        self.tail_bytes = tail_bytes
+        self.entries = {}
+        self.bytes_read = 0
+
+    @staticmethod
+    def _blank(key):
+        return {"key": key, "offset": None, "partial": b"", "discard_first": False,
+                "turns": 0, "tools": 0, "out": 0, "read": 0, "ctx": 0}
+
+    def read(self, path):
+        path = str(path)
+        try:
+            stt = os.stat(path)
+        except OSError:
+            self.entries.pop(path, None)
+            return self._summary(self._blank(None))
+        key = (stt.st_dev, stt.st_ino)
+        e = self.entries.get(path)
+        if e is None or e["key"] != key or stt.st_size < (e["offset"] or 0):
+            e = self.entries[path] = self._blank(key)
+        try:
+            with open(path, "rb") as f:
+                if e["offset"] is None:
+                    start = 0
+                    if self.tail_bytes and stt.st_size > self.tail_bytes:
+                        start = stt.st_size - self.tail_bytes
+                        e["discard_first"] = True
+                    e["offset"] = start
+                f.seek(e["offset"])
+                data = f.read()
+        except OSError:
+            return self._summary(e)
+        self.bytes_read += len(data)
+        e["offset"] += len(data)
+        lines = (e["partial"] + data).split(b"\n")
+        e["partial"] = lines.pop()
+        for raw in lines:
+            if e["discard_first"]:
+                e["discard_first"] = False
+                continue
+            self._count(e, raw)
+        return self._summary(e)
+
+    @staticmethod
+    def _summary(e):
+        return {k: e[k] for k in ("turns", "tools", "out", "read", "ctx")}
+
+    @staticmethod
+    def _count(e, raw):
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(d, dict) or d.get("type") != "assistant":
+            return
+        msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+        u = msg.get("usage") if isinstance(msg.get("usage"), dict) else None
+        if u:
+            e["out"] += _num(u.get("output_tokens"))
+            e["read"] += _num(u.get("cache_read_input_tokens")) + _num(u.get("input_tokens"))
+        content = msg.get("content")
+        if isinstance(content, list):
+            e["tools"] += sum(1 for c in content if isinstance(c, dict) and c.get("type") == "tool_use")
+        if d.get("isSidechain"):
+            return
+        e["turns"] += 1
+        if u:
+            e["ctx"] = (_num(u.get("input_tokens")) + _num(u.get("cache_creation_input_tokens"))
+                        + _num(u.get("cache_read_input_tokens")))
+
+
+CACHE = TranscriptCache(tail_bytes=TAIL_BYTES)
+
+
+def context_tokens(w):
+    """Tokens in the window at the last main-thread assistant turn of the wave's CURRENT
+    session. The transcript is found by session_id, never by directory: waves may share one."""
+    sessions = w.get("sessions") or []
+    if not sessions:
+        return 0
+    return CACHE.read(transcript_path(w["cwd"], sessions[-1]))["ctx"]
+
+
+def session_marker(cfg, wave):
+    return f"[wab:{cfg['chain']}/{cfg['run_id']}/{wave}]"
+
+
+def find_new_session(cfg, st, wave):
+    """After /clear the wave continues in a new session file. Find it by the marker in its
+    first message, among transcripts of this clone that no wave owns yet."""
+    owned = {s for w in st["waves"].values() for s in (w.get("sessions") or [])}
+    d = transcript_dir(st["waves"][wave]["cwd"])
+    if not d.exists():
+        return None
+    marker = session_marker(cfg, wave).encode("utf-8")
+    files = []
+    for f in d.glob("*.jsonl"):
+        try:
+            files.append((f.stat().st_mtime, f))
+        except OSError:
+            continue
+    for _, f in sorted(files, key=lambda t: t[0], reverse=True):
+        if f.stem in owned:
+            continue
+        try:
+            with open(f, "rb") as fh:
+                head = fh.read(FIRST_MESSAGE_BYTES)
+        except OSError:
+            continue
+        if marker in head:
+            return f.stem
+    return None
+
+
+# ---------- Telegram ----------
+
+_tg = {}
+
+# Outgoing text is written by the wave session and may quote secrets or personal data.
+# Everything leaving through notify() passes redact(); the full text stays in $WAB_DIR.
+TG_LIMIT = 600        # quoted wave text (result.md, BLOCKED question)
+TG_MESSAGE_LIMIT = 1200  # whole message; quoted text is capped at TG_LIMIT first, so the
+                         # framing and the attach command after it always fit
+_REDACT = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
+    re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
+    re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"),                      # Telegram bot token
+    re.compile(r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|dsn|"
+               r"connection[_-]?string|accountkey|sharedaccesskey)\b(\s*[:=]\s*)"
+               r"(?:\"[^\"]*\"?|'[^']*'?|\S+)"),                             # quoted value as a whole
+    re.compile(r"(?i)\b((?:proxy-)?authorization)(\s*:\s*)(?:(?:bearer|basic|token|digest)\s+)?\S+"),
+    re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"),                    # userinfo in URLs
+    re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),                      # e-mail addresses
+    re.compile(r"\+\d[\d ()-]{8,}\d"),                                  # phone numbers (+7 ...)
+    re.compile(r"\b[A-Za-z0-9+/_]{40,}={0,2}"),                          # long opaque blobs
+]
+
+
+def redact(text, limit=TG_LIMIT):
+    for rx in _REDACT:
+        text = rx.sub(lambda m: (m.group(1) + m.group(2) + "[скрыто]") if rx.groups >= 2 and m.group(2)
+                      else "[скрыто]", text)
+    return text if len(text) <= limit else text[:limit].rstrip() + " …"
+
+
+def _secret(vault, name):
+    return sh("az", "keyvault", "secret", "show", "--vault-name", vault, "--name", name,
+              "--query", "value", "-o", "tsv").stdout.strip()
+
+
+def _send_telegram(cfg, text):
+    """Transport. Vault and secret names come from chain.json `telegram`; nothing about the
+    host is built in. The HTTP call is made from Python (urllib), not from a shell pipeline."""
+    tg = cfg["telegram"]
+    key = (tg["keyvault"], tg["token_secret"], tg["chat_secret"])
+    if key not in _tg:
+        _tg[key] = (_secret(tg["keyvault"], tg["token_secret"]), _secret(tg["keyvault"], tg["chat_secret"]))
+    token, chat = _tg[key]
+    data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode("utf-8")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=20):
+        pass
+
+
+def notify(cfg, text):
+    tg = cfg.get("telegram")
+    lines = [l for l in text.splitlines() if l.strip()]
+    first = redact(lines[0], 120) if lines else ""
+    if not (isinstance(tg, dict) and all(tg.get(k) for k in ("keyvault", "token_secret", "chat_secret"))):
+        event(cfg, f"notify(skipped): {first}")
+        return
+    try:
+        _send_telegram(cfg, redact(text, TG_MESSAGE_LIMIT))
+        event(cfg, f"telegram: {first}")
+    except Exception as e:  # notification must never stop supervision
+        event(cfg, f"telegram FAILED ({type(e).__name__}): {first[:80]}")
+
+
+# ---------- launch ----------
+
+ADMISSION_ROOT = re.compile(r"cc-admission-[a-z0-9_]{8}")
+ADMISSION_SIGNATURE = {"empty-template", "checkout"}
+
+
+def admitted_workdir(path):
+    """`workdir` must belong to a clone returned by `cc-autonomy prepare`: the clone itself
+    or a worktree derived from it (rules/autonomy-allowlist.md). Return the reason it is not."""
+    r = sh("git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir",
+           check=False)
+    if r.returncode != 0:
+        return f"not a git checkout: {r.stderr.strip()}"
+    common = pathlib.Path(r.stdout.strip()).resolve()
+    checkout, root = common.parent, common.parent.parent
+    if common.name != ".git" or checkout.name != "checkout" or not ADMISSION_ROOT.fullmatch(root.name):
+        return f"git dir {common} is not inside a cc-admission-*/checkout clone"
+    try:
+        if set(os.listdir(root)) != ADMISSION_SIGNATURE or root.stat().st_uid != os.getuid():
+            return f"{root} does not carry the admission signature"
+    except OSError as e:
+        return f"{root}: {e}"
+    return None
+
+
+def prepare_clone(cfg):
+    if cfg.get("workdir"):
+        why = admitted_workdir(cfg["workdir"])
+        if why:
+            raise SystemExit(f"admission refused for workdir {cfg['workdir']}: {why}")
+        return cfg["workdir"]
+    helper = pathlib.Path.home() / ".claude" / "bin" / "cc-autonomy.py"
+    r = sh("python3", str(helper), "prepare", str(cfg.get("repo") or ""), check=False)
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        out = {}
+    if r.returncode != 0 or not out.get("ok"):
+        raise SystemExit(f"admission refused: rc={r.returncode} {r.stdout.strip()} {r.stderr.strip()}")
+    return out["admitted_path"]
+
+
+MANDATE_HEADER = "Прогон: "
+
+
+def system_prompt(cfg):
+    """Generic protocol plus the mandate of THIS run only (run_dir/mandate.md, approved in
+    phase A). A dated mandate must never ride along with an unrelated chain or rerun:
+    its first line must name this run_id, otherwise it is ignored. Waves may write into
+    run_dir, so the approved bytes are pinned by `mandate_sha256` in chain.json (which lives
+    outside run_dir): a mandate whose digest differs is refused, not trusted."""
+    text = PROTOCOL.read_text(encoding="utf-8").rstrip() + "\n"
+    mandate = cfg["run_dir"] / "mandate.md"
+    raw = mandate.read_bytes() if mandate.exists() else b""
+    try:
+        body = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SystemExit(f"{mandate} is not valid UTF-8")
+    first = body.splitlines()[:1]
+    if first and first[0].strip() != MANDATE_HEADER + cfg["run_id"]:
+        event(cfg, f"mandate.md ignored: first line must be «{MANDATE_HEADER}{cfg['run_id']}»")
+    elif first:
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != cfg.get("mandate_sha256"):
+            raise SystemExit(f"mandate.md sha256 {digest} != chain.json mandate_sha256 "
+                             f"{cfg.get('mandate_sha256')}: mandate changed after approval")
+        text += (f"\n## Мандат прогона `{cfg['chain']}` (из {mandate})\n\n" + body.strip() + "\n")
+    out = cfg["run_dir"] / "system-prompt.md"
+    out.write_text(text, encoding="utf-8")
+    return out
+
+
+def launch(cfg, wave, prompt_file):
+    """Start one wave. False when the Claude TUI never became ready: nothing is sent then."""
+    require_tmux()
+    if wave not in cfg["waves"]:
+        raise SystemExit(f"unknown wave {wave}; chain.json waves: {cfg['waves']}")
+    st = load_state(cfg)
+    name = f"{cfg['tmux_prefix']}{wave.lower()}"
+    if tmux_alive(name):
+        raise SystemExit(f"tmux session {name} already exists")
+    wdir = wave_dir(cfg, wave)
+    cwd = prepare_clone(cfg)
+    prompt_path = pathlib.Path(prompt_file).resolve()
+    if not prompt_path.is_file():
+        raise SystemExit(f"prompt file {prompt_file} not found")
+    sid = str(uuid.uuid4())  # known up front: the transcript is bound to the wave by session id
+    (wdir / "status").write_text("STARTING\n", encoding="utf-8")
+    cmd = ["claude", "--permission-mode", "auto", "--append-system-prompt-file", str(system_prompt(cfg)),
+           "--name", f"wab-{cfg['chain']}-{wave}", "--session-id", sid]
+    if cfg["model"]:
+        cmd += ["--model", cfg["model"]]
+    sh("tmux", "new-session", "-d", "-s", name, "-c", cwd, "-x", "220", "-y", "60",
+       "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *cmd)
+    # publish the wave before waiting: a dispatcher that dies here must not lose the session
+    st["current"] = wave
+    st["waves"][wave] = {"tmux": name, "cwd": cwd, "started": time.time(), "restarts": 0,
+                         "phase": "starting", "notified": {}, "sessions": [sid],
+                         "prompt_file": str(prompt_path)}
+    save_state(cfg, st)
+    return deliver_first_prompt(cfg, st, wave)
+
+
+def deliver_first_prompt(cfg, st, wave):
+    """starting -> sending -> running. The phase is saved before the paste: a dispatcher
+    that dies in between leaves `sending`, which is never resent blindly."""
+    w = st["waves"][wave]
+    name, cwd, wdir = w["tmux"], w["cwd"], wave_dir(cfg, wave)
+    if not wait_ready(name):
+        blocked = "BLOCKED: окно Claude не стало готовым, задача не отправлена\n"
+        (wdir / "status").write_text(blocked, encoding="utf-8")
+        w["phase"] = "not_ready"
+        save_state(cfg, st)
+        event(cfg, f"{wave}: Claude TUI not ready in {name}, prompt NOT sent")
+        notify(cfg, f"wave-autobot: окно волны {wave} не стало готовым за 90 с, задачу не отправил. "
+                    f"Цепочка стоит. Посмотри: tmux attach -t {name}")
+        return False
+    prompt = pathlib.Path(w["prompt_file"]).read_text(encoding="utf-8").strip()
+    head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wdir} "
+            f"(он же $WAB_DIR). Рабочая копия (admitted clone): {cwd}. "
+            f"Протокол — в системной инструкции.\n\n")
+    (wdir / "first-prompt.md").write_text(head + prompt + "\n", encoding="utf-8")
+    w["phase"] = "sending"
+    save_state(cfg, st)
+    send_text(name, head + prompt)
+    w["phase"] = "running"
+    save_state(cfg, st)
+    event(cfg, f"{wave}: launched in tmux {name}, cwd {cwd}")
+    notify(cfg, f"wave-autobot: стартовала волна {wave}.\nСмотреть: tmux attach -t {name}\n(выйти: Ctrl-b d)")
+    return True
+
+
+# ---------- supervision ----------
+
+def once_per(w, key, value):
+    """True the first time `value` is seen under `key` (dedup for notifications)."""
+    notified = w.setdefault("notified", {})
+    if notified.get(key) == value:
+        return False
+    notified[key] = value
+    return True
+
+
+def resume(cfg, st):
+    """Pick up after a dispatcher restart from the phase on disk, without relaunching."""
+    wave = st.get("current")
+    if not wave or wave not in st["waves"]:
+        return
+    w = st["waves"][wave]
+    name, phase = w["tmux"], w.get("phase")
+    if phase == "starting" and tmux_alive(name):
+        event(cfg, f"{wave}: resumed in phase 'starting': waiting for the TUI, then sending the task")
+        if w.get("prompt_file") and pathlib.Path(w["prompt_file"]).is_file():
+            deliver_first_prompt(cfg, st, wave)
+        else:
+            event(cfg, f"{wave}: prompt file is gone, task NOT sent")
+            if once_per(w, "no_prompt", "1"):
+                notify(cfg, f"wave-autobot: волна {wave} запущена, но файла с задачей уже нет, "
+                            f"задачу не отправил. Посмотри: tmux attach -t {name}")
+            save_state(cfg, st)
+    elif phase == "sending":
+        event(cfg, f"{wave}: resumed in phase 'sending': unknown whether the task was delivered, "
+                   f"NOT resent")
+        if once_per(w, "sending", "1"):
+            notify(cfg, f"wave-autobot: диспетчер перезапустился при отправке задачи волне {wave}; "
+                        f"неизвестно, дошла ли она, повторно не слал. Проверь окно: tmux attach -t {name}")
+        w["phase"] = "running"
+        save_state(cfg, st)
+    elif phase == "dead" and tmux_alive(name):
+        w["phase"] = "running"
+        w.get("notified", {}).pop("dead", None)
+        save_state(cfg, st)
+        event(cfg, f"{wave}: window is back, supervision resumed")
+
+
+def tick(cfg, st):
+    wave = st.get("current")
+    if not wave:
+        return False
+    if wave not in st["waves"]:
+        event(cfg, f"state.json: current wave {wave} has no record")
+        return False
+    w = st["waves"][wave]
+    w.setdefault("notified", {})
+    w.setdefault("sessions", [])
+    name, wdir = w["tmux"], wave_dir(cfg, wave)
+    status = read(wdir / "status")
+    now = time.time()
+    attach = f"tmux attach -t {name}  (выйти: Ctrl-b d)"
+
+    if w.get("phase") == "awaiting_merge":
+        return True  # the coordinator merges the PR and runs `launch` for the next wave
+    if w.get("phase") == "not_ready":
+        return False
+
+    # DONE first: a wave may finish and close its window between two ticks
+    if status == "DONE" and cfg.get("merge_gate") == "external":
+        event(cfg, f"{wave}: DONE, awaiting merge by the coordinator")
+        notify(cfg, f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n"
+                    f"Мердж и запуск следующей волны — за координатором.")
+        if tmux_alive(name):
+            sh("tmux", "send-keys", "-t", name, "-l", "/exit", check=False)
+            sh("tmux", "send-keys", "-t", name, "Enter", check=False)
+        w["phase"] = "awaiting_merge"
+        w["finished"] = now
+        save_state(cfg, st)
+        return True
+
+    if status == "DONE":
+        waves = cfg["waves"]
+        idx = waves.index(wave)
+        nxt = wdir / "next-prompt.md"
+        if once_per(w, "done", "1"):  # a restart between this and the next launch must not repeat it
+            event(cfg, f"{wave}: DONE")
+            notify(cfg, f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
+                        f"Целиком: {wdir}/result.md")
+            if tmux_alive(name):
+                sh("tmux", "send-keys", "-t", name, "-l", "/exit", check=False)
+                sh("tmux", "send-keys", "-t", name, "Enter", check=False)
+            w["finished"] = now
+        w["phase"] = "done"
+        if idx + 1 >= len(waves):
+            st["current"] = None
+            save_state(cfg, st)
+            event(cfg, "chain finished")
+            notify(cfg, "wave-autobot: цепочка завершена, все волны готовы.")
+            return False
+        if not nxt.exists():
+            st["current"] = None
+            save_state(cfg, st)
+            notify(cfg, f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
+            return False
+        save_state(cfg, st)
+        return launch(cfg, waves[idx + 1], nxt)
+
+    if not tmux_alive(name):
+        if once_per(w, "dead", "1"):
+            event(cfg, f"{wave}: tmux session {name} is gone (status={status})")
+            notify(cfg, f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
+        w["phase"] = "dead"
+        save_state(cfg, st)
+        return False  # the chain stops; restart the wave by hand, then run watch again
+
+    if status.startswith("BLOCKED"):
+        if once_per(w, "blocked", status):
+            event(cfg, f"{wave}: {status[:200]}")
+            notify(cfg, f"wave-autobot: волна {wave} ждёт тебя.\n\n{redact(status)}\n\nОтветить: {attach}")
+        save_state(cfg, st)
+        return True
+
+    if status == "HANDOFF_READY" and w.get("phase") == "checkpoint":
+        event(cfg, f"{wave}: handoff ready, /clear + /update (restart #{w.get('restarts', 0) + 1})")
+        send_command(name, "/clear")
+        w["await_session"] = True  # the next session is found by its marker, not by guesswork
+        time.sleep(6)
+        send_text(name, f"/update {session_marker(cfg, wave)} Продолжаем волну {wave} wave-autobot. "
+                        f"Каталог волны: {wdir}. Прочитай {wdir}/handoff.md и продолжи с шага "
+                        f"«Следующий шаг».")
+        w["restarts"] = w.get("restarts", 0) + 1
+        w["phase"] = "running"
+        w["checkpoint_at"] = None
+        (wdir / "status").write_text("RESUMING\n", encoding="utf-8")
+        save_state(cfg, st)
+        return True
+
+    txt = pane_text(name)
+    awaiting = bool(w.get("await_session"))
+    if awaiting:
+        sid = find_new_session(cfg, st, wave)
+        if sid:
+            w["sessions"].append(sid)
+            w["await_session"] = awaiting = False
+            event(cfg, f"{wave}: new session {sid} bound by marker")
+    if awaiting:
+        tokens = w.get("tokens", 0)  # old session: not measured, no checkpoint requested
+    else:
+        tokens = context_tokens(w)
+        w["tokens"] = tokens
+        w["peak"] = max(w.get("peak", 0), tokens)
+        w["ctx_hist"] = (w.get("ctx_hist", []) + [tokens])[-120:]
+
+    if w.get("phase") == "running" and not awaiting and tokens >= cfg["ctx_limit"]:
+        event(cfg, f"{wave}: context {tokens} >= {cfg['ctx_limit']}, checkpoint requested")
+        w["phase"] = "checkpoint"  # persisted first: a restarted watch must see the request
+        w["checkpoint_at"] = now
+        w["checkpoint_sent"] = False
+        save_state(cfg, st)
+    if w.get("phase") == "checkpoint" and not w.get("checkpoint_sent", True):
+        # also re-sent after a dispatcher restart between the save above and delivery
+        send_text(name, f"WAB-CHECKPOINT: контекст {tokens // 1000}k токенов. По протоколу: доведи "
+                        f"шаг, закоммить и запушь WIP, перепиши {wdir}/handoff.md, запиши "
+                        f"HANDOFF_READY в {wdir}/status и остановись.")
+        w["checkpoint_sent"] = True
+        save_state(cfg, st)
+    elif w.get("phase") == "checkpoint" and now - (w.get("checkpoint_at") or now) > cfg["handoff_timeout_minutes"] * 60:
+        if once_per(w, "checkpoint_timeout", str(w.get("checkpoint_at"))):
+            notify(cfg, f"wave-autobot: {wave} не записала handoff за {cfg['handoff_timeout_minutes']} мин "
+                        f"после запроса. Посмотри: {attach}")
+
+    if w.get("phase") == "running":  # a wave out of auto mode asks for every step
+        off = auto_mode_off(txt)
+        if off:
+            w["auto_off_ticks"] = w.get("auto_off_ticks", 0) + 1
+            if w["auto_off_ticks"] >= 2 and not w.get("auto_alerted"):
+                w["auto_alerted"] = True
+                event(cfg, f"{wave}: window is not in auto mode")
+                notify(cfg, f"wave-autobot: волна {wave} вышла из режима auto и будет спрашивать "
+                            f"подтверждения. Вернуть: {attach}, Shift+Tab до «auto mode on».")
+        elif off is False:
+            w["auto_off_ticks"] = 0
+            w["auto_alerted"] = False
+
+    if any(m in txt for m in PERMISSION_MARKERS):
+        if once_per(w, "permission", hashlib.sha1(txt[-800:].encode("utf-8")).hexdigest()):
+            event(cfg, f"{wave}: permission prompt on screen")
+            notify(cfg, f"wave-autobot: волна {wave} ждёт подтверждения на экране.\n{attach}")
+
+    digest = hashlib.sha1(txt.encode("utf-8")).hexdigest()
+    if digest != w.get("pane_digest"):
+        w["pane_digest"], w["pane_changed"] = digest, now
+    elif now - w.get("pane_changed", now) > cfg["idle_minutes"] * 60:
+        if once_per(w, "idle", digest):
+            event(cfg, f"{wave}: pane idle {cfg['idle_minutes']}+ min, status={status}")
+            notify(cfg, f"wave-autobot: волна {wave} молчит {cfg['idle_minutes']}+ мин "
+                        f"(статус «{status}»). Возможно, ждёт тебя: {attach}")
+    save_state(cfg, st)
+    return True
+
+
+# ---------- Ctrl+\ popup ----------
+
+SAFE_PATH = re.compile(r"/[A-Za-z0-9_./+-]*")
+SAFE_DASH = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def keys_conf(registry):
+    """tmux config for the Ctrl+\\ toggle, from {dash session: [opener, chain.json]}.
+    On a registered dashboard the key opens that chain's current wave in a popup; inside a
+    popup client (attached with -f ignore-size) it closes it; elsewhere it reaches the app.
+    prefix+W and Shift+Tab are not touched. Anything outside a conservative character set is
+    refused: the values end up inside tmux config syntax."""
+    key = '"C-\\\\"'
+    cmd = (f'if-shell -F "#{{m:*ignore-size*,#{{client_flags}}}}" '
+           f'{{ detach-client }} {{ send-keys {key} }}')
+    for dash, entry in sorted(registry.items()):
+        if (not isinstance(dash, str) or not SAFE_DASH.fullmatch(dash) or not isinstance(entry, (list, tuple))
+                or len(entry) != 2 or not all(isinstance(p, str) and SAFE_PATH.fullmatch(p) for p in entry)):
+            raise ValueError(f"unsafe registry entry {dash!r}: names [A-Za-z0-9_-], paths absolute "
+                             f"[A-Za-z0-9_./+-]")
+        opener, chain = entry
+        cmd = (f'if-shell -F "#{{==:#{{session_name}},{dash}}}" '
+               f'{{ display-popup -E -w 95% -h 90% -T " волна (назад: Ctrl+\\\\) " "{opener} {chain}" }} '
+               f'{{ {cmd} }}')
+    return f"bind-key -n {key} {cmd}\n"
+
+
+def bind_popup(cfg, path):
+    """Register this chain's dashboard and (re)generate keys.tmux for every registered chain.
+    tmux key bindings are global to the server, so one binding serves all chains."""
+    dash = f"{cfg['tmux_prefix']}dash"
+    entry = [str(HERE / "wab-open"), str(pathlib.Path(path).resolve())]
+    try:
+        keys_conf({dash: entry})
+    except ValueError as e:
+        event(cfg, f"Ctrl+\\ binding refused: {e}")
+        return
+    try:
+        old = json.loads(registry_path().read_text(encoding="utf-8"))
+        old = old if isinstance(old, dict) else {}
+    except (OSError, ValueError):
+        old = {}
+    reg = {}
+    for name, val in old.items():
+        if name == dash:
+            continue
+        try:
+            keys_conf({name: val})
+        except ValueError:
+            event(cfg, f"registry entry {name!r} dropped: unsafe")
+            continue
+        if not pathlib.Path(val[1]).is_file():
+            event(cfg, f"registry entry {name!r} dropped: chain file is gone")
+            continue
+        reg[name] = val
+    reg[dash] = entry
+    target = registry_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(reg, indent=1, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, target)
+    conf = cfg["run_dir"] / "keys.tmux"
+    conf.write_text(keys_conf(reg), encoding="utf-8")
+    r = sh("tmux", "source-file", str(conf), check=False)
+    event(cfg, "Ctrl+\\ toggles the wave popup" if r.returncode == 0
+          else f"toggle key bind failed: {r.stderr.strip() or r.stdout.strip()}")
+
+
+def watch(cfg, path, max_ticks=None):
+    require_tmux()
+    event(cfg, f"watch started, ctx_limit={cfg['ctx_limit']}")
+    bind_popup(cfg, path)
+    resume(cfg, load_state(cfg))
+    last = 0.0
+    ticks = 0
+    while True:
+        cfg = load_chain(path)  # thresholds can be tuned live
+        st = load_state(cfg)
+        if not tick(cfg, st):
+            event(cfg, "watch stopped: no current wave")
+            return
+        ticks += 1
+        st = load_state(cfg)
+        w = st["waves"].get(st.get("current") or "", {})
+        if time.time() - last > 600 and w:
+            event(cfg, f"{st['current']}: phase={w.get('phase')} ctx={w.get('tokens', 0) // 1000}k "
+                       f"restarts={w.get('restarts')} status={read(wave_dir(cfg, st['current']) / 'status')}")
+            last = time.time()
+        if max_ticks is not None and ticks >= max_ticks:
+            return
+        time.sleep(cfg["tick_seconds"])
+
+
+def status_cmd(cfg):
+    st = load_state(cfg)
+    print("current:", st.get("current"))
+    for wave, w in st["waves"].items():
+        print(f"{wave}: tmux={w.get('tmux')} phase={w.get('phase')} ctx={w.get('tokens', 0) // 1000}k "
+              f"restarts={w.get('restarts', 0)} sessions={len(w.get('sessions') or [])} "
+              f"status={read(cfg['run_dir'] / wave / 'status')}")
+
+
+def main(argv):
+    if len(argv) < 3:
+        sys.exit(__doc__)
+    cmd, path = argv[1], argv[2]
+    if cmd == "current-tmux":
+        cfg = load_chain(path, create=False)
+        st = load_state(cfg)
+        wave = st.get("current")
+        print(st["waves"][wave]["tmux"] if wave and wave in st["waves"] else "")
+    elif cmd == "status":
+        status_cmd(load_chain(path, create=False))
+    elif cmd == "launch" and len(argv) == 5:
+        launch(load_chain(path), argv[3], argv[4])
+    elif cmd == "watch":
+        watch(load_chain(path), path)
+    elif cmd == "notify":
+        notify(load_chain(path), " ".join(argv[3:]))
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

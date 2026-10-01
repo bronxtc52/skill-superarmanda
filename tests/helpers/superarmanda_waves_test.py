@@ -887,7 +887,7 @@ class Mandate(Base):
     def test_without_mandate_file_there_is_no_mandate_section(self):
         cfg, _ = self.chain()
         text = wab.system_prompt(cfg).read_text(encoding="utf-8")
-        self.assertNotIn("Мандат прогона", text)
+        self.assertNotIn("## Мандат прогона", text)
         self.assertIn("handoff", text)
 
     def test_wrong_digest_is_refused_and_right_one_is_included(self):
@@ -898,15 +898,15 @@ class Mandate(Base):
             wab.system_prompt(cfg)
         cfg["mandate_sha256"] = hashlib.sha256(body).hexdigest()
         text = wab.system_prompt(cfg).read_text(encoding="utf-8")
-        self.assertIn("Мандат прогона", text)
+        self.assertIn("## Мандат прогона", text)
         self.assertIn("Мердж разрешён", text)
 
     def test_mandate_of_another_run_is_ignored(self):
         cfg, _ = self.chain()
-        (cfg["run_dir"] / "mandate.md").write_bytes("Прогон: other\nсекрет\n".encode("utf-8"))
+        (cfg["run_dir"] / "mandate.md").write_bytes("Прогон: other\nZZ-UNIQUE-BODY\n".encode("utf-8"))
         text = wab.system_prompt(cfg).read_text(encoding="utf-8")
-        self.assertNotIn("Мандат прогона", text)
-        self.assertNotIn("секрет", text)
+        self.assertNotIn("## Мандат прогона", text)
+        self.assertNotIn("ZZ-UNIQUE-BODY", text)
 
     def test_mandate_is_decoded_as_utf8_whatever_the_locale(self):
         body = f"Прогон: {RUN_ID}\nкириллица\n".encode("utf-8")
@@ -961,8 +961,9 @@ class Utf8(Base):
     def test_the_whole_module_has_no_bare_text_io(self):
         for name in ("wab.py", "dash.py"):
             src = (WAVES / name).read_text(encoding="utf-8")
-            for m in re.finditer(r"\.(read_text|write_text)\(([^)]*)\)", src):
-                self.assertIn("encoding", m.group(2), f"{name}: {m.group(0)}")
+            for line in src.splitlines():
+                if re.search(r"\.(read_text|write_text)\(", line):
+                    self.assertIn("encoding", line, f"{name}: {line.strip()}")
             for line in src.splitlines():
                 if re.search(r"(?<![A-Za-z_])open\(", line) and '"rb"' not in line:
                     self.assertIn("encoding", line, f"{name}: {line.strip()}")
@@ -1032,7 +1033,7 @@ class Dashboard(Base):
         self.assertIn("tty", proc.stderr)
 
     def test_rich_is_imported_by_dash_only(self):
-        self.assertNotIn("rich", (WAVES / "wab.py").read_text(encoding="utf-8").replace("rich_", ""))
+        self.assertNotRegex((WAVES / "wab.py").read_text(encoding="utf-8"), r"(?m)^\s*(import|from)\s+rich")
         self.assertIn("from rich", (WAVES / "dash.py").read_text(encoding="utf-8"))
 
 
