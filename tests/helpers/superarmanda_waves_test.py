@@ -249,13 +249,13 @@ class Base(unittest.TestCase):
     # ----- merge_gate "auto": a wave whose PR is already MERGED at the sha the gate passed -----
     def merged_view(self, args):
         if args[:3] == ("gh", "pr", "view"):
-            doc = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": "c" * 40}
+            doc = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": "c" * 40, "baseRefName": "main"}
             return subprocess.CompletedProcess(args, 0, json.dumps(doc), "")
         return subprocess.CompletedProcess(args, 1, "", "unexpected gh call in tests")
 
     def auto_chain(self, **over):
         """chain.json with merge_gate "auto" and a `gh` that reports every PR MERGED."""
-        cfg, path = self.chain(merge_gate="auto", **over)
+        cfg, path = self.chain(**{"merge_gate": "auto", "base_branch": "main", **over})
         self.gh_handler = self.merged_view
         return cfg, path
 
@@ -5538,7 +5538,7 @@ class W4Round34(Base):
             with self.subTest(case=name):
                 self.windows = {"wv-w1"}
                 self.tmux_calls.clear()
-                cfg, path = self.chain(merge_gate=gate, waves=waves)
+                cfg, path = self.chain(merge_gate=gate, waves=waves, base_branch="main")
                 self.gh_handler = self.merged_view if merged else None
                 self.put_state(cfg, {"current": "W1", "waves": {
                     "W1": self.auto_rec() if merged else self.wave_rec()}})
@@ -6726,7 +6726,7 @@ class PlanPin(Base):
         wab.load_chain(path)
 
     def test_dispatcher_launch_of_next_wave_refuses_on_changed_plan(self):
-        cfg, _ = self.pinned(merge_gate="auto")
+        cfg, _ = self.pinned(merge_gate="auto", base_branch="main")
         self.gh_handler = self.merged_view
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
@@ -7436,7 +7436,7 @@ class GateBase(Base):
         self.facts = green_facts()
         self.manifest = green_manifest()
         self.work = dict(WORK)
-        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD}
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "main"}
         self.merge_rc, self.merge_err, self.ready_rc = 0, "", 0
         self.find_calls = 0
 
@@ -7556,7 +7556,7 @@ class MergeGate(GateBase):
             self.assertTrue(self.tick())
         self.assertEqual(len(self.merges()), 1)
         self.launch.assert_not_called()
-        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
         self.assertTrue(self.tick())
         self.launch.assert_called_once()
         self.assertEqual(self.launch.call_args[0][1], "W2")
@@ -7574,7 +7574,7 @@ class MergeGate(GateBase):
             wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
         self.assertEqual(len(self.merges()), 1)
         self.assertEqual(self.rec()["phase"], "merging")
-        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
         wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
         self.assertEqual(self.rec()["phase"], "done")
         self.assertEqual(len(self.merges()), 1)
@@ -7622,7 +7622,7 @@ class MergeGate(GateBase):
         self.assertTrue((self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge").is_file())
         self.assertEqual(self.log().count("merge result unknown"), 1)
         # the owner merges: the wave completes as usual
-        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
         with mock.patch.object(wab, "GATE_POLL_SECONDS", 0):
             self.tick()
         self.assertEqual(self.rec()["phase"], "done")
@@ -7815,7 +7815,7 @@ class MergeGate(GateBase):
         self.assertIn(f"Выполни: {shown}", said[0])
         self.assertNotIn("gh pr merge", said[0])
         # the owner runs it: MERGED at the gated head -> the next wave starts
-        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
         self.tick()
         self.launch.assert_called_once()
         self.assertEqual(self.merges(), [])
@@ -7847,7 +7847,7 @@ class MergeGate(GateBase):
         self.assertEqual(len(self.merges()), 1)
         self.assertEqual(len([t for t in self.tg if "мердж отклонён" in t]), 1)
         # the owner merges by hand: the chain goes on
-        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
         self.tick()
         self.launch.assert_called_once()
 
@@ -7912,7 +7912,7 @@ class MergeGate(GateBase):
     def test_merged_with_another_head_blocks_and_launches_nothing(self):  # acceptance 1c
         self.start()
         self.merge_it()
-        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": OLD}
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": OLD, "baseRefName": "main"}
         self.assertFalse(self.tick())  # the watch hands the chain over
         self.launch.assert_not_called()
         self.assertTrue(self.status().startswith("BLOCKED: merge gate: PR #7 смержен с HEAD"))
@@ -7920,10 +7920,52 @@ class MergeGate(GateBase):
         self.assertEqual(len([t for t in self.tg if "смержен с HEAD" in t]), 1)
         self.assertIn("next wave NOT launched", self.log())
 
+    def test_merged_into_another_base_blocks_and_launches_nothing(self):
+        self.start()
+        self.merge_it()
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD,
+                     "baseRefName": "release"}
+        self.assertFalse(self.tick())
+        self.launch.assert_not_called()
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+        self.assertIn("смержен в release, цепочка ждёт main", self.status())
+        self.assertEqual(len([t for t in self.tg if "смержен в release" in t]), 1)
+
+    def test_the_last_wave_merged_into_another_base_does_not_end_the_chain(self):
+        cfg = self.start(waves=["W1"])
+        self.merge_it()
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD,
+                     "baseRefName": "release"}
+        self.tick()
+        self.assertEqual(self.get_state(cfg)["current"], "W1")
+        self.assertNotIn("chain finished", self.log())
+        self.assertEqual([t for t in self.tg if "цепочка завершена" in t], [])
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+
+    def test_merged_with_an_unknown_base_is_not_done(self):
+        self.start()
+        self.merge_it()
+        for base in (None, "missing"):
+            self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+            if base is None:
+                self.view["baseRefName"] = None
+            self.assertTrue(self.tick())
+        self.launch.assert_not_called()
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.log().count("base not known"), 1)
+
+    def test_an_open_pr_redirected_to_another_base_goes_back_to_the_gate(self):
+        self.start()
+        self.merge_it()
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "release"}
+        self.assertTrue(self.tick())
+        self.assertEqual(self.rec()["phase"], "gate")
+        self.launch.assert_not_called()
+
     def test_closed_pr_blocks_and_launches_nothing(self):
         self.start()
         self.merge_it()
-        self.view = {"state": "CLOSED", "mergeCommit": None, "headRefOid": HEAD}
+        self.view = {"state": "CLOSED", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "main"}
         self.assertFalse(self.tick())
         self.launch.assert_not_called()
         self.assertEqual(self.rec()["phase"], "awaiting_merge")
@@ -7941,7 +7983,7 @@ class MergeGate(GateBase):
     def test_the_last_wave_ends_the_chain_after_the_merge(self):
         cfg = self.start(waves=["W1"])
         self.merge_it()
-        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
         self.assertFalse(self.tick())
         self.assertIsNone(self.get_state(cfg)["current"])
         self.assertIn("chain finished", self.log())
@@ -8013,7 +8055,7 @@ class Regate(GateBase):  # D2: the head moved while the wave sat in `merging`
             for r in entry["results"].values():
                 r["head"] = self.NEW
         self.work = {**WORK, "head": self.NEW}
-        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": self.NEW}
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": self.NEW, "baseRefName": "main"}
 
     def regate(self):
         self.start()
@@ -8283,7 +8325,7 @@ class OwnerMergeHarness(GateBase):
             return wab.owner_merge(wab.load_chain(self.path), "W1", RUN_ID, HEAD)
 
     def merged_view(self, head=HEAD):
-        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": head}
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": head, "baseRefName": "main"}
 
 
 class GateBaseRedirect(OwnerMergeHarness):  # r8 HIGH: the PR base is checked at every collection

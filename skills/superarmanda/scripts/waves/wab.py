@@ -2345,7 +2345,7 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         return _merge_stopped(cfg, st, wave, w, wdir, "в записи волны нет gate_pr/gate_sha", now)
     try:
         info = _json(_gh("pr", "view", str(number), "--repo", str(cfg["repo"]), "--json",
-                         "state,mergeCommit,headRefOid"), "gh pr view")
+                         "state,mergeCommit,headRefOid,baseRefName"), "gh pr view")
         if not isinstance(info, dict):
             raise gate.CollectError("gh pr view: unexpected response")
     except gate.CollectError as e:
@@ -2355,7 +2355,19 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         return True
     w.get("notified", {}).pop("merge_view_error", None)
     state = info.get("state")
+    got_base = info.get("baseRefName")
+    want_base = base_branch_of(cfg, w["cwd"])
+    if state in ("MERGED", "OPEN") and not (isinstance(got_base, str) and got_base and want_base):
+        # the base is not known (no field / chain.json and origin/HEAD say nothing): a MERGED PR is
+        # never taken for the chain's merge; an event once, the next tick asks again
+        if state == "MERGED" and once_per(w, "merge_base_unknown", sha):
+            event(cfg, f"{wave}: PR #{number} MERGED, base not known (PR: {got_base!r}, chain: {want_base!r}); waiting")
+        save_state(cfg, st)
+        return True
     if state == "MERGED":
+        if got_base != want_base:
+            return _merge_stopped(cfg, st, wave, w, wdir,
+                                  f"PR #{number} смержен в {got_base}, цепочка ждёт {want_base}", now)
         head = info.get("headRefOid")
         if head != sha:
             return _merge_stopped(cfg, st, wave, w, wdir,
@@ -2365,6 +2377,10 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         return _merge_stopped(cfg, st, wave, w, wdir, f"PR #{number} закрыт без мерджа", now)
     if state == "OPEN" and info.get("headRefOid") != sha:
         return _regate(cfg, st, wave, w, wdir, sha, info.get("headRefOid"))
+    if state == "OPEN" and got_base != want_base:
+        # redirected after the pass: back to the gate (which fails on the base) rather than a stop,
+        # since the PR is not merged and the owner may redirect it back
+        return _regate(cfg, st, wave, w, wdir, sha, sha)
     if state == "OPEN" and "merge_rc" not in w and w.get("merge_called") == sha:
         # the dispatcher died between the mark and the saved result of `gh pr merge`: never merged
         # twice for one sha, so the owner gets the script (it gates again and merges); once (merge_rc)
