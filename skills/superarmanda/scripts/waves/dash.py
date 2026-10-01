@@ -108,13 +108,21 @@ def wave_stats(w):
     return s
 
 
+GIT_TIMEOUT = 10  # seconds: the frame is drawn synchronously, a slow repository must not hang it
+
+
 def commits_since(cwd, started, until=None):
     """Commits in the wave's workdir from its start up to its end (`finished`), so a later wave
-    sharing the workdir does not grow a finished wave's counter."""
+    sharing the workdir does not grow a finished wave's counter. None (shown «?») when git cannot
+    tell: a timeout, no git, an unreachable workdir or an error exit - unknown, not a false 0."""
     window = [f"--since=@{int(started)}"] + ([f"--until=@{int(until)}"] if until else [])
-    r = subprocess.run(["git", "-C", cwd, "log", "--all", "--oneline", *window],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
-    return len(r.stdout.splitlines()) if r.returncode == 0 else 0
+    try:
+        r = subprocess.run(["git", "-C", cwd, "log", "--all", "--oneline", *window],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return len(r.stdout.splitlines()) if r.returncode == 0 else None
 
 
 def _fixed_commits(n):

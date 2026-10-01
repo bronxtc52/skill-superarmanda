@@ -5865,6 +5865,57 @@ class W4Round35(Base):
                 self.assertIsNone(dash.wave_commits(w))
 
 
+class W4Round38DashGitTimeout(Base):
+    """Round 38: the dashboard's time-window `git log` (records without start_rev) runs with a
+    timeout; a hung or missing git leaves the commit counter unknown («?»), not a hung or dead
+    frame and not a false 0."""
+
+    def dash(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        return dash
+
+    def legacy(self):
+        return {k: v for k, v in self.wave_rec(phase="running").items() if k != "start_rev"}
+
+    def test_git_log_gets_a_timeout(self):
+        dash = self.dash()
+        done = subprocess.CompletedProcess([], 0, stdout="a\nb\n", stderr="")
+        with mock.patch.object(dash.subprocess, "run", return_value=done) as run:
+            self.assertEqual(dash.commits_since(self.cwd, time.time() - 60), 2)
+        self.assertIsInstance(run.call_args.kwargs.get("timeout"), (int, float))
+        self.assertGreater(run.call_args.kwargs["timeout"], 0)
+
+    def test_failures_are_unknown_not_zero(self):
+        dash = self.dash()
+        for exc in (subprocess.TimeoutExpired(["git"], 10), FileNotFoundError("git"),
+                    PermissionError("cwd"), subprocess.SubprocessError("x")):
+            with self.subTest(exc=type(exc).__name__), \
+                    mock.patch.object(dash.subprocess, "run", side_effect=exc):
+                self.assertIsNone(dash.commits_since(self.cwd, time.time() - 60))
+                self.assertIsNone(dash.wave_commits(self.legacy()))
+                self.assertEqual(dash.fmt_commits(dash.wave_commits(self.legacy())), "?")
+
+    def test_git_error_exit_is_unknown(self):
+        dash = self.dash()
+        bad = subprocess.CompletedProcess([], 128, stdout="", stderr="fatal: not a git repository")
+        with mock.patch.object(dash.subprocess, "run", return_value=bad):
+            self.assertIsNone(dash.commits_since(self.cwd, time.time() - 60))
+
+    def test_frame_survives_a_hung_git(self):
+        dash = self.dash()
+        cfg, _ = self.chain()
+        st = {"current": "W1", "waves": {"W1": self.legacy()}}
+        with mock.patch.object(dash.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(["git"], 10)), \
+                mock.patch.object(dash, "wave_stats", return_value={k: 0 for k in
+                                                                     ("turns", "tools", "agents", "out", "read")}):
+            table = dash.waves_table(cfg, st)
+        self.assertEqual(str(table.columns[-1]._cells[0]), "?")
+
+
 class TmuxGuard(unittest.TestCase):
     """The guard itself: a socketless tmux must fail loudly, a private one passes the guard."""
 
