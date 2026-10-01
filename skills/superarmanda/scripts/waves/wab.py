@@ -251,9 +251,13 @@ def require_tmux():
 TMUX_SOCKET = None  # tests point this at a private `-L` socket; None means the default server
 
 
+def sock_flag(sock):
+    """A value with `/` is the path of a socket file (`tmux -S`), otherwise a `-L` name."""
+    return (("-S" if "/" in sock else "-L"), sock) if sock else ()
+
+
 def tmux_argv(*args):
-    sock = TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET")
-    return ("tmux", *(("-L", sock) if sock else ()), *args)
+    return ("tmux", *sock_flag(TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET")), *args)
 
 
 def attach_cmd(name):
@@ -637,13 +641,41 @@ def admitted_workdir(path):
     return None
 
 
+def host_helper():
+    return pathlib.Path.home() / ".claude" / "bin" / "cc-autonomy.py"
+
+
+def isolated_workdir(path):
+    """Unmanaged host (no admission policy): any git checkout or worktree owned by the current
+    user is a valid isolated worktree. Return the reason it is not."""
+    r = sh("git", "-C", str(path), "rev-parse", "--show-toplevel", check=False)
+    if r.returncode != 0:
+        return f"not a git checkout: {r.stderr.strip()}"
+    try:
+        if pathlib.Path(path).stat().st_uid != os.getuid():
+            return f"{path} is not owned by the current user"
+    except OSError as e:
+        return f"{path}: {e}"
+    return None
+
+
 def prepare_clone(cfg):
+    helper = host_helper()
+    if not helper.is_file():  # standalone install: no host policy, so no admission to satisfy
+        if not cfg.get("workdir"):
+            raise SystemExit("admission: no host policy (~/.claude/bin/cc-autonomy.py not found): "
+                             "set workdir in chain.json to an isolated git worktree")
+        why = isolated_workdir(cfg["workdir"])
+        if why:
+            raise SystemExit(f"workdir {cfg['workdir']} refused: {why}")
+        event(cfg, f"admission: unmanaged host (no host policy), isolated git worktree {cfg['workdir']}")
+        return cfg["workdir"]
     if cfg.get("workdir"):
         why = admitted_workdir(cfg["workdir"])
         if why:
             raise SystemExit(f"admission refused for workdir {cfg['workdir']}: {why}")
+        event(cfg, f"admission: host policy, cc-admission clone {cfg['workdir']}")
         return cfg["workdir"]
-    helper = pathlib.Path.home() / ".claude" / "bin" / "cc-autonomy.py"
     r = sh("python3", str(helper), "prepare", str(cfg.get("repo") or ""), check=False)
     try:
         out = json.loads(r.stdout)
@@ -651,6 +683,7 @@ def prepare_clone(cfg):
         out = {}
     if r.returncode != 0 or not out.get("ok"):
         raise SystemExit(f"admission refused: rc={r.returncode} {r.stdout.strip()} {r.stderr.strip()}")
+    event(cfg, "admission: host policy, cc-autonomy prepare")
     return out["admitted_path"]
 
 
@@ -744,6 +777,7 @@ def _launch(cfg, wave, prompt_file):
     system_prompt(cfg)
     # the intent is saved BEFORE tmux is touched: a restart finds the wave and its session id
     st["current"] = wave
+    st.pop("stopped", None)
     old = st["waves"].get(wave)
     attempts = (old.get("attempts", []) + [{k: v for k, v in old.items() if k != "attempts"}]) if old else []
     st["waves"][wave] = {"tmux": name, "cwd": cwd, "started": time.time(), "restarts": 0,
@@ -1065,8 +1099,12 @@ def _tick(cfg, st):
             return False
         if not nxt.exists():
             st["current"] = None
+            st["stopped"] = f"{wave}: DONE without next-prompt.md"
+            fresh_stop = once_per(w, "no_next", "1")
             save_state(cfg, st)
-            notify(cfg, f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
+            if fresh_stop:
+                event(cfg, f"{wave}: DONE without next-prompt.md; chain stopped")
+                notify(cfg, f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
             return False
         save_state(cfg, st)
         return launch(cfg, waves[idx + 1], nxt)
@@ -1253,7 +1291,8 @@ def stale_btab(list_keys_output):
 
 
 def sock_id(sock=None):
-    """Identity of the tmux server in the registry: the -L name, "" for the default server."""
+    """Identity of the tmux server in the registry: the -L name or the -S socket path (contains
+    `/`), "" for the default server."""
     if sock is not None:
         return sock
     return TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET") or ""
@@ -1268,6 +1307,17 @@ def reg_key(sock, name):
 def split_key(key):
     sock, _, name = key.rpartition("|")
     return sock, name
+
+
+def _dash_session_alive(sock, name):
+    """Does the dashboard session still exist on ITS server? A killed dashboard (kill -9,
+    kill-session) leaves its registry entry behind and the key would stay hijacked there.
+    An unanswerable question (timeout, no tmux binary) keeps the entry."""
+    try:
+        r = sh("tmux", *sock_flag(sock), "has-session", "-t", session_target(name), check=False, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return r.returncode == 0
 
 
 def bind_popup(cfg, path, session=None, sock=None, remove=False):
@@ -1295,9 +1345,14 @@ def _bind_popup(cfg, path, session=None, sock=None, remove=False):
         return
     try:
         old = json.loads(registry_path().read_text(encoding="utf-8"))
-        old = old if isinstance(old, dict) else {}
-    except (OSError, ValueError):
+        if not isinstance(old, dict):
+            raise ValueError("not a JSON object")
+    except FileNotFoundError:
         old = {}
+    except (OSError, ValueError) as e:  # other chains' entries must not be wiped by a bad read
+        event(cfg, f"Ctrl+\\ binding skipped: registry {registry_path()} unreadable "
+                   f"({type(e).__name__}: {e}); not overwritten, fix or remove it")
+        return
     reg = {}
     for name, val in old.items():
         if name == mine:
@@ -1309,6 +1364,9 @@ def _bind_popup(cfg, path, session=None, sock=None, remove=False):
             continue
         if not pathlib.Path(val[1]).is_file():
             event(cfg, f"registry entry {name!r} dropped: chain file is gone")
+            continue
+        if not _dash_session_alive(*split_key(name)):
+            event(cfg, f"registry entry {name!r} dropped: its session is gone")
             continue
         reg[name] = val
     if not remove:
@@ -1378,6 +1436,9 @@ def _stop_event(cfg, st, path):
         return False
     if wave and st["waves"].get(wave, {}).get("phase") not in ("done", None):
         event(cfg, f"{wave}: stopped in phase {st['waves'][wave].get('phase')}; chain stopped")
+        return False
+    if st.get("stopped"):
+        event(cfg, f"watch stopped: {st['stopped']}; chain stopped")
         return False
     event(cfg, "watch stopped: no current wave")
     return True

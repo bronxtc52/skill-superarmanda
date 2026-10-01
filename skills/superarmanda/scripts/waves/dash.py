@@ -6,6 +6,8 @@ command refuses to start. Transcripts are bound to a wave by the session ids in 
 and read incrementally (wab.TranscriptCache), so a frame costs only what was appended."""
 import os
 import pathlib
+import re
+import signal
 import subprocess
 import sys
 import time
@@ -231,10 +233,14 @@ def own_session():
     tmux_env, pane = os.environ.get("TMUX"), os.environ.get("TMUX_PANE")
     if not tmux_env or not pane:
         return None, ""
-    sock = os.path.basename(tmux_env.split(",")[0])
-    sock = "" if sock == "default" else sock
+    path = tmux_env.split(",")[0]
+    if re.fullmatch(r"tmux-\d+", os.path.basename(os.path.dirname(path))):
+        sock = os.path.basename(path)  # a `-L` name in tmux's own socket directory
+        sock = "" if sock == "default" else sock
+    else:
+        sock = path  # `tmux -S <path>`: only the full path names this server
     try:
-        r = subprocess.run(["tmux", "-S", tmux_env.split(",")[0], "display-message", "-p", "-t", pane,
+        r = subprocess.run(["tmux", "-S", path, "display-message", "-p", "-t", pane,
                             "#{session_name}"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None, ""
@@ -257,6 +263,8 @@ def main():
             os.environ.pop("WAB_TMUX_SOCKET", None)
     if session:  # Ctrl+\ is bound to the session the dashboard really runs in
         wab.bind_popup(cfg, sys.argv[1], session=session, sock=sock)
+    for sig in (signal.SIGTERM, signal.SIGHUP):  # the finally below must run on these too
+        signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
     try:
         with Live(safe_render(cfg), refresh_per_second=1, screen=True) as live:
             while True:

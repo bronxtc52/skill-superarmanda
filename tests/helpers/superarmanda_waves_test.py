@@ -462,6 +462,22 @@ class Supervision(Base):
         self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
         self.assertIsNone(self.get_state(cfg)["current"])
 
+    def test_done_without_next_prompt_stops_the_chain_loudly(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertEqual(log.count("W1: DONE without next-prompt.md; chain stopped"), 1)
+        self.assertEqual(len([t for t in self.tg if "next-prompt.md" in t]), 1)
+        with mock.patch.object(wab, "time") as t, mock.patch.object(wab, "bind_popup"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            t.time.return_value = 0.0
+            with self.assertRaises(SystemExit) as ctx:
+                wab.main(["wab.py", "watch", str(path)])
+        self.assertEqual(ctx.exception.code, 3)
+
     def test_dead_window_stops_the_chain_with_one_notice(self):
         cfg, _ = self.chain()
         self.alive = False
@@ -730,7 +746,50 @@ class Admission(Base):
         self.transcript(w["sessions"][0], [asst(inp=1234)], cwd=w["cwd"])
         self.assertEqual(wab.context_tokens(w), 1234)
 
+    def host_policy(self):
+        helper = self.home / ".claude" / "bin" / "cc-autonomy.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("# host policy present\n", encoding="utf-8")
+
+    def test_unmanaged_host_takes_any_isolated_worktree_and_says_so(self):
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        subprocess.run(["git", "init", "-q", str(plain)], check=True)
+        cfg, _ = self.chain(workdir=str(plain))
+        self.assertEqual(wab.prepare_clone(cfg), str(plain.resolve()))
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("unmanaged host", log)
+
+    def test_unmanaged_host_needs_a_workdir_and_a_git_checkout(self):
+        cfg, _ = self.chain()
+        with self.assertRaises(SystemExit) as ctx:
+            wab.prepare_clone(cfg)
+        self.assertIn("workdir", str(ctx.exception))
+        self.assertIn("isolated git worktree", str(ctx.exception))
+        cfg, _ = self.chain(workdir=str(self.tmp / "clone"))  # a directory, not a git checkout
+        with self.assertRaises(SystemExit):
+            wab.prepare_clone(cfg)
+
+    def test_host_policy_keeps_the_signature_check_and_prepare(self):
+        self.host_policy()
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        subprocess.run(["git", "init", "-q", str(plain)], check=True)
+        cfg, _ = self.chain(workdir=str(plain))
+        with self.assertRaises(SystemExit):
+            wab.prepare_clone(cfg)
+        root = self.make_root()
+        cfg, _ = self.chain(workdir=str(root / "checkout"))
+        self.assertEqual(wab.prepare_clone(cfg), str((root / "checkout").resolve()))
+        self.assertIn("host policy", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+        cfg, _ = self.chain()
+        out = json.dumps({"ok": True, "admitted_path": "/x/y"})
+        with mock.patch.object(wab, "sh", return_value=subprocess.CompletedProcess([], 0, out, "")) as m:
+            self.assertEqual(wab.prepare_clone(cfg), "/x/y")
+        self.assertIn("prepare", m.call_args[0])
+
     def test_launch_refuses_an_unadmitted_workdir(self):
+        self.host_policy()
         plain = self.tmp / "plain"
         plain.mkdir()
         subprocess.run(["git", "init", "-q", str(plain)], check=True)
@@ -2074,6 +2133,93 @@ class KeysAndRegistry(Base):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TMUX", None)
             self.assertEqual(dash.own_session(), (None, ""))
+
+    def test_socket_path_means_dash_S_and_a_name_means_dash_L(self):
+        with mock.patch.object(wab, "TMUX_SOCKET", "/tmp/w/waves.sock"):
+            self.assertEqual(wab.tmux_argv("ls"), ("tmux", "-S", "/tmp/w/waves.sock", "ls"))
+            self.assertEqual(wab.attach_cmd("wv-w1"), "tmux -S /tmp/w/waves.sock attach -t wv-w1")
+        with mock.patch.object(wab, "TMUX_SOCKET", None), mock.patch.dict(os.environ, {"WAB_TMUX_SOCKET": "/a/b"}):
+            self.assertEqual(wab.tmux_argv("ls"), ("tmux", "-S", "/a/b", "ls"))
+        with mock.patch.object(wab, "TMUX_SOCKET", "name"):
+            self.assertEqual(wab.tmux_argv("ls"), ("tmux", "-L", "name", "ls"))
+        conf = wab.keys_conf(self.reg(), "/tmp/w/waves.sock")
+        self.assertIn("WAB_TMUX_SOCKET=/tmp/w/waves.sock ", conf)
+
+    def test_dash_keeps_the_full_socket_path_unless_it_is_tmuxs_own_dir(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        done = subprocess.CompletedProcess([], 0, "w\n", "")
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/waves.sock,5,0", "TMUX_PANE": "%1"}), \
+                mock.patch.object(dash.subprocess, "run", return_value=done):
+            self.assertEqual(dash.own_session(), ("w", "/tmp/waves.sock"))
+
+    def test_wab_open_uses_dash_S_for_a_socket_path(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W2", "waves": {"W2": self.wave_rec("W2")}})
+        bindir = self.tmp / "fakebin"
+        bindir.mkdir()
+        log = self.tmp / "tmux.log"
+        fake = bindir / "tmux"
+        fake.write_text(f'#!/bin/sh\necho "$*" >> {log}\nexit 0\n', encoding="utf-8")
+        fake.chmod(0o755)
+        env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "WAB_TMUX_SOCKET": "/tmp/w/s.sock"}
+        subprocess.run([str(WAVES / "wab-open"), str(path)], stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, encoding="utf-8", env=env)
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(lines), 2)
+        for line in lines:
+            self.assertTrue(line.startswith("-S /tmp/w/s.sock "), line)
+
+    def test_real_private_server_on_a_socket_path_roundtrip(self):
+        exe = shutil.which("tmux")
+        if not exe:
+            self.skipTest("tmux is not installed")
+        sock = self.tmp / "waves.sock"
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        run = lambda *a: subprocess.run([exe, "-S", str(sock), "-f", "/dev/null", *a],  # noqa: E731
+                                        capture_output=True, text=True, env=env)
+        try:
+            self.assertEqual(run("new-session", "-d", "-s", "alive", "sleep 60").returncode, 0)
+            with mock.patch.object(wab, "sh", REAL_SH):
+                self.assertTrue(wab._dash_session_alive(str(sock), "alive"))
+                self.assertFalse(wab._dash_session_alive(str(sock), "dead"))
+                self.assertFalse(wab._dash_session_alive(str(self.tmp / "nothing.sock"), "alive"))
+        finally:
+            run("kill-server")
+
+    def test_entries_of_dead_dashboard_sessions_are_dropped_on_bind(self):
+        cfg, path = self.chain()
+        reg_path = wab.registry_path()
+        reg_path.parent.mkdir(parents=True)
+        other = self.tmp / "other.json"
+        other.write_text("{}", encoding="utf-8")
+        opener = str(WAVES / "wab-open")
+        reg_path.write_text(json.dumps({"live-dash": [opener, str(other)],
+                                        "killed-dash": [opener, str(other)]}), encoding="utf-8")
+        with mock.patch.object(wab, "_dash_session_alive", side_effect=lambda sock, name: name != "killed-dash"):
+            wab.bind_popup(cfg, path, session="mine", sock="")
+        reg = json.loads(reg_path.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(reg), ["live-dash", "mine"])
+        conf = (cfg["run_dir"] / "keys.tmux").read_text(encoding="utf-8")
+        self.assertNotIn("killed-dash", conf)
+        self.assertIn("live-dash", conf)
+
+    def test_dash_cleans_the_registry_on_sigterm(self):
+        src = (WAVES / "dash.py").read_text(encoding="utf-8")
+        self.assertIn("signal.SIGTERM", src)
+        self.assertIn("signal.SIGHUP", src)
+
+    def test_a_corrupt_registry_is_not_overwritten(self):
+        cfg, path = self.chain()
+        reg_path = wab.registry_path()
+        reg_path.parent.mkdir(parents=True)
+        reg_path.write_text("{broken", encoding="utf-8")
+        wab.bind_popup(cfg, path, session="mine", sock="")
+        self.assertEqual(reg_path.read_text(encoding="utf-8"), "{broken")
+        self.assertIn("not overwritten", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+        self.assertFalse([c for c in self.tmux_calls if c[1] == "source-file"])
 
     def test_stale_btab_decision(self):
         old = ('bind-key -T root BTab if-shell -F "#{m:*ignore-size*,#{client_flags}}" '
