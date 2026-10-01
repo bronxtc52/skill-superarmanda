@@ -3031,6 +3031,47 @@ class WavesContract(unittest.TestCase):
         self.init_wave()
         self.assertIsNone(self.where()["safe_point"])
 
+    # R11 (W4): a hand-damaged position is reported, not a traceback
+    def test_malformed_position_is_reported_not_a_traceback(self):
+        self.init_wave()
+        self.cli("mark", "--task", "impl", "--step", 4, "--safe-point", "true")
+        good = self.manifest_data()["position"]
+        bad_values = [
+            "text",
+            ["task"],
+            42,
+            {k: v for k, v in good.items() if k != "task"},
+            {**good, "task": 7},
+            {**good, "step": 0},
+            {**good, "step": 8},
+            {**good, "step": True},
+            {**good, "step": "4"},
+            {**good, "safe_point": "true"},
+            {**good, "head": None},
+            {**good, "tree_fingerprint": 1},
+            {**good, "recorded_at": 1},
+        ]
+        for bad in bad_values:
+            with self.subTest(position=bad):
+                data = self.manifest_data()
+                data["position"] = bad
+                self.manifest.write_text(json.dumps(data), encoding="utf-8")
+                for command in ("where", "status"):
+                    proc = self.run_state(command)
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn("malformed position", proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+
+    def test_absent_or_null_position_is_accepted(self):
+        self.init_wave()
+        data = self.manifest_data()
+        data.pop("position", None)
+        self.manifest.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.run_state("where").returncode, 0)
+        data["position"] = None
+        self.manifest.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.run_state("where").returncode, 0)
+
     # R5
     def test_read_accepts_manifests_without_new_keys(self):
         self.cli(

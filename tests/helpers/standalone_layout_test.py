@@ -22,6 +22,10 @@ EXPECTED_FILES = {
     "scripts/codex_review.py",
     "scripts/pr_review.py",
     "scripts/install-skill.py",
+    "scripts/waves/wab.py",
+    "scripts/waves/dash.py",
+    "scripts/waves/PROTOCOL.md",
+    "scripts/waves/wab-open",
 }
 
 
