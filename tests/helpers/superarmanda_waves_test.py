@@ -1603,6 +1603,51 @@ class TwoStepSend(Base):
         self.assertNotIn("no current wave", log)
 
 
+class TickAdvancesPendingTransitions(Base):
+    def w(self, cfg):
+        return self.get_state(cfg)["waves"]["W1"]
+
+    def test_failed_enters_in_sending_are_retried_by_tick_without_a_restart(self):
+        cfg, _ = self.chain()
+        w = self.wave_rec(phase="sending", pending_enter="first prompt")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
+        self.set_status(cfg, "W1", "STARTING")
+        boom = subprocess.CalledProcessError(1, ["tmux"], stderr="boom")
+        wab.press_enter.side_effect = boom
+        for _ in range(3):
+            self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(self.w(cfg)["phase"], "sending")
+        self.assertEqual(len(self.tg), 1)  # one notice for the whole failure episode
+        self.assertEqual(self.enters, [])
+        wab.press_enter.side_effect = lambda n: self.enters.append(n)
+        self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertEqual(self.w(cfg)["phase"], "running")
+        self.assertNotIn("pending_enter", self.w(cfg))
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual((self.enters, len(self.tg)), (["wv-w1"], 1))
+
+    def test_sending_without_pending_enter_is_not_resent_and_goes_on(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="sending")}})
+        self.set_status(cfg, "W1", "STARTING")
+        wab.tick(cfg, wab.load_state(cfg))
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual(([s for s in self.sent if s[0] == "text"], self.enters), ([], []))
+        self.assertEqual((self.w(cfg)["phase"], len(self.tg)), ("running", 1))
+
+    def test_starting_is_completed_by_tick(self):
+        cfg, _ = self.chain()
+        prompt = self.tmp / "p.md"
+        prompt.write_text("the task\n", encoding="utf-8")
+        w = self.wave_rec(phase="starting", prompt_file=str(prompt), sessions=["s1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
+        self.set_status(cfg, "W1", "STARTING")
+        self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(len([s for s in self.sent if s[0] == "text" and "the task" in s[2]]), 1)
+        self.assertEqual(self.w(cfg)["phase"], "running")
+
+
 class AtMostOnce(Base):
     def crash_then_tick(self, cfg, **extra):
         with mock.patch.object(wab, "notify", side_effect=KeyboardInterrupt):

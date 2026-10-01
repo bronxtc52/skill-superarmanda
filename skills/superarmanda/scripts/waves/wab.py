@@ -838,13 +838,15 @@ def once_per(w, key, value):
 
 def resume(cfg, st):
     try:
-        _resume(cfg, st)
+        advance_pending(cfg, st)
     except _WindowGone:
         pass  # recorded as dead; tick follows
 
 
-def _resume(cfg, st):
-    """Pick up after a dispatcher restart from the phase on disk, without relaunching."""
+def advance_pending(cfg, st):
+    """Carry an unfinished transition of the current wave forward from the phase on disk,
+    without relaunching. Called at watch start AND by every tick for the phases that tick
+    does not drive itself (starting, sending)."""
     wave = st.get("current")
     if not wave or wave not in st["waves"]:
         return
@@ -1024,6 +1026,10 @@ def _tick(cfg, st):
     if not tmux_alive(name):
         _mark_dead(cfg, st, wave, status)
         return False  # the chain stops; restart the wave by hand, then run watch again
+
+    if w.get("phase") in ("starting", "sending"):  # the first prompt is not through yet
+        advance_pending(cfg, st)
+        return True
 
     if status.startswith("BLOCKED"):
         fresh = once_per(w, "blocked", status)
