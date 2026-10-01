@@ -133,9 +133,9 @@ def wave_commits(w):
     """A wave's commits: those of the current try plus the counters of its earlier tries
     (`attempts`, archived by a restart; non-objects there are skipped, like in wave_stats).
     An earlier try counts only its fixed number (`commits`, set when it ended): one that never
-    got one (not_ready, or git could not tell) adds 0 - its `start_rev..HEAD` would count the
-    newer try's commits on the shared HEAD. None (shown «?») when any fixed number is corrupt:
-    not a non-negative int."""
+    got one (not_ready, or a record from before the unknown marker) adds 0 - its `start_rev..HEAD` would count the
+    newer try's commits on the shared HEAD. None (shown «?») when any fixed number is unknown
+    (null: git could not count when it ended) or corrupt (not a non-negative int)."""
     own = _own_commits(w)
     attempts = w.get("attempts")
     attempts = [a for a in attempts if isinstance(a, dict)] if isinstance(attempts, list) else []
@@ -153,13 +153,13 @@ def wave_commits(w):
 def _own_commits(w):
     """The current try: the number fixed when it ended (`commits`), else `start_rev..HEAD` in its
     workdir (its own HEAD only: other branches and fetched refs do not count). A record from before
-    `start_rev` existed keeps the time window over the repository. None when the fixed number is
-    corrupt."""
+    `start_rev` existed keeps the time window over the repository. None (shown «?») when the
+    count is unknown: frozen as unknown (`commits: null`, git failed when the wave ended), git
+    cannot count `start_rev..HEAD` now, or the fixed number is corrupt."""
     if "commits" in w:
         return _fixed_commits(w["commits"])
     if isinstance(w.get("start_rev"), str):
-        n = wab.count_wave_commits(w.get("cwd"), w["start_rev"])
-        return n if n is not None else 0
+        return wab.count_wave_commits(w.get("cwd"), w["start_rev"])  # None: git cannot tell, «?»
     return commits_since(w["cwd"], w["started"], w.get("finished"))
 
 

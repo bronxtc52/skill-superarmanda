@@ -269,9 +269,10 @@ def save_state(cfg, st):
                 if rec.get("phase") in ENDED_PHASES:
                     rec.setdefault("finished", time.time())
                     if "commits" not in rec and isinstance(rec.get("start_rev"), str):
-                        n = count_wave_commits(rec.get("cwd"), rec["start_rev"])
-                        if n is not None:  # fixed now: the shared HEAD moves on with the next wave
-                            rec["commits"] = n
+                        # fixed now, known or not: the shared HEAD moves on with the next wave, and a
+                        # recount after that would give the finished wave someone else's history;
+                        # null is the frozen «unknown» (git failed or timed out), shown «?»
+                        rec["commits"] = count_wave_commits(rec.get("cwd"), rec["start_rev"])
                 else:
                     rec.pop("finished", None)  # a dead wave is back: it has not ended
                     rec.pop("commits", None)
@@ -2186,8 +2187,28 @@ def _stop_event(cfg, st, path):
     if st.get("stopped"):
         event(cfg, f"watch stopped: {st['stopped']}; chain stopped")
         return False
+    if not wave and not _last_window_closed(cfg, st, path):
+        return False
     event(cfg, "watch stopped: no current wave")
     return True
+
+
+def _last_window_closed(cfg, st, path):
+    """The chain is finished (no current wave): the last wave's window, asked to close
+    (`pending_exit`), is waited for like in `done` (EXIT_WAIT). False when it is still open after
+    /exit: the watch then exits 3, and the coordinator's `done` pushes it again."""
+    waves = cfg.get("waves") or []
+    w = st.get("waves", {}).get(waves[-1]) if waves else None
+    if not isinstance(w, dict) or not w.get("pending_exit"):
+        return True
+    if wait_window_closed(cfg, st, w, push=False):  # /exit went out in this tick (or at resume)
+        save_state(cfg, st)
+        return True
+    wab_py = f"python3 {shlex.quote(str(pathlib.Path(__file__).resolve()))}"
+    event(cfg, f"{waves[-1]}: window {w.get('tmux')} still open after /exit; the chain is finished; "
+               f"run: {wab_py} done {shlex.quote(str(cfg.get('chain_file', path)))} "
+               f"or close it ({attach_cmd(w.get('tmux') or '')})")
+    return False
 
 
 def watch(cfg, path, max_ticks=None):
@@ -2310,7 +2331,8 @@ def main(argv):
             sys.exit(3)
     elif cmd == "watch":
         if watch(load_chain(path), path) is False:
-            print("wab: watch ended because the chain stopped (window gone or not started)", file=sys.stderr)
+            print("wab: watch ended because the chain stopped (window gone or not started) or the last "
+                  "wave's window is still open after /exit (then run done); see events.log", file=sys.stderr)
             sys.exit(3)
     elif cmd == "done" and len(argv) in (3, 4):
         if done_cmd(load_chain(path), argv[3] if len(argv) == 4 else None) is False:

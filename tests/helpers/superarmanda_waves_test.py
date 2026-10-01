@@ -5916,6 +5916,105 @@ class W4Round38DashGitTimeout(Base):
         self.assertEqual(str(table.columns[-1]._cells[0]), "?")
 
 
+class W4Round39(Base):
+    """Round 39: the watch that finishes the chain waits for the last window like `done` (still
+    open -> exit 3 with a hint to run done); an unknown commit count of an ended wave is frozen as
+    unknown (null), not recounted after the shared checkout moved; the dashboard shows an unknown
+    `start_rev..HEAD` count as «?», not 0."""
+
+    def dash(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        return dash
+
+    # ----- 1: the last window after /exit -----
+    def last_done(self, cfg, **rec):
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(**rec)}})
+        self.set_status(cfg, "W1", "DONE")
+
+    def test_watch_with_last_window_still_open_fails_like_done(self):
+        cfg, path = self.chain(waves=["W1"])
+        self.last_done(cfg)
+        self.alive = True  # Claude ignores /exit
+        self.assertFalse(wab.watch(cfg, path, max_ticks=3))
+        st = self.get_state(cfg)
+        self.assertIsNone(st["current"])
+        self.assertTrue(st["waves"]["W1"].get("pending_exit"))
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("chain finished", log)
+        self.assertIn("still open", log)
+        self.assertIn("wab.py done", log)
+        self.assertNotIn("watch stopped: no current wave", log)
+        with self.assertRaises(SystemExit) as cm:  # the CLI: code 3, as `done` in the same case
+            wab.main(["wab.py", "watch", str(path)])
+        self.assertEqual(cm.exception.code, 3)
+        self.alive = False  # the coordinator's done closes it out
+        wab.main(["wab.py", "done", str(path)])
+        self.assertNotIn("pending_exit", self.get_state(cfg)["waves"]["W1"])
+
+    def test_watch_with_last_window_closed_succeeds(self):
+        cfg, path = self.chain(waves=["W1"])
+        self.last_done(cfg)
+        self.alive = False
+        self.assertTrue(wab.watch(cfg, path, max_ticks=3))
+        self.assertNotIn("pending_exit", self.get_state(cfg)["waves"]["W1"])
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("chain finished", log)
+        self.assertNotIn("still open", log)
+
+    def test_watch_waits_for_the_window_that_obeys_exit(self):
+        cfg, path = self.chain(waves=["W1"])
+        self.last_done(cfg)
+        polls = []
+
+        def alive(name):  # the window goes a few seconds after /exit
+            polls.append(name)
+            return len(polls) < 4
+        with mock.patch.object(wab, "tmux_alive", side_effect=alive):
+            self.assertTrue(wab.watch(cfg, path, max_ticks=3))
+        self.assertNotIn("pending_exit", self.get_state(cfg)["waves"]["W1"])
+
+    # ----- 2: an unknown count is frozen as unknown -----
+    def test_unknown_count_at_end_is_frozen(self):
+        cfg, _ = self.chain()
+        st = {"current": "W1", "waves": {"W1": self.wave_rec(phase="done", start_rev="a" * 40)}}
+        with mock.patch.object(wab, "count_wave_commits", return_value=None):
+            wab.save_state(cfg, st)
+        self.assertIn("commits", self.get_state(cfg)["waves"]["W1"])
+        self.assertIsNone(self.get_state(cfg)["waves"]["W1"]["commits"])
+        st = wab.load_state(cfg)  # the next wave switched the shared checkout: git answers now
+        with mock.patch.object(wab, "count_wave_commits", return_value=7) as count:
+            wab.save_state(cfg, st)
+        count.assert_not_called()
+        self.assertIsNone(self.get_state(cfg)["waves"]["W1"]["commits"])
+        st = wab.load_state(cfg)  # a dead wave back alive drops the marker too
+        st["waves"]["W1"]["phase"] = "running"
+        wab.save_state(cfg, st)
+        self.assertNotIn("commits", self.get_state(cfg)["waves"]["W1"])
+
+    def test_dash_shows_the_frozen_unknown_as_question_mark(self):
+        dash = self.dash()
+        w = self.wave_rec(phase="done", start_rev="a" * 40, commits=None)
+        with mock.patch.object(wab, "count_wave_commits", return_value=7) as count:
+            self.assertEqual(dash.fmt_commits(dash.wave_commits(w)), "?")
+        count.assert_not_called()
+        w = self.wave_rec(start_rev="a" * 40, attempts=[{"commits": None}])
+        with mock.patch.object(wab, "count_wave_commits", return_value=2):
+            self.assertEqual(dash.fmt_commits(dash.wave_commits(w)), "?")
+
+    # ----- 3: start_rev..HEAD that git cannot count -----
+    def test_dash_unknown_start_rev_count_is_question_mark(self):
+        dash = self.dash()
+        w = self.wave_rec(start_rev="a" * 40)
+        with mock.patch.object(wab, "count_wave_commits", return_value=None):
+            self.assertIsNone(dash.wave_commits(w))
+            self.assertEqual(dash.fmt_commits(dash.wave_commits(w)), "?")
+        with mock.patch.object(wab, "count_wave_commits", return_value=0):
+            self.assertEqual(dash.wave_commits(w), 0)
+
+
 class TmuxGuard(unittest.TestCase):
     """The guard itself: a socketless tmux must fail loudly, a private one passes the guard."""
 
