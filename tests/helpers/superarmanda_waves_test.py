@@ -5278,6 +5278,284 @@ class W4Round33(Base):
         cs.assert_called_once()
 
 
+class W4Round34(Base):
+    """Round 34: a terminal wave with a live window always carries pending_exit and every entry of
+    the coordinator (launch, done, watch/resume) pushes it; a dispatcher launch refusal is an event
+    and a notice, not a dead watch; strict `ok` of prepare; the dashboard without rich, its status
+    fallback and corrupt commit counters."""
+
+    def setUp(self):
+        super().setUp()
+        self.windows = {"wv-w1"}
+        self.exit_closes = True  # the Claude TUI obeys /exit at once
+        wab.tmux_alive.side_effect = lambda n: n in self.windows
+
+        def fake_tmux(*args, **kw):
+            self.tmux_calls.append(args)
+            if "new-session" in args:
+                self.windows.add(args[args.index("-s") + 1])
+            if "send-keys" in args and "/exit" in args and self.exit_closes:
+                tgt = args[args.index("-t") + 1]
+                self.windows -= {n for n in set(self.windows) if wab.pane_target(n) == tgt}
+            return subprocess.CompletedProcess(args, 0, "", "")
+        p = mock.patch.object(wab, "tmux", side_effect=fake_tmux)
+        p.start()
+        self.addCleanup(p.stop)
+
+    git = W4Round33.git
+    repo = W4Round33.repo
+
+    def exits(self, name="wv-w1"):
+        return [c for c in self.tmux_calls if "send-keys" in c and "/exit" in c
+                and wab.pane_target(name) in c]
+
+    def policy_host(self, helper_src):
+        r = self.home / ".claude" / "rules" / "autonomy-allowlist.md"
+        r.parent.mkdir(parents=True, exist_ok=True)
+        r.write_text("# host policy\n", encoding="utf-8")
+        h = self.home / ".claude" / "bin" / "cc-autonomy.py"
+        h.parent.mkdir(parents=True, exist_ok=True)
+        h.write_text(helper_src, encoding="utf-8")
+
+    # ----- 1: DONE without a usable next-prompt.md keeps the intent to close the window -----
+    def test_stop_without_next_closes_the_window_and_a_fixed_launch_goes_through(self):
+        wd = self.repo()
+        cfg, _ = self.chain(workdir=str(wd), base_branch="main", merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(cwd=str(wd))}})
+        self.set_status(cfg, "W1", "DONE")
+        self.exit_closes = False  # busy: the first /exit does not close the window yet
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        st = self.get_state(cfg)
+        self.assertEqual((st["waves"]["W1"]["phase"], st["current"]), ("done", None))
+        self.assertTrue(st["waves"]["W1"].get("pending_exit"))
+        self.assertTrue(self.exits())
+        self.assertIn("wv-w1", self.windows)
+        # the coordinator fixes next-prompt.md and launches W2 while W1's window still lives
+        nxt = wab.wave_dir(cfg, "W1") / "next-prompt.md"
+        nxt.write_text("go\n", encoding="utf-8")
+        self.exit_closes = True
+        with mock.patch.object(wab, "refresh_workdir"):
+            self.assertTrue(wab.launch(cfg, "W2", nxt))
+        self.assertNotIn("wv-w1", self.windows)
+        st = self.get_state(cfg)
+        self.assertEqual(st["current"], "W2")
+        self.assertNotIn("pending_exit", st["waves"]["W1"])
+
+    # ----- 2: done finishes the close left by a crash -----
+    def test_done_closes_the_window_left_by_a_crash_after_awaiting_merge(self):
+        cfg, _ = self.chain(waves=["W1"], merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+
+        def crash(*args, **kw):
+            if "send-keys" in args:
+                raise _Crash()
+            return subprocess.CompletedProcess(args, 0, "", "")
+        with mock.patch.object(wab, "tmux", side_effect=crash):
+            with self.assertRaises(_Crash):
+                wab.tick(cfg, wab.load_state(cfg))
+        self.assertTrue(self.get_state(cfg)["waves"]["W1"].get("pending_exit"))
+        self.assertFalse(self.exits())
+        self.exit_closes = False  # the window does not go within the wait
+        wab.done_cmd(cfg)
+        self.assertTrue(self.exits())
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "done")
+        self.assertTrue(w.get("pending_exit"))  # the window is still there: the intent stays
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("still open", log)
+        # a repeated done pushes again; the window goes and the flag with it
+        n = len(self.exits())
+        self.exit_closes = True
+        wab.done_cmd(cfg)
+        self.assertGreater(len(self.exits()), n)
+        self.assertNotIn("wv-w1", self.windows)
+        self.assertNotIn("pending_exit", self.get_state(cfg)["waves"]["W1"])
+
+    def test_done_without_watch_after_a_crash_closes_at_once(self):
+        cfg, _ = self.chain(waves=["W1"], merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {
+            "W1": self.wave_rec(phase="awaiting_merge", pending_exit=True)}})
+        wab.done_cmd(cfg)
+        self.assertTrue(self.exits())
+        self.assertNotIn("wv-w1", self.windows)
+        self.assertNotIn("pending_exit", self.get_state(cfg)["waves"]["W1"])
+
+    # ----- invariant: every terminal transition ends with the window closed -----
+    def test_every_terminal_transition_closes_the_window(self):
+        cases = [  # (name, merge_gate, gate implemented, waves, next-prompt.md, then)
+            ("awaiting_merge, next wave", "external", True, ["W1", "W2"], b"go\n", None),
+            ("awaiting_merge, last wave + done", "external", True, ["W1"], None, "done"),
+            ("external, no next-prompt", "external", True, ["W1", "W2"], None, None),
+            ("external, unusable next-prompt", "external", True, ["W1", "W2"], b" \n", None),
+            ("no gate yet, no next-prompt", None, False, ["W1", "W2"], None, None),
+            ("no gate yet, last wave + done", None, False, ["W1"], None, "done"),
+            ("internal, last wave", None, True, ["W1"], None, None),
+            ("internal, no next-prompt", None, True, ["W1", "W2"], None, None),
+            ("internal, unusable next-prompt", None, True, ["W1", "W2"], b"\xff", None),
+            ("internal, next launched by the dispatcher", None, True, ["W1", "W2"], b"go\n", "launch"),
+        ]
+        for name, gate, impl, waves, nxt, then in cases:
+            with self.subTest(case=name):
+                self.windows = {"wv-w1"}
+                self.tmux_calls.clear()
+                cfg, path = self.chain(merge_gate=gate, waves=waves)
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                self.set_status(cfg, "W1", "DONE")
+                p = wab.wave_dir(cfg, "W1") / "next-prompt.md"
+                p.unlink(missing_ok=True)
+                if nxt is not None:
+                    p.write_bytes(nxt)
+                with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", impl, create=True), \
+                        mock.patch.object(wab, "launch", return_value=True):
+                    wab.tick(cfg, wab.load_state(cfg))
+                    if then == "done":
+                        wab.done_cmd(cfg)
+                    wab.resume(cfg, wab.load_state(cfg))  # any later entry of the coordinator
+                self.assertNotIn("wv-w1", self.windows, name)
+                self.assertTrue(self.exits(), name)
+                self.assertNotIn("pending_exit", self.get_state(cfg)["waves"]["W1"], name)
+
+    def test_not_ready_keeps_its_window_for_the_owner(self):
+        """Deliberate exclusion: a window that never became ready is the owner's to look at."""
+        cfg, _ = self.chain()
+        self.windows = set()
+        self.ready = False
+        prompt = self.tmp / "p.md"
+        prompt.write_text("task\n", encoding="utf-8")
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            self.assertFalse(wab.launch(cfg, "W1", prompt))
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "not_ready")
+        self.assertNotIn("pending_exit", w)
+        self.assertIn("wv-w1", self.windows)
+        self.assertFalse(self.exits())
+
+    # ----- 5: prepare's ok must be exactly true -----
+    def test_admission_requires_ok_to_be_true(self):
+        cfg, _ = self.chain()
+        for ok in ("[1]", "1", '"yes"', "{\"a\": 1}"):
+            with self.subTest(ok=ok):
+                self.policy_host(f"print('{{\"ok\": {ok}, \"admitted_path\": \"/tmp\"}}')\n")
+                with self.assertRaises(SystemExit) as cm:
+                    wab.prepare_clone(cfg)
+                self.assertIn("admission refused", str(cm.exception))
+        self.policy_host(f"print('{{\"ok\": true, \"admitted_path\": \"{self.cwd}\"}}')\n")
+        self.assertEqual(wab.prepare_clone(cfg), self.cwd)
+
+    # ----- 6: a refused launch inside the dispatcher's tick -----
+    def test_dispatcher_launch_refusal_is_an_event_and_a_notice(self):
+        wd = self.repo()
+        cfg, path = self.chain(workdir=str(wd), base_branch="main")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(cwd=str(wd))}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.exit_closes = False  # the previous wave's window will not close: launch refuses
+        with mock.patch.object(wab, "drop_stale_btab"):
+            self.assertIs(wab.watch(cfg, path, max_ticks=3), False)
+        st = self.get_state(cfg)
+        self.assertEqual(st["current"], "W1")
+        self.assertNotIn("W2", st["waves"])
+        self.assertIn("launch of W2 refused", st.get("stopped", ""))
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("W1: launch of W2 refused", log)
+        self.assertIn("previous wave session wv-w1 is still running", log)
+        self.assertIn("watch stopped: W1: launch of W2 refused", log)
+        refused = [t for t in self.tg if "не запустил" in t]
+        self.assertEqual(len(refused), 1, self.tg)
+        self.assertIn("W2", refused[0])
+        self.assertIn("launch_refused", wab.NOTICE_EPISODE_ENDS)
+        # a second watch on the same refusal does not notify again
+        with mock.patch.object(wab, "drop_stale_btab"):
+            self.assertIs(wab.watch(cfg, path, max_ticks=3), False)
+        self.assertEqual(len([t for t in self.tg if "не запустил" in t]), 1)
+        # the window goes: the coordinator's launch goes through and clears the stop
+        self.exit_closes = True
+        with mock.patch.object(wab, "refresh_workdir"):
+            self.assertTrue(wab.launch(cfg, "W2", wab.wave_dir(cfg, "W1") / "next-prompt.md"))
+        st = self.get_state(cfg)
+        self.assertEqual(st["current"], "W2")
+        self.assertNotIn("stopped", st)
+        self.assertNotIn("launch_refused", st["waves"]["W1"].get("outbox") or {})
+
+    # ----- 3: dash.py without rich -----
+    def test_dash_without_rich_is_one_clear_line_and_rc_2(self):
+        shim = self.tmp / "norich"
+        (shim / "rich").mkdir(parents=True)
+        (shim / "rich" / "__init__.py").write_text(
+            "raise ModuleNotFoundError(\"No module named 'rich'\", name='rich')\n", encoding="utf-8")
+        cfg, path = self.chain()
+        env = dict(os.environ, PYTHONPATH=str(shim))
+        r = subprocess.run([sys.executable, str(WAVES / "dash.py"), str(path)], capture_output=True,
+                           text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(r.stderr.strip(),
+                         "dash.py needs the Python package rich: python3 -m pip install --user rich")
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_dash_imported_without_rich_raises_import_error(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("dash_norich", WAVES / "dash.py")
+        mod = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {"rich": None}):
+            with self.assertRaises(ImportError):
+                spec.loader.exec_module(mod)
+
+
+class W4Round34Dashboard(Base):
+    """Round 34: the current-wave panel shows the same status as the table (last_status fallback);
+    a corrupt commit counter is shown as «?»."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        self.dash = dash
+
+    def panel_text(self, cfg):
+        from rich.console import Console
+        buf = io.StringIO()
+        Console(file=buf, width=200, force_terminal=False).print(
+            self.dash.current_panel(cfg, wab.load_state(cfg)))
+        return buf.getvalue()
+
+    def test_panel_status_falls_back_to_last_status(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {
+            "W1": self.wave_rec(last_status="BLOCKED: нужен ключ")}})
+        self.set_status(cfg, "W1", "")
+        self.assertIn("статус: BLOCKED: нужен ключ", self.panel_text(cfg))
+        st_file = wab.wave_dir(cfg, "W1") / "status"
+        st_file.unlink()
+        st_file.mkdir()  # unreadable
+        self.assertIn("статус: BLOCKED: нужен ключ", self.panel_text(cfg))
+        st_file.rmdir()
+        self.set_status(cfg, "W1", "RUNNING")
+        self.assertIn("статус: RUNNING", self.panel_text(cfg))
+        w = wab.load_state(cfg)["waves"]["W1"]
+        self.assertEqual(self.dash.wave_status(cfg, "W1", w), "RUNNING")
+
+    def test_corrupt_commit_counter_is_a_question_mark(self):
+        for bad in (-1, "3", 2.5, True, None, [1]):
+            with self.subTest(bad=bad):
+                self.assertIsNone(self.dash.wave_commits({"commits": bad, "cwd": self.cwd,
+                                                          "started": 0, "start_rev": "x"}))
+        self.assertEqual(self.dash.wave_commits({"commits": 0}), 0)
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(commits=-4)}})
+        self.set_status(cfg, "W1", "RUNNING")
+        from rich.console import Console
+        buf = io.StringIO()
+        Console(file=buf, width=200, force_terminal=False).print(
+            self.dash.waves_table(cfg, wab.load_state(cfg)))
+        row = [l for l in buf.getvalue().splitlines() if l.strip().startswith("W1")]
+        self.assertTrue(row and row[0].rstrip().endswith("?"), buf.getvalue())
+        self.assertNotIn("-4", row[0])
+
+
 class TmuxGuard(unittest.TestCase):
     """The guard itself: a socketless tmux must fail loudly, a private one passes the guard."""
 

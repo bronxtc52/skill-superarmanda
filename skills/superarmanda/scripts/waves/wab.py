@@ -799,7 +799,8 @@ def put_notice(w, key, value, text):
     episode is over the notice is stale and leaves the outbox undelivered (key -> end:
     started/tmux_failed/permission/idle/auto_off -> window gone; not_ready, no_prompt,
     checkpoint_timeout, dead, handoff -> their phase is left; sending -> the wave wrote a status;
-    updating -> the new session is bound; blocked -> status not BLOCKED; done/no_next -> ack only;
+    updating -> the new session is bound; blocked -> status not BLOCKED; done/no_next/
+    launch_refused -> ack only;
     chain_done -> never).
     The caller saves it with the SAME save_state as the change it reports (the phase, the
     once_per mark), then calls flush_notices: a process killed right after that save still owes
@@ -854,7 +855,7 @@ def _status(w):
 #   permission, idle, auto_off   window gone   # + the prompt left the screen / the pane moved /
 #                                              #   auto mode is back (_tick)
 #   handoff             the phase left awaiting_merge (the coordinator confirmed it); + ack
-#   done, no_next       None: only the coordinator's confirmation (ack)
+#   done, no_next, launch_refused   None: only the coordinator's confirmation (ack)
 #   chain_done          None and kept even on ack: the end of the chain must get through
 NOTICE_EPISODE_ENDS = {
     "started": _gone,
@@ -872,6 +873,7 @@ NOTICE_EPISODE_ENDS = {
     "handoff": lambda w: w.get("phase") != "awaiting_merge",
     "done": None,
     "no_next": None,
+    "launch_refused": None,
     "chain_done": None,
 }
 
@@ -1040,7 +1042,7 @@ def admit(cfg, st=None):
     if not isinstance(out, dict):  # valid JSON that is not an object ([], null, 5, "x"): no answer
         out = {}
     path = out.get("admitted_path")
-    if r.returncode != 0 or not out.get("ok") or not isinstance(path, str) or not path:
+    if r.returncode != 0 or out.get("ok") is not True or not isinstance(path, str) or not path:
         raise SystemExit(f"admission refused: rc={r.returncode} {r.stdout.strip()} {r.stderr.strip()}")
     event(cfg, f"admission: host policy, cc-autonomy prepare -> {path}")
     if st is not None:
@@ -1256,6 +1258,7 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     # is switched: the file may live in the previous wave's checkout and change or vanish with it
     prompt_text = read_prompt(prompt_file)
     st = load_state(cfg)
+    pushed = close_pending_windows(cfg, st)  # an entry of the coordinator: even a refused launch pushes
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
     _check_launch_allowed(cfg, st, wave, name)
     if tmux_alive(name):
@@ -1268,7 +1271,7 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     reused = bool(cfg.get("workdir")) or (bool(saved) and cwd == saved)
     cur = st.get("current")
     restart = cur == wave and st["waves"].get(cur, {}).get("phase") in STOPPED
-    previous_window_closed(cfg, st, wave, restart)  # before the workdir is touched
+    previous_window_closed(cfg, st, wave, restart, pushed)  # before the workdir is touched
     if reused and cfg["waves"].index(wave) > 0 and not restart:
         refresh_workdir(cfg, wave, cwd)
     prev = st.get("current")
@@ -1490,14 +1493,37 @@ def close_window(cfg, st, w):
 
 
 def close_pending_windows(cfg, st):
+    """Every entry of the coordinator (watch/resume, each tick, launch, done) pushes the saved
+    intents: /exit to every live window with `pending_exit`, the flag dropped where the window is
+    gone. Returns the names /exit was sent to, so a caller that waits does not send it twice."""
+    pushed = set()
     for rec in list((st.get("waves") or {}).values()):
-        if isinstance(rec, dict) and rec.get("pending_exit"):
-            close_window(cfg, st, rec)
+        if isinstance(rec, dict) and rec.get("pending_exit") and close_window(cfg, st, rec):
+            pushed.add(rec.get("tmux"))
+    return pushed
 
 
-def previous_window_closed(cfg, st, wave, restart):
+def wait_window_closed(cfg, st, w, push=True):
+    """Wait up to EXIT_WAIT for the window of a finished wave `w` to go. True when it is gone (the
+    flag is dropped in `w`, the caller saves it); False when it still lives: nobody asked it to
+    close (no pending_exit) or it did not within EXIT_WAIT. `push`: send /exit first."""
+    name = w.get("tmux")
+    for attempt in range(EXIT_WAIT + 1):
+        if not (isinstance(name, str) and name and tmux_alive(name)):
+            w.pop("pending_exit", None)
+            return True
+        if not w.get("pending_exit") or attempt == EXIT_WAIT:
+            return False
+        if attempt == 0 and push:
+            close_window(cfg, st, w)
+        time.sleep(1)
+    return False
+
+
+def previous_window_closed(cfg, st, wave, restart, pushed=()):
     """The wave before `wave` must not still run in its window when the shared workdir is switched
-    under it: a pending /exit is pushed and waited for (EXIT_WAIT), else the launch is refused."""
+    under it: a pending /exit is pushed (unless it is in `pushed` already) and waited for
+    (EXIT_WAIT), else the launch is refused."""
     idx = cfg["waves"].index(wave)
     if idx == 0 or restart:
         return
@@ -1505,15 +1531,8 @@ def previous_window_closed(cfg, st, wave, restart):
     if not isinstance(before, dict) or not isinstance(before.get("tmux"), str):
         return
     name = before["tmux"]
-    for attempt in range(EXIT_WAIT + 1):
-        if not tmux_alive(name):
-            before.pop("pending_exit", None)  # saved with the launch intent
-            return
-        if not before.get("pending_exit") or attempt == EXIT_WAIT:
-            break  # nobody asked it to close, or it did not within EXIT_WAIT
-        if attempt == 0:
-            close_window(cfg, st, before)
-        time.sleep(1)
+    if wait_window_closed(cfg, st, before, push=name not in pushed):
+        return  # the dropped flag is saved with the launch intent
     raise SystemExit(f"wab: wave {wave} refused: previous wave session {name} is still running; "
                      f"wait or close it ({attach_cmd(name)})")
 
@@ -1633,9 +1652,11 @@ def next_prompt_problem(path):
 
 def _stop_without_next(cfg, st, w, wave, now, why=None):
     """A non-last wave wrote DONE without a usable next-prompt.md (missing, or `why`: refused by
-    read_prompt): one event, one notice, the chain stops."""
+    read_prompt): one event, one notice, the chain stops. Terminal like any DONE: the intent to
+    close the window goes into the same save, then /exit (a later launch finds it and waits)."""
     w.setdefault("finished", now)
     w["phase"] = "done"
+    w["pending_exit"] = True
     st["current"] = None
     st["stopped"] = f"{wave}: DONE with an unusable next-prompt.md" if why else f"{wave}: DONE without next-prompt.md"
     fresh_stop = once_per(w, "no_next", "1")
@@ -1649,7 +1670,28 @@ def _stop_without_next(cfg, st, w, wave, now, why=None):
         event(cfg, f"{wave}: DONE with an unusable next-prompt.md ({why}); chain stopped" if why else
               f"{wave}: DONE without next-prompt.md; chain stopped")
     flush_notices(cfg, st, w)
+    close_window(cfg, st, w)
     return False
+
+
+def _launch_refused(cfg, st, wave, nxt, why):
+    """The dispatcher's own launch of `nxt` was refused (SystemExit before the launch intent):
+    the chain stops with the reason (st `stopped`), one event and one notice per reason, and the
+    watch ends through _stop_event; it does not retry by itself every tick. The coordinator fixes
+    the cause and runs `launch` (or watch again, which retries the launch from the DONE wave)."""
+    fresh = load_state(cfg)  # the refused launch may have saved (admitted_path, a dropped flag)
+    st.clear()
+    st.update(fresh)
+    w = st["waves"][wave]
+    st["stopped"] = f"{wave}: launch of {nxt} refused"
+    first = once_per(w, "launch_refused", why)
+    if first:
+        put_notice(w, "launch_refused", why,
+                   f"wave-autobot: {wave} готова, но следующую волну {nxt} не запустил: {redact(why)}. "
+                   f"Цепочка стоит; устрани причину и запусти {nxt} (wab.py launch).")
+    save_state(cfg, st)
+    event(cfg, f"{wave}: launch of {nxt} refused: {why}")
+    flush_notices(cfg, st, w)
 
 
 def tick(cfg, st):
@@ -1756,7 +1798,11 @@ def _tick(cfg, st):
         if why:
             return _stop_without_next(cfg, st, w, wave, now, why)
         flush_notices(cfg, st, w)  # «волна завершена» goes out before the next wave starts
-        started = launch(cfg, waves[idx + 1], nxt, by_dispatcher=True)
+        try:
+            started = launch(cfg, waves[idx + 1], nxt, by_dispatcher=True)
+        except SystemExit as e:  # refused before its intent (previous window alive, admission...)
+            _launch_refused(cfg, st, wave, waves[idx + 1], str(e))
+            return False
         fresh_st = load_state(cfg)  # launch saved a newer snapshot (new current, new record):
         st.clear()                  # the caller's dict must not be written back over it
         st.update(fresh_st)
@@ -2105,9 +2151,11 @@ def _watch(cfg, path, max_ticks=None):
 
 
 def done_cmd(cfg, wave=None):
-    """The coordinator merged the PR of the LAST wave: close it and finish the chain. Idempotent."""
+    """The coordinator merged the PR of the LAST wave: close it and finish the chain. Idempotent;
+    a repeat also pushes a window that is still open (pending_exit) and drops the flag once it is gone."""
     with _RunLock(cfg, "done"):
         st = load_state(cfg)
+        pushed = close_pending_windows(cfg, st)  # an entry of the coordinator
         waves = cfg["waves"]
         last = waves[-1]
         wave = wave or st.get("current") or last
@@ -2136,6 +2184,12 @@ def done_cmd(cfg, wave=None):
             ack_wave_notices(w)  # a repeat call confirms too: only chain_done may still be owed
             save_state(cfg, st)
             flush_notices(cfg, st, w, force=True)  # a repeat call sends what was not delivered
+        if w.get("pending_exit"):  # e.g. a crash between the awaiting_merge save and /exit
+            if wait_window_closed(cfg, st, w, push=w.get("tmux") not in pushed):
+                save_state(cfg, st)
+            else:
+                event(cfg, f"{wave}: window {w.get('tmux')} still open after /exit; run done again "
+                           f"or close it ({attach_cmd(w.get('tmux') or '')})")
 
 
 def status_cmd(cfg):

@@ -12,14 +12,21 @@ import subprocess
 import sys
 import time
 
-from rich import box
-from rich.align import Align
-from rich.console import Group
-from rich.layout import Layout
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
+RICH_MISSING = "dash.py needs the Python package rich: python3 -m pip install --user rich"
+try:  # the one third-party package of the waves runtime, not installed with the skill
+    from rich import box
+    from rich.align import Align
+    from rich.console import Group
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+except ImportError:
+    if __name__ == "__main__":  # the command: one clear line and rc 2, no traceback
+        print(RICH_MISSING, file=sys.stderr)
+        sys.exit(2)
+    raise  # imported as a module: the importer decides
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import wab  # noqa: E402
@@ -113,23 +120,36 @@ def commits_since(cwd, started, until=None):
 def wave_commits(w):
     """A wave's commits: the number fixed when it ended (`commits`), else `start_rev..HEAD` in its
     workdir (its own HEAD only: other branches and fetched refs do not count). A record from before
-    `start_rev` existed keeps the time window over the repository."""
-    if isinstance(w.get("commits"), int) and not isinstance(w.get("commits"), bool):
-        return w["commits"]
+    `start_rev` existed keeps the time window over the repository. None (shown «?») when the fixed
+    number is corrupt: not a non-negative int."""
+    if "commits" in w:
+        n = w["commits"]
+        return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
     if isinstance(w.get("start_rev"), str):
         n = wab.count_wave_commits(w.get("cwd"), w["start_rev"])
         return n if n is not None else 0
     return commits_since(w["cwd"], w["started"], w.get("finished"))
 
 
+def wave_status(cfg, wave, w):
+    """The status of a wave as the watch decides on it: the file, else (unreadable or mid-rewrite)
+    the last known status from the record. One function for the table and the current panel."""
+    status = wab.read(cfg["run_dir"] / wave / "status", on_error=None)
+    if not status:
+        status = w.get("last_status") or ""
+        status = status if isinstance(status, str) else ""
+    return status
+
+
+def fmt_commits(n):
+    return "?" if n is None else str(n)
+
+
 def wave_state(cfg, st, wave):
     w = st["waves"].get(wave)
     if not w:
         return "pending", w
-    status = wab.read(cfg["run_dir"] / wave / "status", on_error=None)
-    if not status:  # unreadable or mid-rewrite: the last known status, as the watch decides
-        status = w.get("last_status") or ""
-        status = status if isinstance(status, str) else ""
+    status = wave_status(cfg, wave, w)
     if status.startswith("BLOCKED"):
         return "BLOCKED", w
     if w.get("phase") == "awaiting_merge":
@@ -176,7 +196,7 @@ def waves_table(cfg, st):
             Text(wave, style="bold"), Text(f"{icon} {label}", style=colour),
             fmt_dur(end - w["started"]), bar(w.get("tokens", 0), cfg["ctx_limit"], 16),
             ktok(w.get("peak", 0)), str(w.get("restarts", 0)), str(s["turns"]), str(s["tools"]),
-            str(s["agents"]), ktok(s["out"]), str(wave_commits(w)))
+            str(s["agents"]), ktok(s["out"]), fmt_commits(wave_commits(w)))
     return tb
 
 
@@ -186,7 +206,7 @@ def current_panel(cfg, st):
         return Panel(Align.center(Text("цепочка не запущена или завершена", style="grey50")),
                      title="Текущая волна", border_style="grey42")
     w = st["waves"][wave]
-    status = wab.read(cfg["run_dir"] / wave / "status")
+    status = wave_status(cfg, wave, w)
     head = Text()
     if BINDING:
         head.append(" Ctrl+\\ ", style="bold black on bright_yellow")
