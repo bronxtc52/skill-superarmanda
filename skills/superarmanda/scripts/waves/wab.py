@@ -1954,6 +1954,9 @@ def gh_graphql(query, variables):
     return _json(_gh(*argv), "gh api graphql")
 
 
+PR_LIST_LIMIT = 1000
+
+
 def find_pr(cfg, cwd):
     """The PR of the wave's branch (the branch of its working copy) from the chain's repository INTO the
     chain's base branch: the open one, else the newest. None: no branch yet or no PR; CollectError: gh
@@ -1972,7 +1975,10 @@ def find_pr(cfg, cwd):
     base = base_branch_of(cfg, cwd)
     if not base:
         raise gate.CollectError("base branch is unknown (set base_branch in chain.json or origin/HEAD)")
-    items = _json(_gh("pr", "list", "--repo", repo, "--head", branch, "--base", base, "--state", "all", "--json",
+    # `--limit` (default 30) is applied BEFORE the head-repository filter below: forks reusing the branch
+    # name must not push the wave's own PR out of the page
+    items = _json(_gh("pr", "list", "--repo", repo, "--head", branch, "--base", base, "--state", "all",
+                      "--limit", str(PR_LIST_LIMIT), "--json",
                       "number,headRefOid,isDraft,state,baseRefName,headRepositoryOwner,headRepository"), "gh pr list")
     items = [i for i in items if isinstance(i, dict) and isinstance(i.get("number"), int)
              and isinstance(i.get("headRefOid"), str) and i.get("baseRefName") == base
@@ -2138,6 +2144,16 @@ def _gate_tick(cfg, st, wave, w, wdir, now):
     w.get("notified", {}).pop("gate_wait", None)
     if v["verdict"] == "fail":
         return _gate_failed(cfg, st, wave, w, wdir, reasons)
+    # collecting the facts takes a while: the wave may have taken its DONE back meanwhile, and `_tick`
+    # would only see it on the next tick, after `gh pr ready`/`gh pr merge`. Re-read it right before acting.
+    again = read(wdir / "status", on_error=None)
+    if again != "DONE":
+        if again:  # taken back: the wave goes on, its next DONE is gated afresh
+            w["last_status"], w["phase"] = again, "running"
+        w["gate_at"] = 0  # empty/unreadable: mid-rewrite, decide on the next tick
+        save_state(cfg, st)
+        event(cfg, f"{wave}: merge gate passed, but the status is «{_one_line(again or '', 80)}» now: nothing done")
+        return True
     return _gate_passed(cfg, st, wave, w, wdir, v)
 
 

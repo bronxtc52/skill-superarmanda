@@ -7577,6 +7577,25 @@ class MergeGate(GateBase):
         self.assertEqual(self.log().count("merge gate waits"), 2)
         self.assertEqual(self.tg, [])
 
+    def test_done_taken_back_while_the_gate_collects_is_not_merged(self):  # Codex P1 on e6e70c6
+        for draft, back in ((False, "RUNNING"), (True, "RUNNING"), (False, "")):
+            with self.subTest(draft=draft, back=back):
+                self.gh_calls.clear()
+                cfg = self.start()
+                self.pr = dict(self.pr, isDraft=draft)
+                self.facts = green_facts()
+                self.facts["pr"]["draft"] = draft
+
+                def collect(cfg_, pr, back=back):  # the wave rewrites its status mid-collection
+                    (wab.wave_dir(cfg, "W1") / "status").write_text(back + ("\n" if back else ""), encoding="utf-8")
+                    return self.facts
+                with mock.patch.object(wab, "gate_facts", side_effect=collect):
+                    self.assertTrue(self.tick())
+                self.assertEqual(self.merges(), [])
+                self.assertEqual([c for c in self.gh_calls if c[:3] == ("gh", "pr", "ready")], [])
+                self.assertNotIn(self.rec()["phase"], ("merging", "done"))
+                self.assertEqual(self.rec()["phase"], "running" if back else "gate")
+
     def test_a_collection_error_or_another_head_waits(self):
         cfg = self.start()
         self.pr = gate.CollectError("gh: no network")
@@ -8991,6 +9010,8 @@ class GateWrappers(Base):
         fields = argv[argv.index("--json") + 1]
         self.assertIn("headRepositoryOwner", fields)
         self.assertIn("headRepository", fields)
+        # Codex P2 on e6e70c6: gh's default --limit 30 cuts the list before the head-repository filter
+        self.assertGreaterEqual(int(argv[argv.index("--limit") + 1]), 100)
         self.gh(lambda a: _cp(a, out=json.dumps([fork])))
         self.assertIsNone(self.find_pr(cfg, self.cwd))  # only a fork's PR: not the wave's
         bare = {k: v for k, v in own.items()}
