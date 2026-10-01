@@ -7701,6 +7701,140 @@ class OwnerMerge(GateBase):  # D3
         self.assertNotEqual(ctx.exception.code, 0)
 
 
+class OwnerMergeHarness(GateBase):
+    """gate_check over fixtures; gh_graphql and the order of resolve / ready / merge are recorded."""
+
+    def setUp(self):
+        super().setUp()
+        self.graphql_calls, self.order = [], []
+        real = self.handle
+
+        def handle(args):
+            if args[:3] in (("gh", "pr", "ready"), ("gh", "pr", "merge")):
+                self.order.append(args[2])
+            return real(args)
+        self.gh_handler = handle
+
+        def graphql(query, variables):
+            self.graphql_calls.append(variables)
+            self.order.append("resolve")
+            return {"data": {}}
+        p = mock.patch.object(wab, "gh_graphql", side_effect=graphql)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_owner_merge(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return wab.owner_merge(wab.load_chain(self.path), "W1")
+
+    def merged_view(self, head=HEAD):
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": head}
+
+
+class ExternalOwnerMerge(OwnerMergeHarness):  # R1: the script offered by an external hand-off must work
+    def handoff(self):
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
+        self.pr["isDraft"] = True
+        self.facts["pr"]["draft"] = True
+        cfg, path = self.chain(merge_gate="external")
+        self.cfg, self.path = cfg, path
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        rec = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(rec["phase"], "awaiting_merge")
+        return rec
+
+    def test_the_handoff_keeps_the_gated_sha_and_pr(self):
+        rec = self.handoff()
+        self.assertEqual((rec["gate_sha"], rec["gate_pr"]), (HEAD, 7))
+
+    def test_owner_merge_after_an_external_handoff_resolves_readies_merges(self):
+        self.handoff()
+        self.run_owner_merge()
+        self.assertEqual(self.order, ["resolve", "ready", "merge"])
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+        self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+
+    def test_owner_merge_after_an_external_handoff_refuses_a_moved_head(self):
+        self.handoff()
+        other = "e" * 40
+        self.pr = {**self.pr, "headRefOid": other}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": True, "head": other},
+                                 reviews=[{"user": BOT, "commit_id": other, "state": "COMMENTED"}])
+        self.manifest = {**green_manifest(), "head": other}
+        self.work = {**WORK, "head": other}
+        with self.assertRaises(SystemExit):
+            self.run_owner_merge()
+        self.assertEqual((self.order, self.merges()), ([], []))
+
+
+class MergedByHand(OwnerMergeHarness):  # R2: a manual merge must not strand the chain
+    def refuse_then_merge_by_hand(self, **chain):
+        self.start(**chain)
+        self.merge_rc, self.merge_err = 1, "blocked by policy"
+        self.tick()
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate passed; merge refused"))
+        self.merged_view()
+
+    def test_a_refused_automerge_then_a_manual_merge_launches_the_next_wave(self):  # (a)
+        self.refuse_then_merge_by_hand()
+        self.assertTrue(self.tick())
+        self.launch.assert_called_once()
+        self.assertEqual(self.launch.call_args[0][1], "W2")
+
+    def test_owner_merge_then_the_next_wave_launches(self):  # (b)
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
+        self.start()
+        self.tick()
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate passed; 1 unresolved"))
+        self.run_owner_merge()
+        self.merged_view()
+        self.assertTrue(self.tick())
+        self.launch.assert_called_once()
+
+    def test_a_crash_between_done_and_launch_is_finished_by_the_next_watch_once(self):  # (c)
+        self.refuse_then_merge_by_hand()
+        calls = []
+
+        def die_once(*a, **kw):
+            calls.append(a[1])
+            if len(calls) == 1:
+                raise KeyboardInterrupt  # the process dies after the phase was saved
+            st = wab.load_state(a[0])  # a real launch makes W2 current
+            st["current"] = "W2"
+            st["waves"]["W2"] = self.wave_rec("W2")
+            self.put_state(a[0], st)
+            return True
+        self.launch.side_effect = die_once
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick()
+        self.assertEqual(self.rec()["phase"], "done")
+        self.assertTrue(self.status().startswith("BLOCKED"))  # still the dispatcher's old line
+        for _ in range(3):
+            wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(calls, ["W2", "W2"])  # the dead try and exactly one more
+        self.assertEqual(len([t for t in self.tg if "волна W1 завершена" in t]), 1)
+
+    def test_the_last_wave_after_a_manual_merge_ends_the_chain(self):  # (d)
+        self.refuse_then_merge_by_hand(waves=["W1"])
+        self.assertFalse(self.tick())
+        self.assertIsNone(self.get_state(self.cfg)["current"])
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1)
+        self.launch.assert_not_called()
+
+    def test_the_last_wave_cut_short_after_done_still_reports_the_chain_end(self):  # (d)
+        self.refuse_then_merge_by_hand(waves=["W1"])
+        with mock.patch.object(wab, "close_window", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick()
+        for _ in range(2):
+            wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertIsNone(self.get_state(self.cfg)["current"])
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1)
+
+
 class ExternalHandoffVerdict(GateBase):
     def handoff(self):
         cfg, path = self.chain(merge_gate="external")

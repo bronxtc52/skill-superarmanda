@@ -2048,6 +2048,7 @@ def handoff_gate_line(cfg, wave, w):
         if v["verdict"] != "pass":
             return f"Гейт мерджа {'ждёт' if v['verdict'] == 'wait' else 'не пройден'}: {reasons}"
         number, sha = v["number"], v["head"]
+        w["gate_sha"], w["gate_pr"] = sha, number  # saved with the hand-off: `owner-merge` gates against them
         if v["unresolved"]:
             path = write_owner_script(cfg, wave)
             return (f"Гейт мерджа пройден, но есть незакрытые треды ({len(v['unresolved'])}). "
@@ -2187,8 +2188,10 @@ def owner_merge(cfg, wave):
     touched: the running `watch` sees MERGED. Any refusal is SystemExit (rc 1) before any action."""
     st = load_state(cfg)
     w = st["waves"].get(wave)
-    if not isinstance(w, dict) or w.get("phase") != "merging" or not isinstance(w.get("gate_sha"), str):
-        raise SystemExit(f"wab: owner-merge: wave {wave} is not in phase merging with a passed gate; nothing done")
+    if not isinstance(w, dict) or w.get("phase") not in ("merging", "awaiting_merge") \
+            or not isinstance(w.get("gate_sha"), str):
+        raise SystemExit(f"wab: owner-merge: wave {wave} is not in phase merging (auto) or awaiting_merge "
+                         f"(external) with a passed gate; nothing done")
     v = gate_check(cfg, wave, w)
     if v["verdict"] != "pass":
         raise SystemExit(f"wab: owner-merge: the gate is {v['verdict']}: {'; '.join(v['reasons'])}; nothing done")
@@ -2380,6 +2383,10 @@ def _tick(cfg, st):
     external = gate_mode == "external"
     waves = cfg["waves"]
     is_last = waves.index(wave) + 1 >= len(waves)
+    if gate_mode == "auto" and w.get("phase") == "done":
+        # the PR is merged and `done` was saved, but the completion was cut short (a crash, a refused
+        # launch): carry it on whatever the status file says (it may still hold our BLOCKED line)
+        return _complete_wave(cfg, st, wave, w, wdir, now)
     if status == "DONE" and gate_mode == "auto" and w.get("phase") != "done":
         return _gate_tick(cfg, st, wave, w, wdir, now)  # phase `done`: completion was cut short, see below
     if status == "DONE" and gate_mode != "auto" and (external or not is_last):

@@ -253,7 +253,10 @@ ref не обновляет, а при merge queue вообще только с�
   `~/.cache/wab/<chain>-<волна>-merge` (`chmod 700`): `exec python3 <wab.py> owner-merge <chain.json> <волна>`.
   `wab.py owner-merge` **заново** прогоняет гейт (двойной сбор): нужен `pass` на том же `gate_sha` и PR (иначе выход ≠ 0
   с причиной, без действий); затем закрывает текущие незакрытые треды (`resolveReviewThread`), снимает draft и мерджит
-  той же командой с `--match-head-commit`. Запись волны он не меняет: `merging` подхватит `MERGED`. Статус
+  той же командой с `--match-head-commit`. Работает и после передачи при `merge_gate: external` (фаза `awaiting_merge`: сдача с `pass` сохраняет `gate_sha`/`gate_pr`).
+Запись волны он не меняет: `merging` подхватит `MERGED`. Завершение волны после `MERGED` (или сохранённой фазы `done`)
+не зависит от текста `status`: строка `BLOCKED: …` диспетчера не мешает, обрыв между сохранением `done` и запуском
+следующей волны добирается следующим `watch`. Статус
   `BLOCKED: merge gate passed; N unresolved review threads; owner runs <путь>`, в Telegram одна короткая команда — путь к скрипту.
 
 **Фаза `merging`** (проверка раз в `GATE_POLL_SECONDS`, переживает перезапуск `watch`): `gh pr view <N> --json
