@@ -5739,7 +5739,10 @@ class W4Round35(Base):
 
     # ----- 4: the dashboard sums the commits of earlier attempts -----
     def test_dashboard_commits_include_earlier_attempts(self):
-        import dash
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
         w = self.wave_rec(commits=2, attempts=[{"commits": 3, "cwd": self.cwd, "started": 0},
                                                "junk", {"commits": 1, "cwd": self.cwd, "started": 0}])
         self.assertEqual(dash.wave_commits(w), 6)
