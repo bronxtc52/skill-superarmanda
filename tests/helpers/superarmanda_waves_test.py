@@ -7437,6 +7437,23 @@ class GateCommands(unittest.TestCase):
         done = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, encoding="utf-8")
         self.assertEqual(done.returncode, 0, done.stderr)
 
+    def test_owner_script_names_do_not_collide_across_runs(self):  # Codex P2 on a27908b
+        base = {"chain_file": "/r/chain.json", "chain": "a-b", "run_id": "c"}
+        names = {wab.owner_script_name(dict(base, **over), "W1", HEAD) for over in (
+            {}, {"chain": "a", "run_id": "b-c"}, {"chain_file": "/other/chain.json"}, {"run_id": "d"})}
+        self.assertEqual(len(names), 4)  # hyphen-joined parts used to give a-b-c for the first two
+        name = wab.owner_script_name(base, "W1", HEAD)
+        self.assertEqual(name, wab.owner_script_name(dict(base), "W1", HEAD))  # stable for the same run
+        self.assertNotEqual(name, wab.owner_script_name(base, "W2", HEAD))
+        self.assertNotEqual(name, wab.owner_script_name(base, "W1", OLD))
+        self.assertTrue(name.startswith(f"W1.{HEAD[:12]}.") and name.endswith(".merge"))
+        self.assertNotIn("/", name)
+        # the path the owner is told survives `redact` with a real (not word-like) sha
+        real = "18d21df306a4dcda4745c2ac1523d3d93c107c2d"
+        for cfg in (base, {"chain_file": "/r/chain.json", "chain": "superarmanda-waves", "run_id": "2026-10-01"}):
+            line = "Выполни: ~/.cache/wab/" + wab.owner_script_name(cfg, "W5", real)
+            self.assertEqual(wab.redact(line), line)
+
     def test_owner_script_refuses_malformed_wave_run_or_sha(self):
         for wave, run_id, sha in (("x'; touch /tmp/x #", "r", HEAD), ("a b", "r", HEAD), ("", "r", HEAD),
                                   ("W1", "r; x", HEAD), ("W1", "", HEAD), ("W1", "r", "abc"),
@@ -7684,7 +7701,7 @@ class MergeGate(GateBase):
                 self.tick()
         self.assertEqual(self.rec()["merge_called"], HEAD)
         self.assertNotIn("merge_rc", self.rec())
-        shown = f"~/.cache/wab/{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge"
+        shown = "~/.cache/wab/" + wab.owner_script_name(self.cfg, "W1", HEAD)
         with mock.patch.object(wab, "GATE_POLL_SECONDS", 0):
             for _ in range(3):
                 self.tick()
@@ -7693,7 +7710,7 @@ class MergeGate(GateBase):
         said = [t for t in self.tg if "неизвестен (диспетчер" in t]
         self.assertEqual(len(said), 1)
         self.assertIn(f"Выполни: {shown}", said[0])
-        self.assertTrue((self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge").is_file())
+        self.assertTrue((self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)).is_file())
         self.assertEqual(self.log().count("merge result unknown"), 1)
         # the owner merges: the wave completes as usual
         self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
@@ -7871,8 +7888,8 @@ class MergeGate(GateBase):
                                           {"id": "PRRT_c", "isResolved": True}])
         self.assertTrue(self.tick())
         self.assertEqual(self.merges(), [])
-        script = self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge"
-        shown = f"~/.cache/wab/{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge"  # people see the `~` form
+        script = self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)
+        shown = "~/.cache/wab/" + wab.owner_script_name(self.cfg, "W1", HEAD)  # people see the `~` form
         self.assertTrue(script.is_file())
         self.assertEqual(script.stat().st_mode & 0o777, 0o700)
         self.assertTrue(os.access(script, os.X_OK))
@@ -7911,10 +7928,10 @@ class MergeGate(GateBase):
         self.assertEqual(self.rec()["phase"], "merging")
         sent = [t for t in self.tg if "мердж отклонён" in t]
         self.assertEqual(len(sent), 1)
-        shown = f"~/.cache/wab/{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge"
+        shown = "~/.cache/wab/" + wab.owner_script_name(self.cfg, "W1", HEAD)
         self.assertIn(f"Выполни: {shown}", sent[0])
         self.assertNotIn("gh pr merge", sent[0])  # never the raw command: the owner script gates again
-        self.assertTrue((self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge").is_file())
+        self.assertTrue((self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)).is_file())
         self.assertIn("not mergeable", sent[0])
         for _ in range(2):
             self.tick()
@@ -8380,8 +8397,9 @@ class OwnerMerge(GateBase):  # D3
         a = wab.write_owner_script(cfg_a, "W1", HEAD)
         b = wab.write_owner_script(cfg_b, "W1", "e" * 40)
         self.assertNotEqual(a, b)
-        self.assertIn(RUN_ID, a.name)
-        self.assertIn("2099-01-01", b.name)
+        self.assertEqual(a.name, wab.owner_script_name(cfg_a, "W1", HEAD))  # the run is in the hash of the name
+        self.assertEqual(b.name, wab.owner_script_name(cfg_b, "W1", "e" * 40))
+        self.assertNotEqual(wab.owner_script_name(cfg_a, "W1", HEAD), wab.owner_script_name(cfg_b, "W1", HEAD))
         self.assertTrue(a.read_text(encoding="utf-8").rstrip().endswith(f"W1 {RUN_ID} {HEAD}"))
         self.assertTrue(b.read_text(encoding="utf-8").rstrip().endswith("W1 2099-01-01 " + "e" * 40))
 
@@ -8625,6 +8643,7 @@ class MergedByHand(OwnerMergeHarness):  # R2: a manual merge must not strand the
 class ExternalHandoffVerdict(GateBase):
     def handoff(self):
         cfg, path = self.chain(merge_gate="external")
+        self.handoff_cfg = cfg
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
@@ -8638,13 +8657,13 @@ class ExternalHandoffVerdict(GateBase):
         text = self.handoff()
         self.assertIn("Гейт мерджа пройден", text)
         self.assertNotIn("gh pr merge", text)  # P1-b: only the owner script, which gates again
-        self.assertIn(f"Выполни: ~/.cache/wab/{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge", text)
+        self.assertIn("Выполни: ~/.cache/wab/" + wab.owner_script_name(self.handoff_cfg, "W1", HEAD), text)
         self.assertEqual(self.merges(), [])  # external never merges
 
     def test_pass_with_open_threads_carries_the_owner_script(self):
         self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
         text = self.handoff()
-        self.assertIn(f"Выполни: ~/.cache/wab/{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge", text)
+        self.assertIn("Выполни: ~/.cache/wab/" + wab.owner_script_name(self.handoff_cfg, "W1", HEAD), text)
 
     def test_fail_and_wait_and_error_are_said_plainly(self):
         self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
@@ -9011,7 +9030,7 @@ class GateWrappers(Base):
         self.assertIn("headRepositoryOwner", fields)
         self.assertIn("headRepository", fields)
         # Codex P2 on e6e70c6: gh's default --limit 30 cuts the list before the head-repository filter
-        self.assertGreaterEqual(int(argv[argv.index("--limit") + 1]), 100)
+        self.assertEqual(argv[argv.index("--limit") + 1], "1000")
         self.gh(lambda a: _cp(a, out=json.dumps([fork])))
         self.assertIsNone(self.find_pr(cfg, self.cwd))  # only a fork's PR: not the wave's
         bare = {k: v for k, v in own.items()}
@@ -9077,7 +9096,7 @@ class GateWrappers(Base):
     def test_owner_script_file_is_private_and_replaced_not_appended(self):
         cfg, _ = self.chain()
         path = wab.write_owner_script(cfg, "W1", HEAD)
-        self.assertEqual(path.name, f"{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge")
+        self.assertEqual(path.name, wab.owner_script_name(cfg, "W1", HEAD))
         self.assertEqual(path.stat().st_mode & 0o777, 0o700)
         again = wab.write_owner_script(cfg, "W1", HEAD)
         self.assertEqual(again, path)

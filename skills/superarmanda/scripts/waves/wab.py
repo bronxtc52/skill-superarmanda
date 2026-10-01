@@ -2082,14 +2082,23 @@ def home_form(path):
         return str(path)
 
 
+def owner_script_name(cfg, wave, sha):
+    """<wave>.<sha12>.<id16>.merge, id16 = sha256 of the run identity (chain file, chain, run_id, wave,
+    sha) as a JSON list: hyphen-joined parts could collide across runs (chain a-b/run c vs a/b-c), and
+    one run's script would then overwrite another's. Dots, not dashes: `redact` masks a 40+ run of
+    [A-Za-z0-9+/_-] that is not word-like, and a real sha in a dashed name made the owner's path «[скрыто]»."""
+    ident = json.dumps([str(cfg["chain_file"]), cfg["chain"], cfg["run_id"], wave, sha])
+    return f"{wave}.{sha[:12]}.{hashlib.sha256(ident.encode('utf-8')).hexdigest()[:16]}.merge"
+
+
 def write_owner_script(cfg, wave, sha):
-    """~/.cache/wab/<chain>-<run_id>-<wave>-<sha12>-merge: executable by the owner only, bound to this
-    run and to the gated sha (a re-gate on another sha writes another file: the old notice keeps its
-    script, which refuses once the head moved); it runs `owner-merge` (which gates the PR again)."""
+    """~/.cache/wab/<owner_script_name>: executable by the owner only, bound to this run and to the
+    gated sha (a re-gate on another sha writes another file: the old notice keeps its script, which
+    refuses once the head moved); it runs `owner-merge` (which gates the PR again)."""
     text = gate.owner_script(pathlib.Path(__file__).resolve(), cfg["chain_file"], wave, cfg["run_id"], sha)
     folder = pathlib.Path.home() / ".cache" / "wab"
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = folder / f"{cfg['chain']}-{cfg['run_id']}-{wave}-{sha[:12]}-merge"
+    path = folder / owner_script_name(cfg, wave, sha)
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".merge.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
