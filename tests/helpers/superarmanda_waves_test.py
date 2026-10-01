@@ -6678,6 +6678,77 @@ class PlanPin(Base):
         new = [c for c in self.tmux_calls if c[1] == "new-session"][0]
         self.assertFalse([a for a in new if str(a).startswith("WAB_PLAN_SHA256")])
 
+    # ----- recovery of a launch that died after the intent was saved -----
+    def launching(self, cfg):
+        pf = self.tmp / "p.md"
+        pf.write_text("go\n", encoding="utf-8")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+            phase="launching", sessions=["sid-1"], prompt_file=str(pf))}})
+
+    def recover(self, cfg, path, alive=False):
+        self.alive = alive
+        self.tmux_calls.clear()
+        self.sent.clear()
+        wab.watch(cfg, path, max_ticks=2)
+
+    def assert_recovery_refused(self, cfg):
+        self.assertEqual([c for c in self.tmux_calls if c[1] == "new-session"], [])
+        self.assertEqual(self.sent, [])
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "not_ready")
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("BLOCKED: plan changed since approval", log)
+        self.assertIn("BLOCKED: plan changed since approval",
+                      (wab.wave_dir(cfg, "W1") / "status").read_text(encoding="utf-8"))
+        self.assertTrue([t for t in self.tg if "plan changed since approval" in t], self.tg)
+
+    def test_recover_launch_refuses_changed_plan(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path)
+        self.assert_recovery_refused(cfg)
+
+    def test_recover_launch_refuses_deleted_plan(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        (cfg["run_dir"] / "waves.json").unlink()
+        self.recover(cfg, path)
+        self.assert_recovery_refused(cfg)
+
+    def test_recover_launch_with_live_window_does_not_send_prompt_on_changed_plan(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "not_ready")
+
+    def test_recover_launch_starting_phase_does_not_send_prompt_on_changed_plan(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "starting"
+        self.put_state(cfg, st)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "not_ready")
+
+    def test_recover_launch_with_unchanged_plan_goes_on(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        self.recover(cfg, path)
+        self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_recover_launch_without_pin_goes_on(self):
+        cfg, path = self.chain()
+        self.launching(cfg)
+        self.recover(cfg, path)
+        self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
+        self.assertEqual(len(self.sent), 1)
+
     def test_plan_pin_is_tunable(self):
         cfg, _ = self.pinned()
         other = dict(cfg, plan_sha256="1" * 64)

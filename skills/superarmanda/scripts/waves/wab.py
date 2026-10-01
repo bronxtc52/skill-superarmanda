@@ -1492,10 +1492,33 @@ def start_session(cfg, st, wave):
     save_state(cfg, st)
 
 
+def _plan_pin_refused(cfg, st, wave):
+    """A pinned plan that changed while the launch was half done (the dispatcher died after the
+    intent was saved): no session, no prompt. Phase not_ready (the chain stops, a `launch`
+    retries through _launch, which checks the pin again), the reason in status, event, notice."""
+    try:
+        check_plan_pin(cfg)
+    except SystemExit as e:
+        why = str(e)
+        w = st["waves"][wave]
+        (wave_dir(cfg, wave) / "status").write_text(why + "\n", encoding="utf-8")
+        w["phase"] = "not_ready"
+        if once_per(w, "not_ready", "plan_pin"):
+            put_notice(w, "not_ready", "plan_pin",
+                       f"wave-autobot: волна {wave} не запущена: {redact(why)}. Цепочка стоит.")
+        save_state(cfg, st)
+        event(cfg, f"{wave}: {why}; session/prompt NOT started")
+        flush_notices(cfg, st, w)
+        return True
+    return False
+
+
 def recover_launch(cfg, st, wave):
     """Dispatcher died around `tmux new-session`: a live window means it was started,
     otherwise start it again with the same session id. Then carry on as `starting`."""
     w = st["waves"][wave]
+    if _plan_pin_refused(cfg, st, wave):
+        return
     if tmux_alive(w["tmux"]):
         event(cfg, f"{wave}: resumed in phase 'launching': window exists, not starting another")
         w["phase"] = "starting"
@@ -1570,6 +1593,8 @@ def deliver_first_prompt(cfg, st, wave):
     that dies in between leaves `sending`, which is never resent blindly."""
     w = st["waves"][wave]
     name, cwd, wdir = w["tmux"], w["cwd"], wave_dir(cfg, wave)
+    if _plan_pin_refused(cfg, st, wave):
+        return False
     if not wait_ready(name):
         blocked = "BLOCKED: окно Claude не стало готовым, задача не отправлена\n"
         (wdir / "status").write_text(blocked, encoding="utf-8")
