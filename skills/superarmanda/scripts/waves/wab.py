@@ -92,6 +92,8 @@ def load_chain(path, create=True):
     if (not isinstance(waves, list) or not waves
             or not all(isinstance(w, str) and WAVE_NAME.fullmatch(w) for w in waves)):
         raise SystemExit("chain.json: waves must be a non-empty list of [A-Za-z0-9_-]+ names")
+    if len({w.lower() for w in waves}) != len(waves):  # tmux session names are lower-cased
+        raise SystemExit("chain.json: duplicate wave id in waves (compared case-insensitively)")
     here = path.resolve().parent
     # a relative run_dir is relative to chain.json, never to the cwd of whoever runs us
     base = pathlib.Path(os.path.abspath(here / cfg["run_dir"])) if cfg.get("run_dir") else here / "runs"
@@ -612,6 +614,9 @@ def _launch(cfg, wave, prompt_file):
     prompt_path = pathlib.Path(prompt_file).resolve()
     if not prompt_path.is_file():
         raise SystemExit(f"prompt file {prompt_file} not found")
+    prev = st.get("current")
+    if prev and prev != wave and st["waves"].get(prev, {}).get("phase") == "awaiting_merge":
+        st["waves"][prev]["phase"] = "done"  # merged by the coordinator; saved with the launch intent
     sid = str(uuid.uuid4())  # known up front: the transcript is bound to the wave by session id
     (wdir / "status").write_text("STARTING\n", encoding="utf-8")  # the wave has not started yet
     system_prompt(cfg)
@@ -799,7 +804,7 @@ def tick(cfg, st):
     attach = f"tmux attach -t {name}  (выйти: Ctrl-b d)"
 
     if w.get("phase") == "awaiting_merge":
-        return True  # the coordinator merges the PR and runs `launch` for the next wave
+        return False  # handed to the coordinator: the watch ends and frees the run lock
     if w.get("phase") == "not_ready":
         return False
     if w.get("phase") == "launching":
@@ -817,7 +822,7 @@ def tick(cfg, st):
         if tmux_alive(name):
             sh("tmux", "send-keys", "-t", name, "-l", "/exit", check=False)
             sh("tmux", "send-keys", "-t", name, "Enter", check=False)
-        return True
+        return False
 
     if status == "DONE":
         waves = cfg["waves"]
@@ -1087,6 +1092,23 @@ def _identity(cfg):
     return {k: v for k, v in cfg.items() if k not in TUNABLE}
 
 
+def _stop_event(cfg, st, path):
+    wave = st.get("current")
+    if wave and st["waves"].get(wave, {}).get("phase") == "awaiting_merge":
+        waves = cfg["waves"]
+        idx = waves.index(wave) if wave in waves else len(waves)
+        chain_file = cfg.get("chain_file", path)
+        if idx + 1 < len(waves):
+            nxt = waves[idx + 1]
+            event(cfg, f"{wave}: handed to the coordinator; after merge run: wab.py launch {chain_file} "
+                       f"{nxt} {cfg['run_dir'] / wave / 'next-prompt.md'} && wab.py watch {chain_file}")
+        else:
+            event(cfg, f"{wave}: handed to the coordinator; it is the last wave, nothing to launch after the merge")
+        event(cfg, "watch stopped: handed to the coordinator")
+    else:
+        event(cfg, "watch stopped: no current wave")
+
+
 def watch(cfg, path, max_ticks=None):
     with _RunLock(cfg, "watch"):
         _watch(cfg, path, max_ticks)
@@ -1114,7 +1136,7 @@ def _watch(cfg, path, max_ticks=None):
             cfg = fresh
         st = _state_or_event(cfg)
         if not tick(cfg, st):
-            event(cfg, "watch stopped: no current wave")
+            _stop_event(cfg, load_state(cfg), path)
             return
         ticks += 1
         st = load_state(cfg)

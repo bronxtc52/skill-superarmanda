@@ -417,8 +417,8 @@ class Supervision(Base):
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         with mock.patch.object(wab, "launch") as launch:
-            self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
-            self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+            self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))  # handed over: the watch ends
+            self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
         launch.assert_not_called()
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
         self.assertEqual(len(self.tg), 1)
@@ -1130,6 +1130,61 @@ class WatchIdentity(Base):
         self.assertIn("cannot read", (self.cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
 
+class CoordinatorHandoff(Base):
+    def lock_is_free(self, cfg):
+        import fcntl
+        with open(cfg["run_dir"] / "dispatcher.lock", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_external_gate_ends_the_watch_and_the_next_wave_continues_by_cli(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        nxt = wab.wave_dir(cfg, "W1") / "next-prompt.md"
+        nxt.write_text("second wave\n", encoding="utf-8")
+        with mock.patch.object(wab, "bind_popup"):
+            wab.watch(cfg, path, max_ticks=50)  # returns on its own: no endless loop
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("handed to the coordinator", log)
+        self.assertIn(f"wab.py launch {path.resolve()} W2 {nxt}", log)
+        self.assertIn(f"wab.py watch {path.resolve()}", log)
+        self.lock_is_free(cfg)
+        # the coordinator merged: CLI launch of the next wave
+        self.alive = False
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            self.assertTrue(wab.launch(cfg, "W2", nxt))
+        st = self.get_state(cfg)
+        self.assertEqual((st["current"], st["waves"]["W1"]["phase"], st["waves"]["W2"]["phase"]),
+                         ("W2", "done", "running"))
+        self.lock_is_free(cfg)
+        news = len([c for c in self.tmux_calls if c[1] == "new-session"])
+        self.alive = True
+        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "launch") as again:
+            wab.watch(cfg, path, max_ticks=1)
+        again.assert_not_called()
+        self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), news)
+        self.assertEqual(self.get_state(cfg)["waves"]["W2"]["phase"], "running")
+
+    def test_resume_in_awaiting_merge_exits_with_the_same_hint(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge")}})
+        self.set_status(cfg, "W1", "DONE")
+        with mock.patch.object(wab, "bind_popup"):
+            wab.watch(cfg, path, max_ticks=50)
+        self.assertIn("handed to the coordinator", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+        self.lock_is_free(cfg)
+
+    def test_last_wave_ends_the_watch_in_both_modes(self):
+        for gate in (None, "external"):
+            with self.subTest(gate=gate):
+                cfg, path = self.chain(waves=["W1"], merge_gate=gate)
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                self.set_status(cfg, "W1", "DONE")
+                with mock.patch.object(wab, "bind_popup"):
+                    wab.watch(cfg, path, max_ticks=50)
+                self.lock_is_free(cfg)
+
+
 class AtMostOnce(Base):
     def crash_then_tick(self, cfg, **extra):
         with mock.patch.object(wab, "notify", side_effect=KeyboardInterrupt):
@@ -1582,6 +1637,14 @@ class ChainConfig(Base):
         cfg, path = self.chain(run_dir="runs")
         self.assertTrue(wab.wave_dir(cfg, "W1").is_absolute())
         self.assertTrue(wab.system_prompt(cfg).is_absolute())
+
+    def test_duplicate_wave_ids_are_rejected(self):
+        for waves in (["W1", "W1", "W2"], ["W1", "w1"]):
+            with self.subTest(waves=waves):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.chain(waves=waves)
+                self.assertIn("duplicate", str(ctx.exception))
+        self.chain(waves=["W1", "W2"])
 
     def test_unsafe_identifiers_are_rejected(self):
         for field, value in (("run_id", None), ("run_id", ""), ("run_id", ".."), ("run_id", "a/b"),
