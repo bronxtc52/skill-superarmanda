@@ -1444,6 +1444,65 @@ class ExactTargets(Base):
         self.assertEqual(ctx.exception.code, 3)
 
 
+class WindowVanishesMidAction(Base):
+    def failing(self, kill_window):
+        def boom(*args):
+            if kill_window:
+                self.alive = False
+            raise subprocess.CalledProcessError(1, ["tmux"], stderr="can't find session")
+        return boom
+
+    def w(self, cfg):
+        return self.get_state(cfg)["waves"]["W1"]
+
+    def test_checkpoint_request_when_the_window_is_gone(self):
+        cfg, _ = self.chain()
+        self.transcript("s1", [asst(inp=400000)])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(sessions=["s1"])}})
+        self.set_status(cfg, "W1", "RUNNING")
+        wab.send_text.side_effect = self.failing(True)
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(self.w(cfg)["phase"], "dead")
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(len(self.tg), 1)
+        self.assertIn("закрылось", self.tg[0])
+
+    def test_clear_when_the_window_is_gone_keeps_one_notice(self):
+        cfg, _ = self.chain()
+        w = self.wave_rec(phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time(), sessions=["s1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
+        self.set_status(cfg, "W1", "HANDOFF_READY")
+        wab.send_command.side_effect = self.failing(True)
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(self.w(cfg)["phase"], "dead")
+        self.assertEqual(len(self.tg), 1)
+
+    def test_clear_failing_in_a_live_window_notifies_once_and_retries(self):
+        cfg, _ = self.chain()
+        w = self.wave_rec(phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time(), sessions=["s1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
+        self.set_status(cfg, "W1", "HANDOFF_READY")
+        rec = wab.send_command.side_effect
+        wab.send_command.side_effect = self.failing(False)
+        self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual((self.w(cfg)["phase"], len(self.tg)), ("clearing", 1))
+        wab.send_command.side_effect = rec
+        self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual((self.w(cfg)["phase"], self.w(cfg)["restarts"]), ("running", 1))
+
+    def test_first_prompt_when_the_window_is_gone(self):
+        cfg, _ = self.chain()
+        self.alive = False
+        wab.send_text.side_effect = self.failing(True)
+        prompt = self.tmp / "p.md"
+        prompt.write_text("x", encoding="utf-8")
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            self.assertFalse(wab.launch(cfg, "W1", prompt))
+        self.assertEqual(self.w(cfg)["phase"], "dead")
+        self.assertEqual(len(self.tg), 1)
+
+
 class AtMostOnce(Base):
     def crash_then_tick(self, cfg, **extra):
         with mock.patch.object(wab, "notify", side_effect=KeyboardInterrupt):

@@ -728,6 +728,43 @@ def recover_launch(cfg, st, wave):
         deliver_first_prompt(cfg, st, wave)
 
 
+class _WindowGone(Exception):
+    """The wave's tmux session vanished while we were acting on it."""
+
+
+def _mark_dead(cfg, st, wave, status=""):
+    """The one `window closed` branch: phase dead, event and a single notice."""
+    w = st["waves"][wave]
+    fresh = once_per(w, "dead", "1")
+    w["phase"] = "dead"
+    save_state(cfg, st)
+    if fresh:
+        event(cfg, f"{wave}: tmux session {w['tmux']} is gone (status={status})")
+        notify(cfg, f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
+
+
+def _act(cfg, st, wave, what, fn, *args):
+    """Run one outside tmux action. True when done. Window gone -> phase dead and
+    _WindowGone. Window alive but the command failed -> one event and one notice, False;
+    the intent phase is already on disk, so the next tick (or a restart) decides."""
+    w = st["waves"][wave]
+    try:
+        fn(*args)
+    except (subprocess.CalledProcessError, OSError) as e:
+        if not tmux_alive(w["tmux"]):
+            _mark_dead(cfg, st, wave, read(cfg["run_dir"] / wave / "status"))
+            raise _WindowGone() from e
+        fresh = once_per(w, "tmux_failed", what)
+        save_state(cfg, st)
+        event(cfg, f"{wave}: tmux action '{what}' failed ({type(e).__name__}); the window is alive")
+        if fresh:
+            notify(cfg, f"wave-autobot: не удалось выполнить «{what}» в окне волны {wave} "
+                        f"({type(e).__name__}). Окно живо: tmux attach -t {w['tmux']}")
+        return False
+    w.get("notified", {}).pop("tmux_failed", None)
+    return True
+
+
 def deliver_first_prompt(cfg, st, wave):
     """starting -> sending -> running. The phase is saved before the paste: a dispatcher
     that dies in between leaves `sending`, which is never resent blindly."""
@@ -749,7 +786,11 @@ def deliver_first_prompt(cfg, st, wave):
     (wdir / "first-prompt.md").write_text(head + prompt + "\n", encoding="utf-8")
     w["phase"] = "sending"
     save_state(cfg, st)
-    send_text(name, head + prompt)
+    try:
+        if not _act(cfg, st, wave, "первая задача", send_text, name, head + prompt):
+            return False  # phase `sending` stays on disk; a restart will not resend blindly
+    except _WindowGone:
+        return False
     w["phase"] = "running"
     once_per(w, "started", "1")  # saved before the notice: at most once
     save_state(cfg, st)
@@ -770,6 +811,13 @@ def once_per(w, key, value):
 
 
 def resume(cfg, st):
+    try:
+        _resume(cfg, st)
+    except _WindowGone:
+        pass  # recorded as dead; tick follows
+
+
+def _resume(cfg, st):
     """Pick up after a dispatcher restart from the phase on disk, without relaunching."""
     wave = st.get("current")
     if not wave or wave not in st["waves"]:
@@ -858,6 +906,13 @@ def recover_update(cfg, st, wave):
 
 
 def tick(cfg, st):
+    try:
+        return _tick(cfg, st)
+    except _WindowGone:
+        return False  # already recorded as dead
+
+
+def _tick(cfg, st):
     wave = st.get("current")
     if not wave:
         return False
@@ -930,12 +985,7 @@ def tick(cfg, st):
         return launch(cfg, waves[idx + 1], nxt)
 
     if not tmux_alive(name):
-        fresh = once_per(w, "dead", "1")
-        w["phase"] = "dead"
-        save_state(cfg, st)
-        if fresh:
-            event(cfg, f"{wave}: tmux session {name} is gone (status={status})")
-            notify(cfg, f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
+        _mark_dead(cfg, st, wave, status)
         return False  # the chain stops; restart the wave by hand, then run watch again
 
     if status.startswith("BLOCKED"):
@@ -955,14 +1005,16 @@ def tick(cfg, st):
         event(cfg, f"{wave}: handoff ready, /clear + /update (restart #{w.get('restarts', 0) + 1})")
         w["phase"] = "clearing"  # saved before each outside action; a repeated /clear is safe
         save_state(cfg, st)
-        send_command(name, "/clear")
+        if not _act(cfg, st, wave, "/clear", send_command, name, "/clear"):
+            return True  # phase `clearing` is on disk: retried next tick
         w["phase"] = "updating"  # from here /update is never resent blindly
         w["await_session"] = True  # the next session is found by its marker, not by guesswork
         save_state(cfg, st)
         time.sleep(6)
-        send_text(name, f"/update {session_marker(cfg, wave)} Продолжаем волну {wave} wave-autobot. "
-                        f"Каталог волны: {wdir}. Прочитай {wdir}/handoff.md и продолжи с шага "
-                        f"«Следующий шаг».")
+        update = (f"/update {session_marker(cfg, wave)} Продолжаем волну {wave} wave-autobot. "
+                  f"Каталог волны: {wdir}. Прочитай {wdir}/handoff.md и продолжи с шага «Следующий шаг».")
+        if not _act(cfg, st, wave, "/update", send_text, name, update):
+            return True  # phase `updating` is on disk: recover_update decides, nothing is resent
         finish_update(cfg, st, wave)
         return True
 
@@ -990,10 +1042,11 @@ def tick(cfg, st):
         save_state(cfg, st)
     if w.get("phase") == "checkpoint" and not w.get("checkpoint_sent", True):
         # also re-sent after a dispatcher restart between the save above and delivery
-        send_text(name, f"WAB-CHECKPOINT: контекст {tokens // 1000}k токенов. По протоколу: доведи "
-                        f"шаг, закоммить и запушь WIP, перепиши {wdir}/handoff.md, запиши "
-                        f"HANDOFF_READY в {wdir}/status и остановись.")
-        w["checkpoint_sent"] = True
+        request = (f"WAB-CHECKPOINT: контекст {tokens // 1000}k токенов. По протоколу: доведи "
+                   f"шаг, закоммить и запушь WIP, перепиши {wdir}/handoff.md, запиши "
+                   f"HANDOFF_READY в {wdir}/status и остановись.")
+        if _act(cfg, st, wave, "запрос чекпоинта", send_text, name, request):
+            w["checkpoint_sent"] = True
         save_state(cfg, st)
     elif w.get("phase") == "checkpoint" and now - (w.get("checkpoint_at") or now) > cfg["handoff_timeout_minutes"] * 60:
         if once_per(w, "checkpoint_timeout", str(w.get("checkpoint_at"))):
@@ -1258,7 +1311,7 @@ def main(argv):
         status_cmd(load_chain(path, create=False))
     elif cmd == "launch" and len(argv) == 5:
         if not launch(load_chain(path), argv[3], argv[4]):
-            print(f"wab: wave {argv[3]} not started: TUI not ready (see events.log)", file=sys.stderr)
+            print(f"wab: wave {argv[3]} not started (see events.log)", file=sys.stderr)
             sys.exit(3)
     elif cmd == "watch":
         if watch(load_chain(path), path) is False:
