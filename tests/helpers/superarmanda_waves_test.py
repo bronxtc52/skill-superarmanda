@@ -6495,6 +6495,45 @@ class W4Round44DashHeaderDone(Base):
         self.assertIn("волн 0/2", self.header_text(dash, cfg, st))
 
 
+class W4Round45DashHeaderAttemptStart(Base):
+    """Round 45: «в работе» in the header starts at the earliest known start of the chain,
+    archived tries included: a first wave restarted after dead or not_ready keeps its original
+    start in `attempts`, and the timer must not reset to the retry. Corrupt starts of archived
+    tries (a string, a bool, NaN, a huge int) are skipped, not a crashed frame."""
+
+    dash = W4Round42DashAttemptMetrics.dash
+
+    def header_text(self, dash, cfg, st, now):
+        from rich.console import Console
+        with mock.patch.object(dash, "wave_stats", return_value={"turns": 0}), \
+                mock.patch.object(dash.time, "time", return_value=now):
+            con = Console(width=220, record=True)
+            con.print(dash.header(cfg, st))
+        return con.export_text()
+
+    def test_restarted_first_wave_keeps_its_original_start(self):
+        dash = self.dash()
+        cfg, _ = self.chain(waves=["W1", "W2"])
+        now = 1_000_000.0
+        w1 = self.wave_rec(name="W1", started=now - 100)
+        w1["attempts"] = [{"started": now - 5000, "phase": "dead"}]
+        st = {"current": "W1", "waves": {"W1": w1}}
+        self.assertIn(f"в работе {dash.fmt_dur(5000)}", self.header_text(dash, cfg, st, now))
+
+    def test_corrupt_attempt_starts_are_skipped(self):
+        dash = self.dash()
+        cfg, _ = self.chain(waves=["W1"])
+        now = 1_000_000.0
+        w1 = self.wave_rec(name="W1", started=now - 100)
+        w1["attempts"] = ["junk", {"started": "yesterday"}, {"started": True},
+                          {"started": float("nan")}, {"started": -(10 ** 400)},
+                          {"started": now - 300}]
+        st = {"current": "W1", "waves": {"W1": w1}}
+        self.assertIn(f"в работе {dash.fmt_dur(300)}", self.header_text(dash, cfg, st, now))
+        w1["attempts"] = "corrupt"
+        self.assertIn(f"в работе {dash.fmt_dur(100)}", self.header_text(dash, cfg, st, now))
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")

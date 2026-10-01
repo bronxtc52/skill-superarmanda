@@ -347,8 +347,11 @@ def header(cfg, st):
     # finished as the row and the pipeline show it, not by the raw status file: a done wave whose
     # file is gone, unreadable or a directory stays in the count; a dead wave does not
     done = sum(1 for w in cfg["waves"] if wave_state(cfg, st, w)[0] in FINISHED)
+    # the chain's earliest known start, archived tries included: a wave restarted after dead or
+    # not_ready keeps its original start in `attempts`, the timer does not reset to the retry;
     # a corrupt or missing `started` is skipped, not a crashed frame
-    started = min((s for s in (_num(w.get("started")) for w in waves.values()) if s is not None),
+    started = min((s for s in (_num(r.get("started")) for w in waves.values()
+                               for r in [w, *_attempts(w)]) if s is not None),
                   default=time.time())
     restarts = sum(wave_restarts(w) for w in waves.values())
     turns = sum(wave_stats(w)["turns"] for w in waves.values())
