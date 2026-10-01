@@ -644,7 +644,9 @@ NOTIFY_RETRY_SECONDS = 300  # a standing notice that failed is repeated no more 
 def queue_notice(cfg, st, w, key, value, text):
     """A notice about a standing episode (`key`, `value`). It is written to the state BEFORE the
     send and removed only after the transport took it, so a transient Telegram failure is
-    retried by later ticks (flush_notices) instead of being lost; supervision never waits for it."""
+    retried by later ticks (flush_notices) instead of being lost; supervision never waits for it.
+    At least once, not exactly once: a crash or a lost transport reply after the actual delivery
+    sends it again."""
     box = w.setdefault("outbox", {})
     cur = box.get(key)
     if cur is None or cur.get("value") != value:
@@ -854,7 +856,9 @@ def system_prompt(cfg):
     phase A). A dated mandate must never ride along with an unrelated chain or rerun:
     its first line must name this run_id, otherwise it is ignored. Waves may write into
     run_dir, so the approved bytes are pinned by `mandate_sha256` in chain.json (which lives
-    outside run_dir): a mandate whose digest differs is refused, not trusted."""
+    outside run_dir): a mandate whose digest differs is refused, not trusted. A pin is also
+    a promise that the mandate exists: with `mandate_sha256` set, a missing, empty or
+    foreign-headed mandate.md refuses the launch instead of falling back to the bare protocol."""
     text = PROTOCOL.read_text(encoding="utf-8").rstrip() + "\n"
     mandate = cfg["run_dir"] / "mandate.md"
     raw = mandate.read_bytes() if mandate.exists() else b""
@@ -863,6 +867,12 @@ def system_prompt(cfg):
     except UnicodeDecodeError:
         raise SystemExit(f"{mandate} is not valid UTF-8")
     first = body.splitlines()[:1]
+    pinned = cfg.get("mandate_sha256")
+    if pinned and not (first and first[0].strip() == MANDATE_HEADER + cfg["run_id"]):
+        why = ("is missing" if not mandate.exists() else "is empty" if not body.strip()
+               else f"first line is not «{MANDATE_HEADER}{cfg['run_id']}»")
+        raise SystemExit(f"{mandate} {why}, but chain.json pins mandate_sha256 {pinned}: "
+                         f"the approved mandate is gone, refusing to launch without it")
     if first and first[0].strip() != MANDATE_HEADER + cfg["run_id"]:
         event(cfg, f"mandate.md ignored: first line must be «{MANDATE_HEADER}{cfg['run_id']}»")
     elif first:

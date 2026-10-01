@@ -73,19 +73,26 @@ def spark(values, limit, width=60):
 
 
 def wave_stats(w):
-    """Counters of ONE wave: its own sessions (state.json `sessions`) and their subagents.
-    A shared workdir never mixes waves: nothing is found by directory."""
+    """Counters of ONE wave: its own sessions (state.json `sessions`) and their subagents,
+    plus those of its earlier attempts (`attempts`: a restart archives the old record there,
+    with its own cwd), each session counted once. A shared workdir never mixes waves:
+    nothing is found by directory."""
     s = {"turns": 0, "tools": 0, "out": 0, "read": 0, "agents": 0}
-    d = wab.transcript_dir(w["cwd"])
-    for sid in w.get("sessions") or []:
-        main = CACHE.read(wab.transcript_path(w["cwd"], sid))
-        for k in ("turns", "tools", "out", "read"):
-            s[k] += main[k]
-        for f in sorted((d / sid / "subagents").glob("*.jsonl")):
-            sub = CACHE.read(f)
-            s["agents"] += 1
-            for k in ("tools", "out", "read"):  # a subagent's turns are not the wave's turns
-                s[k] += sub[k]
+    seen = set()  # a session id is a uuid: the same id in two records is the same session
+    for rec in [w, *(w.get("attempts") or [])]:
+        cwd = rec.get("cwd") or w["cwd"]
+        for sid in rec.get("sessions") or []:
+            if sid in seen:
+                continue
+            seen.add(sid)
+            main = CACHE.read(wab.transcript_path(cwd, sid))
+            for k in ("turns", "tools", "out", "read"):
+                s[k] += main[k]
+            for f in sorted((wab.transcript_dir(cwd) / sid / "subagents").glob("*.jsonl")):
+                sub = CACHE.read(f)
+                s["agents"] += 1
+                for k in ("tools", "out", "read"):  # a subagent's turns are not the wave's turns
+                    s[k] += sub[k]
     return s
 
 

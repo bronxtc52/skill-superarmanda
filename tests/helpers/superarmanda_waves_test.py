@@ -2521,6 +2521,24 @@ class Mandate(Base):
         self.assertNotIn("## Мандат прогона", text)
         self.assertNotIn("ZZ-UNIQUE-BODY", text)
 
+    def test_pinned_mandate_cannot_be_dodged_by_removing_or_spoiling_the_file(self):
+        # A mandate_sha256 in chain.json pins phase A: deleting, emptying or re-heading
+        # mandate.md must refuse the launch, not quietly fall back to the bare protocol.
+        body = f"Прогон: {RUN_ID}\nМердж разрешён при зелёном CI.\n".encode("utf-8")
+        for name, content in (("missing", None), ("empty", b""), ("blank", b"\n\n"),
+                              ("foreign header", "Прогон: other\nМердж разрешён\n".encode("utf-8"))):
+            with self.subTest(name):
+                cfg, _ = self.chain(mandate_sha256=hashlib.sha256(body).hexdigest())
+                mandate = cfg["run_dir"] / "mandate.md"
+                if mandate.exists():
+                    mandate.unlink()
+                if content is not None:
+                    mandate.write_bytes(content)
+                with self.assertRaises(SystemExit) as cm:
+                    wab.system_prompt(cfg)
+                self.assertIn("mandate_sha256", str(cm.exception))
+                self.assertFalse((cfg["run_dir"] / "system-prompt.md").exists())
+
     def test_mandate_is_decoded_as_utf8_whatever_the_locale(self):
         body = f"Прогон: {RUN_ID}\nкириллица\n".encode("utf-8")
         cfg, _ = self.chain(mandate_sha256=hashlib.sha256(body).hexdigest())
@@ -3297,6 +3315,20 @@ class Dashboard(Base):
         done = self.dash.CACHE.bytes_read
         self.dash.wave_stats(wa)
         self.assertEqual(self.dash.CACHE.bytes_read, done)
+
+    def test_stats_sum_the_sessions_of_earlier_attempts_once(self):
+        # A restarted wave keeps its earlier tries in `attempts` (each a flat copy of the old
+        # record, with its own cwd and sessions): their work is the wave's work too.
+        other = str(self.tmp / "old-clone")
+        self.transcript("old1", [asst(inp=1, out=40, tools=3)], cwd=other)
+        self.transcript("old2", [asst(inp=1, out=2, tools=1)])
+        self.transcript("cur1", [asst(inp=1, out=5, tools=2)])
+        w = self.wave_rec("W1", sessions=["cur1"])
+        w["attempts"] = [dict(self.wave_rec("W1", sessions=["old1"]), cwd=other),
+                         self.wave_rec("W1", sessions=["old2", "cur1"])]
+        self.dash.CACHE = wab.TranscriptCache()
+        s = self.dash.wave_stats(w)
+        self.assertEqual((s["turns"], s["tools"], s["out"]), (3, 6, 47))
 
     def test_without_a_tty_it_refuses_to_draw(self):
         cfg, path = self.chain()
