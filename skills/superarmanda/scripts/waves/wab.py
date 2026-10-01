@@ -113,6 +113,9 @@ def load_chain(path, create=True):
         raise SystemExit(f"chain.json: cannot read {path}: {e}")
     if not isinstance(cfg, dict):
         raise SystemExit("chain.json: must be a JSON object")
+    for key in OPTIONAL_STRINGS + ("tmux_prefix",):
+        if key in cfg and cfg[key] is None:
+            del cfg[key]  # an explicit null is the same as leaving the field out (the default)
     _check_types(cfg)
     cfg.setdefault("ctx_limit", 300_000)
     cfg.setdefault("idle_minutes", 12)
@@ -231,11 +234,19 @@ def load_state(cfg):
     return st
 
 
+ENDED_PHASES = ("done", "awaiting_merge", "dead")
+
+
 def save_state(cfg, st):
     waves = st.get("waves")
     if isinstance(waves, dict):  # an episode that ended with this save loses its stale notice here
         for rec in waves.values():
             drop_ended_episodes(rec)
+            if isinstance(rec, dict):  # `finished`: the end of the wave's work (dash counts commits up to it)
+                if rec.get("phase") in ENDED_PHASES:
+                    rec.setdefault("finished", time.time())
+                else:
+                    rec.pop("finished", None)  # a dead wave is back: it has not ended
     target = state_path(cfg)
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".state.", suffix=".tmp")  # unique per writer
     try:
@@ -267,9 +278,14 @@ def wave_dir(cfg, wave):
     return d
 
 
-def read(p):
+def read(p, on_error=""):
+    """The stripped text of a small file; "" when it does not exist, `on_error` when it exists but
+    cannot be read (a directory, no permission, removed between exists() and read_text())."""
     p = pathlib.Path(p)
-    return p.read_text(encoding="utf-8", errors="replace").strip() if p.exists() else ""
+    try:
+        return p.read_text(encoding="utf-8", errors="replace").strip() if p.exists() else ""
+    except OSError:
+        return on_error
 
 
 # ---------- tmux ----------
@@ -588,15 +604,25 @@ _tg = {}
 TG_LIMIT = 600        # quoted wave text (result.md, BLOCKED question)
 TG_MESSAGE_LIMIT = 1200  # whole message; quoted text is capped at TG_LIMIT first, so the
                          # framing and the attach command after it always fit
+# redact() rules, in order (the list is also in references/waves.md, «redact»):
+#  1. STRUCTURED: secrets recognised by their form or their key — PEM private keys, prefixed tokens
+#     (sk-, ghp_, xox?-, AKIA, JWT, Telegram bot token), Cookie/Set-Cookie values, `key=value` with a
+#     secret-like key, Authorization, bearer/basic, userinfo in URLs, e-mail. Applied everywhere.
+#  2. HEURISTIC: phone numbers, hex keys (_HEX_KEY) and long opaque blobs (_OPAQUE). The path of a
+#     github.com URL is exempt from them (owner/repo/pull/12, actions/runs/N stay readable), except
+#     _HEX_KEY: a 32+ hex run there is masked too, unless it is a 40-hex SHA right after /commit/,
+#     /commits/ or /tree/. The query and fragment of the URL are not exempt.
+#  3. Explicit exceptions only: a bare 40-64 hex after a SHA label (`commit`, `sha`, `head`, ...),
+#     the github SHA above, and an _OPAQUE run made only of word-like parts (_readable_dashed).
 # A long run of base64/base64url characters. Without a dash any 40+ run is a blob; with a dash
 # it stays readable only when every part between -, /, _ and + looks like a word (see
 # _readable_dashed): `kebab-case-words`, paths, dates stay, base64url and UUID-like keys go.
 _OPAQUE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}")
-# 32+ hex digits, bare or in dashed groups (UUID, hex keys); a bare 40-64 hex after an explicit
-# SHA label survives (_keep_match). Shorter than _OPAQUE's 40, so it is its own rule.
-_HEX_KEY = re.compile(r"(?<![A-Za-z0-9+/_-])(?=(?:-?[0-9A-Fa-f]){32})[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*"
-                      r"(?![A-Za-z0-9+/_-])")
-_REDACT = [
+# 32+ hex digits in a row, or in dashed groups (UUID), WHEREVER they are: inside a token with a
+# prefix or suffix (`key-<hex>`, `<hex>-us21`, `id_<hex>`, `v<hex>`, `cache/<hex>`) only the hex
+# part is masked, the rest stays.
+_HEX_KEY = re.compile(r"(?=(?:-?[0-9A-Fa-f]){32})[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*")
+_STRUCTURED = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
     re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"),
     re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"),
@@ -613,12 +639,17 @@ _REDACT = [
     re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(r"(?<=://)[^/\s@]+(?=@)"),                           # userinfo in URLs, with or without password
     re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),                      # e-mail addresses
+]
+_HEURISTIC = [
     re.compile(r"\+\d[\d ()-]{8,}\d"),                                  # phone numbers (+7 ...)
     re.compile(r"(?<![\w+])(?:\+?7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)"),  # RU, no plus
     re.compile(r"(?<!\d)\d{3}[-\s]\d{3}[-\s]\d{2}[-\s]\d{2}(?!\d)"),             # 10 digits, separated
     _HEX_KEY,                                                           # UUID, hex keys
     _OPAQUE,                                                            # long opaque blobs
 ]
+# The host and path of a github.com URL (scheme optional); the query and fragment are not part of it.
+_GITHUB_PATH = re.compile(r"(?i)(?<![\w.-])github\.com/[^\s?#]*")
+_GITHUB_SHA = re.compile(r"/(?:commit|commits|tree)/$")
 
 
 _SHA_LABEL = re.compile(r"(?i)(?:\b(?:commit|sha|head|reviewed_head|base|packet_hash)(?:\s+|\s*[=:]\s*)"
@@ -638,17 +669,36 @@ def _readable_dashed(m):
     return "-" in t and all(_WORDISH.fullmatch(part) for part in re.split(r"[-/_+=]", t))
 
 
-def _keep_match(m):
+def _labelled_sha(m):
     """A bare 40-64 hex string is a key; only one right after an explicit SHA/hash label is a commit id."""
     return bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", m.group(0))
                 and _SHA_LABEL.search(m.string[:m.start()]))
 
 
+def _mask_structured(m):
+    if m.re.groups >= 2 and m.group(2):  # `key: value` -> the key and separator stay
+        return m.group(1) + m.group(2) + "[скрыто]"
+    return "[скрыто]"
+
+
 def redact(text, limit=TG_LIMIT):
-    for rx in _REDACT:
-        text = rx.sub(lambda m: (m.group(1) + m.group(2) + "[скрыто]") if rx.groups >= 2 and m.group(2)
-                      else m.group(0) if _keep_match(m) or (rx is _OPAQUE and _readable_dashed(m))
-                      else "[скрыто]", text)
+    """Mask secrets and personal data in text that leaves for Telegram. Rules: see the comment
+    above _OPAQUE. A heuristic, not a guarantee; its limits are listed in references/waves.md."""
+    for rx in _STRUCTURED:
+        text = rx.sub(_mask_structured, text)
+    for rx in _HEURISTIC:
+        spans = [m.span() for m in _GITHUB_PATH.finditer(text)]
+
+        def keep(m, rx=rx, spans=spans):
+            if _labelled_sha(m):
+                return True
+            in_github = any(a <= m.start() and m.end() <= b for a, b in spans)
+            if rx is _HEX_KEY:
+                return bool(in_github and re.fullmatch(r"[0-9a-fA-F]{40}", m.group(0))
+                            and _GITHUB_SHA.search(m.string[:m.start()]))
+            return in_github or (rx is _OPAQUE and _readable_dashed(m))
+
+        text = rx.sub(lambda m: m.group(0) if keep(m) else "[скрыто]", text)
     return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
 
 
@@ -670,8 +720,14 @@ def _send_telegram(cfg, text):
     token, chat = _tg[key]
     data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode("utf-8")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=20):
-        pass
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=20):
+            pass
+    except BaseException:
+        # the secret may have been rotated in Key Vault: the next attempt (an outbox retry) reads it
+        # again instead of failing with the cached value forever
+        _tg.pop(key, None)
+        raise
 
 
 def notify(cfg, text):
@@ -1085,7 +1141,13 @@ def _check_launch_allowed(cfg, st, wave, name):
         raise SystemExit(f"wab: wave {wave} is already {records[wave]['phase']}; launch refused")
 
 
-_INVISIBLE = ("Cc", "Cf", "Cs", "Cn", "Zs", "Zl", "Zp")  # controls, format (BOM, ZWSP), separators
+# Visible = a letter, digit, punctuation or symbol (categories L*, N*, P*, S*) that is not a filler
+# drawn as blank: combining marks, variation selectors, controls, format and separators alone are empty.
+_BLANK_FILLERS = frozenset("\u3164\u2800\u115f\u1160\uffa0")
+
+
+def _visible(c):
+    return unicodedata.category(c)[0] in "LNPS" and c not in _BLANK_FILLERS
 
 
 def read_prompt(path):
@@ -1111,7 +1173,7 @@ def read_prompt(path):
         text = raw.decode("utf-8")
     except UnicodeDecodeError as e:
         raise SystemExit(f"wab: prompt file {path} is not valid UTF-8 (byte {e.start}); launch refused")
-    if all(unicodedata.category(c) in _INVISIBLE for c in text):
+    if not any(_visible(c) for c in text):
         raise SystemExit(f"wab: prompt file {path} is empty (only whitespace or invisible characters); "
                          f"launch refused")
     return text.lstrip("\ufeff").strip()
@@ -1472,7 +1534,13 @@ def _tick(cfg, st):
     w.setdefault("notified", {})
     w.setdefault("sessions", [])
     name, wdir = w["tmux"], wave_dir(cfg, wave)
-    status = read(wdir / "status")
+    status = read(wdir / "status", on_error=None)
+    if status is None:  # unreadable: decide on the last known status, one event per episode
+        if once_per(w, "status_unreadable", "1"):
+            event(cfg, f"{wave}: status unreadable ({wdir / 'status'}), keeping «{w.get('last_status', '')}»")
+        status = ""
+    else:
+        w.get("notified", {}).pop("status_unreadable", None)  # readable again: the episode is over
     if status:
         w["last_status"] = status
     else:  # an empty read is the wave mid-rewrite: decide on the last real status

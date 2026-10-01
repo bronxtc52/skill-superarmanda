@@ -101,8 +101,11 @@ def wave_stats(w):
     return s
 
 
-def commits_since(cwd, started):
-    r = subprocess.run(["git", "-C", cwd, "log", "--all", "--oneline", f"--since=@{int(started)}"],
+def commits_since(cwd, started, until=None):
+    """Commits in the wave's workdir from its start up to its end (`finished`), so a later wave
+    sharing the workdir does not grow a finished wave's counter."""
+    window = [f"--since=@{int(started)}"] + ([f"--until=@{int(until)}"] if until else [])
+    r = subprocess.run(["git", "-C", cwd, "log", "--all", "--oneline", *window],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     return len(r.stdout.splitlines()) if r.returncode == 0 else 0
 
@@ -158,7 +161,7 @@ def waves_table(cfg, st):
             Text(wave, style="bold"), Text(f"{icon} {label}", style=colour),
             fmt_dur(end - w["started"]), bar(w.get("tokens", 0), cfg["ctx_limit"], 16),
             ktok(w.get("peak", 0)), str(w.get("restarts", 0)), str(s["turns"]), str(s["tools"]),
-            str(s["agents"]), ktok(s["out"]), str(commits_since(w["cwd"], w["started"])))
+            str(s["agents"]), ktok(s["out"]), str(commits_since(w["cwd"], w["started"], w.get("finished"))))
     return tb
 
 

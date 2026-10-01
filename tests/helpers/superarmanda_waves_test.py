@@ -4623,6 +4623,254 @@ class W4Round30PendingEnterStarted(Base):
         self.assertIn("W1: launched in tmux", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
 
+class W4Round31Redact(Base):
+    """Round 31: github.com URL paths stay readable (A1); a 32+ hex run inside any token is masked
+    whatever surrounds it (A2). Exceptions are explicit: a labelled SHA and a 40-hex SHA right
+    after /commit/, /commits/ or /tree/ in a github.com URL."""
+
+    SHA = "3f2a9c1d4e5b6a7988776655443322110099aabb"
+
+    def test_github_urls_stay_readable(self):
+        for url in ("https://github.com/bronxtc52/skill-superarmanda/pull/12",
+                    "https://github.com/bronxtc52/skill-superarmanda/actions/runs/18234567890",
+                    "https://github.com/bronxtc52/skill-superarmanda/actions/runs/81234567890",
+                    "https://github.com/bronxtc52/skill-superarmanda/pull/12/files",
+                    f"https://github.com/bronxtc52/skill-superarmanda/commit/{self.SHA}",
+                    f"https://github.com/bronxtc52/skill-superarmanda/tree/{self.SHA}",
+                    f"https://github.com/bronxtc52/skill-superarmanda/pull/12/commits/{self.SHA}",
+                    "github.com/bronxtc52/wave-autobot-superarmanda-dispatcher/issues/345"):
+            for text in (url, f"PR: {url} готов", f"({url})"):
+                with self.subTest(text=text):
+                    self.assertEqual(wab.redact(text, 1200), text)
+
+    def test_secrets_in_github_query_fragment_and_tokens_in_path_are_masked(self):
+        hexkey = "a1b2c3d4" * 4  # synthetic values, built so secret scanners do not flag the test
+        tok = "Zz9Yy8" + "Xx7Ww6"
+        cases = [
+            (f"https://github.com/o/r/pull/1?token={tok}", tok),
+            (f"https://github.com/o/r/pull/1#key={hexkey}", hexkey),
+            (f"https://github.com/o/r/blob/{hexkey}/x.md", hexkey),
+            ("https://github.com/o/r/blob/main/ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2", "a1B2c3D4e5F6g7H8i9J0k1L2"),
+            ("https://ghp_a1B2c3D4e5F6g7H8i9J0@github.com/o/r", "a1B2c3D4e5F6g7H8i9J0"),
+        ]
+        for text, secret in cases:
+            with self.subTest(text=text):
+                out = wab.redact(text, 1200)
+                self.assertNotIn(secret, out)
+                self.assertIn("[скрыто]", out)
+
+    def test_hex_inside_a_token_is_masked_whatever_the_boundaries(self):
+        hx = "0123456789abcdef0123456789abcdef"
+        for text in (f"{hx}-us21", f"key-{hx}", f"id_{hx}", f"cache/{hx}", f"v{hx}", f"{hx}x",
+                     f"apikey {hx}-us21 end", f"https://example.com/cache/{hx}/blob",
+                     f"https://example.com/commit/{self.SHA}", f"x{self.SHA}"):
+            with self.subTest(text=text):
+                out = wab.redact(text, 1200)
+                self.assertNotIn(hx, out)
+                self.assertNotIn(self.SHA, out)
+                self.assertIn("[скрыто]", out)
+        self.assertEqual(wab.redact(f"{hx}-us21"), "[скрыто]-us21")
+
+    def test_explicit_exceptions_still_hold(self):
+        for text in (f"commit {self.SHA}", f"sha {self.SHA}", "deadbeef-cafe", "short 3c71c34b0a12",
+                     "wave-autobot/runs/superarmanda-waves/2026-10-01/W4/sa/coder-report.md"):
+            with self.subTest(text=text):
+                self.assertEqual(wab.redact(text), text)
+
+
+class W4Round31TelegramCache(Base):
+    """Round 31 (Codex P2): a failed send drops the cached Telegram credentials, so a secret rotated
+    in Key Vault is picked up by the next retry instead of failing forever."""
+
+    def test_rotated_token_is_reread_after_a_failed_send(self):
+        import urllib.error
+        cfg, _ = self.chain()
+        orig = load_orig("wab_tg_cache")
+        tokens = iter(["OLD:tok", "chat1", "NEW:tok", "chat1"])
+        reads = []
+
+        def fake_sh(*args, **kw):
+            reads.append(args)
+            return subprocess.CompletedProcess(args, 0, next(tokens) + "\n", "")
+
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            if "OLD:tok" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+            sent.append(req.full_url)
+            return contextlib.nullcontext()
+
+        with mock.patch.object(orig, "sh", side_effect=fake_sh), \
+                mock.patch.object(orig.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self.assertFalse(orig.notify(cfg, "first"))
+            self.assertEqual(orig._tg, {}, "a failed send must drop the cached credentials")
+            self.assertTrue(orig.notify(cfg, "second"))
+            self.assertTrue(orig.notify(cfg, "third"))  # cached again after a success: no new read
+        self.assertEqual(len(reads), 4)
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(all("NEW:tok" in u for u in sent))
+
+
+class W4Round31StatusRead(Base):
+    """Round 31 (Codex P2): an unreadable status file (a directory, chmod 0, gone between exists()
+    and read_text()) keeps the last known status; one event per episode; watch keeps running."""
+
+    def run_ticks(self, cfg, n=2):
+        for _ in range(n):
+            wab.tick(cfg, wab.load_state(cfg))  # must not raise
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        return [l for l in log.splitlines() if "status unreadable" in l]
+
+    def setup_wave(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(last_status="BLOCKED: q?")}})
+        return cfg
+
+    def test_status_is_a_directory(self):
+        cfg = self.setup_wave()
+        (wab.wave_dir(cfg, "W1") / "status").mkdir()
+        self.assertEqual(len(self.run_ticks(cfg)), 1)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["last_status"], "BLOCKED: q?")
+        self.assertTrue(any("q?" in t for t in self.tg), "the last known status still drives the tick")
+
+    def test_status_is_unreadable(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root reads a chmod 0 file")
+        cfg = self.setup_wave()
+        p = wab.wave_dir(cfg, "W1") / "status"
+        p.write_text("DONE\n", encoding="utf-8")
+        p.chmod(0)
+        self.addCleanup(p.chmod, 0o644)
+        self.assertEqual(len(self.run_ticks(cfg)), 1)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
+
+    def test_status_vanishes_between_exists_and_read(self):
+        cfg = self.setup_wave()
+        self.set_status(cfg, "W1", "DONE")
+        real = Path.read_text
+
+        def flaky(path, *a, **kw):
+            if path.name == "status":
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return real(path, *a, **kw)
+
+        with mock.patch.object(Path, "read_text", flaky):
+            self.assertEqual(len(self.run_ticks(cfg, 3)), 1)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
+        # readable again: the episode is over, a later failure is a new event
+        self.set_status(cfg, "W1", "BLOCKED: q?")
+        wab.tick(cfg, wab.load_state(cfg))
+        (wab.wave_dir(cfg, "W1") / "status").unlink()
+        (wab.wave_dir(cfg, "W1") / "status").mkdir()
+        self.assertEqual(len(self.run_ticks(cfg)), 2)
+
+
+class W4Round31ChainNulls(Base):
+    """Round 31: an explicit JSON null in an optional string field is the same as leaving it out."""
+
+    def write(self, **fields):
+        doc = {"chain": CHAIN, "run_id": RUN_ID, "repo": "o/r", "waves": ["W1", "W2"]}
+        doc.update(fields)
+        cfgdir = self.tmp / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        path = cfgdir / "chain.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")  # null kept: the helper would drop None
+        return path
+
+    def test_base_branch_null_is_auto(self):
+        path = self.write(base_branch=None)
+        self.assertIn('"base_branch": null', path.read_text(encoding="utf-8"))
+        cfg = wab.load_chain(path)
+        self.assertNotIn("base_branch", cfg)
+        with mock.patch.object(wab, "sh", return_value=subprocess.CompletedProcess(
+                [], 0, "origin/main\n", "")):
+            self.assertEqual(wab.base_branch_of(cfg, self.cwd), "main")
+
+    def test_tmux_prefix_null_is_the_default(self):
+        cfg = wab.load_chain(self.write(tmux_prefix=None))
+        self.assertEqual(cfg["tmux_prefix"], "wab-")
+
+    def test_other_optional_nulls_load(self):
+        cfg = wab.load_chain(self.write(model=None, merge_gate=None, workdir=None, run_dir=None))
+        self.assertIsNone(cfg.get("model"))
+        self.assertIsNone(cfg.get("merge_gate"))
+
+
+class W4Round31CommitsWindow(Base):
+    """Round 31: the dashboard counts a finished wave's commits only up to its end, so a later
+    wave in the same workdir does not grow W1's counter; the end is stored on every terminal phase."""
+
+    def git(self, *args, when=None):
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@e", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@e")
+        if when is not None:
+            env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = f"@{int(when)} +0000"
+        subprocess.run(["git", "-C", self.cwd, *args], check=True, capture_output=True, env=env)
+
+    def test_two_sequential_waves_in_one_workdir(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        t0 = int(time.time()) - 10_000
+        self.git("init", "-q")
+        self.git("commit", "-q", "--allow-empty", "-m", "w1", when=t0 + 10)
+        self.git("commit", "-q", "--allow-empty", "-m", "w1b", when=t0 + 20)
+        self.git("commit", "-q", "--allow-empty", "-m", "w2", when=t0 + 200)
+        self.assertEqual(dash.commits_since(self.cwd, t0, t0 + 100), 2)
+        self.assertEqual(dash.commits_since(self.cwd, t0 + 150), 1)
+        cfg, _ = self.chain()
+        st = {"current": "W2", "waves": {
+            "W1": self.wave_rec("W1", phase="done", started=t0, finished=t0 + 100),
+            "W2": self.wave_rec("W2", phase="running", started=t0 + 150)}}
+        seen = {}
+        with mock.patch.object(dash, "commits_since", side_effect=lambda cwd, s, until=None:
+                               seen.setdefault(s, until) or 0), \
+                mock.patch.object(dash, "wave_stats", return_value={k: 0 for k in
+                                                                     ("turns", "tools", "agents", "out", "read")}):
+            dash.waves_table(cfg, st)
+        self.assertEqual(seen.get(t0), t0 + 100)
+        self.assertIsNone(seen.get(t0 + 150))
+
+    def test_every_terminal_phase_records_its_end(self):
+        cfg, _ = self.chain()
+        st = {"current": "W1", "waves": {"W1": self.wave_rec()}}
+        self.put_state(cfg, st)
+        self.alive = False
+        self.set_status(cfg, "W1", "RUNNING")
+        wab.tick(cfg, wab.load_state(cfg))
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "dead")
+        self.assertIsInstance(w.get("finished"), (int, float))
+        # the window is back: the wave runs again, the end is not an end any more
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "running"
+        wab.save_state(cfg, st)
+        self.assertNotIn("finished", self.get_state(cfg)["waves"]["W1"])
+
+
+class W4Round31PromptVisible(Base):
+    """Round 31 (P3): a prompt of only combining marks, variation selectors or filler characters
+    (U+3164, U+2800, U+115F, U+1160, U+FFA0) is empty."""
+
+    def test_visually_empty_prompts_are_refused(self):
+        for text in ("́", "️", "ㅤ", "⠀", "ᅟᅠﾠ", " ́️ㅤ⠀\n"):
+            with self.subTest(text=ascii(text)):
+                p = self.tmp / "p.md"
+                p.write_text(text, encoding="utf-8")
+                with self.assertRaises(SystemExit) as cm:
+                    wab.read_prompt(p)
+                self.assertIn("empty", str(cm.exception))
+
+    def test_real_text_is_accepted(self):
+        for text in ("a", "задача", "#", "1", "✓", "é"):
+            with self.subTest(text=ascii(text)):
+                p = self.tmp / "p.md"
+                p.write_text(text, encoding="utf-8")
+                self.assertTrue(wab.read_prompt(p))
+
+
 class TmuxGuard(unittest.TestCase):
     """The guard itself: a socketless tmux must fail loudly, a private one passes the guard."""
 
