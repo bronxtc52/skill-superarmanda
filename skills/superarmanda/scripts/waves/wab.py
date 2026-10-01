@@ -205,6 +205,10 @@ def load_state(cfg):
 
 
 def save_state(cfg, st):
+    waves = st.get("waves")
+    if isinstance(waves, dict):  # an episode that ended with this save loses its stale notice here
+        for rec in waves.values():
+            drop_ended_episodes(rec)
     target = state_path(cfg)
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".state.", suffix=".tmp")  # unique per writer
     try:
@@ -651,6 +655,12 @@ NOTIFY_RETRY_SECONDS = 300  # a standing notice that failed is repeated no more 
 
 def put_notice(w, key, value, text):
     """Put a notice about a standing episode (`key`, `value`) into the wave's outbox, IN MEMORY only.
+    `key` is a literal with a row in NOTICE_EPISODE_ENDS (the end of its episode): once the
+    episode is over the notice is stale and leaves the outbox undelivered (key -> end:
+    started/tmux_failed/permission/idle/auto_off -> window gone; not_ready, no_prompt,
+    checkpoint_timeout, dead, handoff -> their phase is left; sending -> the wave wrote a status;
+    updating -> the new session is bound; blocked -> status not BLOCKED; done/no_next -> ack only;
+    chain_done -> never).
     The caller saves it with the SAME save_state as the change it reports (the phase, the
     once_per mark), then calls flush_notices: a process killed right after that save still owes
     the notice and the next watch/done sends it, while a save in between would lose it for good.
@@ -665,8 +675,78 @@ def put_notice(w, key, value, text):
 
 def drop_notice(w, key):
     """The episode is over: forget it, and a notice not yet delivered is stale."""
-    w.get("notified", {}).pop(key, None)
-    w.get("outbox", {}).pop(key, None)
+    notified, box = w.get("notified"), w.get("outbox")
+    if isinstance(notified, dict):
+        notified.pop(key, None)
+    if isinstance(box, dict):
+        box.pop(key, None)
+        if not box:
+            w.pop("outbox", None)
+
+
+WINDOW_GONE = ("dead", "done", "awaiting_merge")  # no live window of this wave to look at
+
+
+def _gone(w):
+    return w.get("phase") in WINDOW_GONE
+
+
+def _status(w):
+    return str(w.get("last_status") or "")
+
+
+# Every notice is about an episode, and it is stale once the episode is over. Key -> the end of
+# its episode as a predicate on the wave record (applied by drop_ended_episodes on EVERY save and
+# before every send), None = ended only by the coordinator's confirmation (ack_wave_notices).
+# Ends that are not in the record (the screen) are dropped inline where they are seen; they are
+# listed after `#`. A new put_notice key without a row here fails the completeness test.
+#   started             window gone / wave finished
+#   not_ready           the phase left not_ready (a relaunch); + ack
+#   no_prompt           the phase left starting (the task was sent after all)
+#   sending             the wave wrote its own status (the task arrived), or window gone
+#   updating            the new session is bound by its marker (/update arrived), or window gone
+#   checkpoint_timeout  the phase left checkpoint (HANDOFF_READY taken, /clear + /update done)
+#   tmux_failed         window gone   # + the next successful action (_act)
+#   dead                the phase left dead (the window is back); + ack on a relaunch
+#   blocked             the status is no longer BLOCKED, or window gone
+#   permission, idle, auto_off   window gone   # + the prompt left the screen / the pane moved /
+#                                              #   auto mode is back (_tick)
+#   handoff             the phase left awaiting_merge (the coordinator confirmed it); + ack
+#   done, no_next       None: only the coordinator's confirmation (ack)
+#   chain_done          None and kept even on ack: the end of the chain must get through
+NOTICE_EPISODE_ENDS = {
+    "started": _gone,
+    "not_ready": lambda w: w.get("phase") != "not_ready",
+    "no_prompt": lambda w: w.get("phase") != "starting",
+    "sending": lambda w: _gone(w) or _status(w) not in ("", "STARTING"),
+    "updating": lambda w: _gone(w) or not w.get("await_session"),
+    "checkpoint_timeout": lambda w: w.get("phase") != "checkpoint",
+    "tmux_failed": _gone,
+    "dead": lambda w: w.get("phase") != "dead",
+    "blocked": lambda w: _gone(w) or not _status(w).startswith("BLOCKED"),
+    "permission": _gone,
+    "idle": _gone,
+    "auto_off": _gone,
+    "handoff": lambda w: w.get("phase") != "awaiting_merge",
+    "done": None,
+    "no_next": None,
+    "chain_done": None,
+}
+
+
+def drop_ended_episodes(w):
+    """Apply NOTICE_EPISODE_ENDS to one wave record: an ended episode loses its undelivered
+    notice and its «already notified» mark (the next episode notifies again). True if the
+    outbox changed. Called by save_state, so it lands in the same save as the transition."""
+    if not isinstance(w, dict):
+        return False
+    box = w.get("outbox")
+    before = set(box) if isinstance(box, dict) else set()
+    for key, ended in NOTICE_EPISODE_ENDS.items():
+        if ended is not None and ended(w):
+            drop_notice(w, key)
+    box = w.get("outbox")
+    return before != (set(box) if isinstance(box, dict) else set())
 
 
 KEEP_ON_ACK = ("chain_done",)  # the end of the chain is never stale: it must get through
@@ -690,7 +770,9 @@ def ack_wave_notices(w):
 
 def flush_notices(cfg, st, w, force=False):
     """Send the queued notices that are due; one attempt per notice per NOTIFY_RETRY_SECONDS
-    (also bounds the `telegram FAILED` events). `force` ignores the interval (the watch is leaving)."""
+    (also bounds the `telegram FAILED` events). `force` ignores the interval (the watch is leaving). An ended episode is dropped first."""
+    if drop_ended_episodes(w):
+        save_state(cfg, st)
     box = w.get("outbox")
     if not box:
         return
@@ -961,10 +1043,31 @@ def _check_launch_allowed(cfg, st, wave, name):
         raise SystemExit(f"wab: wave {wave} is already {records[wave]['phase']}; launch refused")
 
 
+def read_prompt(path):
+    """The task text of a prompt file: a readable regular file, valid UTF-8, not just whitespace.
+    Anything else is refused with the reason, so a launch never sends only the dispatcher's
+    header nor fails after the session and the launch intent already exist."""
+    if not path.is_file():
+        raise SystemExit(f"wab: prompt file {path} not found; launch refused")
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        raise SystemExit(f"wab: cannot read prompt file {path} ({e.strerror or type(e).__name__}); launch refused")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise SystemExit(f"wab: prompt file {path} is not valid UTF-8 (byte {e.start}); launch refused")
+    if not text.strip():
+        raise SystemExit(f"wab: prompt file {path} is empty (only whitespace); launch refused")
+    return text.strip()
+
+
 def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     require_tmux()
     if wave not in cfg["waves"]:
         raise SystemExit(f"unknown wave {wave}; chain.json waves: {cfg['waves']}")
+    prompt_path = pathlib.Path(prompt_file).resolve()
+    read_prompt(prompt_path)  # before anything is prepared, saved or started
     st = load_state(cfg)
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
     _check_launch_allowed(cfg, st, wave, name)
@@ -976,9 +1079,6 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     restart = cur == wave and st["waves"].get(cur, {}).get("phase") in STOPPED
     if cfg.get("workdir") and cfg["waves"].index(wave) > 0 and not restart:
         refresh_workdir(cfg, wave, cwd)
-    prompt_path = pathlib.Path(prompt_file).resolve()
-    if not prompt_path.is_file():
-        raise SystemExit(f"prompt file {prompt_file} not found")
     prev = st.get("current")
     if prev and prev != wave and st["waves"].get(prev, {}).get("phase") == "awaiting_merge":
         st["waves"][prev]["phase"] = "done"  # merged by the coordinator; saved with the launch intent
@@ -1196,8 +1296,7 @@ def advance_pending(cfg, st):
     elif phase == "updating":
         recover_update(cfg, st, wave)
     elif phase == "dead" and tmux_alive(name):
-        w["phase"] = "running"
-        drop_notice(w, "dead")
+        w["phase"] = "running"  # the save drops the dead notice (NOTICE_EPISODE_ENDS)
         save_state(cfg, st)
         event(cfg, f"{wave}: window is back, supervision resumed")
 
@@ -1307,8 +1406,6 @@ def _tick(cfg, st):
     now = time.time()
     attach = f"{attach_cmd(name)}  (выйти: Ctrl-b d)"
 
-    if not status.startswith("BLOCKED"):
-        drop_notice(w, "blocked")  # the episode is over: the next one notifies again
     if w.get("phase") == "awaiting_merge":
         return False  # handed to the coordinator: the watch ends and frees the run lock
     if w.get("phase") == "not_ready":

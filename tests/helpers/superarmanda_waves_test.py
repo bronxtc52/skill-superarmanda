@@ -3499,7 +3499,9 @@ class W4Round27(Base):
     # ----- 2: only the confirmed wave is acknowledged; another wave keeps its notices -----
     def test_unconfirmed_waves_keep_their_notices(self):
         cfg, _ = self.chain(waves=["W1", "W2", "W3"], merge_gate="external")
-        w1 = self.wave_rec("W1", phase="done", outbox={"idle": self.item("W1 idle")})
+        # a notice that only a confirmation ends («волна завершена»): idle of a finished wave is
+        # stale by itself since round 29 (NOTICE_EPISODE_ENDS), so it would not test the ack
+        w1 = self.wave_rec("W1", phase="done", outbox={"done": self.item("W1 done")})
         w2 = self.wave_rec("W2", phase="awaiting_merge",
                            outbox={"handoff": self.item("W2 handoff"), "permission": self.item("W2 perm"),
                                    "chain_done": self.item("W2 chain_done")})
@@ -3508,7 +3510,7 @@ class W4Round27(Base):
         self.down = True
         self.assertTrue(self.launch(cfg, "W3", self.prompt()))
         st = self.get_state(cfg)
-        self.assertEqual(set(st["waves"]["W1"].get("outbox", {})), {"idle"})
+        self.assertEqual(set(st["waves"]["W1"].get("outbox", {})), {"done"})
         self.assertEqual(set(st["waves"]["W2"].get("outbox", {})), {"chain_done"})
 
     def test_done_command_acknowledges_every_episode_but_chain_done(self):
@@ -3856,6 +3858,437 @@ class Dashboard(Base):
     def test_rich_is_imported_by_dash_only(self):
         self.assertNotRegex((WAVES / "wab.py").read_text(encoding="utf-8"), r"(?m)^\s*(import|from)\s+rich")
         self.assertIn("from rich", (WAVES / "dash.py").read_text(encoding="utf-8"))
+
+
+class W4Round29EpisodeEnds(Base):
+    """Round 29: a notice about an episode leaves the outbox when its episode is over, wherever
+    that happens. For every key: Telegram down -> the notice waits in the outbox -> the episode
+    ends -> Telegram is back -> the stale notice is NOT sent; and the control: while the episode
+    lasts, the notice is delivered exactly once."""
+
+    def setUp(self):
+        super().setUp()
+        self.down = True
+
+        def flaky(cfg, text):
+            if self.down:
+                raise OSError("telegram down")
+            self.tg.append(text)
+        p = mock.patch.object(wab, "_send_telegram", side_effect=flaky)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+        self.cfg, self.path = self.chain()
+
+    # ----- helpers -----
+    def state(self, **rec):
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(**rec)}})
+
+    def tick(self):
+        return wab.tick(self.cfg, wab.load_state(self.cfg))
+
+    def box(self):
+        return self.get_state(self.cfg)["waves"]["W1"].get("outbox") or {}
+
+    def queued(self, key):
+        self.assertIn(key, self.box())
+        self.assertEqual(self.tg, [])
+
+    def restore(self):
+        self.down = False
+        wab.drain_notices(self.cfg)
+        wab.drain_notices(self.cfg)
+
+    def count(self, part):
+        return len([t for t in self.tg if part in t])
+
+    def prompt(self):
+        p = self.tmp / "p.md"
+        p.write_text("do it\n", encoding="utf-8")
+        return p
+
+    def launch(self, wave="W1", prompt=None):
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            return wab.launch(self.cfg, wave, prompt or self.prompt())
+
+    # ----- the table covers every key -----
+    def test_every_put_notice_key_has_an_episode_end(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        keys = set(re.findall(r'put_notice\(\s*\w+\s*,\s*"([a-z_]+)"', src))
+        self.assertGreaterEqual(len(keys), 16, keys)
+        self.assertEqual(keys, set(wab.NOTICE_EPISODE_ENDS), "a new notice key needs an episode end")
+        for key in wab.KEEP_ON_ACK:
+            self.assertIsNone(wab.NOTICE_EPISODE_ENDS[key])
+
+    def test_a_put_with_a_dynamic_key_is_not_allowed(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        calls = re.findall(r"(?<!def )put_notice\(([^,]+),\s*([^,]+),", src)
+        for _, key in calls:
+            self.assertRegex(key.strip(), r'^"[a-z_]+"$', "put_notice key must be a literal")
+
+    # ----- checkpoint_timeout: ends when HANDOFF_READY is taken (clear + update) -----
+    def checkpoint_timeout(self):
+        self.state(phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time() - 3600)
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.tick()
+        self.queued("checkpoint_timeout")
+
+    def test_checkpoint_timeout_is_stale_after_the_handoff_went_through(self):
+        self.checkpoint_timeout()
+        self.set_status(self.cfg, "W1", "HANDOFF_READY")
+        self.tick()
+        self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["phase"], "running")
+        self.restore()
+        self.assertEqual(self.count("не записала handoff"), 0, self.tg)
+
+    def test_checkpoint_timeout_is_delivered_once_while_the_handoff_is_missing(self):
+        self.checkpoint_timeout()
+        self.restore()
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("не записала handoff"), 1, self.tg)
+
+    # ----- updating: ends when the new session is bound by its marker (/update arrived) -----
+    def updating(self):
+        self.state(phase="updating", sessions=["s1"])
+        self.set_status(self.cfg, "W1", "HANDOFF_READY")
+        self.tick()
+        self.queued("updating")
+
+    def test_updating_is_stale_once_the_new_session_is_bound(self):
+        self.updating()
+        self.transcript("s2", [asst(inp=1)], marker=wab.session_marker(self.cfg, "W1"))
+        self.tick()
+        self.assertFalse(self.get_state(self.cfg)["waves"]["W1"].get("await_session"))
+        self.restore()
+        self.assertEqual(self.count("при передаче /update"), 0, self.tg)
+
+    def test_updating_is_delivered_once_while_unknown(self):
+        self.updating()
+        self.restore()
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("при передаче /update"), 1, self.tg)
+
+    # ----- sending: ends when the wave writes its own status (the task arrived) -----
+    def sending(self):
+        self.state(phase="sending", sessions=["s1"], prompt_file=str(self.prompt()))
+        self.set_status(self.cfg, "W1", "STARTING")
+        self.tick()
+        self.queued("sending")
+
+    def test_sending_is_stale_once_the_wave_writes_its_status(self):
+        self.sending()
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("при отправке задачи"), 0, self.tg)
+
+    def test_sending_is_delivered_once_while_unknown(self):
+        self.sending()
+        self.restore()
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("при отправке задачи"), 1, self.tg)
+
+    # ----- no_prompt: ends when the task is sent after all -----
+    def no_prompt(self):
+        missing = self.tmp / "gone.md"
+        self.state(phase="starting", sessions=["s1"], prompt_file=str(missing))
+        self.set_status(self.cfg, "W1", "STARTING")
+        self.tick()
+        self.queued("no_prompt")
+        return missing
+
+    def test_no_prompt_is_stale_once_the_task_is_sent(self):
+        missing = self.no_prompt()
+        missing.write_text("task\n", encoding="utf-8")
+        self.tick()
+        self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["phase"], "running")
+        self.restore()
+        self.assertEqual(self.count("файла с задачей уже нет"), 0, self.tg)
+
+    def test_no_prompt_is_delivered_once_while_the_file_is_missing(self):
+        self.no_prompt()
+        self.restore()
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("файла с задачей уже нет"), 1, self.tg)
+
+    # ----- not_ready: ends with a relaunch of the wave -----
+    def not_ready(self):
+        self.alive = False
+        self.ready = False
+        self.assertFalse(self.launch())
+        self.queued("not_ready")
+
+    def test_not_ready_is_stale_after_a_relaunch(self):
+        self.not_ready()
+        self.ready = True
+        self.assertTrue(self.launch())
+        self.restore()
+        self.assertEqual(self.count("не стало готовым"), 0, self.tg)
+
+    def test_not_ready_is_delivered_once_while_the_wave_stands(self):
+        self.not_ready()
+        self.restore()
+        self.restore()
+        self.assertEqual(self.count("не стало готовым"), 1, self.tg)
+
+    # ----- started: ends when the window closes (or the wave finishes) -----
+    def started(self):
+        self.alive = False
+        self.assertTrue(self.launch())
+        self.queued("started")
+        self.alive = True
+        self.set_status(self.cfg, "W1", "RUNNING")
+
+    def test_started_is_stale_once_the_window_closed(self):
+        self.started()
+        self.alive = False
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("стартовала волна W1"), 0, self.tg)
+        self.assertEqual(self.count("окно волны W1 закрылось"), 1, self.tg)
+
+    def test_started_is_delivered_once_while_the_wave_runs(self):
+        self.started()
+        self.restore()
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("стартовала волна W1"), 1, self.tg)
+
+    # ----- dead: ends when the window is back -----
+    def dead(self):
+        self.state(sessions=["s1"])
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.alive = False
+        self.tick()
+        self.queued("dead")
+
+    def test_dead_is_stale_once_the_window_is_back(self):
+        self.dead()
+        self.alive = True
+        wab.resume(self.cfg, wab.load_state(self.cfg))
+        self.restore()
+        self.assertEqual(self.count("закрылось"), 0, self.tg)
+
+    def test_dead_is_delivered_once_while_the_window_is_gone(self):
+        self.dead()
+        self.restore()
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("закрылось"), 1, self.tg)
+
+    # ----- tmux_failed: ends on the next successful action or when the window is gone -----
+    def tmux_failed(self):
+        def boom(name, text, **kw):
+            raise subprocess.CalledProcessError(1, "tmux")
+        self.state(phase="checkpoint", checkpoint_sent=False, checkpoint_at=time.time(), sessions=["s1"])
+        self.set_status(self.cfg, "W1", "RUNNING")
+        with mock.patch.object(wab, "send_text", side_effect=boom):
+            self.tick()
+        self.queued("tmux_failed")
+
+    def test_tmux_failed_is_stale_once_the_window_closed(self):
+        self.tmux_failed()
+        self.alive = False
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("не удалось выполнить"), 0, self.tg)
+        self.assertEqual(self.count("закрылось"), 1, self.tg)
+
+    def test_tmux_failed_is_stale_after_a_successful_retry(self):
+        self.tmux_failed()
+        self.tick()
+        self.assertTrue(self.get_state(self.cfg)["waves"]["W1"]["checkpoint_sent"])
+        self.restore()
+        self.assertEqual(self.count("не удалось выполнить"), 0, self.tg)
+
+    def test_tmux_failed_is_delivered_once_while_it_fails(self):
+        self.tmux_failed()
+        self.restore()
+        self.restore()
+        self.assertEqual(self.count("не удалось выполнить"), 1, self.tg)
+
+    # ----- blocked / permission / idle / auto_off: end on screen, and when the window is gone -----
+    def blocked(self):
+        self.state(sessions=["s1"])
+        self.set_status(self.cfg, "W1", "BLOCKED: question")
+        self.tick()
+        self.queued("blocked")
+
+    def test_blocked_is_stale_once_answered(self):
+        self.blocked()
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("ждёт тебя"), 0, self.tg)
+
+    def test_blocked_is_stale_once_the_window_closed(self):
+        self.blocked()
+        self.alive = False
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("ждёт тебя"), 0, self.tg)
+
+    def test_blocked_is_delivered_once_while_it_waits(self):
+        self.blocked()
+        self.restore()
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("ждёт тебя"), 1, self.tg)
+
+    def permission(self):
+        self.state(sessions=["s1"])
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.pane = "Do you want to proceed?\n❯ 1. Yes"
+        self.tick()
+        self.queued("permission")
+
+    def test_permission_is_stale_once_the_window_closed(self):
+        self.permission()
+        self.alive = False
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("ждёт подтверждения"), 0, self.tg)
+
+    def test_permission_is_stale_once_the_prompt_left_the_screen(self):
+        self.permission()
+        self.pane = "working"
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("ждёт подтверждения"), 0, self.tg)
+
+    def test_permission_is_delivered_once_while_on_screen(self):
+        self.permission()
+        self.restore()
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("ждёт подтверждения"), 1, self.tg)
+
+    def idle(self):
+        self.cfg, self.path = self.chain(idle_minutes=0)
+        self.state(sessions=["s1"], pane_digest="x", pane_changed=time.time() - 60)
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.pane = "a\nb\nc\nd"
+        self.tick()  # a new digest: the clock restarts
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["pane_changed"] = time.time() - 60
+        wab.save_state(self.cfg, st)
+        self.tick()
+        self.queued("idle")
+
+    def test_idle_is_stale_once_the_window_closed(self):
+        self.idle()
+        self.alive = False
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("молчит"), 0, self.tg)
+
+    def test_idle_is_delivered_once_while_silent(self):
+        self.idle()
+        self.restore()
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("молчит"), 1, self.tg)
+
+    def auto_off(self):
+        self.state(sessions=["s1"])
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.pane = AutoGuard.OFF
+        self.tick()
+        self.tick()
+        self.queued("auto_off")
+
+    def test_auto_off_is_stale_once_the_window_closed(self):
+        self.auto_off()
+        self.alive = False
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("вышла из режима auto"), 0, self.tg)
+
+    def test_auto_off_is_delivered_once_while_off(self):
+        self.auto_off()
+        self.restore()
+        self.tick()
+        self.restore()
+        self.assertEqual(self.count("вышла из режима auto"), 1, self.tg)
+
+    # ----- handoff: ends when the wave leaves awaiting_merge (the coordinator confirmed it) -----
+    def test_handoff_is_stale_once_the_wave_left_awaiting_merge(self):
+        w = self.wave_rec(phase="done", outbox={"handoff": {"value": "1", "text": "old handoff", "next_at": 0}})
+        self.put_state(self.cfg, {"current": None, "waves": {"W1": w}})
+        self.restore()
+        self.assertEqual(self.count("old handoff"), 0, self.tg)
+
+    def test_handoff_is_delivered_once_while_awaiting_merge(self):
+        self.cfg, self.path = self.chain(merge_gate="external")
+        self.state(sessions=["s1"])
+        self.set_status(self.cfg, "W1", "DONE")
+        (wab.wave_dir(self.cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.assertFalse(self.tick())
+        self.queued("handoff")
+        self.restore()
+        self.restore()
+        self.assertEqual(self.count("сдала PR"), 1, self.tg)
+
+    # ----- done / no_next / chain_done: only the coordinator's confirmation ends them -----
+    def test_done_and_no_next_wait_for_the_confirmation_and_go_out_once(self):
+        box = {k: {"value": "1", "text": f"old {k}", "next_at": 0} for k in ("done", "no_next", "chain_done")}
+        self.put_state(self.cfg, {"current": None, "waves": {"W1": self.wave_rec(phase="done", outbox=box)}})
+        self.restore()
+        self.restore()
+        self.assertEqual(sorted(self.tg), ["old chain_done", "old done", "old no_next"])
+
+
+class W4Round29PromptFile(Base):
+    """Round 29 (Codex P2): a prompt file that cannot be read, is not UTF-8 or holds only
+    whitespace is refused BEFORE the tmux session and the launch intent: nothing changes."""
+
+    def refused(self, raw=None, mode=None):
+        cfg, _ = self.chain()
+        p = self.tmp / "p.md"
+        p.write_bytes(raw if raw is not None else b"do it\n")
+        if mode is not None:
+            p.chmod(mode)
+            self.addCleanup(p.chmod, 0o644)
+        self.alive = False
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd) as prep:
+            with self.assertRaises(SystemExit) as cm:
+                wab.launch(cfg, "W1", p)
+        self.assertFalse(prep.called, "nothing is prepared for a prompt that is refused")
+        self.assertIn("prompt", str(cm.exception))
+        self.assertEqual([c for c in self.tmux_calls if "new-session" in c], [])
+        self.assertEqual(self.sent, [])
+        self.assertFalse(wab.state_path(cfg).exists() and "W1" in self.get_state(cfg).get("waves", {}))
+        self.assertFalse((wab.wave_dir(cfg, "W1") / "status").exists())
+        return str(cm.exception)
+
+    def test_empty_prompt_is_refused(self):
+        self.assertIn("empty", self.refused(b""))
+
+    def test_whitespace_prompt_is_refused(self):
+        self.assertIn("empty", self.refused(b"  \n\t\n \xc2\xa0\n"))
+
+    def test_invalid_utf8_prompt_is_refused(self):
+        self.assertIn("UTF-8", self.refused(b"\xff\xfe task \x80\n"))
+
+    def test_unreadable_prompt_is_refused(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root reads a chmod 0 file")
+        self.assertIn("cannot read", self.refused(b"task\n", mode=0))
+
+    def test_a_good_prompt_still_launches(self):
+        cfg, _ = self.chain()
+        p = self.tmp / "p.md"
+        p.write_text("  задача\n", encoding="utf-8")
+        self.alive = False
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            self.assertTrue(wab.launch(cfg, "W1", p))
+        self.assertIn("задача", self.sent[-1][2])
 
 
 class TmuxGuard(unittest.TestCase):
