@@ -8297,6 +8297,66 @@ class Alarm(GateBase):
         self.assertNotIn("alarm_msg", self.rec())
         self.assertNotIn("pending_enter", self.rec())
 
+    def test_a_head_that_moved_before_the_retry_never_gets_the_old_text(self):  # r6
+        self.running()
+        self.crash_tick(typed=False)
+        new = "e" * 40
+        self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new},
+                                 reviews=[{"user": BOT, "commit_id": new, "state": "COMMENTED"}])
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+        self.assertIn(new[:12], self.alarms()[0][2])
+        self.assertNotIn(HEAD[:12], self.alarms()[0][2])
+        self.assertEqual(self.rec()["alarm_msg"]["head"], new)
+
+    def test_a_head_that_moved_and_is_not_ready_drops_the_old_intent_and_sends_nothing(self):  # r6
+        self.running()
+        self.crash_tick(typed=False)
+        new = "e" * 40
+        self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new}, reviews=[])
+        self.tick()
+        self.assertEqual(self.alarms(), [])
+        self.assertNotIn("alarm_msg", self.rec())
+
+    def test_a_pr_closed_before_the_retry_gets_nothing_and_loses_the_intent(self):  # r6
+        self.running()
+        self.crash_tick(typed=False)
+        self.pr = {**self.pr, "state": "CLOSED"}
+        self.tick()
+        self.restart()
+        self.assertEqual(self.alarms(), [])
+        self.assertNotIn("alarm_msg", self.rec())
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.running()
+        self.crash_tick(typed=False)
+        self.pr = None  # not found at all
+        self.tick()
+        self.assertEqual(self.alarms(), [])
+        self.assertNotIn("alarm_msg", self.rec())
+
+    def test_a_collect_error_before_the_retry_defers_it_and_keeps_the_intent(self):  # r6
+        for name, setup in (("find_pr", lambda: setattr(self, "pr", gate.CollectError("gh: boom"))),
+                            ("facts", lambda: setattr(self, "facts", {"error": "gh api: boom"}))):
+            with self.subTest(case=name):
+                self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+                self.facts = green_facts()
+                self.sent.clear()
+                self.running()
+                self.crash_tick(typed=False)
+                setup()
+                self.tick()
+                self.restart()
+                self.assertEqual(self.alarms(), [], name)
+                msg = self.rec()["alarm_msg"]
+                self.assertEqual((msg["head"], msg["sent"]), (HEAD, False))
+                self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+                self.facts = green_facts()
+                self.tick()
+                self.assertEqual(len(self.alarms()), 1, name)
+                self.assertTrue(self.rec()["alarm_msg"]["sent"])
+
 
 class GateWrappers(Base):
     """gh_api, gh_graphql, find_pr, workdir_state, read_manifest, write_owner_script: the thin layer

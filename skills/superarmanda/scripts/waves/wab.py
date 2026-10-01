@@ -2311,20 +2311,26 @@ def _alarm_tick(cfg, st, wave, w, now):
     gets ONE message per head with the results (so it need not poll them itself). The intent
     (`alarm_msg`, saved first) outlives a crash: an undelivered message is retried by the next tick or
     a restarted watch (after a paste, with Enter only); `sent` is saved after the delivery."""
-    _send_alarm(cfg, st, wave, w)  # a retry of a delivery that failed or was cut short
+    msg = w.get("alarm_msg")
+    if isinstance(msg, dict) and not msg.get("sent") and w.get("pending_enter") == "alarm":
+        # the text is already in the window: finish what was started (there is no way to clear the
+        # input line here), otherwise the typed text hangs there; nothing new is typed
+        _send_alarm(cfg, st, wave, w)
     if now - (w.get("alarm_at") or 0) < ALARM_POLL_SECONDS:
         return
     w["alarm_at"] = now
     try:
         pr = find_pr(cfg, w["cwd"])
         if not pr or pr.get("state") != "OPEN":
+            _drop_stale_alarm(w)  # closed, merged or gone: a saved message is outdated
+            save_state(cfg, st)
             return
         head = pr["headRefOid"]
         facts = gate_facts(cfg, pr)
     except gate.CollectError as e:
         if once_per(w, "alarm_error", str(e)[:150]):
             event(cfg, f"{wave}: alarm: PR facts not collected: {e}")
-        return
+        return  # the intent is kept, nothing is delivered
     w.get("notified", {}).pop("alarm_error", None)
     if facts.get("error"):
         if once_per(w, "alarm_error", str(facts["error"])[:150]):
@@ -2332,21 +2338,30 @@ def _alarm_tick(cfg, st, wave, w, now):
         return
     msg = w.get("alarm_msg")
     if isinstance(msg, dict) and msg.get("head") != head and not msg.get("sent"):
-        w.pop("alarm_msg")  # outdated: the head moved before it was delivered
-        if w.get("pending_enter") == "alarm":
-            w.pop("pending_enter")
+        _drop_stale_alarm(w)  # outdated: the head moved before it was delivered
         msg = None
     if not gate.alarm_ready(facts, head):
         save_state(cfg, st)
         return
     if isinstance(msg, dict) and msg.get("head") == head:
-        return  # delivered, or being retried above: one message per head
+        if not msg.get("sent"):
+            _send_alarm(cfg, st, wave, w)  # the open PR is still at this head: the retry is safe
+        return  # delivered: one message per head
     w["alarm_msg"] = {"head": head, "sent": False, "text": gate.alarm_text(pr["number"], head, facts)}
     if w.get("pending_enter") == "alarm":
         w.pop("pending_enter")  # a new message: typed afresh
     save_state(cfg, st)  # the intent first: a crash before the paste does not lose it
     event(cfg, f"{wave}: alarm: PR #{pr['number']} checks completed and Codex finished at {head[:12]}")
     _send_alarm(cfg, st, wave, w)
+
+
+def _drop_stale_alarm(w):
+    """An undelivered alarm whose PR is not open or whose head moved is dropped before any delivery."""
+    msg = w.get("alarm_msg")
+    if isinstance(msg, dict) and not msg.get("sent"):
+        w.pop("alarm_msg")
+        if w.get("pending_enter") == "alarm":
+            w.pop("pending_enter")
 
 
 def _send_alarm(cfg, st, wave, w):
