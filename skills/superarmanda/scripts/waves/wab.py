@@ -649,18 +649,18 @@ def notify(cfg, text):
 NOTIFY_RETRY_SECONDS = 300  # a standing notice that failed is repeated no more often than this
 
 
-def queue_notice(cfg, st, w, key, value, text):
-    """A notice about a standing episode (`key`, `value`). It is written to the state BEFORE the
-    send and removed only after the transport took it, so a transient Telegram failure is
-    retried by later ticks (flush_notices) instead of being lost; supervision never waits for it.
-    At least once, not exactly once: a crash or a lost transport reply after the actual delivery
-    sends it again."""
+def put_notice(w, key, value, text):
+    """Put a notice about a standing episode (`key`, `value`) into the wave's outbox, IN MEMORY only.
+    The caller saves it with the SAME save_state as the change it reports (the phase, the
+    once_per mark), then calls flush_notices: a process killed right after that save still owes
+    the notice and the next watch/done sends it, while a save in between would lose it for good.
+    The notice is removed only after the transport took it, so a transient Telegram failure is
+    retried by later ticks instead of being lost; supervision never waits for it. At least once,
+    not exactly once: a crash or a lost transport reply after the actual delivery sends it again."""
     box = w.setdefault("outbox", {})
     cur = box.get(key)
     if cur is None or cur.get("value") != value:
         box[key] = {"value": value, "text": text, "next_at": 0}
-    save_state(cfg, st)
-    flush_notices(cfg, st, w)
 
 
 def drop_notice(w, key):
@@ -1050,11 +1050,12 @@ def _mark_dead(cfg, st, wave, status=""):
     w = st["waves"][wave]
     fresh = once_per(w, "dead", "1")
     w["phase"] = "dead"
-    save_state(cfg, st)
+    if fresh:
+        put_notice(w, "dead", "1", f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
+    save_state(cfg, st)  # the phase, the mark and the notice together
     if fresh:
         event(cfg, f"{wave}: tmux session {w['tmux']} is gone (status={status})")
-        queue_notice(cfg, st, w, "dead", "1",
-                     f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
+    flush_notices(cfg, st, w)
 
 
 def _act(cfg, st, wave, what, fn, *args, **kw):
@@ -1069,12 +1070,13 @@ def _act(cfg, st, wave, what, fn, *args, **kw):
             _mark_dead(cfg, st, wave, read(cfg["run_dir"] / wave / "status"))
             raise _WindowGone() from e
         fresh = once_per(w, "tmux_failed", what)
+        if fresh:
+            put_notice(w, "tmux_failed", what,
+                       f"wave-autobot: не удалось выполнить «{what}» в окне волны {wave} "
+                       f"({type(e).__name__}). Окно живо: {attach_cmd(w['tmux'])}")
         save_state(cfg, st)
         event(cfg, f"{wave}: tmux action '{what}' failed ({type(e).__name__}); the window is alive")
-        if fresh:
-            queue_notice(cfg, st, w, "tmux_failed", what,
-                         f"wave-autobot: не удалось выполнить «{what}» в окне волны {wave} "
-                         f"({type(e).__name__}). Окно живо: {attach_cmd(w['tmux'])}")
+        flush_notices(cfg, st, w)
         return False
     drop_notice(w, "tmux_failed")
     return True
@@ -1106,11 +1108,12 @@ def deliver_first_prompt(cfg, st, wave):
         blocked = "BLOCKED: окно Claude не стало готовым, задача не отправлена\n"
         (wdir / "status").write_text(blocked, encoding="utf-8")
         w["phase"] = "not_ready"
+        put_notice(w, "not_ready", "1",
+                   f"wave-autobot: окно волны {wave} не стало готовым за 90 с, задачу не отправил. "
+                   f"Цепочка стоит. Посмотри: {attach_cmd(name)}")
         save_state(cfg, st)
         event(cfg, f"{wave}: Claude TUI not ready in {name}, prompt NOT sent")
-        queue_notice(cfg, st, w, "not_ready", "1",
-                     f"wave-autobot: окно волны {wave} не стало готовым за 90 с, задачу не отправил. "
-                     f"Цепочка стоит. Посмотри: {attach_cmd(name)}")
+        flush_notices(cfg, st, w)
         return False
     prompt = pathlib.Path(w["prompt_file"]).read_text(encoding="utf-8").strip()
     head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wdir} "
@@ -1125,12 +1128,12 @@ def deliver_first_prompt(cfg, st, wave):
     except _WindowGone:
         return False
     w["phase"] = "running"
-    fresh = once_per(w, "started", "1")
+    if once_per(w, "started", "1"):
+        put_notice(w, "started", "1",
+                   f"wave-autobot: стартовала волна {wave}.\nСмотреть: {attach_cmd(name)}\n(выйти: Ctrl-b d)")
     save_state(cfg, st)
     event(cfg, f"{wave}: launched in tmux {name}, cwd {cwd}")
-    if fresh:
-        queue_notice(cfg, st, w, "started", "1",
-                     f"wave-autobot: стартовала волна {wave}.\nСмотреть: {attach_cmd(name)}\n(выйти: Ctrl-b d)")
+    flush_notices(cfg, st, w)
     return True
 
 
@@ -1169,12 +1172,12 @@ def advance_pending(cfg, st):
             deliver_first_prompt(cfg, st, wave)
         else:
             event(cfg, f"{wave}: prompt file is gone, task NOT sent")
-            fresh = once_per(w, "no_prompt", "1")
+            if once_per(w, "no_prompt", "1"):
+                put_notice(w, "no_prompt", "1",
+                           f"wave-autobot: волна {wave} запущена, но файла с задачей уже нет, "
+                           f"задачу не отправил. Посмотри: {attach_cmd(name)}")
             save_state(cfg, st)
-            if fresh:
-                queue_notice(cfg, st, w, "no_prompt", "1",
-                             f"wave-autobot: волна {wave} запущена, но файла с задачей уже нет, "
-                             f"задачу не отправил. Посмотри: {attach_cmd(name)}")
+            flush_notices(cfg, st, w)
     elif phase == "sending" and w.get("pending_enter") == "first prompt":
         event(cfg, f"{wave}: resumed in phase 'sending': the text is typed, pressing only Enter")
         if _deliver(cfg, st, wave, "first prompt", send_text, ""):
@@ -1183,13 +1186,13 @@ def advance_pending(cfg, st):
     elif phase == "sending":
         event(cfg, f"{wave}: resumed in phase 'sending': unknown whether the task was delivered, "
                    f"NOT resent")
-        fresh = once_per(w, "sending", "1")
         w["phase"] = "running"
+        if once_per(w, "sending", "1"):
+            put_notice(w, "sending", "1",
+                       f"wave-autobot: диспетчер перезапустился при отправке задачи волне {wave}; "
+                       f"неизвестно, дошла ли она, повторно не слал. Проверь окно: {attach_cmd(name)}")
         save_state(cfg, st)
-        if fresh:
-            queue_notice(cfg, st, w, "sending", "1",
-                         f"wave-autobot: диспетчер перезапустился при отправке задачи волне {wave}; "
-                         f"неизвестно, дошла ли она, повторно не слал. Проверь окно: {attach_cmd(name)}")
+        flush_notices(cfg, st, w)
     elif phase == "updating":
         recover_update(cfg, st, wave)
     elif phase == "dead" and tmux_alive(name):
@@ -1249,11 +1252,12 @@ def recover_update(cfg, st, wave):
     arrived = read(cfg["run_dir"] / wave / "status") not in ("HANDOFF_READY", "", "STARTING")
     event(cfg, f"{wave}: resumed in phase 'updating': "
                f"{'/update evidently arrived' if arrived else 'unknown whether /update arrived'}, NOT resent")
-    finish_update(cfg, st, wave)
-    if fresh and not arrived and not informed:
-        queue_notice(cfg, st, w, "updating", str(w.get("restarts", 0)),
-                     f"wave-autobot: диспетчер перезапустился при передаче /update волне {wave}; "
-                     f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: {attach_cmd(w['tmux'])}")
+    if fresh and not arrived and not informed:  # keyed by the restart count BEFORE finish_update
+        put_notice(w, "updating", str(w.get("restarts", 0)),
+                   f"wave-autobot: диспетчер перезапустился при передаче /update волне {wave}; "
+                   f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: {attach_cmd(w['tmux'])}")
+    finish_update(cfg, st, wave)  # saves the phase, the mark and the notice together
+    flush_notices(cfg, st, w)
 
 
 def _stop_without_next(cfg, st, w, wave, now):
@@ -1263,11 +1267,13 @@ def _stop_without_next(cfg, st, w, wave, now):
     st["current"] = None
     st["stopped"] = f"{wave}: DONE without next-prompt.md"
     fresh_stop = once_per(w, "no_next", "1")
+    if fresh_stop:
+        put_notice(w, "no_next", "1",
+                   f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
     save_state(cfg, st)
     if fresh_stop:
         event(cfg, f"{wave}: DONE without next-prompt.md; chain stopped")
-        queue_notice(cfg, st, w, "no_next", "1",
-                     f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
+    flush_notices(cfg, st, w)
     return False
 
 
@@ -1319,17 +1325,20 @@ def _tick(cfg, st):
         nxt = wdir / "next-prompt.md"
         if not is_last and not nxt.exists():  # the coordinator's launch would fail: stop loudly now
             return _stop_without_next(cfg, st, w, wave, now)
-        w["phase"] = "awaiting_merge"  # saved before any notice: at most once
+        # the phase and its notice in ONE save: a crash after it still owes the notice (at least once),
+        # and the phase stops a second hand-off, so a restart does not queue it twice
+        w["phase"] = "awaiting_merge"
         w["finished"] = now
+        put_notice(w, "handoff", "1",
+                   f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n"
+                   + ("Мердж и запуск следующей волны — за координатором." if not is_last else
+                      f"Мердж последнего PR и завершение цепочки (wab.py done) — за координатором."))
         save_state(cfg, st)
         if external:
             event(cfg, f"{wave}: DONE, awaiting merge by the coordinator")
         else:
             event(cfg, f"{wave}: DONE, merge gate not implemented yet (W5); handing off to coordinator")
-        queue_notice(cfg, st, w, "handoff", "1",
-                     f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n"
-                     + ("Мердж и запуск следующей волны — за координатором." if not is_last else
-                        f"Мердж последнего PR и завершение цепочки (wab.py done) — за координатором."))
+        flush_notices(cfg, st, w)
         if tmux_alive(name):
             tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
             tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
@@ -1342,25 +1351,27 @@ def _tick(cfg, st):
         fresh = once_per(w, "done", "1")  # a restart between this and the next launch must not repeat it
         if fresh:
             w["finished"] = now
+            put_notice(w, "done", "1",
+                       f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
+                       f"Целиком: {wdir}/result.md")
         w["phase"] = "done"
+        last = idx + 1 >= len(waves)
+        if last:  # the end of the chain goes into the same save as the mark
+            st["current"] = None
+            put_notice(w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
         save_state(cfg, st)
         if fresh:
             event(cfg, f"{wave}: DONE")
-            queue_notice(cfg, st, w, "done", "1",
-                         f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
-                         f"Целиком: {wdir}/result.md")
             if tmux_alive(name):
                 tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
                 tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
-        if idx + 1 >= len(waves):
-            st["current"] = None
-            save_state(cfg, st)
+        if last:
             event(cfg, "chain finished")
-            queue_notice(cfg, st, w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
+            flush_notices(cfg, st, w)
             return False
         if not nxt.exists():
             return _stop_without_next(cfg, st, w, wave, now)
-        save_state(cfg, st)
+        flush_notices(cfg, st, w)  # «волна завершена» goes out before the next wave starts
         started = launch(cfg, waves[idx + 1], nxt, by_dispatcher=True)
         fresh_st = load_state(cfg)  # launch saved a newer snapshot (new current, new record):
         st.clear()                  # the caller's dict must not be written back over it
@@ -1377,11 +1388,13 @@ def _tick(cfg, st):
 
     if status.startswith("BLOCKED"):
         fresh = once_per(w, "blocked", status)
+        if fresh:
+            put_notice(w, "blocked", status,
+                       f"wave-autobot: волна {wave} ждёт тебя.\n\n{redact(status)}\n\nОтветить: {attach}")
         save_state(cfg, st)
         if fresh:
             event(cfg, f"{wave}: {status[:200]}")
-            queue_notice(cfg, st, w, "blocked", status,
-                         f"wave-autobot: волна {wave} ждёт тебя.\n\n{redact(status)}\n\nОтветить: {attach}")
+        flush_notices(cfg, st, w)
         return True
 
     if w.get("phase") == "updating":
@@ -1438,10 +1451,11 @@ def _tick(cfg, st):
         save_state(cfg, st)
     elif w.get("phase") == "checkpoint" and now - (w.get("checkpoint_at") or now) > cfg["handoff_timeout_minutes"] * 60:
         if once_per(w, "checkpoint_timeout", str(w.get("checkpoint_at"))):
+            put_notice(w, "checkpoint_timeout", str(w.get("checkpoint_at")),
+                       f"wave-autobot: {wave} не записала handoff за {cfg['handoff_timeout_minutes']} мин "
+                       f"после запроса. Посмотри: {attach}")
             save_state(cfg, st)
-            queue_notice(cfg, st, w, "checkpoint_timeout", str(w.get("checkpoint_at")),
-                         f"wave-autobot: {wave} не записала handoff за {cfg['handoff_timeout_minutes']} мин "
-                         f"после запроса. Посмотри: {attach}")
+            flush_notices(cfg, st, w)
 
     if w.get("phase") == "running":  # a wave out of auto mode asks for every step
         off = auto_mode_off(txt)
@@ -1449,11 +1463,12 @@ def _tick(cfg, st):
             w["auto_off_ticks"] = w.get("auto_off_ticks", 0) + 1
             if w["auto_off_ticks"] >= 2 and not w.get("auto_alerted"):
                 w["auto_alerted"] = True
+                put_notice(w, "auto_off", "1",
+                           f"wave-autobot: волна {wave} вышла из режима auto и будет спрашивать "
+                           f"подтверждения. Вернуть: {attach}, Shift+Tab до «auto mode on».")
                 save_state(cfg, st)
                 event(cfg, f"{wave}: window is not in auto mode")
-                queue_notice(cfg, st, w, "auto_off", "1",
-                             f"wave-autobot: волна {wave} вышла из режима auto и будет спрашивать "
-                             f"подтверждения. Вернуть: {attach}, Shift+Tab до «auto mode on».")
+                flush_notices(cfg, st, w)
         elif off is False:
             w["auto_off_ticks"] = 0
             w["auto_alerted"] = False
@@ -1463,10 +1478,11 @@ def _tick(cfg, st):
         drop_notice(w, "permission")
     if any(m in txt for m in PERMISSION_MARKERS):
         if once_per(w, "permission", "visible"):  # one episode while the prompt stays on screen
+            put_notice(w, "permission", "visible",
+                       f"wave-autobot: волна {wave} ждёт подтверждения на экране.\n{attach}")
             save_state(cfg, st)
             event(cfg, f"{wave}: permission prompt on screen")
-            queue_notice(cfg, st, w, "permission", "visible",
-                         f"wave-autobot: волна {wave} ждёт подтверждения на экране.\n{attach}")
+            flush_notices(cfg, st, w)
 
     # idleness is judged without the last two non-empty lines (spinner, timer, footer)
     body = [l for l in txt.splitlines() if l.strip()][:-2]
@@ -1476,11 +1492,12 @@ def _tick(cfg, st):
         drop_notice(w, "idle")
     elif now - w.get("pane_changed", now) > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
+            put_notice(w, "idle", digest,
+                       f"wave-autobot: волна {wave} молчит {cfg['idle_minutes']}+ мин "
+                       f"(статус «{status}»). Возможно, ждёт тебя: {attach}")
             save_state(cfg, st)
             event(cfg, f"{wave}: pane idle {cfg['idle_minutes']}+ min, status={status}")
-            queue_notice(cfg, st, w, "idle", digest,
-                         f"wave-autobot: волна {wave} молчит {cfg['idle_minutes']}+ мин "
-                         f"(статус «{status}»). Возможно, ждёт тебя: {attach}")
+            flush_notices(cfg, st, w)
     save_state(cfg, st)
     return True
 
@@ -1724,9 +1741,10 @@ def done_cmd(cfg, wave=None):
             ack_wave_notices(w)  # confirmed by this call; chain_done below must still get through
             if st.get("current") == wave:
                 st["current"] = None
-            save_state(cfg, st)
+            put_notice(w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
+            save_state(cfg, st)  # the phase and the notice together: a repeated `done` still owes it
             event(cfg, "chain finished")
-            queue_notice(cfg, st, w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
+            flush_notices(cfg, st, w)
         else:
             ack_wave_notices(w)  # a repeat call confirms too: only chain_done may still be owed
             save_state(cfg, st)

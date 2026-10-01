@@ -3546,6 +3546,200 @@ class W4Round27(Base):
                 (wab.wave_dir(cfg, "W1") / "status").unlink()
 
 
+class _Crash(BaseException):
+    """The dispatcher process dies right here (not an Exception: nothing in wab may swallow it)."""
+
+
+class W4Round28(Base):
+    """Round 28: a phase change (or an «already notified» mark) and its notice in the outbox are
+    saved by ONE save_state. A process killed right after that save still owes the notice, and the
+    next `watch` / `done` delivers it exactly once."""
+
+    def setUp(self):
+        super().setUp()
+        self.crash_when = None
+        real = load_orig("wab_r28_orig").save_state
+
+        def crashing(cfg, st):
+            real(cfg, st)
+            if self.crash_when and self.crash_when(st):
+                self.crash_when = None
+                raise _Crash()
+        p = mock.patch.object(wab, "save_state", side_effect=crashing)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "prepare_clone", return_value=self.cwd)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def prompt(self):
+        p = self.tmp / "p.md"
+        p.write_text("do it\n", encoding="utf-8")
+        return p
+
+    def count(self, needle):
+        return len([t for t in self.tg if needle in t])
+
+    def crash(self, fn, *a, **kw):
+        with self.assertRaises(_Crash):
+            fn(*a, **kw)
+        self.assertIsNone(self.crash_when, "the crash point was never saved")
+        self.assertEqual(self.tg, [])
+
+    def test_dead(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "RUNNING")
+        self.alive = False
+        self.crash_when = lambda st: st["waves"]["W1"].get("phase") == "dead"
+        self.crash(wab.watch, cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(self.count("окно волны W1 закрылось"), 1, self.tg)
+
+    def test_started(self):
+        cfg, path = self.chain()
+        self.alive = False
+        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("started") == "1"
+        self.crash(wab.launch, cfg, "W1", self.prompt())
+        self.alive = True
+        self.set_status(cfg, "W1", "RUNNING")
+        wab.watch(cfg, path, max_ticks=2)
+        self.assertEqual(self.count("стартовала волна W1"), 1, self.tg)
+
+    def test_not_ready(self):
+        cfg, path = self.chain()
+        self.alive = False
+        self.ready = False
+        self.crash_when = lambda st: st["waves"]["W1"].get("phase") == "not_ready"
+        self.crash(wab.launch, cfg, "W1", self.prompt())
+        wab.watch(cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(self.count("не стало готовым"), 1, self.tg)
+
+    def test_handoff(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.crash_when = lambda st: st["waves"]["W1"].get("phase") == "awaiting_merge"
+        self.crash(wab.watch, cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(self.count("сдала PR"), 1, self.tg)
+
+    def test_no_next(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("no_next") == "1"
+        self.crash(wab.watch, cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(self.count("не запускаю"), 1, self.tg)
+
+    def test_tick_done_before_the_next_launch(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("done") == "1"
+        self.crash(wab.watch, cfg, path, max_ticks=1)
+        self.alive = False  # the old window closed; W2 gets a new one
+        wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(self.get_state(cfg)["current"], "W2")
+        self.assertEqual(self.count("волна W1 завершена"), 1, self.tg)
+
+    def test_tick_chain_done(self):
+        cfg, path = self.chain(waves=["W1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        self.crash_when = lambda st: st.get("current") is None
+        self.crash(wab.watch, cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        self.assertEqual(self.count("волна W1 завершена"), 1, self.tg)
+        self.assertEqual(self.count("цепочка завершена"), 1, self.tg)
+
+    def test_done_command(self):
+        cfg, path = self.chain(waves=["W1"], merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge")}})
+        self.crash_when = lambda st: st["waves"]["W1"].get("phase") == "done"
+        self.crash(wab.main, ["wab.py", "done", str(path), "W1"])
+        wab.main(["wab.py", "done", str(path)])
+        wab.main(["wab.py", "done", str(path)])
+        self.assertEqual(self.count("цепочка завершена"), 1, self.tg)
+
+    def test_blocked(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "BLOCKED: need a decision")
+        self.crash_when = lambda st: "blocked" in st["waves"]["W1"].get("notified", {})
+        self.crash(wab.watch, cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=2)
+        self.assertEqual(self.count("need a decision"), 1, self.tg)
+
+    def test_no_save_between_a_mark_and_its_notice(self):
+        """The rule in code: no save_state call sits between once_per/a phase change and the
+        put_notice that belongs to it (put_notice itself never saves)."""
+        import ast
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "put_notice")
+        self.assertFalse([n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                          and getattr(n.func, "id", None) in ("save_state", "flush_notices")])
+        self.assertNotIn("def queue_notice", src)
+        self.assertNotIn("saved before any notice: at most once", src)
+
+
+class DashboardBindingHint(Base):
+    """Round 28 (P2): the Ctrl+\\ hint is shown only when this dashboard's binding really works."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import dash  # noqa: F401
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        import dash
+        self.dash = dash
+
+    def first_frame(self, registered):
+        from rich.console import Console
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "RUNNING")
+        frames = []
+
+        def live(renderable, **kw):
+            buf = io.StringIO()
+            Console(file=buf, width=200, force_terminal=False).print(renderable)
+            frames.append(buf.getvalue())
+            raise KeyboardInterrupt
+        with mock.patch.object(sys, "argv", ["dash.py", str(path)]), \
+                mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                mock.patch.object(self.dash.signal, "signal"), \
+                mock.patch.object(self.dash, "own_session", return_value=("s", "privsock", "%1")), \
+                mock.patch.object(wab, "register_dash", return_value=registered), \
+                mock.patch.object(wab, "unregister_dash"), \
+                mock.patch.object(self.dash, "Live", side_effect=live), \
+                mock.patch.object(self.dash, "BINDING", None, create=True):
+            with self.assertRaises(KeyboardInterrupt):
+                self.dash.main()
+        return frames[0]
+
+    def test_refused_binding_is_not_advertised(self):
+        text = self.first_frame(False)
+        self.assertNotIn("открыть/закрыть волну", text)
+        self.assertIn("W1", text)
+
+    def test_working_binding_is_advertised(self):
+        self.assertIn("открыть/закрыть волну", self.first_frame(True))
+
+
 class Utf8(Base):
     def test_subprocess_and_files_are_explicitly_utf8(self):
         seen = {}
@@ -3607,7 +3801,8 @@ class Dashboard(Base):
         self.transcript("s1", [asst(inp=1000, out=50, tools=2)])
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(sessions=["s1"])}})
         self.set_status(cfg, "W1", "RUNNING")
-        text = self.render_text(cfg)
+        with mock.patch.object(self.dash, "BINDING", True):  # the hint is shown only for a working binding
+            text = self.render_text(cfg)
         self.assertIn("Ctrl+\\", text)
         self.assertIn("W1", text)
 

@@ -38,6 +38,9 @@ STYLE = {  # phase/status -> (icon, colour, label)
     "dead": ("✖", "bold red", "окно закрыто"),
 }
 CACHE = wab.TranscriptCache()  # full counters: no tail limit here
+# Ctrl+\ of this dashboard: None - not in tmux (no binding), True - registered by wab, False - refused
+# (a foreign binding of the key, an unsafe path...). Only True advertises the key.
+BINDING = None
 
 
 def fmt_dur(sec):
@@ -167,8 +170,11 @@ def current_panel(cfg, st):
     w = st["waves"][wave]
     status = wab.read(cfg["run_dir"] / wave / "status")
     head = Text()
-    head.append(" Ctrl+\\ ", style="bold black on bright_yellow")
-    head.append(" открыть/закрыть волну  ·  ", style="bright_yellow")
+    if BINDING:
+        head.append(" Ctrl+\\ ", style="bold black on bright_yellow")
+        head.append(" открыть/закрыть волну  ·  ", style="bright_yellow")
+    elif BINDING is False:
+        head.append("Ctrl+\\ не подключён (см. события)  ·  ", style="grey50")
     head.append(f"{wave}  ", style="bold magenta")
     head.append(wab.attach_cmd(w["tmux"]), style="bold white on grey23")
     head.append(f"   статус: {status}", style="yellow" if status.startswith("BLOCKED") else "green")
@@ -261,6 +267,7 @@ def own_session():
 
 
 def main():
+    global BINDING
     if len(sys.argv) != 2:
         raise SystemExit("usage: dash.py <chain.json>")
     if not sys.stdout.isatty():
@@ -276,7 +283,7 @@ def main():
         else:
             os.environ.pop("WAB_TMUX_SOCKET", None)
     if session:  # Ctrl+\ works in the session the dashboard really runs in: it carries @wab_open
-        wab.register_dash(cfg, sys.argv[1], session, sock, pane)
+        BINDING = bool(wab.register_dash(cfg, sys.argv[1], session, sock, pane))
     for sig in (signal.SIGTERM, signal.SIGHUP):  # the finally below must run on these too
         signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
     try:
