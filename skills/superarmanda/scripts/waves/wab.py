@@ -1940,8 +1940,9 @@ def gh_graphql(query, variables):
 
 
 def find_pr(cfg, cwd):
-    """The PR of the wave's branch (the branch of its working copy): an open one, else the newest.
-    None: no branch yet or no PR; CollectError: gh could not tell."""
+    """The PR of the wave's branch (the branch of its working copy) INTO the chain's base branch: an
+    open one, else the newest. None: no branch yet or no PR; CollectError: gh could not tell or the
+    base branch is unknown (it is never guessed: several PRs of one branch may go to different bases)."""
     repo = cfg.get("repo")
     if not repo:
         raise gate.CollectError("repo is not set in chain.json")
@@ -1952,10 +1953,14 @@ def find_pr(cfg, cwd):
     branch = r.stdout.strip()
     if r.returncode != 0 or not branch:
         return None  # detached HEAD: the wave has not made its branch yet
-    items = _json(_gh("pr", "list", "--repo", repo, "--head", branch, "--state", "all", "--json",
-                      "number,headRefOid,isDraft,state"), "gh pr list")
+    base = base_branch_of(cfg, cwd)
+    if not base:
+        raise gate.CollectError("base branch is unknown (set base_branch in chain.json or origin/HEAD)")
+    items = _json(_gh("pr", "list", "--repo", repo, "--head", branch, "--base", base, "--state", "all", "--json",
+                      "number,headRefOid,isDraft,state,baseRefName"), "gh pr list")
     items = [i for i in items if isinstance(i, dict) and isinstance(i.get("number"), int)
-             and isinstance(i.get("headRefOid"), str)] if isinstance(items, list) else []
+             and isinstance(i.get("headRefOid"), str) and i.get("baseRefName") == base] \
+        if isinstance(items, list) else []
     pool = [i for i in items if i.get("state") == "OPEN"] or items
     return max(pool, key=lambda i: i["number"]) if pool else None
 
@@ -2077,10 +2082,8 @@ def handoff_gate_line(cfg, wave, w):
             return (f"Гейт мерджа пройден, но есть незакрытые треды ({len(v['unresolved'])}"
                     f"{gate.threads_note(v['old_p01'])}). "
                     f"Выполни: {home_form(path)}")
-        command = gate.merge_command(cfg["repo"], number, sha)
-        if v["draft"]:
-            command = f"{gate.ready_command(cfg['repo'], number)} && {command}"
-        return f"Гейт мерджа пройден. Мердж: {command}"
+        path = write_owner_script(cfg, wave, sha)  # never the raw `gh pr merge`: the script gates again
+        return f"Гейт мерджа пройден. Выполни: {home_form(path)} (заново проверит гейт на этом HEAD и смержит)"
     except Exception as e:  # noqa: BLE001
         return f"Гейт мерджа не проверен: {type(e).__name__}: {_one_line(e, 200)}"
 
@@ -2177,7 +2180,10 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
         save_state(cfg, st)
         event(cfg, f"{wave}: merge gate passed, merge of PR #{number} requested at {sha[:12]}")
         return True
-    command = merge if not v["draft"] else f"{gate.ready_command(repo, number)} && {merge}"
+    try:  # the owner gets the script (it gates again, readies a draft, merges pinned to the sha), not the raw command
+        command = home_form(write_owner_script(cfg, wave, sha))
+    except (OSError, ValueError) as e:
+        command = f"(скрипт владельца не записан: {_one_line(e, 100)}; проверь PR #{number} вручную)"
     w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate passed; merge refused: {refused}")
     put_notice(w, "merge_refused", sha,
                f"wave-autobot: волна {wave}: гейт пройден, мердж отклонён: {refused}. Выполни: {command}")

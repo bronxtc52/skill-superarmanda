@@ -7650,7 +7650,10 @@ class MergeGate(GateBase):
         self.assertEqual(self.rec()["phase"], "merging")
         sent = [t for t in self.tg if "мердж отклонён" in t]
         self.assertEqual(len(sent), 1)
-        self.assertIn(f"gh pr merge 7 --repo o/r --squash --match-head-commit {HEAD}", sent[0])
+        shown = f"~/.cache/wab/{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge"
+        self.assertIn(f"Выполни: {shown}", sent[0])
+        self.assertNotIn("gh pr merge", sent[0])  # never the raw command: the owner script gates again
+        self.assertTrue((self.home / ".cache" / "wab" / f"{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge").is_file())
         self.assertIn("not mergeable", sent[0])
         for _ in range(2):
             self.tick()
@@ -7679,7 +7682,9 @@ class MergeGate(GateBase):
         self.assertEqual(self.merges(), [])
         sent = [t for t in self.tg if "мердж отклонён" in t]
         self.assertEqual(len(sent), 1)
-        self.assertIn("gh pr ready 7 --repo o/r && gh pr merge 7", sent[0])
+        self.assertNotIn("gh pr merge", sent[0])
+        self.assertNotIn("gh pr ready", sent[0])
+        self.assertIn("Выполни: ~/.cache/wab/", sent[0])
 
     def test_merged_with_another_head_blocks_and_launches_nothing(self):  # acceptance 1c
         self.start()
@@ -8113,6 +8118,16 @@ class MergedByHand(OwnerMergeHarness):  # R2: a manual merge must not strand the
         self.launch.assert_called_once()
         self.assertEqual(self.launch.call_args[0][1], "W2")
 
+    def test_owner_script_after_a_refused_merge_gates_again_and_merges(self):  # P1-b
+        self.start()
+        self.merge_rc, self.merge_err = 1, "Pull request is not mergeable"
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.merge_rc = 0
+        self.run_owner_merge()  # phase merging + gate_sha saved by the refusal: accepted, gated anew
+        self.assertEqual(len(self.merges()), 2)
+        self.assertIn("--match-head-commit", self.merges()[-1])
+
     def test_owner_merge_then_the_next_wave_launches(self):  # (b)
         self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
         self.start()
@@ -8179,7 +8194,8 @@ class ExternalHandoffVerdict(GateBase):
     def test_pass_carries_the_merge_command(self):
         text = self.handoff()
         self.assertIn("Гейт мерджа пройден", text)
-        self.assertIn(f"gh pr merge 7 --repo o/r --squash --match-head-commit {HEAD}", text)
+        self.assertNotIn("gh pr merge", text)  # P1-b: only the owner script, which gates again
+        self.assertIn(f"Выполни: ~/.cache/wab/{CHAIN}-{RUN_ID}-W1-{HEAD[:12]}-merge", text)
         self.assertEqual(self.merges(), [])  # external never merges
 
     def test_pass_with_open_threads_carries_the_owner_script(self):
@@ -8492,16 +8508,19 @@ class GateWrappers(Base):
                 "commit", "-q", "--allow-empty", "-m", "c")
 
     def test_find_pr_takes_the_open_pr_of_the_branch_else_the_newest(self):
-        cfg, _ = self.chain()
+        cfg, _ = self.chain(base_branch="main")
         self.git_branch()
-        prs = [{"number": 3, "headRefOid": "1" * 40, "isDraft": False, "state": "MERGED"},
-               {"number": 9, "headRefOid": "2" * 40, "isDraft": False, "state": "CLOSED"},
-               {"number": 5, "headRefOid": "3" * 40, "isDraft": True, "state": "OPEN"}]
+        prs = [{"number": 3, "headRefOid": "1" * 40, "isDraft": False, "state": "MERGED", "baseRefName": "main"},
+               {"number": 9, "headRefOid": "2" * 40, "isDraft": False, "state": "CLOSED", "baseRefName": "main"},
+               {"number": 5, "headRefOid": "3" * 40, "isDraft": True, "state": "OPEN", "baseRefName": "main"}]
         self.gh(lambda a: _cp(a, out=json.dumps(prs)))
         self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 5)
         argv = self.gh_calls[-1]
         self.assertEqual(argv[:6], ("gh", "pr", "list", "--repo", "o/r", "--head"))
         self.assertEqual(argv[argv.index("--head") + 1], "feat/x")
+        self.assertIn("--base", argv)
+        self.assertEqual(argv[argv.index("--base") + 1], "main")
+        self.assertIn("baseRefName", argv[argv.index("--json") + 1])
         self.assertIn("all", argv)
         self.gh(lambda a: _cp(a, out=json.dumps(prs[:2])))
         self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 9)
@@ -8510,6 +8529,25 @@ class GateWrappers(Base):
         self.gh(lambda a: _cp(a, 1, "", "boom"))
         with self.assertRaises(gate.CollectError):
             self.find_pr(cfg, self.cwd)
+
+    def test_find_pr_filters_by_the_base_branch(self):  # P1-a
+        cfg, _ = self.chain(base_branch="main")
+        self.git_branch()
+        prs = [{"number": 4, "headRefOid": "1" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "main"},
+               {"number": 8, "headRefOid": "2" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "release"}]
+        self.gh(lambda a: _cp(a, out=json.dumps(prs)))
+        self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 4)  # the newest one is in a foreign base
+        self.gh(lambda a: _cp(a, out=json.dumps(prs[1:])))
+        self.assertIsNone(self.find_pr(cfg, self.cwd))  # only a foreign base: no PR of this wave
+
+    def test_find_pr_with_an_unknown_base_is_a_collect_error(self):  # P1-a
+        cfg, _ = self.chain()  # no base_branch, no origin/HEAD in the working copy
+        self.git_branch()
+        self.gh(lambda a: _cp(a, out="[]"))
+        with self.assertRaises(gate.CollectError) as ctx:
+            self.find_pr(cfg, self.cwd)
+        self.assertIn("base", str(ctx.exception))
+        self.assertEqual([c for c in self.gh_calls if c[:3] == ("gh", "pr", "list")], [])
 
     def test_find_pr_without_a_branch_or_a_repo(self):
         cfg, _ = self.chain()
