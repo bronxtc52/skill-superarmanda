@@ -523,7 +523,7 @@ skill не ставится: `python3 -m pip install --user rich`. Без нег
   `start_rev..HEAD` посчитал бы коммиты новой попытки на общем HEAD.
 
 Каталог прогона: `<база>/<chain>/<run_id>`, где база — `run_dir` из `chain.json` или
-`<каталог chain.json>/runs`. Журнал волны находится по `session_id`, а после `/clear` — по
+`<каталог chain.json>/runs`. `chain.json` обязан лежать вне каталога прогона (физические пути, с symlink): иначе волна подменила бы план и пин вместе, `load_chain` отказывает. Журнал волны находится по `session_id`, а после `/clear` — по
 метке `[wab:<chain>/<run_id>/<волна>]` в первом сообщении.
 
 Поля `chain.json`:

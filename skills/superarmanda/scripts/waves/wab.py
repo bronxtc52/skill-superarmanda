@@ -191,6 +191,14 @@ def load_chain(path, create=True):
             cfg["workdir"] = str(pathlib.Path(os.path.abspath(here / cfg["workdir"])).resolve())
         cfg["chain_file"] = str(path.resolve())
         cfg["run_dir"] = base / chain / run_id
+        # the pins (plan_sha256, mandate_sha256) are only worth anything if the waves, which write
+        # into run_dir, cannot rewrite chain.json together with the files it pins: compare the
+        # physical paths (symlinks of chain.json and of run_dir components), run_dir may not exist yet
+        real_run = cfg["run_dir"].resolve(strict=False)
+        for where in (path.resolve(strict=False), pathlib.Path(os.path.abspath(path))):
+            if where == real_run or real_run in where.parents:
+                raise SystemExit(f"chain.json: chain.json must live outside run_dir ({real_run}): a wave "
+                                 f"writes there and could replace the pinned files together with the pin")
         if create:
             cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     except (OSError, RuntimeError, ValueError) as e:  # symlink loop, no permission, a file in the way
@@ -2331,11 +2339,11 @@ def _alarm_tick(cfg, st, wave, w, now):
         if once_per(w, "alarm_error", str(e)[:150]):
             event(cfg, f"{wave}: alarm: PR facts not collected: {e}")
         return  # the intent is kept, nothing is delivered
-    w.get("notified", {}).pop("alarm_error", None)
     if facts.get("error"):
         if once_per(w, "alarm_error", str(facts["error"])[:150]):
             event(cfg, f"{wave}: alarm: PR facts not collected: {facts['error']}")
         return
+    w.get("notified", {}).pop("alarm_error", None)  # a clean collection closes the error episode
     msg = w.get("alarm_msg")
     if isinstance(msg, dict) and msg.get("head") != head and not msg.get("sent"):
         _drop_stale_alarm(w)  # outdated: the head moved before it was delivered

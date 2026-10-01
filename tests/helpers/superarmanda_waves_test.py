@@ -6650,6 +6650,78 @@ class PlanPin(Base):
         path.write_text(json.dumps(doc), encoding="utf-8")
         return path
 
+    # ----- round 4/2: chain.json must live outside run_dir -----
+    def raw_at(self, where, **over):
+        doc = {"chain": CHAIN, "run_id": RUN_ID, "repo": "o/r", "waves": ["W1", "W2"],
+               "tmux_prefix": "wv-", **over}
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(json.dumps(doc), encoding="utf-8")
+        return where
+
+    def test_chain_json_inside_run_dir_is_refused(self):  # (a)
+        run = self.tmp / "base" / CHAIN / RUN_ID
+        for create in (True, False):
+            with self.subTest(create=create, where="run_dir itself"):
+                path = self.raw_at(run / "chain.json", run_dir=str(self.tmp / "base"))
+                with self.assertRaises(SystemExit) as cm:
+                    wab.load_chain(path, create=create)
+                self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+            with self.subTest(create=create, where="subdirectory"):
+                path = self.raw_at(run / "sub" / "chain.json", run_dir=str(self.tmp / "base"))
+                with self.assertRaises(SystemExit) as cm:
+                    wab.load_chain(path, create=create)
+                self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+        # a relative run_dir that climbs back over the chain file's own directory
+        path = self.raw_at(self.tmp / "x" / CHAIN / RUN_ID / "chain.json", run_dir="../..")
+        with self.assertRaises(SystemExit) as cm:
+            wab.load_chain(path, create=False)
+        self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+
+    def test_chain_json_symlinked_into_run_dir_is_refused(self):  # (b)
+        run = self.tmp / "base" / CHAIN / RUN_ID
+        run.mkdir(parents=True)
+        real = self.raw_at(run / "chain.json", run_dir=str(self.tmp / "base"))
+        link = self.tmp / "outside" / "chain.json"
+        link.parent.mkdir()
+        os.symlink(real, link)
+        with self.assertRaises(SystemExit) as cm:
+            wab.load_chain(link)
+        self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+
+    def test_a_run_dir_through_a_symlink_to_the_chain_dir_is_refused(self):
+        cfgdir = self.tmp / "cfgdir"
+        path = self.raw_at(cfgdir / "chain.json", run_dir=str(self.tmp / "alias"))
+        (cfgdir / CHAIN).mkdir()
+        os.symlink(cfgdir, self.tmp / "alias")
+        # alias/<chain>/<run_id> resolves to cfgdir/<chain>/<run_id>: not containing chain.json
+        wab.load_chain(path, create=False)
+        os.symlink(self.tmp / "cfgdir", cfgdir / CHAIN / RUN_ID)  # now run_dir resolves to cfgdir itself
+        with self.assertRaises(SystemExit) as cm:
+            wab.load_chain(path, create=False)
+        self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+
+    def test_joint_swap_of_plan_and_pin_inside_run_dir_never_passes(self):  # (c)
+        run = self.tmp / "base" / CHAIN / RUN_ID
+        run.mkdir(parents=True)
+        evil = b'{"waves": ["evil"]}\n'
+        (run / "waves.json").write_bytes(evil)
+        path = self.raw_at(run / "chain.json", run_dir=str(self.tmp / "base"),
+                           plan_sha256=hashlib.sha256(evil).hexdigest())
+        with self.assertRaises(SystemExit) as cm:
+            wab.load_chain(path)
+        self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+
+    def test_ordinary_layouts_still_load(self):  # (d)
+        path = self.raw_at(self.tmp / "ok1" / "chain.json")
+        self.assertEqual(wab.load_chain(path)["run_dir"], path.parent.resolve() / "runs" / CHAIN / RUN_ID)
+        path = self.raw_at(self.tmp / "ok2" / "chain.json", run_dir=str(self.tmp / "elsewhere"))
+        self.assertEqual(wab.load_chain(path)["run_dir"], self.tmp / "elsewhere" / CHAIN / RUN_ID)
+        path = self.raw_at(self.tmp / "ok3" / "chain.json", run_dir="../shared")
+        wab.load_chain(path, create=False)
+        # a sibling whose name merely starts like the chain file's directory is not inside it
+        path = self.raw_at(self.tmp / "ok4" / "chain.json", run_dir=str(self.tmp / "ok4-runs"))
+        wab.load_chain(path)
+
     def test_dispatcher_launch_of_next_wave_refuses_on_changed_plan(self):
         cfg, _ = self.pinned(merge_gate="auto")
         self.gh_handler = self.merged_view
@@ -8206,6 +8278,24 @@ class Alarm(GateBase):
         self.facts = green_facts()
         self.tick()
         self.assertEqual(len(self.alarms()), 1)
+
+    def test_one_error_episode_is_one_event_until_a_clean_collection(self):
+        self.running()
+        for _ in range(3):
+            self.facts = {"error": "gh api: boom"}
+            self.tick()
+        self.assertEqual(self.log().count("alarm: PR facts not collected"), 1)
+        self.facts = green_facts()
+        self.tick()  # a clean collection closes the episode
+        self.pr = gate.CollectError("gh: down")
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.log().count("alarm: PR facts not collected"), 2)
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.facts = {"error": "gh api: boom"}  # the same text again after a failure episode
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.log().count("alarm: PR facts not collected"), 3)
 
     def test_github_is_asked_at_most_once_per_interval(self):
         self.running()
