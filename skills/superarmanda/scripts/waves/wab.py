@@ -601,12 +601,45 @@ def launch(cfg, wave, prompt_file):
         return _launch(cfg, wave, prompt_file)
 
 
+HANDED_OVER = ("awaiting_merge", "done")
+STOPPED = ("dead", "not_ready")
+
+
+def _check_launch_allowed(cfg, st, wave, name):
+    """The chain state decides, before any outside action. No bypass flag."""
+    waves, records, cur = cfg["waves"], st["waves"], st.get("current")
+    if cur and cur in records:
+        phase = records[cur].get("phase")
+        if phase in HANDED_OVER:
+            nxt = waves[waves.index(cur) + 1] if cur in waves and waves.index(cur) + 1 < len(waves) else None
+            if wave != nxt:
+                raise SystemExit(f"wab: wave {cur} is {phase}; only {nxt or 'nothing (last wave)'} may follow, "
+                                 f"not {wave}; launch refused")
+        elif phase in STOPPED:
+            if wave != cur:
+                raise SystemExit(f"wab: wave {cur} is {phase}; only {cur} may be restarted, not {wave}; "
+                                 f"launch refused")
+            if tmux_alive(name):
+                raise SystemExit(f"wab: wave {cur} is {phase} but its tmux session {name} is alive; "
+                                 f"launch refused")
+        else:
+            raise SystemExit(f"wab: wave {cur} is {phase}; launch refused")
+    else:  # nothing current: the first wave that is not finished, in order
+        expected = next((w for w in waves if records.get(w, {}).get("phase") not in HANDED_OVER), None)
+        if wave != expected:
+            raise SystemExit(f"wab: launch refused: expected {expected or 'no wave (the chain is finished)'}, "
+                             f"not {wave}")
+    if wave != cur and records.get(wave, {}).get("phase") in HANDED_OVER:
+        raise SystemExit(f"wab: wave {wave} is already {records[wave]['phase']}; launch refused")
+
+
 def _launch(cfg, wave, prompt_file):
     require_tmux()
     if wave not in cfg["waves"]:
         raise SystemExit(f"unknown wave {wave}; chain.json waves: {cfg['waves']}")
     st = load_state(cfg)
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
+    _check_launch_allowed(cfg, st, wave, name)
     if tmux_alive(name):
         raise SystemExit(f"tmux session {name} already exists")
     wdir = wave_dir(cfg, wave)
@@ -622,9 +655,13 @@ def _launch(cfg, wave, prompt_file):
     system_prompt(cfg)
     # the intent is saved BEFORE tmux is touched: a restart finds the wave and its session id
     st["current"] = wave
+    old = st["waves"].get(wave)
+    attempts = (old.get("attempts", []) + [{k: v for k, v in old.items() if k != "attempts"}]) if old else []
     st["waves"][wave] = {"tmux": name, "cwd": cwd, "started": time.time(), "restarts": 0,
                          "phase": "launching", "notified": {}, "sessions": [sid],
                          "prompt_file": str(prompt_path)}
+    if attempts:
+        st["waves"][wave]["attempts"] = attempts  # the earlier try is kept, not overwritten
     save_state(cfg, st)
     start_session(cfg, st, wave)
     return deliver_first_prompt(cfg, st, wave)
@@ -1105,6 +1142,10 @@ def _stop_event(cfg, st, path):
         else:
             event(cfg, f"{wave}: handed to the coordinator; it is the last wave, nothing to launch after the merge")
         event(cfg, "watch stopped: handed to the coordinator")
+    elif wave and st["waves"].get(wave, {}).get("phase") == "not_ready":
+        event(cfg, f"next wave {wave} not started: TUI not ready; chain stopped")
+    elif wave and st["waves"].get(wave, {}).get("phase") == "dead":
+        event(cfg, f"{wave}: window is gone; chain stopped")
     else:
         event(cfg, "watch stopped: no current wave")
 

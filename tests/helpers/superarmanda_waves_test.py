@@ -994,7 +994,7 @@ class DispatcherLock(Base):
         self.alive = False
         prompt = self.tmp / "p.md"
         prompt.write_text("x", encoding="utf-8")
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="done")}})
 
         def tick_that_launches(c, st):
             wab.launch(c, "W2", prompt)
@@ -1183,6 +1183,90 @@ class CoordinatorHandoff(Base):
                 with mock.patch.object(wab, "bind_popup"):
                     wab.watch(cfg, path, max_ticks=50)
                 self.lock_is_free(cfg)
+
+
+class LaunchGuard(Base):
+    def setUp(self):
+        super().setUp()
+        self.prompt = self.tmp / "p.md"
+        self.prompt.write_text("go\n", encoding="utf-8")
+        self.alive = False
+
+    def attempt(self, cfg, wave):
+        self.tmux_calls.clear()
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            return wab.launch(cfg, wave, self.prompt)
+
+    def refused(self, cfg, wave, text="launch refused"):
+        with self.assertRaises(SystemExit) as ctx:
+            self.attempt(cfg, wave)
+        self.assertIn(text, str(ctx.exception))
+        self.assertEqual(self.tmux_calls, [])
+        return str(ctx.exception)
+
+    def state(self, cfg, current, **phases):
+        self.put_state(cfg, {"current": current,
+                             "waves": {w: self.wave_rec(w, phase=p) for w, p in phases.items()}})
+
+    def test_busy_current_wave_refuses_everything(self):
+        cfg, _ = self.chain(waves=["W1", "W2", "W3"])
+        for phase in ("running", "starting", "launching", "sending", "checkpoint", "clearing", "updating"):
+            with self.subTest(phase=phase):
+                self.state(cfg, "W1", W1=phase)
+                msg = self.refused(cfg, "W2")
+                self.assertIn(f"wave W1 is {phase}", msg)
+                self.refused(cfg, "W1")
+
+    def test_order_is_enforced(self):
+        cfg, _ = self.chain(waves=["W1", "W2", "W3"])
+        self.state(cfg, "W1", W1="done")
+        self.refused(cfg, "W3")
+        self.refused(cfg, "W1")  # a finished wave is not launched again
+        self.put_state(cfg, {"current": None, "waves": {}})
+        self.refused(cfg, "W2")
+        self.assertTrue(self.attempt(cfg, "W1"))
+
+    def test_finished_chain_refuses_any_launch(self):
+        cfg, _ = self.chain()
+        self.state(cfg, None, W1="done", W2="done")
+        self.refused(cfg, "W1")
+        self.refused(cfg, "W2")
+
+    def test_next_wave_after_done_or_awaiting_merge_is_allowed(self):
+        for phase in ("done", "awaiting_merge"):
+            with self.subTest(phase=phase):
+                cfg, _ = self.chain(waves=["W1", "W2", "W3"])
+                self.state(cfg, "W1", W1=phase)
+                self.refused(cfg, "W3")
+                self.assertTrue(self.attempt(cfg, "W2"))
+                self.assertEqual(self.get_state(cfg)["current"], "W2")
+
+    def test_dead_or_not_ready_wave_restarts_itself_only_when_its_window_is_gone(self):
+        for phase in ("dead", "not_ready"):
+            with self.subTest(phase=phase):
+                cfg, _ = self.chain(waves=["W1", "W2", "W3"])
+                self.state(cfg, "W1", W1=phase)
+                self.refused(cfg, "W2")
+                self.alive = True
+                self.refused(cfg, "W1")
+                self.alive = False
+                self.assertTrue(self.attempt(cfg, "W1"))
+                w = self.get_state(cfg)["waves"]["W1"]
+                self.assertEqual(len(w["attempts"]), 1)
+                self.assertEqual(w["attempts"][0]["phase"], phase)
+
+    def test_failed_next_launch_is_reported_with_its_reason(self):
+        cfg, path = self.chain()
+        self.alive = False
+        self.ready = False
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        with mock.patch.object(wab, "bind_popup"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            wab.watch(cfg, path, max_ticks=3)
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("next wave W2 not started: TUI not ready", log)
+        self.assertNotIn("no current wave", log)
 
 
 class AtMostOnce(Base):
