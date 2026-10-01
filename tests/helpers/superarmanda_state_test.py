@@ -2798,9 +2798,7 @@ class WavesContract(unittest.TestCase):
     def test_where_non_pass_findings_route_to_disposition(self):
         cases = [
             (("coder",), "tester", "findings"),
-            (("coder",), "tester", "incomplete"),
             (("coder", "tester"), "cross_provider_reviewer", "findings"),
-            (("coder", "tester"), "cross_provider_reviewer", "incomplete"),
             (("coder", "tester", "cross_provider_reviewer"), "github_codex_review", "findings"),
             (("coder", "tester", "cross_provider_reviewer", "github_codex_review"), "coderabbit", "findings"),
         ]
@@ -3076,13 +3074,16 @@ class WhereDerivationExhaustive(unittest.TestCase):
             ("github_codex_review", 7),
         ]
         for name, _ in reviewers:
-            if verdict.get(name) in ("findings", "incomplete"):
+            if verdict.get(name) == "findings":
                 return (6, "coordinator", False, name)
         if verdict.get("coderabbit") == "findings":
             return (6, "coordinator", False, "coderabbit")
         for name, step in reviewers:
             if verdict.get(name) in ("error", "unavailable"):
                 return (step, name, True, None)
+        for name, step in reviewers:
+            if verdict.get(name) == "incomplete":
+                return (step, name, False, None)
         if verdict.get("coder") != "pass":
             return (4, "coder", False, None)
         for name, step in reviewers:
@@ -3146,6 +3147,38 @@ class WhereDerivationExhaustive(unittest.TestCase):
             self.observed(module, "in_progress", verdict),
             (6, "coordinator", False, "coderabbit"),
         )
+
+    def test_named_incomplete_cases(self):
+        module = self.load()
+        full = {
+            "coder": "pass",
+            "tester": "pass",
+            "cross_provider_reviewer": "pass",
+            "github_codex_review": "pass",
+        }
+        cases = [
+            ({"coder": "pass", "tester": "incomplete"}, (5, "tester", False, None)),
+            (
+                {"coder": "pass", "cross_provider_reviewer": "incomplete", "tester": "findings"},
+                (6, "coordinator", False, "tester"),
+            ),
+            (
+                {"coder": "pass", "github_codex_review": "incomplete",
+                 "cross_provider_reviewer": "error"},
+                (5, "cross_provider_reviewer", True, None),
+            ),
+            (dict(full, github_codex_review="incomplete"), (7, "github_codex_review", False, None)),
+        ]
+        for verdict, expected in cases:
+            with self.subTest(verdict=verdict):
+                self.assertEqual(
+                    self.observed(module, "in_progress", verdict), expected
+                )
+        step, role, note = module.derive_step(
+            {"status": "in_progress"}, {"coder": "pass", "tester": "incomplete"}
+        )
+        self.assertIn("re-run tester with the missing context", note)
+        self.assertIn("do not record fix-loop", note)
 
     def test_named_case_findings_beat_error(self):
         module = self.load()

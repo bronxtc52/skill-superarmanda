@@ -1142,7 +1142,7 @@ def derive_step(entry, verdicts):
     disposition = [
         role
         for role, _step in REVIEW_ORDER
-        if verdicts.get(role) in ("findings", "incomplete")
+        if verdicts.get(role) == "findings"
     ]
     # CodeRabbit is optional: only its findings need disposition; its
     # error/unavailable/incomplete are recorded and ignored.
@@ -1162,6 +1162,15 @@ def derive_step(entry, verdicts):
                 role,
                 f"BLOCKED: {role} {verdicts[role]}; retry once explicitly "
                 "or escalate to the owner (not a fix-loop)",
+            )
+    for role, step in REVIEW_ORDER:
+        if verdicts.get(role) == "incomplete":
+            # incomplete = missing context, not a finding: no fix cycle
+            return (
+                step,
+                role,
+                f"re-run {role} with the missing context "
+                "(incomplete is not a finding; do not record fix-loop)",
             )
     if verdicts.get("coder") != "pass":
         if verdicts.get("coder") is not None:
