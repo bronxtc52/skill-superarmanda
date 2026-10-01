@@ -2085,13 +2085,27 @@ def _gate_tick(cfg, st, wave, w, wdir, now):
 def _gate_failed(cfg, st, wave, w, wdir, reasons):
     w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate: {reasons}")
     w["phase"] = "running"  # the wave goes on; its next DONE is gated again
+    if w.get("pending_enter") == "gate failure":
+        w.pop("pending_enter")  # a new episode: its text is typed afresh, not just confirmed with Enter
+    # the message to the window is saved WITH the status, like the checkpoint request: a tmux failure
+    # (before the paste, or between the paste and Enter) is retried by the next ticks and restarts
+    w["gate_fail_msg"] = {"sent": False, "text": (
+        f"[wab] Гейт мерджа не пройден: {_one_line(reasons, 1500)}. Исправь причину, при необходимости "
+        f"перезапиши manifest и снова запиши DONE в $WAB_DIR/status (или BLOCKED с вопросом).")}
     save_state(cfg, st)
     event(cfg, f"{wave}: merge gate failed: {reasons}")
-    _deliver(cfg, st, wave, "gate failure", send_text,
-             f"[wab] Гейт мерджа не пройден: {_one_line(reasons, 1500)}. Исправь причину, при необходимости "
-             f"перезапиши manifest и снова запиши DONE в $WAB_DIR/status (или BLOCKED с вопросом).")
-    save_state(cfg, st)
+    _send_gate_failure(cfg, st, wave, w)
     return True
+
+
+def _send_gate_failure(cfg, st, wave, w):
+    """Deliver the saved gate-failure text to the window (once: `sent` is saved after Enter)."""
+    msg = w.get("gate_fail_msg")
+    if not isinstance(msg, dict) or msg.get("sent"):
+        return
+    if _deliver(cfg, st, wave, "gate failure", send_text, str(msg.get("text") or "")):
+        msg["sent"] = True
+    save_state(cfg, st)
 
 
 def _gate_passed(cfg, st, wave, w, wdir, v):
@@ -2196,6 +2210,10 @@ def owner_merge(cfg, wave, run_id, sha):
         raise SystemExit(f"wab: owner-merge: this script is for run {run_id}, chain.json is run {cfg['run_id']}; "
                          f"nothing done")
     st = load_state(cfg)
+    if not st.get("identity"):  # no pin saved by a launch: nothing ties this state to this chain.json
+        raise SystemExit("wab: owner-merge: state.json has no saved run identity; nothing done "
+                         "(owner-merge never writes the pin: run `launch` or `watch` first)")
+    check_identity(cfg, st, "owner-merge")  # a changed repo (or any non-tunable field) is refused here
     w = st["waves"].get(wave)
     if isinstance(w, dict) and isinstance(w.get("gate_sha"), str) and w["gate_sha"] != sha:
         raise SystemExit(f"wab: owner-merge: this script is for the gated sha {sha[:12]}, the wave's gate passed "
@@ -2449,6 +2467,14 @@ def _tick(cfg, st):
         save_state(cfg, st)  # a screen episode that ended is not sent by another record's flush
         advance_pending(cfg, st)
         return True
+
+    if isinstance(w.get("gate_fail_msg"), dict):
+        if status.startswith("BLOCKED: merge gate:"):
+            _send_gate_failure(cfg, st, wave, w)  # a retry of a delivery that failed or was cut short
+        else:  # the wave has moved on: an outdated failure is not sent
+            w.pop("gate_fail_msg")
+            if w.get("pending_enter") == "gate failure":
+                w.pop("pending_enter")
 
     if status.startswith("BLOCKED"):
         fresh = once_per(w, "blocked", status)

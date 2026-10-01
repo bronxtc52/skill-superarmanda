@@ -7213,7 +7213,8 @@ class GateBase(Base):
     def start(self, status="DONE", phase="running", **chain):
         chain.setdefault("merge_gate", "auto")
         cfg, path = self.chain(**chain)
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase=phase)}})
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase=phase)},
+                             "identity": wab._pinned_identity(cfg)})  # what the first launch saves
         if status:
             self.set_status(cfg, "W1", status)
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
@@ -7348,6 +7349,88 @@ class MergeGate(GateBase):
         self.assertEqual(len(blocked), 1)
         self.assertIn("ci (failure)", blocked[0])
         self.assertNotIn("gh pr merge", blocked[0])
+
+    def failing_send(self, *, typed):
+        calls = self.fail_calls = []
+
+        def send(name, text, on_typed=None):
+            calls.append(text)
+            if typed and on_typed:
+                on_typed()  # the text is in the window; Enter is what failed
+            raise subprocess.CalledProcessError(1, ["tmux"], stderr="boom")
+        return send
+
+    def gate_fail_facts(self, name="ci"):
+        return green_facts(check_runs=[{"name": name, "status": "completed", "conclusion": "failure"}])
+
+    def told(self):
+        return [s for s in self.sent if "Гейт мерджа не пройден" in s[2]]
+
+    def test_a_failed_delivery_of_the_gate_failure_is_retried(self):  # M1, before the paste
+        self.start()
+        self.facts = self.gate_fail_facts()
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = self.failing_send(typed=False)
+        self.assertTrue(self.tick())
+        self.assertEqual(self.told(), [])
+        self.assertFalse(self.rec()["gate_fail_msg"]["sent"])
+        wab.send_text.side_effect = real
+        self.tick()
+        self.assertEqual(len(self.told()), 1)
+        self.assertTrue(self.rec()["gate_fail_msg"]["sent"])
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(len(self.told()), 1)  # delivered once, never again
+
+    def test_a_failure_after_the_paste_presses_only_enter(self):  # M1, like the checkpoint request
+        self.start()
+        self.facts = self.gate_fail_facts()
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = self.failing_send(typed=True)
+        self.tick()
+        self.assertEqual(self.rec()["pending_enter"], "gate failure")
+        wab.send_text.side_effect = real
+        self.tick()
+        self.assertEqual(self.told(), [])  # not typed twice
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertTrue(self.rec()["gate_fail_msg"]["sent"])
+
+    def test_a_restarted_watch_delivers_the_pending_gate_failure(self):  # M1
+        self.start()
+        self.facts = self.gate_fail_facts()
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = self.failing_send(typed=False)
+        self.tick()
+        wab.send_text.side_effect = real
+        wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(len(self.told()), 1)
+        wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(len(self.told()), 1)
+
+    def test_a_new_episode_replaces_the_pending_text_and_a_moved_on_wave_gets_nothing_stale(self):  # M1
+        self.start()
+        self.facts = self.gate_fail_facts("old-check")
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = self.failing_send(typed=False)
+        self.tick()
+        self.assertIn("old-check", self.rec()["gate_fail_msg"]["text"])
+        wab.send_text.side_effect = real
+        self.set_status(self.cfg, "W1", "DONE")  # the wave wrote DONE again before the retry
+        self.facts = self.gate_fail_facts("new-check")
+        self.tick()
+        self.assertEqual(len(self.told()), 1)
+        self.assertIn("new-check", self.told()[0][2])
+        self.assertNotIn("old-check", self.told()[0][2])
+        # a wave that has moved on (RUNNING) is not sent an outdated failure
+        self.facts = self.gate_fail_facts("third")
+        wab.send_text.side_effect = self.failing_send(typed=False)
+        self.set_status(self.cfg, "W1", "DONE")
+        self.tick()
+        wab.send_text.side_effect = real
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.tick()
+        self.assertEqual(len(self.told()), 1)
+        self.assertNotIn("gate_fail_msg", self.rec())
 
     def test_status_file_is_replaced_atomically(self):
         self.start()
@@ -7746,6 +7829,33 @@ class OwnerMerge(GateBase):  # D3
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 wab.owner_merge(cfg, *bad)
 
+    def test_a_changed_repo_is_refused_before_any_gh_call(self):  # H1
+        doc = json.loads(self.path.read_text(encoding="utf-8"))
+        doc["repo"] = "other/repo"  # same run_id, same PR number and sha, another repository
+        self.path.write_text(json.dumps(doc), encoding="utf-8")
+        self.gh_calls.clear()
+        before = self.find_calls
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("identity", str(ctx.exception))
+        self.assertEqual((self.gh_calls, self.order, self.graphql_calls, self.find_calls),
+                         ([], [], [], before))
+        self.assertEqual(json.dumps(self.rec(), sort_keys=True), self.snapshot)
+
+    def test_a_state_without_a_saved_identity_is_refused_and_not_pinned(self):  # H1
+        st = self.get_state(self.cfg)
+        del st["identity"]
+        self.put_state(self.cfg, st)
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("identity", str(ctx.exception))
+        self.assertEqual((self.gh_calls, self.order, self.graphql_calls), ([], [], []))
+        self.assertNotIn("identity", self.get_state(self.cfg))  # owner-merge writes no pin
+
+    def test_an_unchanged_identity_works_as_before(self):  # H1
+        self.run_it()
+        self.assertEqual(self.order[-1], "merge")
+
     def test_the_old_call_form_without_run_and_sha_is_refused(self):  # G2
         for argv in (["wab.py", "owner-merge", str(self.path), "W1"],
                      ["wab.py", "owner-merge", str(self.path), "W1", RUN_ID]):
@@ -7830,7 +7940,8 @@ class ExternalOwnerMerge(OwnerMergeHarness):  # R1: the script offered by an ext
         self.facts["pr"]["draft"] = True
         cfg, path = self.chain(merge_gate="external")
         self.cfg, self.path = cfg, path
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()},
+                             "identity": wab._pinned_identity(cfg)})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
