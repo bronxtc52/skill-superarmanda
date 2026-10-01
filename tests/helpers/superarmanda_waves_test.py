@@ -6291,6 +6291,82 @@ class TmuxGuard(unittest.TestCase):
         self.assertNotEqual(r.returncode, 97, r.stderr)
 
 
+class W4Round42DashAttemptMetrics(Base):
+    """Round 42: the wave row's «Время», «Пик» and «↻» count the earlier attempts (archived by a
+    restart) like the turns and commits do: durations and restarts are summed, the peak is the
+    maximum. An attempt without `finished` (dead) ran until the next try started; corrupt or
+    missing fields are skipped, not a crashed frame. «Контекст» stays the current session's."""
+
+    def dash(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        return dash
+
+    def row(self, dash, w):
+        cfg, _ = self.chain()
+        st = {"current": "W1", "waves": {"W1": w}}
+        zero = {k: 0 for k in ("turns", "tools", "agents", "out", "read")}
+        with mock.patch.object(dash, "wave_stats", return_value=zero), \
+                mock.patch.object(dash, "wave_commits", return_value=0), \
+                mock.patch.object(dash.wab, "tmux_alive", return_value=True):
+            table = dash.waves_table(cfg, st)
+        return {c.header: str(c._cells[0]) for c in table.columns}
+
+    def test_row_sums_durations_and_restarts_and_takes_the_peak(self):
+        dash = self.dash()
+        now = time.time()
+        w = self.wave_rec(started=now - 600, finished=now, peak=50_000, restarts=1, tokens=10_000,
+                          attempts=[
+                              # ended: 1 hour; its own end, not the next start
+                              {"cwd": self.cwd, "started": now - 10_000, "finished": now - 6_400,
+                               "peak": 250_000, "restarts": 2},
+                              # dead (no finished): ran until the next try started (now - 600)
+                              {"cwd": self.cwd, "started": now - 1_800, "peak": 120_000, "restarts": 3},
+                          ])
+        cells = self.row(dash, w)
+        self.assertEqual(cells["Время"], dash.fmt_dur(3_600 + 1_200 + 600))
+        self.assertEqual(cells["Пик"], dash.ktok(250_000))
+        self.assertEqual(cells["↻"], "6")
+        # the context bar stays the current session's fill, not an accumulated value
+        self.assertEqual(cells["Контекст"], str(dash.bar(10_000, 300000, 16)))
+
+    def test_corrupt_attempt_fields_are_skipped(self):
+        dash = self.dash()
+        now = time.time()
+        attempts = ["junk", None,
+                    {"started": "x", "finished": now - 100, "peak": "big", "restarts": "2"},
+                    {"started": now - 900, "finished": None, "peak": True, "restarts": -1},
+                    {"started": float("nan"), "peak": float("inf"), "restarts": 2.5},
+                    {"started": now - 5_000, "finished": now - 4_000, "peak": 70_000, "restarts": 1}]
+        w = self.wave_rec(started=now - 300, finished=now, peak=40_000, restarts=0, attempts=attempts)
+        cells = self.row(dash, w)
+        # the record with started now-900 has no usable end of its own: the next record with a
+        # valid start is the attempt at now-5000, which is earlier - nothing known, nothing added
+        self.assertEqual(cells["Время"], dash.fmt_dur(300 + 1_000))
+        self.assertEqual(cells["Пик"], dash.ktok(70_000))
+        self.assertEqual(cells["↻"], "1")
+        for bad in ("junk", None, 5, {"x": 1}):
+            with self.subTest(attempts=bad):
+                cells = self.row(dash, self.wave_rec(started=now - 60, finished=now, peak=1_000,
+                                                     restarts=2, attempts=bad))
+                self.assertEqual(cells["Время"], dash.fmt_dur(60))
+                self.assertEqual(cells["Пик"], dash.ktok(1_000))
+                self.assertEqual(cells["↻"], "2")
+
+    def test_header_counts_restarts_of_earlier_attempts(self):
+        dash = self.dash()
+        from rich.console import Console
+        cfg, _ = self.chain()
+        w = self.wave_rec(restarts=1, attempts=[{"cwd": self.cwd, "started": 0, "restarts": 4}])
+        st = {"current": "W1", "waves": {"W1": w}}
+        with mock.patch.object(dash, "wave_stats", return_value={"turns": 0}):
+            con = Console(width=200, record=True)
+            con.print(dash.header(cfg, st))
+        self.assertIn("свежих голов 5", con.export_text())
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")

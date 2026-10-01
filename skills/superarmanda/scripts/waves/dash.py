@@ -4,6 +4,7 @@
 Needs a terminal: `rich` draws nothing when stdout is a file or a pipe, so without a tty the
 command refuses to start. Transcripts are bound to a wave by the session ids in state.json
 and read incrementally (wab.TranscriptCache), so a frame costs only what was appended."""
+import math
 import os
 import pathlib
 import re
@@ -106,6 +107,56 @@ def wave_stats(w):
                 for k in ("tools", "out", "read"):  # a subagent's turns are not the wave's turns
                     s[k] += sub[k]
     return s
+
+
+def _attempts(w):
+    """The earlier tries of a wave (`attempts`, archived by a restart), oldest first; a corrupt
+    list or a non-object entry is skipped, not a crashed frame."""
+    attempts = w.get("attempts")
+    return [a for a in attempts if isinstance(a, dict)] if isinstance(attempts, list) else []
+
+
+def _num(x):
+    """A finite real number from state.json, else None (a bool, a string, NaN or inf is not one)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        return None
+    return x
+
+
+def wave_duration(w, now):
+    """The wave's working time: the current try (until `finished`, else now) plus each earlier
+    try. An earlier try ran until its own `finished`; one without it (dead, stopped) ran until the
+    next try with a known start began - the restart that archived it. A try whose start or end is
+    unknown, or whose end is before its start, adds nothing."""
+    recs = [*_attempts(w), w]
+    total = 0.0
+    for i, rec in enumerate(recs):
+        start = _num(rec.get("started"))
+        if start is None:
+            continue
+        end = _num(rec.get("finished"))
+        if end is None:
+            if rec is w:
+                end = now
+            else:
+                end = next((s for s in (_num(r.get("started")) for r in recs[i + 1:]) if s is not None),
+                           None)
+        if end is not None and end > start:
+            total += end - start
+    return total
+
+
+def wave_peak(w):
+    """The highest context fill over all tries of the wave (a restart does not reset it)."""
+    return max((int(p) for p in (_num(r.get("peak")) for r in [w, *_attempts(w)])
+                if p is not None and p > 0), default=0)
+
+
+def wave_restarts(w):
+    """Checkpoint restarts over all tries of the wave; a corrupt counter (not a non-negative int)
+    adds nothing."""
+    return sum(n for n in (r.get("restarts") for r in [w, *_attempts(w)])
+               if isinstance(n, int) and not isinstance(n, bool) and n > 0)
 
 
 GIT_TIMEOUT = 10  # seconds: the frame is drawn synchronously, a slow repository must not hang it
@@ -230,11 +281,10 @@ def waves_table(cfg, st):
             tb.add_row(Text(wave, style="grey50"), Text(f"{icon} {label}", style=colour), *[""] * 9)
             continue
         s = wave_stats(w)
-        end = w.get("finished") or now
         tb.add_row(
             Text(wave, style="bold"), Text(f"{icon} {label}", style=colour),
-            fmt_dur(end - w["started"]), bar(w.get("tokens", 0), cfg["ctx_limit"], 16),
-            ktok(w.get("peak", 0)), str(w.get("restarts", 0)), str(s["turns"]), str(s["tools"]),
+            fmt_dur(wave_duration(w, now)), bar(w.get("tokens", 0), cfg["ctx_limit"], 16),
+            ktok(wave_peak(w)), str(wave_restarts(w)), str(s["turns"]), str(s["tools"]),
             str(s["agents"]), ktok(s["out"]), fmt_commits(wave_commits(w)))
     return tb
 
@@ -290,7 +340,7 @@ def header(cfg, st):
     waves = st["waves"]
     done = sum(1 for w in cfg["waves"] if wab.read(cfg["run_dir"] / w / "status") == "DONE")
     started = min((w["started"] for w in waves.values()), default=time.time())
-    restarts = sum(w.get("restarts", 0) for w in waves.values())
+    restarts = sum(wave_restarts(w) for w in waves.values())
     turns = sum(wave_stats(w)["turns"] for w in waves.values())
     t = Text(justify="center")
     t.append("🌊 wave-autobot ", style="bold bright_cyan")
