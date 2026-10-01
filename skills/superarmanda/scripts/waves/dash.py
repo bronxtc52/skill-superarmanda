@@ -236,6 +236,8 @@ def fmt_commits(n):
 # question of a window that has since closed), the phase is what the watch decided afterwards.
 # Every phase of wab.WINDOW_GONE has a row (a test holds it).
 TERMINAL_PHASES = {"dead": "dead", "awaiting_merge": "awaiting_merge", "done": "DONE"}
+# the states the view shows as a finished wave: the pipeline's solid arrow, the header's count
+FINISHED = ("DONE", "awaiting_merge")
 
 
 def wave_state(cfg, st, wave):
@@ -263,7 +265,7 @@ def pipeline(cfg, st):
         current = st.get("current") == wave
         t.append(f" {icon} {wave} ", style=f"{colour} {'reverse' if current else ''}")
         if i < len(cfg["waves"]) - 1:
-            done = key in ("DONE", "awaiting_merge")
+            done = key in FINISHED
             t.append(" ━━▶ " if done else " ──▷ ", style="green" if done else "grey42")
     titles = cfg.get("titles") or {}
     sub = Text("  ·  ".join(f"{w}: {titles[w]}" for w in cfg["waves"] if w in titles),
@@ -342,7 +344,9 @@ def events_panel(cfg, n=12):
 
 def header(cfg, st):
     waves = st["waves"]
-    done = sum(1 for w in cfg["waves"] if wab.read(cfg["run_dir"] / w / "status") == "DONE")
+    # finished as the row and the pipeline show it, not by the raw status file: a done wave whose
+    # file is gone, unreadable or a directory stays in the count; a dead wave does not
+    done = sum(1 for w in cfg["waves"] if wave_state(cfg, st, w)[0] in FINISHED)
     # a corrupt or missing `started` is skipped, not a crashed frame
     started = min((s for s in (_num(w.get("started")) for w in waves.values()) if s is not None),
                   default=time.time())

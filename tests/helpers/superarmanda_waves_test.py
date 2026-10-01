@@ -6448,6 +6448,53 @@ class W4Round43DashHugeAndOrder(Base):
                 self.assertIn(f"в работе {expect}", con.export_text())
 
 
+
+class W4Round44DashHeaderDone(Base):
+    """Round 44: the header's «волн N/M» counts a wave as finished by the same wave_state the row
+    and the pipeline show (DONE or awaiting_merge), not by the raw status file: a finished wave
+    whose status file is gone, unreadable or replaced by a directory stays in the count."""
+
+    dash = W4Round42DashAttemptMetrics.dash
+
+    def header_text(self, dash, cfg, st):
+        from rich.console import Console
+        with mock.patch.object(dash, "wave_stats", return_value={"turns": 0}):
+            con = Console(width=220, record=True)
+            con.print(dash.header(cfg, st))
+        return con.export_text()
+
+    def test_finished_wave_without_status_file_is_counted(self):
+        dash = self.dash()
+        cfg, _ = self.chain(waves=["W1", "W2", "W3", "W4"])
+        for w in ("W1", "W2", "W3", "W4"):
+            wab.wave_dir(cfg, w).mkdir(parents=True, exist_ok=True)
+        # W1: terminal phase done, status file deleted
+        # W2: awaiting_merge, status file replaced by a directory
+        (wab.wave_dir(cfg, "W2") / "status").mkdir()
+        # W3: no terminal phase yet, the file is gone, the cached last status is DONE
+        # W4: current, still running
+        self.set_status(cfg, "W4", "RUNNING")
+        st = {"current": "W4", "waves": {
+            "W1": self.wave_rec(name="W1", phase="done"),
+            "W2": self.wave_rec(name="W2", phase="awaiting_merge"),
+            "W3": self.wave_rec(name="W3", last_status="DONE"),
+            "W4": self.wave_rec(name="W4"),
+        }}
+        self.assertIn("волн 3/4", self.header_text(dash, cfg, st))
+        # the count matches what the rows show
+        keys = [dash.wave_state(cfg, st, w)[0] for w in cfg["waves"]]
+        self.assertEqual(keys[:3], ["DONE", "awaiting_merge", "DONE"])
+
+    def test_dead_and_pending_waves_are_not_counted(self):
+        dash = self.dash()
+        cfg, _ = self.chain(waves=["W1", "W2"])
+        for w in ("W1", "W2"):
+            wab.wave_dir(cfg, w).mkdir(parents=True, exist_ok=True)
+        self.set_status(cfg, "W1", "DONE")
+        st = {"current": "W1", "waves": {"W1": self.wave_rec(name="W1", phase="dead")}}
+        self.assertIn("волн 0/2", self.header_text(dash, cfg, st))
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
