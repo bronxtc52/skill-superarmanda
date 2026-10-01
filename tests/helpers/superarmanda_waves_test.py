@@ -7064,6 +7064,56 @@ class GateVerdict(unittest.TestCase):
             with self.subTest(status=status):
                 self.assertEqual(self.ev(manifest=green_manifest(status=status))["verdict"], "fail")
 
+    def test_unfinished_fix_loop_statuses_fail(self):  # r6 HIGH
+        for status in ("needs_fix", "needs_verification", "pending", "in_progress", None):
+            with self.subTest(status=status):
+                v = self.ev(manifest=green_manifest(status=status))
+                self.assertEqual(v["verdict"], "fail")
+                self.assertTrue(any("цикл исправлений не завершён" in r for r in v["reasons"]), v["reasons"])
+        self.assertEqual(self.ev(manifest=green_manifest(status="ready_for_pr_review"))["verdict"], "pass")
+
+    def test_other_sources_findings_on_head_fail(self):  # r6 HIGH
+        for role in ("github_codex_review", "coderabbit"):
+            for status in ("findings", "fail"):
+                with self.subTest(role=role, status=status):
+                    m = green_manifest()
+                    m["tasks"]["T1"]["results"][role] = result(status)
+                    v = self.ev(manifest=m)
+                    self.assertEqual(v["verdict"], "fail")
+                    self.assertTrue(any(role in r for r in v["reasons"]), v["reasons"])
+            ok = green_manifest()
+            ok["tasks"]["T1"]["results"][role] = result("pass")
+            self.assertEqual(self.ev(manifest=ok)["verdict"], "pass")
+            old = green_manifest()
+            old["tasks"]["T1"]["results"][role] = result("findings", head=OLD)
+            self.assertEqual(self.ev(manifest=old)["verdict"], "pass")
+
+    def test_needs_fix_is_explained_only_by_the_accepted_limitation(self):  # r6 HIGH
+        def manifest(decisions, **task):
+            m = green_manifest(**dict({"status": "needs_fix", "decisions": decisions}, **task))
+            m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = result("findings", at="2026-10-01T10:05:00Z")
+            return m
+
+        def decision(**kw):
+            return dict({"source": "cross_provider_reviewer", "decision": "accept_limitation",
+                         "note": "n", "recorded_at": "2026-10-01T10:10:00Z"}, **kw)
+        self.assertEqual(self.ev(manifest=manifest([decision()]))["verdict"], "pass")
+        self.assertEqual(self.ev(manifest=manifest([decision()], fix_cycles=2,
+                                                   fix_sources={"cross_provider_reviewer": 2}))["verdict"], "pass")
+        # the last decision is not the accepted limitation of the reviewer
+        later = decision(source="tester", decision="invariant", recorded_at="2026-10-01T10:20:00Z")
+        self.assertEqual(self.ev(manifest=manifest([decision(), later]))["verdict"], "fail")
+        self.assertEqual(self.ev(manifest=manifest([]))["verdict"], "fail")
+        # a new failed fix-loop after the decision: another source, then the same one
+        self.assertEqual(self.ev(manifest=manifest([decision()], fix_cycles=3,
+                                                   fix_sources={"cross_provider_reviewer": 2, "tester": 1}))["verdict"],
+                         "fail")
+        self.assertEqual(self.ev(manifest=manifest([decision()], status="needs_decision"))["verdict"], "fail")
+        # reviewer result is pass: needs_fix is not explained by anything
+        m = manifest([decision()])
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = result("pass")
+        self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
+
     def test_results_on_another_tree_or_a_dirty_copy_fail(self):  # acceptance 1a
         dirty_result = green_manifest()
         dirty_result["tasks"]["T1"]["results"]["tester"] = result(fp="0" * 64)

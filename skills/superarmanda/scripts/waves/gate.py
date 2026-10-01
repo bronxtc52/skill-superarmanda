@@ -250,8 +250,13 @@ def manifest_problems(manifest, head, cwd_fingerprint):
         entry = entry if isinstance(entry, dict) else {}
         results = entry.get("results") if isinstance(entry.get("results"), dict) else {}
         status = entry.get("status")
-        if status in ("needs_decision", "blocked"):
-            problems.append(f"задача {name}: статус {status}")
+        review = results.get("cross_provider_reviewer")
+        if status != "ready_for_pr_review" and not _needs_fix_explained(entry, review, head, cwd_fingerprint):
+            problems.append(f"задача {name}: статус {status} (цикл исправлений не завершён)")
+        for role, other in sorted(results.items()):  # github_codex_review, coderabbit, ...
+            if (role not in ("coder", "tester", "cross_provider_reviewer") and isinstance(other, dict)
+                    and other.get("head") == head and other.get("status") != "pass"):
+                problems.append(f"задача {name}: {role} {other.get('status')}")
         coder = results.get("coder")
         if not (isinstance(coder, dict) and coder.get("status") == "pass" and coder.get("head") == head):
             problems.append(f"задача {name}: нет coder pass на HEAD")
@@ -262,7 +267,6 @@ def manifest_problems(manifest, head, cwd_fingerprint):
             problems.append(f"задача {name}: нет tester pass на HEAD PR")
         elif not _bound(tester, head, cwd_fingerprint):
             problems.append(f"задача {name}: tester pass получен на другом дереве, чем рабочая копия")
-        review = results.get("cross_provider_reviewer")
         if not (isinstance(review, dict) and review.get("head") == head):
             problems.append(f"задача {name}: нет cross_provider_reviewer на HEAD PR")
         elif not _bound(review, head, cwd_fingerprint):
@@ -271,6 +275,27 @@ def manifest_problems(manifest, head, cwd_fingerprint):
             problems.append(f"задача {name}: cross_provider_reviewer {review.get('status')} без решения "
                             f"владельца accept_limitation по этому результату")
     return problems
+
+
+def _needs_fix_explained(entry, review, head, fingerprint_now):
+    """`needs_fix` is allowed only as the accepted-limitation path: the reviewer's findings on HEAD are
+    accepted and the LAST decision is accept_limitation of the reviewer. A later failed fix-loop leaves
+    no timestamp in the manifest, so it is told apart by its traces only: another source in
+    `fix_sources`, `fix_cycles` beyond the reviewer's count, or status needs_decision/blocked.
+    Limit: one more failed round on the reviewer itself right after the decision stays needs_fix
+    with the same counters shape and is not distinguishable here."""
+    if entry.get("status") != "needs_fix" or not (_bound(review, head, fingerprint_now) and _accepted(entry, review)):
+        return False
+    decisions = [d for d in entry.get("decisions") or [] if isinstance(d, dict) and _ts(d.get("recorded_at"))]
+    if not decisions:
+        return False
+    last = max(decisions, key=lambda d: _ts(d.get("recorded_at")))
+    if last.get("source") != "cross_provider_reviewer" or last.get("decision") != "accept_limitation":
+        return False
+    sources = entry.get("fix_sources") if isinstance(entry.get("fix_sources"), dict) else {}
+    own = sources.get("cross_provider_reviewer") or 0
+    return (all(n in (0, None) for k, n in sources.items() if k != "cross_provider_reviewer")
+            and (entry.get("fix_cycles") or 0) <= own)
 
 
 def _accepted(entry, review):
