@@ -1323,20 +1323,57 @@ class Episodes(Base):
         self.cfg, _ = self.chain(idle_minutes=0)
         self.set_status(self.cfg, "W1", "RUNNING")
         t = [1000.0]
+
+        def screen(body, footer):
+            return f"{body}\nline2\nline3\n{footer} one\n{footer} two\n"
         with mock.patch("time.time", side_effect=lambda: t[0]):
-            self.pane = "same screen"
+            self.pane = screen("same screen", "f0")
             self.tick()
             t[0] += 5
             self.tick()
             self.tick()
             self.assertEqual(len(self.tg), 1)
-            self.pane = "screen moved"
+            self.pane = screen("screen moved", "f0")
             self.tick()
             t[0] += 5
-            self.pane = "same screen"  # a digest seen before, a new episode
+            self.pane = screen("same screen", "f0")  # a body seen before: a new episode
             self.tick()
             t[0] += 5
             self.tick()
+        self.assertEqual(len(self.tg), 2)
+
+    def test_a_ticking_footer_does_not_hide_idleness(self):
+        self.cfg, _ = self.chain(idle_minutes=0)
+        self.set_status(self.cfg, "W1", "RUNNING")
+        t = [1000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for i in range(4):
+                self.pane = f"work\nmore work\nthe end\n* Thinking... ({i}s)\n  esc to interrupt {i}\n"
+                self.tick()
+                t[0] += 5
+        self.assertEqual(len(self.tg), 1)
+        self.assertIn("молчит", self.tg[0])
+
+    def test_empty_status_read_changes_nothing(self):
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        for text in ("", "  \n"):
+            (wab.wave_dir(self.cfg, "W1") / "status").write_text(text, encoding="utf-8")
+            self.tick()
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        self.assertEqual(len(self.tg), 1)
+
+    def test_permission_episode_is_keyed_by_the_marker_not_the_screen(self):
+        self.set_status(self.cfg, "W1", "RUNNING")
+        for i in range(4):
+            self.pane = f"Do you want to proceed?\n❯ 1. Yes\ncountdown {i}"
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+        self.pane = "working"
+        self.tick()
+        self.pane = "Do you want to proceed?\n❯ 1. Yes\ncountdown 9"
+        self.tick()
         self.assertEqual(len(self.tg), 2)
 
 

@@ -847,6 +847,10 @@ def tick(cfg, st):
     w.setdefault("sessions", [])
     name, wdir = w["tmux"], wave_dir(cfg, wave)
     status = read(wdir / "status")
+    if status:
+        w["last_status"] = status
+    else:  # an empty read is the wave mid-rewrite: decide on the last real status
+        status = w.get("last_status", "")
     now = time.time()
     attach = f"tmux attach -t {name}  (выйти: Ctrl-b d)"
 
@@ -992,12 +996,14 @@ def tick(cfg, st):
     if not any(m in txt for m in PERMISSION_MARKERS):
         w["notified"].pop("permission", None)
     if any(m in txt for m in PERMISSION_MARKERS):
-        if once_per(w, "permission", hashlib.sha1(txt[-800:].encode("utf-8")).hexdigest()):
+        if once_per(w, "permission", "visible"):  # one episode while the prompt stays on screen
             save_state(cfg, st)
             event(cfg, f"{wave}: permission prompt on screen")
             notify(cfg, f"wave-autobot: волна {wave} ждёт подтверждения на экране.\n{attach}")
 
-    digest = hashlib.sha1(txt.encode("utf-8")).hexdigest()
+    # idleness is judged without the last two non-empty lines (spinner, timer, footer)
+    body = [l for l in txt.splitlines() if l.strip()][:-2]
+    digest = hashlib.sha1("\n".join(body).encode("utf-8")).hexdigest()
     if digest != w.get("pane_digest"):
         w["pane_digest"], w["pane_changed"] = digest, now
         w["notified"].pop("idle", None)
