@@ -3226,6 +3226,136 @@ class W4Round24(Base):
                 self.assertEqual(wab.redact(text), text)
 
 
+class W4Round26(Base):
+    """Round 26: the mandate pin is 64 lowercase hex or nothing, an unreadable mandate.md is a clear
+    refusal, a confirmed handoff leaves the outbox, a corrupt `attempts` does not break the dashboard."""
+
+    def setUp(self):
+        super().setUp()
+        self.down = False
+
+        def flaky(cfg, text):
+            if self.down:
+                raise OSError("telegram down")
+            self.tg.append(text)
+        p = mock.patch.object(wab, "_send_telegram", side_effect=flaky)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def raw_chain(self, **over):
+        doc = {"chain": CHAIN, "run_id": RUN_ID, "repo": "o/r", "waves": ["W1", "W2"],
+               "tmux_prefix": "wv-", "tick_seconds": 1}
+        doc.update(over)
+        cfgdir = self.tmp / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        path = cfgdir / "chain.json"
+        path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    # ----- 1: a present mandate_sha256 is 64 lowercase hex, never a falsy "no pin" -----
+    def test_present_pin_must_be_64_lowercase_hex(self):
+        for bad in ("", None, False, 0, 1, True, [], {}, "A" * 64, "0" * 63, "0" * 65, "g" * 64,
+                    " " + "0" * 63, hashlib.sha256(b"x").hexdigest().upper()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as cm:
+                    wab.load_chain(self.raw_chain(mandate_sha256=bad))
+                self.assertIn("mandate_sha256", str(cm.exception))
+        wab.load_chain(self.raw_chain(mandate_sha256=hashlib.sha256(b"x").hexdigest()))
+        cfg = wab.load_chain(self.raw_chain())  # no key: no pin, the old behaviour
+        self.assertNotIn("mandate_sha256", cfg)
+
+    def test_pin_is_checked_by_presence_not_truthiness(self):
+        # load_chain is the gate; system_prompt must still refuse a falsy pin that slipped past it
+        for bad in ("", None, False, 0):
+            with self.subTest(bad=bad):
+                cfg, _ = self.chain()
+                cfg["mandate_sha256"] = bad
+                with self.assertRaises(SystemExit) as cm:
+                    wab.system_prompt(cfg)
+                self.assertIn("mandate_sha256", str(cm.exception))
+                self.assertFalse((cfg["run_dir"] / "system-prompt.md").exists())
+
+    # ----- 3: an unreadable mandate.md is a refusal with a reason, not a traceback -----
+    def unreadable(self, cfg, how):
+        mandate = cfg["run_dir"] / "mandate.md"
+        if how == "directory":
+            mandate.mkdir()
+        else:
+            mandate.write_bytes(f"Прогон: {RUN_ID}\nx\n".encode("utf-8"))
+            mandate.chmod(0)
+            self.addCleanup(mandate.chmod, 0o600)
+
+    def test_unreadable_mandate_is_a_clear_refusal(self):
+        for how in ("directory", "chmod 0"):
+            if how == "chmod 0" and os.geteuid() == 0:
+                continue  # root reads it anyway
+            for pin in (None, hashlib.sha256(b"x").hexdigest()):
+                with self.subTest(how=how, pin=bool(pin)):
+                    shutil.rmtree(self.tmp / "cfg", ignore_errors=True)
+                    cfg, _ = self.chain(mandate_sha256=pin)
+                    self.unreadable(cfg, how)
+                    with self.assertRaises(SystemExit) as cm:
+                        wab.system_prompt(cfg)
+                    self.assertIn("mandate.md", str(cm.exception))
+                    self.assertIn("cannot read", str(cm.exception))
+                    self.assertFalse((cfg["run_dir"] / "system-prompt.md").exists())
+
+    # ----- 2: a confirmed handoff is not delivered later as a stale notice -----
+    def handoff_undelivered(self, **over):
+        cfg, path = self.chain(merge_gate="external", **over)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.down = True
+        wab.watch(cfg, path, max_ticks=3)
+        self.assertIn("handoff", self.get_state(cfg)["waves"]["W1"].get("outbox", {}))
+        return cfg, path
+
+    def test_launch_of_the_next_wave_drops_the_undelivered_handoff(self):
+        cfg, path = self.handoff_undelivered()
+        self.alive = False
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            self.assertTrue(wab.launch(cfg, "W2", wab.wave_dir(cfg, "W1") / "next-prompt.md"))
+        st = self.get_state(cfg)
+        self.assertEqual(st["waves"]["W1"]["phase"], "done")
+        self.assertNotIn("handoff", st["waves"]["W1"].get("outbox") or {})
+        self.down = False
+        wab.drain_notices(cfg)
+        self.assertEqual([t for t in self.tg if "сдала PR" in t], [])
+
+    def test_done_drops_the_undelivered_handoff_but_keeps_chain_done(self):
+        cfg, path = self.handoff_undelivered(waves=["W1"])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+        wab.main(["wab.py", "done", str(path), "W1"])  # Telegram still down
+        box = self.get_state(cfg)["waves"]["W1"].get("outbox") or {}
+        self.assertNotIn("handoff", box)
+        self.assertIn("chain_done", box)  # the end of the chain must still get through
+        self.down = False
+        wab.main(["wab.py", "done", str(path)])
+        self.assertEqual([t for t in self.tg if "сдала PR" in t], [])
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1, self.tg)
+        self.assertFalse(self.get_state(cfg)["waves"]["W1"].get("outbox"))
+
+    # ----- 4: a corrupt `attempts` in state.json does not crash the dashboard -----
+    def test_wave_stats_skip_corrupt_attempts(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        self.transcript("cur1", [asst(inp=1, out=5, tools=2)])
+        self.transcript("old1", [asst(inp=1, out=40, tools=3)])
+        good = self.wave_rec("W1", sessions=["old1"])
+        for bad, want in (("junk", 5), ({"sessions": ["old1"]}, 5), (7, 5),
+                          ([None, 3, "x", good], 45), ([[good]], 5)):
+            with self.subTest(attempts=bad):
+                w = self.wave_rec("W1", sessions=["cur1"], attempts=bad)
+                dash.CACHE = wab.TranscriptCache()
+                self.assertEqual(dash.wave_stats(w)["out"], want)
+
+
 class Utf8(Base):
     def test_subprocess_and_files_are_explicitly_utf8(self):
         seen = {}

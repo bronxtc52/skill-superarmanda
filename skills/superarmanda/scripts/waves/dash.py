@@ -79,7 +79,9 @@ def wave_stats(w):
     nothing is found by directory."""
     s = {"turns": 0, "tools": 0, "out": 0, "read": 0, "agents": 0}
     seen = set()  # a session id is a uuid: the same id in two records is the same session
-    for rec in [w, *(w.get("attempts") or [])]:
+    attempts = w.get("attempts")
+    attempts = [a for a in attempts if isinstance(a, dict)] if isinstance(attempts, list) else []
+    for rec in [w, *attempts]:  # a corrupt state.json `attempts` is skipped, not a crashed frame
         cwd = rec.get("cwd") or w["cwd"]
         for sid in rec.get("sessions") or []:
             if sid in seen:

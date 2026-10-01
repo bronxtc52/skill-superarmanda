@@ -65,6 +65,9 @@ NUM_LIMITS = {"ctx_limit": 10_000_000, "idle_minutes": 1440, "handoff_timeout_mi
               "tick_seconds": 3600}
 
 
+MANDATE_PIN = re.compile(r"[0-9a-f]{64}")
+
+
 def _plain_name(value):
     return bool(NAME.fullmatch(value)) and set(value) != {"."}
 
@@ -108,6 +111,11 @@ def load_chain(path, create=True):
         # an enabled block with a hole would silently turn every notice into a local event
         raise SystemExit("chain.json: telegram needs non-empty string keyvault, token_secret and chat_secret "
                          "(or leave it out / empty to disable)")
+    if "mandate_sha256" in cfg and not (isinstance(cfg["mandate_sha256"], str)
+                                        and MANDATE_PIN.fullmatch(cfg["mandate_sha256"])):
+        # a present pin is never "no pin": "", null, false or 0 must not let a wave start unpinned
+        raise SystemExit(f"chain.json: mandate_sha256 must be 64 lowercase hex characters (the sha256 "
+                         f"of mandate.md), got {cfg['mandate_sha256']!r}; leave it out for no pin")
     chain = str(cfg.get("chain") or "")
     run_id = str(cfg.get("run_id") or "")
     if not _plain_name(chain):
@@ -857,21 +865,26 @@ def system_prompt(cfg):
     its first line must name this run_id, otherwise it is ignored. Waves may write into
     run_dir, so the approved bytes are pinned by `mandate_sha256` in chain.json (which lives
     outside run_dir): a mandate whose digest differs is refused, not trusted. A pin is also
-    a promise that the mandate exists: with `mandate_sha256` set, a missing, empty or
-    foreign-headed mandate.md refuses the launch instead of falling back to the bare protocol."""
+    a promise that the mandate exists: with the `mandate_sha256` key present (whatever its value;
+    load_chain only lets 64 lowercase hex through), a missing, empty or foreign-headed mandate.md
+    refuses the launch instead of falling back to the bare protocol. An unreadable mandate.md
+    (a directory, no permission) is refused with or without a pin."""
     text = PROTOCOL.read_text(encoding="utf-8").rstrip() + "\n"
     mandate = cfg["run_dir"] / "mandate.md"
-    raw = mandate.read_bytes() if mandate.exists() else b""
+    try:
+        raw = mandate.read_bytes() if mandate.exists() else b""
+    except OSError as e:
+        raise SystemExit(f"{mandate}: cannot read the mandate ({e.strerror or e}); refusing to launch")
     try:
         body = raw.decode("utf-8")
     except UnicodeDecodeError:
         raise SystemExit(f"{mandate} is not valid UTF-8")
     first = body.splitlines()[:1]
-    pinned = cfg.get("mandate_sha256")
+    pinned = "mandate_sha256" in cfg
     if pinned and not (first and first[0].strip() == MANDATE_HEADER + cfg["run_id"]):
         why = ("is missing" if not mandate.exists() else "is empty" if not body.strip()
                else f"first line is not «{MANDATE_HEADER}{cfg['run_id']}»")
-        raise SystemExit(f"{mandate} {why}, but chain.json pins mandate_sha256 {pinned}: "
+        raise SystemExit(f"{mandate} {why}, but chain.json pins mandate_sha256 {cfg['mandate_sha256']!r}: "
                          f"the approved mandate is gone, refusing to launch without it")
     if first and first[0].strip() != MANDATE_HEADER + cfg["run_id"]:
         event(cfg, f"mandate.md ignored: first line must be «{MANDATE_HEADER}{cfg['run_id']}»")
@@ -945,6 +958,7 @@ def _launch(cfg, wave, prompt_file):
     prev = st.get("current")
     if prev and prev != wave and st["waves"].get(prev, {}).get("phase") == "awaiting_merge":
         st["waves"][prev]["phase"] = "done"  # merged by the coordinator; saved with the launch intent
+        drop_notice(st["waves"][prev], "handoff")  # confirmed: an undelivered one would be stale
     sid = str(uuid.uuid4())  # known up front: the transcript is bound to the wave by session id
     (wdir / "status").write_text("STARTING\n", encoding="utf-8")  # the wave has not started yet
     system_prompt(cfg)
@@ -1669,6 +1683,7 @@ def done_cmd(cfg, wave=None):
         if w.get("phase") == "awaiting_merge":
             w["phase"] = "done"
             w.setdefault("finished", time.time())
+            drop_notice(w, "handoff")  # confirmed by this call; chain_done below must still get through
             if st.get("current") == wave:
                 st["current"] = None
             save_state(cfg, st)
