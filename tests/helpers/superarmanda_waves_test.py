@@ -6903,6 +6903,37 @@ class PlanPin(Base):
         self.assertEqual(len(self.kills()), 1)
         self.assertEqual(self.sent, [])
 
+    def _starting_pinned(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "starting"
+        self.put_state(cfg, st)
+        return cfg, path
+
+    def test_plan_changed_during_wait_ready_does_not_paste_prompt(self):
+        cfg, path = self._starting_pinned()
+
+        def changing(name, timeout=90):
+            (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+            return True
+
+        with unittest.mock.patch.object(wab, "wait_ready", side_effect=changing):
+            self.recover(cfg, path, alive=True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.enters, [])
+        self.assertEqual(len(self.kills()), 1)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "not_ready")
+        self.assertIn("BLOCKED: plan changed since approval",
+                      (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_plan_unchanged_during_wait_ready_sends_prompt(self):
+        cfg, path = self._starting_pinned()
+        with unittest.mock.patch.object(wab, "wait_ready", return_value=True):
+            self.recover(cfg, path, alive=True)
+        self.assertEqual(self.kills(), [])
+        self.assertEqual(len([s for s in self.sent if s[0] == "text"]), 1)
+
     def test_pin_refusal_in_recover_launch_kills_live_session(self):
         cfg, path = self.pinned()
         self.launching(cfg)

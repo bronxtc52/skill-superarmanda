@@ -1629,6 +1629,9 @@ def deliver_first_prompt(cfg, st, wave):
         event(cfg, f"{wave}: Claude TUI not ready in {name}, prompt NOT sent")
         flush_notices(cfg, st, w)
         return False
+    # the wait above lasts up to 90 s: waves.json may have changed meanwhile
+    if _plan_pin_refused(cfg, st, wave):
+        return False
     prompt = pathlib.Path(w["prompt_file"]).read_text(encoding="utf-8").strip()
     head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wdir} "
             f"(он же $WAB_DIR). Рабочая копия (admitted clone): {cwd}. "
