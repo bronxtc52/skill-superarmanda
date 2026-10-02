@@ -4,6 +4,7 @@
 Needs a terminal: `rich` draws nothing when stdout is a file or a pipe, so without a tty the
 command refuses to start. Transcripts are bound to a wave by the session ids in state.json
 and read incrementally (wab.TranscriptCache), so a frame costs only what was appended."""
+import json
 import math
 import os
 import pathlib
@@ -109,45 +110,9 @@ def wave_stats(w):
     return s
 
 
-def _attempts(w):
-    """The earlier tries of a wave (`attempts`, archived by a restart), oldest first; a corrupt
-    list or a non-object entry is skipped, not a crashed frame."""
-    attempts = w.get("attempts")
-    return [a for a in attempts if isinstance(a, dict)] if isinstance(attempts, list) else []
-
-
-def _num(x):
-    """A finite real number from state.json, else None (a bool, a string, NaN or inf is not one)."""
-    if isinstance(x, bool) or not isinstance(x, (int, float)):
-        return None
-    try:
-        return x if math.isfinite(x) else None
-    except OverflowError:  # an int too big for a float (10**400) is not a number either
-        return None
-
-
-def wave_duration(w, now):
-    """The wave's working time: the current try (until `finished`, else now) plus each earlier
-    try. An earlier try ran until its own `finished`; one without it (dead, stopped) ran until the
-    nearest later known start among all the records (earlier tries and the current one) - the
-    restart that archived it, whatever the list order. A try whose start or end is unknown, or
-    whose end is before its start, adds nothing."""
-    recs = [*_attempts(w), w]
-    starts = [s for s in (_num(r.get("started")) for r in recs) if s is not None]
-    total = 0.0
-    for rec in recs:
-        start = _num(rec.get("started"))
-        if start is None:
-            continue
-        end = _num(rec.get("finished"))
-        if end is None:
-            if rec is w:
-                end = now
-            else:
-                end = min((s for s in starts if s > start), default=None)
-        if end is not None and end > start:
-            total += end - start
-    return total
+_attempts = wab.wave_attempts  # the pure helpers live in wab (the end-of-chain summary needs them too)
+_num = wab.num
+wave_duration = wab.wave_duration
 
 
 def wave_peak(w):
@@ -156,11 +121,7 @@ def wave_peak(w):
                 if p is not None and p > 0), default=0)
 
 
-def wave_restarts(w):
-    """Checkpoint restarts over all tries of the wave; a corrupt counter (not a non-negative int)
-    adds nothing."""
-    return sum(n for n in (r.get("restarts") for r in [w, *_attempts(w)])
-               if isinstance(n, int) and not isinstance(n, bool) and n > 0)
+wave_restarts = wab.wave_restarts
 
 
 GIT_TIMEOUT = 10  # seconds: the frame is drawn synchronously, a slow repository must not hang it
@@ -275,7 +236,7 @@ def pipeline(cfg, st):
 
 def waves_table(cfg, st):
     tb = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold cyan")
-    for col, j in (("Волна", "left"), ("Статус", "left"), ("Время", "right"), ("Контекст", "left"),
+    for col, j in (("Волна", "left"), ("Статус", "left"), ("PR", "right"), ("Время", "right"), ("Контекст", "left"),
                    ("Пик", "right"), ("↻", "right"), ("Ходы", "right"), ("Tools", "right"),
                    ("Агенты", "right"), ("Вывод", "right"), ("Коммиты", "right")):
         tb.add_column(col, justify=j, no_wrap=True)
@@ -284,15 +245,118 @@ def waves_table(cfg, st):
         key, w = wave_state(cfg, st, wave)
         icon, colour, label = STYLE.get(key, ("?", "white", key))
         if not w:
-            tb.add_row(Text(wave, style="grey50"), Text(f"{icon} {label}", style=colour), *[""] * 9)
+            tb.add_row(Text(wave, style="grey50"), Text(f"{icon} {label}", style=colour), *[""] * 10)
             continue
         s = wave_stats(w)
         tb.add_row(
             Text(wave, style="bold"), Text(f"{icon} {label}", style=colour),
-            fmt_dur(wave_duration(w, now)), bar(w.get("tokens", 0), cfg["ctx_limit"], 16),
+            "" if wave_pr(w) is None else f"#{wave_pr(w)}", fmt_dur(wave_duration(w, now)), bar(w.get("tokens", 0), cfg["ctx_limit"], 16),
             ktok(wave_peak(w)), str(wave_restarts(w)), str(s["turns"]), str(s["tools"]),
             str(s["agents"]), ktok(s["out"]), fmt_commits(wave_commits(w)))
     return tb
+
+
+MANIFEST_POLL_SECONDS = 15  # `state.py where` is a subprocess: not more often than this per manifest
+WHERE_TIMEOUT = 10
+MANIFEST_CACHE = {}  # manifest path -> (signature, taken at, result)
+STATE_PY = pathlib.Path(__file__).resolve().parent.parent / "state.py"
+VERDICT_ROLES = ("tester", "cross_provider_reviewer", "github_codex_review", "coderabbit")
+SEVERITIES = ("critical", "high", "medium", "low", "P0", "P1", "P2", "P3")
+
+
+def manifest_where(cfg, wave):
+    """`state.py where` of the wave's superarmanda manifest (never parsed here): None when there is
+    no manifest yet, {"error": ...} when it cannot be read, else the printed JSON object. Cached by
+    (mtime, size) and not recomputed within MANIFEST_POLL_SECONDS."""
+    path = cfg["run_dir"] / wave / "superarmanda" / "manifest.json"
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    sig, now = (stat.st_mtime_ns, stat.st_size), time.monotonic()
+    hit = MANIFEST_CACHE.get(path)
+    if hit and (hit[0] == sig or now - hit[1] < MANIFEST_POLL_SECONDS):
+        return hit[2]
+    try:
+        proc = subprocess.run([sys.executable, str(STATE_PY), "where", "--manifest", str(path)],
+                              capture_output=True, text=True, encoding="utf-8", timeout=WHERE_TIMEOUT)
+        if proc.returncode != 0:
+            raise ValueError((proc.stderr or proc.stdout).strip().splitlines()[-1:] or ["rc " + str(proc.returncode)])
+        result = json.loads(proc.stdout)
+        if not isinstance(result, dict):
+            raise ValueError("where: not an object")
+    except subprocess.TimeoutExpired:
+        result = {"error": f"state.py where: таймаут {WHERE_TIMEOUT} с"}
+    except (OSError, ValueError) as e:
+        result = {"error": str(e.args[0] if e.args and isinstance(e.args[0], list) else e)[:150]}
+    MANIFEST_CACHE[path] = (sig, now, result)
+    return result
+
+
+def finding_counts(artifact):
+    """{severity: n} of a local findings JSON (`findings[].severity|priority`), None when it is a
+    URL, unreadable or not in that shape: shown as «?»."""
+    try:
+        if not isinstance(artifact, str) or "://" in artifact:
+            return None
+        data = json.loads(pathlib.Path(artifact).read_text(encoding="utf-8"))
+        items = data["findings"] if isinstance(data, dict) else data
+        counts = {}
+        for item in items:
+            sev = str(item.get("severity") or item.get("priority")).strip()
+            sev = sev.lower() if sev.lower() in SEVERITIES else sev.upper()
+            counts[sev] = counts.get(sev, 0) + 1
+        return counts
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def wave_pr(w):
+    merged = w.get("merged")
+    for v in (w.get("pr"), w.get("gate_pr"), merged.get("pr") if isinstance(merged, dict) else None):
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+    return None
+
+
+def manifest_lines(cfg, wave, w):
+    """The superarmanda block of the current panel; never raises on a manifest it cannot read."""
+    where = manifest_where(cfg, wave)
+    head = Text("superarmanda  ", style="bold")
+    if where is None:
+        return [head.append("manifest ещё нет", style="grey50")]
+    if where.get("error"):
+        return [head.append(f"manifest: {where['error']}", style="yellow")]
+    head.append(f"{where.get('task')} ", style="cyan").append(f"[{where.get('task_status')}]  ", style="grey62")
+    head.append(f"шаг {where.get('step')} ({where.get('role')})", style="bright_green")
+    fr = where.get("fix_round") if isinstance(where.get("fix_round"), dict) else {}
+    srcs = "  ".join(f"{k} {v}" for k, v in fr.items() if k != "total")
+    head.append(f"   круг {srcs or '—'}  total {fr.get('total', '—')}", style="yellow")
+    verdicts = where.get("verdicts") if isinstance(where.get("verdicts"), dict) else {}
+    roles = [*VERDICT_ROLES, *(r for r in verdicts if r not in VERDICT_ROLES)]
+    vt = Text("вердикты  ", style="bold")
+    for r in roles:
+        v = verdicts.get(r)
+        vt.append(f"{r}: ", style="grey62").append(f"{v or '—'}  ", style="green" if v == "pass" else "yellow" if v else "grey50")
+    open_f = [f for f in where.get("open_findings") or [] if isinstance(f, dict)]
+    ft = Text("находки  ", style="bold")
+    if not open_f:
+        ft.append("нет открытых", style="green")
+    for f in open_f:
+        counts = finding_counts(f.get("artifact"))
+        label = "?" if counts is None else (", ".join(f"{k} {n}" for k, n in sorted(
+            counts.items(), key=lambda kv: SEVERITIES.index(kv[0]) if kv[0] in SEVERITIES else 99)) or "0")
+        ft.append(f"{f.get('role')} {f.get('status')}: {label}  ", style="red")
+    pr = wave_pr(w)
+    codex = verdicts.get("github_codex_review") or "нет результата"
+    pt = Text("PR  ", style="bold").append(f"#{pr}" if pr is not None else "—", style="cyan")
+    pt.append(f"   Codex: {codex}", style="grey78")
+    lines = [head, vt, ft, pt]
+    if where.get("decision_required_for"):
+        lines.append(Text(f"нужно решение: {where['decision_required_for']}", style="bold red"))
+    nxt = str(where.get("next_action") or "")
+    lines.append(Text("дальше  ", style="bold").append(nxt if len(nxt) <= 110 else nxt[:109] + "…", style="grey78"))
+    return lines
 
 
 def current_panel(cfg, st):
@@ -322,7 +386,11 @@ def current_panel(cfg, st):
                 Text("История  ", style="bold").append(spark(w.get("ctx_hist", []), cfg["ctx_limit"])))
     lines = [l for l in wab.pane_text(w["tmux"]).splitlines() if l.strip()][-14:]
     screen = Text("\n".join(l[:150] for l in lines), style="grey78")
-    return Panel(Group(head, Text(), ctx, Text(), Panel(screen, title="экран волны (live)",
+    try:
+        block = manifest_lines(cfg, wave, w)
+    except Exception as e:  # noqa: BLE001 - a block of the frame, not the frame
+        block = [Text(f"manifest: {type(e).__name__}: {e}", style="yellow")]
+    return Panel(Group(head, Text(), ctx, Text(), *block, Text(), Panel(screen, title="экран волны (live)",
                                                          border_style="grey35", box=box.ROUNDED)),
                  title=f"⚙ Текущая волна {wave}", border_style="magenta")
 

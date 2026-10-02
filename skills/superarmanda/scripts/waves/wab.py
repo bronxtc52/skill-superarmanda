@@ -2145,6 +2145,7 @@ def handoff_gate_line(cfg, wave, w):
         if v["verdict"] != "pass":
             return f"Гейт мерджа {'ждёт' if v['verdict'] == 'wait' else 'не пройден'}: {reasons}"
         number, sha = v["number"], v["head"]
+        w["pr"] = number
         w["gate_sha"], w["gate_pr"] = sha, number  # saved with the hand-off: `owner-merge` gates against them
         if v["unresolved"]:
             path = write_owner_script(cfg, wave, sha)
@@ -2463,6 +2464,8 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         if head != sha:
             return _merge_stopped(cfg, st, wave, w, wdir,
                                   f"PR #{number} смержен с HEAD {str(head)[:12]}, а гейт проверял {sha[:12]}", now)
+        w["merged"] = {"pr": number, "sha": sha, "commit": (info.get("mergeCommit") or {}).get("oid"),
+                       "at": now}
         return _complete_wave(cfg, st, wave, w, wdir, now)
     if state == "CLOSED":
         return _merge_stopped(cfg, st, wave, w, wdir, f"PR #{number} закрыт без мерджа", now)
@@ -2515,6 +2518,8 @@ def _alarm_tick(cfg, st, wave, w, now):
             save_state(cfg, st)
             return
         head = pr["headRefOid"]
+        if isinstance(pr.get("number"), int):
+            w["pr"] = pr["number"]
         facts = gate_facts(cfg, pr)
     except gate.CollectError as e:
         if once_per(w, "alarm_error", str(e)[:150]):
@@ -2568,6 +2573,151 @@ def _send_alarm(cfg, st, wave, w):
     save_state(cfg, st)
 
 
+def wave_attempts(w):
+    """The earlier tries of a wave (`attempts`, archived by a restart), oldest first; a corrupt
+    list or a non-object entry is skipped, not a crashed frame."""
+    attempts = w.get("attempts")
+    return [a for a in attempts if isinstance(a, dict)] if isinstance(attempts, list) else []
+
+
+def num(x):
+    """A finite real number from state.json, else None (a bool, a string, NaN or inf is not one)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    try:
+        return x if math.isfinite(x) else None
+    except OverflowError:  # an int too big for a float (10**400) is not a number either
+        return None
+
+
+def wave_duration(w, now):
+    """The wave's working time: the current try (until `finished`, else now) plus each earlier
+    try. An earlier try ran until its own `finished`; one without it (dead, stopped) ran until the
+    nearest later known start among all the records (earlier tries and the current one) - the
+    restart that archived it, whatever the list order. A try whose start or end is unknown, or
+    whose end is before its start, adds nothing."""
+    recs = [*wave_attempts(w), w]
+    starts = [s for s in (num(r.get("started")) for r in recs) if s is not None]
+    total = 0.0
+    for rec in recs:
+        start = num(rec.get("started"))
+        if start is None:
+            continue
+        end = num(rec.get("finished"))
+        if end is None:
+            if rec is w:
+                end = now
+            else:
+                end = min((s for s in starts if s > start), default=None)
+        if end is not None and end > start:
+            total += end - start
+    return total
+
+
+def wave_restarts(w):
+    """Checkpoint restarts (fresh heads) over all tries of the wave; a corrupt counter (not a
+    non-negative int) adds nothing."""
+    return sum(n for n in (r.get("restarts") for r in [w, *wave_attempts(w)])
+               if isinstance(n, int) and not isinstance(n, bool) and n > 0)
+
+
+QUESTIONS_CAP = 50  # BLOCKED questions kept per wave
+
+
+def _utc(ts):
+    ts = num(ts)
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + "Z" if ts is not None else "?"
+
+
+def _human_dur(sec):
+    sec = int(sec)
+    h, m = divmod(sec // 60, 60)
+    return f"{h}ч{m:02d}м" if h else f"{m}м{sec % 60:02d}с"
+
+
+def _wave_pr(w):
+    for v in (w.get("pr"), w.get("gate_pr"), (w.get("merged") or {}).get("pr")
+              if isinstance(w.get("merged"), dict) else None):
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+    return None
+
+
+def write_chain_result(cfg, st):
+    """Write `<run_dir>/chain-result.md` (atomically) and return (path, short summary for the
+    end-of-chain message). Read-only over the state; nothing leaves the machine from here."""
+    now = time.time()
+    repo = cfg.get("repo")
+    rows, questions, prs = [], [], 0
+    restarts_heads = restarts_waves = 0
+    starts, ends, total = [], [], 0.0
+    for wave in cfg["waves"]:
+        w = st.get("waves", {}).get(wave)
+        if not isinstance(w, dict):
+            rows.append(f"### {wave}\n\n- итог: не запускалась\n")
+            continue
+        recs = [w, *wave_attempts(w)]
+        starts += [s for s in (num(r.get("started")) for r in recs) if s is not None]
+        fin = num(w.get("finished")) or (now if w.get("phase") == "done" else None)
+        ends += [fin] if fin is not None else []
+        dur = wave_duration(w, fin or now)
+        total += dur
+        heads, retries = wave_restarts(w), len(wave_attempts(w))
+        restarts_heads += heads
+        restarts_waves += retries
+        pr = _wave_pr(w)
+        prs += pr is not None
+        pr_text = "нет" if pr is None else (f"[#{pr}](https://github.com/{repo}/pull/{pr})" if repo else f"#{pr}")
+        merged = w.get("merged")
+        if isinstance(merged, dict):
+            sha = merged.get("commit") or merged.get("sha") or ""
+            merge_text = f"смержен ({str(sha)[:12]})" if sha else "смержен"
+        elif w.get("phase") == "done":
+            merge_text = "смержен координатором"
+        else:
+            merge_text = "нет"
+        qs = [q for q in w.get("questions") or [] if isinstance(q, dict)]
+        questions += [(wave, q) for q in qs]
+        rows.append(
+            f"### {wave}\n\n- итог: {w.get('phase') or '?'}\n- PR: {pr_text}\n- мердж: {merge_text}\n"
+            f"- перезапуски: свежих голов {heads}, перезапусков волны {retries}\n"
+            f"- вопросов владельцу: {len(qs)}\n- Время: {_human_dur(dur)}\n")
+    span = f"{_utc(min(starts))} - {_utc(max(ends))}" if starts and ends else "?"
+    lines = [f"# Итог цепочки {cfg.get('chain')}\n", f"- run: {cfg.get('run_id')}",
+             f"- начало / конец (UTC): {span}", f"- Время общее: {_human_dur(total)}",
+             f"- волн: {len(cfg['waves'])}, PR: {prs}, перезапусков голов: {restarts_heads}, "
+             f"перезапусков волн: {restarts_waves}, вопросов: {len(questions)}\n", "## Волны\n", *rows,
+             "## Вопросы к владельцу\n"]
+    lines += ([f"- {_utc(q.get('at'))} {wave}: {redact(str(q.get('text') or ''), 300)}"
+               for wave, q in questions] or ["нет"])
+    path = cfg["run_dir"] / "chain-result.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".chain-result.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    summary = (f"волн {len(cfg['waves'])}, PR {prs}, перезапусков {restarts_heads}+{restarts_waves}, "
+               f"вопросов {len(questions)}, время {_human_dur(total)}")
+    return path, summary
+
+
+def chain_done_text(cfg, st):
+    """The end-of-chain message: the short summary and the path of chain-result.md. A failed write
+    costs the file, never the message or the watch."""
+    try:
+        path, summary = write_chain_result(cfg, st)
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        return f"wave-autobot: цепочка завершена, все волны готовы (chain-result.md не записан: {e})."
+    return f"wave-autobot: цепочка завершена, все волны готовы.\n{summary}\nИтог: {path}"
+
+
 def _complete_wave(cfg, st, wave, w, wdir, now):
     """The wave's PR is in (merged, or there is nothing to merge): done, window closed, then the
     chain ends (last wave) or the next wave is launched by the dispatcher. True: the watch goes on."""
@@ -2585,7 +2735,7 @@ def _complete_wave(cfg, st, wave, w, wdir, now):
     last = idx + 1 >= len(waves)
     if last:  # the end of the chain goes into the same save as the mark
         st["current"] = None
-        put_notice(w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
+        put_notice(w, "chain_done", "1", chain_done_text(cfg, st))
     save_state(cfg, st)
     if fresh:
         event(cfg, f"{wave}: DONE")
@@ -2734,6 +2884,9 @@ def _tick(cfg, st):
     if status.startswith("BLOCKED"):
         fresh = once_per(w, "blocked", status)
         if fresh:
+            qs = w.setdefault("questions", [])
+            qs.append({"at": now, "text": redact(status, 300)})
+            del qs[:-QUESTIONS_CAP]
             put_notice(w, "blocked", status,
                        f"wave-autobot: волна {wave} ждёт тебя.\n\n{redact(status)}\n\nОтветить: {attach}")
         save_state(cfg, st)
@@ -3137,7 +3290,7 @@ def done_cmd(cfg, wave=None):
             ack_wave_notices(w)  # confirmed by this call; chain_done below must still get through
             if st.get("current") == wave:
                 st["current"] = None
-            put_notice(w, "chain_done", "1", "wave-autobot: цепочка завершена, все волны готовы.")
+            put_notice(w, "chain_done", "1", chain_done_text(cfg, st))
             save_state(cfg, st)  # the phase and the notice together: a repeated `done` still owes it
             event(cfg, "chain finished")
             flush_notices(cfg, st, w)
