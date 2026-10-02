@@ -5,6 +5,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import uuid
 import os
 import re
 import stat
@@ -1040,6 +1041,9 @@ def result(args):
         "packet_hash": args.packet_hash,
         "tree_fingerprint": data["tree_fingerprint"],
         "recorded_at": now(),
+        # unique per recorded result: a byte-identical rerun (same session, same second)
+        # is still another result, and a deferral covers exactly one (#36 п.3)
+        "result_id": uuid.uuid4().hex,
     }
     update_task_status(entry)
     data["updated_at"] = now()

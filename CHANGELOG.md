@@ -13,7 +13,7 @@
   `decisions`. Только для `cross_provider_reviewer`, `github_codex_review`, `coderabbit` (tester —
   нет) и только на результате `findings` текущего head; не в `blocked`/`needs_decision`. Готовность
   задачи и гейт диспетчера (одна функция `state.is_deferred`) засчитывают `findings`, только если
-  deferral привязан ровно к этому результату (sha256 его записи) и его head;
+  deferral привязан ровно к этому результату (sha256 его записи с уникальным `result_id`) и его head;
   `where` показывает счётчик `deferred`.
   ([#36](https://github.com/bronxtc52/skill-superarmanda/issues/36), п. 3)
 

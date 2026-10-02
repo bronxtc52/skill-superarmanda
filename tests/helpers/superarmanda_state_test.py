@@ -2123,14 +2123,18 @@ class StateContract(unittest.TestCase):
         entry = self.manifest_data()["tasks"]["implement"]
         self.assertEqual(entry["status"], "in_progress")
 
-    def test_deferral_older_than_a_rerun_result_on_same_head_does_not_cover_it(self):
+    def test_deferral_does_not_cover_an_identical_rerun_on_same_head_and_second(self):
+        # no sleep: the rerun lands in the same second with the same session and arguments
         self.record("coder", session="coder-1")
         self.record("tester", session="tester-1")
         self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        first = self.manifest_data()["tasks"]["implement"]["results"]["cross_provider_reviewer"]
         self.defer()
-        time.sleep(1.1)
         self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
         entry = self.manifest_data()["tasks"]["implement"]
+        rerun = entry["results"]["cross_provider_reviewer"]
+        self.assertRegex(rerun["result_id"], r"^[0-9a-f]{32}$")
+        self.assertNotEqual(rerun["result_id"], first["result_id"])
         self.assertEqual(entry["status"], "in_progress")
 
     def test_three_deferred_findings_in_a_row_do_not_block(self):
@@ -3449,6 +3453,11 @@ class DeferralIdentity(unittest.TestCase):  # #36 п.3: a deferral covers one ex
         self.assertFalse(st.is_deferred(entry, "tester", dict(first)))  # tester is never deferred
         moved = dict(first, head="b" * 40)
         self.assertFalse(st.is_deferred(entry, "cross_provider_reviewer", moved))
+        # a byte-identical rerun differs only by its result_id, and that is enough
+        a, b = dict(first, result_id="1" * 32), dict(first, result_id="2" * 32)
+        entry["deferrals"][0]["result_sha256"] = st.result_digest(a)
+        self.assertTrue(st.is_deferred(entry, "cross_provider_reviewer", a))
+        self.assertFalse(st.is_deferred(entry, "cross_provider_reviewer", b))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
