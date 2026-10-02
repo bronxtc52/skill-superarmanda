@@ -2522,6 +2522,14 @@ def owner_handover(cfg, wave, run_id):
         if not base:
             raise SystemExit(f"wab: {what}: the base branch is unknown (base_branch in chain.json); nothing done")
         git = lambda *a: sh("git", "-C", str(cwd), *a, check=False, timeout=GIT_TIMEOUT)
+        # the next launch refreshes this working copy and refuses a dirty tree: refuse it here, before
+        # the hand-off, not after (the same check as refresh_workdir)
+        dirty = git("status", "--porcelain")
+        if dirty.returncode != 0:
+            raise SystemExit(f"wab: {what}: git status failed in {cwd}: {_one_line(dirty.stderr, 200)}; nothing done")
+        if dirty.stdout.strip():
+            raise SystemExit(f"wab: {what}: the wave's working copy {cwd} is not clean (uncommitted or untracked "
+                             f"changes: not what was merged); commit or remove them; nothing done")
         fetch = git("fetch", "origin", base)
         if fetch.returncode != 0:
             raise SystemExit(f"wab: {what}: git fetch origin {base} failed: "

@@ -9616,6 +9616,16 @@ class OwnerHandover(GateBase):  # #36 п.2: the owner merged the wave's PR himse
         nxt.write_text("   \n", encoding="utf-8")
         self.refused("next-prompt.md of W1 is not usable for W2")
 
+    def test_refused_when_the_wave_tree_is_dirty(self):
+        Path(self.cwd, "a.txt").write_text("edited after the merge\n", encoding="utf-8")
+        self.refused("is not clean")
+        self.git("checkout", "--", "a.txt")
+        Path(self.cwd, "new.txt").write_text("untracked\n", encoding="utf-8")
+        self.refused("is not clean")
+        Path(self.cwd, "new.txt").unlink()
+        self.run_it()  # clean again: handed over
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+
     def test_last_wave_needs_no_next_prompt(self):
         self.start(waves=["W1"])
         (self.cfg["run_dir"] / "W1" / "next-prompt.md").unlink(missing_ok=True)
