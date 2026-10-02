@@ -882,10 +882,20 @@ def init(args):
     if path.exists():
         fail("manifest already exists")
     location = repo(args.repo)
+    if args.expect_sha256 is not None:
+        if args.from_plan is None:
+            fail("--expect-sha256 requires --from-plan")
+        if not re.fullmatch(r"[0-9a-f]{64}", args.expect_sha256):
+            fail("--expect-sha256 must be 64 lowercase hex characters")
     base, head = validate_revision_pair(location, args.base, args.head)
     plan = wave_copy = None
     if args.from_plan is not None:
         plan, wave_copy = load_plan(args.from_plan)
+        if args.expect_sha256 is not None and plan["sha256"] != args.expect_sha256:
+            fail(
+                f"plan sha256 {plan['sha256']} != expected {args.expect_sha256}: "
+                "plan changed since approval"
+            )
     data = {
         "version": 1,
         "run_id": args.run_id,
@@ -1328,6 +1338,7 @@ def parser():
     q.add_argument("--head", required=True)
     q.add_argument("--run-id", default=None)
     q.add_argument("--from-plan", default=None)
+    q.add_argument("--expect-sha256", default=None)
     q.set_defaults(func=init)
     q = sub.add_parser("status", parents=[common])
     q.set_defaults(func=status)

@@ -98,6 +98,8 @@ sys.path.insert(0, str(WAVES))
 import wab  # noqa: E402
 
 REAL_SH = wab.sh
+REAL_FIND_PR = wab.find_pr
+OWN_HEAD = {"headRepositoryOwner": {"login": "o"}, "headRepository": {"name": "r"}}  # PR from the chain repo "o/r"
 CHAIN = "demo"
 RUN_ID = "2026-10-01"
 
@@ -146,16 +148,28 @@ class Base(unittest.TestCase):
         self.tmux_calls = []
         self.sent = []  # (kind, name, text)
         self.alive = True
+        self.kill_closes = True  # a mocked `tmux kill-session` really closes the session
         self.pane = ""
         self.ready = True
         self.tg = []
         self.cwd = str(self.tmp / "clone")
         Path(self.cwd).mkdir()
 
+        self.gh_calls = []
+        self.gh_real = False  # gh_shim() puts a fake `gh` into PATH: then the real subprocess call runs it
+        self.gh_handler = None  # args -> CompletedProcess; without it every `gh` fails, never the network
+
         def fake_sh(*args, **kw):
             if args and args[0] == "tmux":
                 self.tmux_calls.append(args)
+                if args[1:2] == ("kill-session",) and self.kill_closes:
+                    self.alive = False
                 return subprocess.CompletedProcess(args, 0, "", "")
+            if args and args[0] == "gh" and not self.gh_real:
+                self.gh_calls.append(args)
+                if self.gh_handler:
+                    return self.gh_handler(args)
+                return subprocess.CompletedProcess(args, 1, "", "gh is not available in tests")
             return REAL_SH(*args, **kw)
 
         def patch(name, **kw):
@@ -172,8 +186,8 @@ class Base(unittest.TestCase):
         patch("press_enter", side_effect=lambda n: self.enters.append(n))
         patch("wait_ready", side_effect=lambda name, timeout=90: self.ready)
         patch("require_tmux")
-        # the auto-merge branch is W5; legacy launch tests exercise it, the fail-closed ones turn it off
-        patch("MERGE_GATE_IMPLEMENTED", new=True, create=True)
+        # nothing may reach GitHub: no PR is known unless a test sets one (see MergeGateBase)
+        patch("find_pr", return_value=None)
         patch("_send_telegram", side_effect=lambda cfg, text: self.tg.append(text))
         sleeper = mock.patch("time.sleep")
         sleeper.start()
@@ -232,6 +246,23 @@ class Base(unittest.TestCase):
 
     def messages(self):
         return [t for t in self.tg]
+
+    # ----- merge_gate "auto": a wave whose PR is already MERGED at the sha the gate passed -----
+    def merged_view(self, args):
+        if args[:3] == ("gh", "pr", "view"):
+            doc = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": "c" * 40, "baseRefName": "main"}
+            return subprocess.CompletedProcess(args, 0, json.dumps(doc), "")
+        return subprocess.CompletedProcess(args, 1, "", "unexpected gh call in tests")
+
+    def auto_chain(self, **over):
+        """chain.json with merge_gate "auto" and a `gh` that reports every PR MERGED."""
+        cfg, path = self.chain(**{"merge_gate": "auto", "base_branch": "main", **over})
+        self.gh_handler = self.merged_view
+        return cfg, path
+
+    def auto_rec(self, name="W1", **kw):
+        """A wave record in phase `merging`: the gate passed at sha c*40 for PR #7."""
+        return self.wave_rec(name, phase="merging", gate_pr=7, gate_sha="c" * 40, **kw)
 
 
 # ---------------------------------------------------------------- A1
@@ -487,9 +518,9 @@ class Supervision(Base):
         self.assertEqual(len(self.tg), 2)
 
     def test_done_with_dead_session_launches_the_next_wave(self):
-        cfg, _ = self.chain()
+        cfg, _ = self.auto_chain()
         self.alive = False
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "result.md").write_text("PR #1\n", encoding="utf-8")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
@@ -500,8 +531,8 @@ class Supervision(Base):
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "done")
 
     def test_done_is_not_notified_twice_when_watch_restarts_before_the_next_launch(self):
-        cfg, _ = self.chain()
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        cfg, _ = self.auto_chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         with mock.patch.object(wab, "launch", side_effect=KeyboardInterrupt):
@@ -978,6 +1009,8 @@ class WaveOwnsStatus(Base):
         return ln
 
     def test_done_after_a_crashed_transition_is_done(self):
+        cfg, _ = self.auto_chain()  # same chain.json, now with the gate: the PR is merged already
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(self.cfg, "W1", "DONE")
         ln = self.restart()
         self.assertEqual(self.status(), "DONE")
@@ -1098,8 +1131,8 @@ class LaunchIntent(Base):
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
 
     def test_previous_wave_is_saved_done_before_the_next_launch(self):
-        cfg, _ = self.chain()
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        cfg, _ = self.auto_chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         seen = {}
@@ -1383,10 +1416,10 @@ class LaunchGuard(Base):
                 self.assertEqual(w["attempts"][0]["phase"], phase)
 
     def test_failed_next_launch_is_reported_with_its_reason(self):
-        cfg, path = self.chain()
+        cfg, path = self.auto_chain()
         self.alive = False
         self.ready = False
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
@@ -1693,8 +1726,8 @@ class TwoStepSend(Base):
         self.assertEqual((self.w(cfg)["phase"], self.w(cfg)["restarts"]), ("running", 1))
 
     def test_watch_exits_nonzero_when_the_next_wave_does_not_reach_running(self):
-        cfg, path = self.chain()
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        cfg, path = self.auto_chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         calls = {"wv-w2": 0}
@@ -2530,12 +2563,12 @@ class Mandate(Base):
 
 class ChainConfig(Base):
     def test_unknown_merge_gate_fails_closed(self):
-        for bad in ("externl", "EXTERNAL", "auto", 1, True):
+        for bad in ("externl", "EXTERNAL", "Auto", 1, True):
             with self.subTest(bad=bad):
                 with self.assertRaises(SystemExit) as ctx:
                     self.chain(merge_gate=bad)
                 self.assertIn("merge_gate", str(ctx.exception))
-        for ok in (None, "", "external"):
+        for ok in (None, "", "external", "auto"):
             with self.subTest(ok=ok):
                 self.chain(merge_gate=ok)
 
@@ -2706,52 +2739,49 @@ class W4Round20(Base):
         for line in lines:
             self.assertNotRegex(line, r"(^|\s)-[LS]\s")
 
-    def test_without_merge_gate_done_hands_off_until_w5_exists(self):
+    def test_without_merge_gate_done_hands_off_to_the_coordinator(self):
         cfg, path = self.chain()
         self.alive = False
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "DONE")
         nxt = wab.wave_dir(cfg, "W1") / "next-prompt.md"
         nxt.write_text("go\n", encoding="utf-8")
-        with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", False, create=True), \
-                mock.patch.object(wab, "launch") as launch, mock.patch.object(wab, "drop_stale_btab"):
+        with mock.patch.object(wab, "launch") as launch, mock.patch.object(wab, "drop_stale_btab"):
             wab.watch(cfg, path, max_ticks=5)
         launch.assert_not_called()
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
         log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
-        self.assertIn("merge gate not implemented yet (W5); handing off to coordinator", log)
+        self.assertIn("no merge_gate: handing off to coordinator", log)
         self.assertIn(f"wab.py launch {path.resolve()} W2 {nxt}", log)
 
     def test_last_wave_without_merge_gate_finishes_as_before(self):
         cfg, _ = self.chain(waves=["W1"])
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "DONE")
-        with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", False, create=True):
-            self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
         self.assertIsNone(self.get_state(cfg)["current"])
         self.assertIn("chain finished", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
     def test_external_done_without_next_prompt_stops_loudly(self):
-        for gate, impl in (("external", True), (None, False)):
+        for gate in ("external", None):
             with self.subTest(gate=gate):
                 self.tg.clear()
                 cfg, path = self.chain(merge_gate=gate)
                 (cfg["run_dir"] / "events.log").unlink(missing_ok=True)  # shared run dir between subtests
                 self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
                 self.set_status(cfg, "W1", "DONE")
-                with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", impl, create=True):
-                    self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
-                    self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
-                    log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
-                    self.assertEqual(log.count("W1: DONE without next-prompt.md; chain stopped"), 1)
-                    self.assertNotIn("handed to the coordinator", log)
-                    self.assertEqual(len([t for t in self.tg if "next-prompt.md" in t]), 1)
-                    with mock.patch.object(wab, "time") as t, mock.patch.object(wab, "drop_stale_btab"), \
-                            contextlib.redirect_stderr(io.StringIO()):
-                        t.time.return_value = 0.0
-                        with self.assertRaises(SystemExit) as ctx:
-                            wab.main(["wab.py", "watch", str(path)])
-                    self.assertEqual(ctx.exception.code, 3)
+                self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+                self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+                log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+                self.assertEqual(log.count("W1: DONE without next-prompt.md; chain stopped"), 1)
+                self.assertNotIn("handed to the coordinator", log)
+                self.assertEqual(len([t for t in self.tg if "next-prompt.md" in t]), 1)
+                with mock.patch.object(wab, "time") as t, mock.patch.object(wab, "drop_stale_btab"), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    t.time.return_value = 0.0
+                    with self.assertRaises(SystemExit) as ctx:
+                        wab.main(["wab.py", "watch", str(path)])
+                self.assertEqual(ctx.exception.code, 3)
 
     def test_enabled_telegram_needs_all_three_fields_as_strings(self):
         full = {"keyvault": "kv", "token_secret": "t", "chat_secret": "c"}
@@ -2895,8 +2925,7 @@ class W4Round23Notices(Base):
         self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(self.cfg, "W1", "DONE")
         (wab.wave_dir(self.cfg, "W1") / "result.md").write_text("r\n", encoding="utf-8")
-        with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", False):
-            self.tick()  # chain stops: current is None afterwards
+        self.tick()  # chain stops: current is None afterwards
         self.assertIn("no_next", self.rec().get("outbox", {}))
         self.down = False
         self.due()
@@ -2932,10 +2961,10 @@ class W4Round24(Base):
 
     # ----- 1: a notice flush must not roll the state back after launch -----
     def test_flush_after_launch_keeps_the_new_current_and_record(self):
-        cfg, _ = self.chain()
+        cfg, _ = self.auto_chain()
         self.alive = False
         old = {"value": "x", "text": "old notice", "next_at": 0}
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(outbox={"no_next": old})}})
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec(outbox={"no_next": old})}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         self.down = True
@@ -3101,6 +3130,7 @@ class W4Round24(Base):
         p = mock.patch.dict(os.environ, {"PATH": f"{d}{os.pathsep}{os.environ['PATH']}"})
         p.start()
         self.addCleanup(p.stop)
+        self.gh_real = True
 
     def wave1_branch(self, clone):
         self.git(clone, "checkout", "-q", "-b", "wave-1")
@@ -3617,8 +3647,8 @@ class W4Round28(Base):
         self.assertEqual(self.count("не запускаю"), 1, self.tg)
 
     def test_tick_done_before_the_next_launch(self):
-        cfg, path = self.chain()
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        cfg, path = self.auto_chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("done") == "1"
@@ -5083,17 +5113,16 @@ class W4Round32NextPrompt(Base):
     coordinator's launch will accept (read_prompt); an unusable one stops like a missing one."""
 
     def test_unusable_next_prompt_is_not_handed_over(self):
-        for gate, impl in (("external", True), (None, False), (None, True)):
+        for gate in ("external", None):
             for content in (b"", b"  \n\t", b"\xff\xfe bad", "\u200b\u3164".encode()):
-                with self.subTest(gate=gate, impl=impl, content=content):
+                with self.subTest(gate=gate, content=content):
                     self.tg.clear()
                     cfg, _ = self.chain(merge_gate=gate)
                     (cfg["run_dir"] / "events.log").unlink(missing_ok=True)
                     self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
                     self.set_status(cfg, "W1", "DONE")
                     (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_bytes(content)
-                    with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", impl, create=True), \
-                            mock.patch.object(wab, "launch") as launch:
+                    with mock.patch.object(wab, "launch") as launch:
                         self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
                     launch.assert_not_called()
                     st = self.get_state(cfg)
@@ -5492,31 +5521,34 @@ class W4Round34(Base):
 
     # ----- invariant: every terminal transition ends with the window closed -----
     def test_every_terminal_transition_closes_the_window(self):
-        cases = [  # (name, merge_gate, gate implemented, waves, next-prompt.md, then)
-            ("awaiting_merge, next wave", "external", True, ["W1", "W2"], b"go\n", None),
-            ("awaiting_merge, last wave + done", "external", True, ["W1"], None, "done"),
-            ("external, no next-prompt", "external", True, ["W1", "W2"], None, None),
-            ("external, unusable next-prompt", "external", True, ["W1", "W2"], b" \n", None),
-            ("no gate yet, no next-prompt", None, False, ["W1", "W2"], None, None),
-            ("no gate yet, last wave + done", None, False, ["W1"], None, "done"),
-            ("internal, last wave", None, True, ["W1"], None, None),
-            ("internal, no next-prompt", None, True, ["W1", "W2"], None, None),
-            ("internal, unusable next-prompt", None, True, ["W1", "W2"], b"\xff", None),
-            ("internal, next launched by the dispatcher", None, True, ["W1", "W2"], b"go\n", "launch"),
+        cases = [  # (name, merge_gate, "auto" = the PR is merged already, waves, next-prompt.md, then)
+            ("awaiting_merge, next wave", "external", False, ["W1", "W2"], b"go\n", None),
+            ("awaiting_merge, last wave + done", "external", False, ["W1"], None, "done"),
+            ("external, no next-prompt", "external", False, ["W1", "W2"], None, None),
+            ("external, unusable next-prompt", "external", False, ["W1", "W2"], b" \n", None),
+            ("no gate, next wave handed over", None, False, ["W1", "W2"], b"go\n", None),
+            ("no gate, no next-prompt", None, False, ["W1", "W2"], None, None),
+            ("no gate, last wave + done", None, False, ["W1"], None, "done"),
+            ("no gate, unusable next-prompt", None, False, ["W1", "W2"], b"\xff", None),
+            ("auto, merged, last wave", "auto", True, ["W1"], None, None),
+            ("auto, merged, no next-prompt", "auto", True, ["W1", "W2"], None, None),
+            ("auto, merged, unusable next-prompt", "auto", True, ["W1", "W2"], b"\xff", None),
+            ("auto, merged, next launched by the dispatcher", "auto", True, ["W1", "W2"], b"go\n", "launch"),
         ]
-        for name, gate, impl, waves, nxt, then in cases:
+        for name, gate, merged, waves, nxt, then in cases:
             with self.subTest(case=name):
                 self.windows = {"wv-w1"}
                 self.tmux_calls.clear()
-                cfg, path = self.chain(merge_gate=gate, waves=waves)
-                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                cfg, path = self.chain(merge_gate=gate, waves=waves, base_branch="main")
+                self.gh_handler = self.merged_view if merged else None
+                self.put_state(cfg, {"current": "W1", "waves": {
+                    "W1": self.auto_rec() if merged else self.wave_rec()}})
                 self.set_status(cfg, "W1", "DONE")
                 p = wab.wave_dir(cfg, "W1") / "next-prompt.md"
                 p.unlink(missing_ok=True)
                 if nxt is not None:
                     p.write_bytes(nxt)
-                with mock.patch.object(wab, "MERGE_GATE_IMPLEMENTED", impl, create=True), \
-                        mock.patch.object(wab, "launch", return_value=True):
+                with mock.patch.object(wab, "launch", return_value=True):
                     wab.tick(cfg, wab.load_state(cfg))
                     if then == "done":
                         wab.done_cmd(cfg)
@@ -5555,8 +5587,8 @@ class W4Round34(Base):
     # ----- 6: a refused launch inside the dispatcher's tick -----
     def test_dispatcher_launch_refusal_is_an_event_and_a_notice(self):
         wd = self.repo()
-        cfg, path = self.chain(workdir=str(wd), base_branch="main")
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(cwd=str(wd))}})
+        cfg, path = self.auto_chain(workdir=str(wd), base_branch="main")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec(cwd=str(wd))}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
         self.exit_closes = False  # the previous wave's window will not close: launch refuses
@@ -6534,12 +6566,2594 @@ class W4Round45DashHeaderAttemptStart(Base):
         self.assertIn(f"в работе {dash.fmt_dur(100)}", self.header_text(dash, cfg, st, now))
 
 
+class PlanPin(Base):
+    """T1: chain.json plan_sha256 pins the approved waves.json before every wave launch."""
+
+    def setUp(self):
+        super().setUp()
+        self.alive = False
+        self.prompt = self.tmp / "p.md"
+        self.prompt.write_text("go\n", encoding="utf-8")
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+        self.plan_bytes = b'{"waves": []}\n'
+        self.pin = hashlib.sha256(self.plan_bytes).hexdigest()
+
+    def pinned(self, write=True, **over):
+        cfg, path = self.chain(plan_sha256=self.pin, **over)
+        if write:
+            (cfg["run_dir"] / "waves.json").write_bytes(self.plan_bytes)
+        return cfg, path
+
+    def attempt(self, cfg, wave="W1"):
+        self.tmux_calls.clear()
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd) as pc:
+            self.prepare = pc
+            return wab.launch(cfg, wave, self.prompt)
+
+    def refused(self, cfg):
+        with self.assertRaises(SystemExit) as cm:
+            self.attempt(cfg)
+        self.assertTrue(str(cm.exception).startswith("BLOCKED: plan changed since approval"),
+                        str(cm.exception))
+        self.assertFalse(self.prepare.called)
+        self.assertEqual([c for c in self.tmux_calls if c[1] == "new-session"], [])
+        st = wab.load_state(cfg)
+        self.assertNotEqual(st.get("waves", {}).get("W1", {}).get("phase"), "starting")
+        return str(cm.exception)
+
+    def test_matching_pin_launches(self):
+        cfg, _ = self.pinned()
+        self.assertTrue(self.attempt(cfg))
+        self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
+
+    def test_changed_plan_refuses_before_any_launch_step(self):
+        cfg, _ = self.pinned()
+        (cfg["run_dir"] / "waves.json").write_bytes(self.plan_bytes + b" ")
+        self.refused(cfg)
+
+    def test_deleted_plan_refuses(self):
+        cfg, _ = self.pinned(write=False)
+        self.refused(cfg)
+
+    def test_symlinked_or_non_regular_plan_refuses(self):
+        cfg, _ = self.pinned(write=False)
+        target = self.tmp / "real.json"
+        target.write_bytes(self.plan_bytes)
+        os.symlink(target, cfg["run_dir"] / "waves.json")
+        self.refused(cfg)
+        os.unlink(cfg["run_dir"] / "waves.json")
+        (cfg["run_dir"] / "waves.json").mkdir()
+        self.refused(cfg)
+
+    def test_oversized_plan_refuses(self):
+        cfg, _ = self.pinned(write=False)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"x" * (1024 * 1024 + 1))
+        self.refused(cfg)
+
+    def test_no_pin_does_not_read_waves_json(self):
+        cfg, _ = self.chain()
+        (cfg["run_dir"] / "waves.json").write_bytes(b"anything")
+        with mock.patch.object(wab.os, "open", wraps=os.open) as op:
+            self.assertTrue(self.attempt(cfg))
+        self.assertFalse([c for c in op.call_args_list if "waves.json" in str(c.args[0])])
+
+    def test_invalid_pin_is_refused_by_load_chain(self):
+        for bad in ("", None, 0, False, "A" * 64, "0" * 63, "g" * 64, 5):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as cm:
+                    self.chain(plan_sha256=bad) if bad is not None else \
+                        wab.load_chain(self.write_raw(plan_sha256=None))
+                self.assertIn("plan_sha256", str(cm.exception))
+
+    def write_raw(self, **over):
+        doc = {"chain": CHAIN, "run_id": RUN_ID, "repo": "o/r", "waves": ["W1", "W2"],
+               "tmux_prefix": "wv-", **over}
+        path = self.tmp / "raw-chain.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path
+
+    # ----- round 4/2: chain.json must live outside run_dir -----
+    def raw_at(self, where, **over):
+        doc = {"chain": CHAIN, "run_id": RUN_ID, "repo": "o/r", "waves": ["W1", "W2"],
+               "tmux_prefix": "wv-", **over}
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(json.dumps(doc), encoding="utf-8")
+        return where
+
+    def test_chain_json_inside_run_dir_is_refused(self):  # (a)
+        run = self.tmp / "base" / CHAIN / RUN_ID
+        for create in (True, False):
+            with self.subTest(create=create, where="run_dir itself"):
+                path = self.raw_at(run / "chain.json", run_dir=str(self.tmp / "base"))
+                with self.assertRaises(SystemExit) as cm:
+                    wab.load_chain(path, create=create)
+                self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+            with self.subTest(create=create, where="subdirectory"):
+                path = self.raw_at(run / "sub" / "chain.json", run_dir=str(self.tmp / "base"))
+                with self.assertRaises(SystemExit) as cm:
+                    wab.load_chain(path, create=create)
+                self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+        # a relative run_dir that climbs back over the chain file's own directory
+        path = self.raw_at(self.tmp / "x" / CHAIN / RUN_ID / "chain.json", run_dir="../..")
+        with self.assertRaises(SystemExit) as cm:
+            wab.load_chain(path, create=False)
+        self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+
+    def test_chain_json_symlinked_into_run_dir_is_refused(self):  # (b)
+        run = self.tmp / "base" / CHAIN / RUN_ID
+        run.mkdir(parents=True)
+        real = self.raw_at(run / "chain.json", run_dir=str(self.tmp / "base"))
+        link = self.tmp / "outside" / "chain.json"
+        link.parent.mkdir()
+        os.symlink(real, link)
+        with self.assertRaises(SystemExit) as cm:
+            wab.load_chain(link)
+        self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+
+    def test_a_run_dir_through_a_symlink_to_the_chain_dir_is_refused(self):
+        cfgdir = self.tmp / "cfgdir"
+        path = self.raw_at(cfgdir / "chain.json", run_dir=str(self.tmp / "alias"))
+        (cfgdir / CHAIN).mkdir()
+        os.symlink(cfgdir, self.tmp / "alias")
+        # alias/<chain>/<run_id> resolves to cfgdir/<chain>/<run_id>: not containing chain.json
+        wab.load_chain(path, create=False)
+        os.symlink(self.tmp / "cfgdir", cfgdir / CHAIN / RUN_ID)  # now run_dir resolves to cfgdir itself
+        with self.assertRaises(SystemExit) as cm:
+            wab.load_chain(path, create=False)
+        self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+
+    def test_joint_swap_of_plan_and_pin_inside_run_dir_never_passes(self):  # (c)
+        run = self.tmp / "base" / CHAIN / RUN_ID
+        run.mkdir(parents=True)
+        evil = b'{"waves": ["evil"]}\n'
+        (run / "waves.json").write_bytes(evil)
+        path = self.raw_at(run / "chain.json", run_dir=str(self.tmp / "base"),
+                           plan_sha256=hashlib.sha256(evil).hexdigest())
+        with self.assertRaises(SystemExit) as cm:
+            wab.load_chain(path)
+        self.assertIn("chain.json must live outside run_dir", str(cm.exception))
+
+    def test_ordinary_layouts_still_load(self):  # (d)
+        path = self.raw_at(self.tmp / "ok1" / "chain.json")
+        self.assertEqual(wab.load_chain(path)["run_dir"], path.parent.resolve() / "runs" / CHAIN / RUN_ID)
+        path = self.raw_at(self.tmp / "ok2" / "chain.json", run_dir=str(self.tmp / "elsewhere"))
+        self.assertEqual(wab.load_chain(path)["run_dir"], self.tmp / "elsewhere" / CHAIN / RUN_ID)
+        path = self.raw_at(self.tmp / "ok3" / "chain.json", run_dir="../shared")
+        wab.load_chain(path, create=False)
+        # a sibling whose name merely starts like the chain file's directory is not inside it
+        path = self.raw_at(self.tmp / "ok4" / "chain.json", run_dir=str(self.tmp / "ok4-runs"))
+        wab.load_chain(path)
+
+    def test_dispatcher_launch_of_next_wave_refuses_on_changed_plan(self):
+        cfg, _ = self.pinned(merge_gate="auto", base_branch="main")
+        self.gh_handler = self.merged_view
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd) as pc:
+            wab.tick(cfg, wab.load_state(cfg))
+        self.assertFalse(pc.called)
+        st = self.get_state(cfg)
+        self.assertIn("launch of W2 refused", st.get("stopped", ""))
+        self.assertNotIn("W2", st["waves"])
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("plan changed since approval", log)
+
+    def test_pin_goes_into_tmux_env_only_when_set(self):
+        cfg, _ = self.pinned()
+        self.attempt(cfg)
+        new = [c for c in self.tmux_calls if c[1] == "new-session"][0]
+        self.assertIn(f"WAB_PLAN_SHA256={self.pin}", new)
+        cfg2, _ = self.chain()
+        self.put_state(cfg2, {})
+        self.alive = False
+        self.attempt(cfg2)
+        new = [c for c in self.tmux_calls if c[1] == "new-session"][0]
+        self.assertFalse([a for a in new if str(a).startswith("WAB_PLAN_SHA256")])
+
+    # ----- recovery of a launch that died after the intent was saved -----
+    def launching(self, cfg):
+        pf = self.tmp / "p.md"
+        pf.write_text("go\n", encoding="utf-8")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+            phase="launching", sessions=["sid-1"], prompt_file=str(pf))}})
+
+    def recover(self, cfg, path, alive=False):
+        self.alive = alive
+        self.tmux_calls.clear()
+        self.sent.clear()
+        wab.watch(cfg, path, max_ticks=2)
+
+    def assert_recovery_refused(self, cfg):
+        self.assertEqual([c for c in self.tmux_calls if c[1] == "new-session"], [])
+        self.assertEqual(self.sent, [])
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "not_ready")
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("BLOCKED: plan changed since approval", log)
+        self.assertIn("BLOCKED: plan changed since approval",
+                      (wab.wave_dir(cfg, "W1") / "status").read_text(encoding="utf-8"))
+        self.assertTrue([t for t in self.tg if "plan changed since approval" in t], self.tg)
+
+    def test_recover_launch_refuses_changed_plan(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path)
+        self.assert_recovery_refused(cfg)
+
+    def test_recover_launch_refuses_deleted_plan(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        (cfg["run_dir"] / "waves.json").unlink()
+        self.recover(cfg, path)
+        self.assert_recovery_refused(cfg)
+
+    def test_recover_launch_with_live_window_does_not_send_prompt_on_changed_plan(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "not_ready")
+
+    def test_recover_launch_starting_phase_does_not_send_prompt_on_changed_plan(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "starting"
+        self.put_state(cfg, st)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "not_ready")
+
+    def test_recover_launch_with_unchanged_plan_goes_on(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        self.recover(cfg, path)
+        self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_recover_launch_without_pin_goes_on(self):
+        cfg, path = self.chain()
+        self.launching(cfg)
+        self.recover(cfg, path)
+        self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    # ----- the typed first prompt waits for Enter when the dispatcher dies -----
+    def typed_first_prompt(self, cfg):
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+            phase="sending", sessions=["sid-1"], pending_enter="first prompt")}})
+
+    def test_pending_enter_of_first_prompt_is_not_pressed_on_changed_plan(self):
+        cfg, path = self.pinned()
+        self.typed_first_prompt(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.enters.clear()
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(self.enters, [])
+        self.assertEqual(self.sent, [])
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "not_ready")
+        self.assertNotIn("pending_enter", w)
+        self.assertIn("BLOCKED: plan changed since approval",
+                      (wab.wave_dir(cfg, "W1") / "status").read_text(encoding="utf-8"))
+        self.assertIn("BLOCKED: plan changed since approval",
+                      (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_pending_enter_of_first_prompt_is_pressed_when_plan_unchanged(self):
+        cfg, path = self.pinned()
+        self.typed_first_prompt(cfg)
+        self.enters.clear()
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
+
+    def test_pending_enter_of_first_prompt_is_pressed_without_pin(self):
+        cfg, path = self.chain()
+        self.typed_first_prompt(cfg)
+        self.enters.clear()
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(self.enters, ["wv-w1"])
+
+    # ----- a refused pin closes the live session that holds the typed, stale prompt -----
+    def kills(self):
+        return [c for c in self.tmux_calls if "kill-session" in c]
+
+    def test_pin_refusal_after_typed_prompt_kills_session_and_allows_relaunch(self):
+        cfg, path = self.pinned()
+        self.typed_first_prompt(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.enters.clear()
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(len(self.kills()), 1)
+        self.assertIn("=wv-w1", self.kills()[0])
+        self.assertEqual(self.enters, [])
+        w = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(w["phase"], "not_ready")
+        self.assertTrue([t for t in self.tg if "закрыта" in t], self.tg)
+        self.assertIn("closed", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+        # the corrected plan: a repeated launch of the same wave is allowed (no session left)
+        (cfg["run_dir"] / "waves.json").write_bytes(self.plan_bytes)
+        self.attempt(cfg)
+        self.assertEqual(len([c for c in self.tmux_calls if c[1] == "new-session"]), 1)
+
+    def test_pin_refusal_with_session_that_survives_kill_says_so(self):
+        cfg, path = self.pinned()
+        self.typed_first_prompt(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.kill_closes = False
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(len(self.kills()), 1)
+        self.assertTrue([t for t in self.tg if "tmux kill-session -t" in t], self.tg)
+        self.assertIn("tmux kill-session -t", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_pin_refusal_in_deliver_first_prompt_kills_live_session(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "starting"
+        self.put_state(cfg, st)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(len(self.kills()), 1)
+        self.assertEqual(self.sent, [])
+
+    def _starting_pinned(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "starting"
+        self.put_state(cfg, st)
+        return cfg, path
+
+    def test_plan_changed_during_wait_ready_does_not_paste_prompt(self):
+        cfg, path = self._starting_pinned()
+
+        def changing(name, timeout=90):
+            (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+            return True
+
+        with unittest.mock.patch.object(wab, "wait_ready", side_effect=changing):
+            self.recover(cfg, path, alive=True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.enters, [])
+        self.assertEqual(len(self.kills()), 1)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "not_ready")
+        self.assertIn("BLOCKED: plan changed since approval",
+                      (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_plan_unchanged_during_wait_ready_sends_prompt(self):
+        cfg, path = self._starting_pinned()
+        with unittest.mock.patch.object(wab, "wait_ready", return_value=True):
+            self.recover(cfg, path, alive=True)
+        self.assertEqual(self.kills(), [])
+        self.assertEqual(len([s for s in self.sent if s[0] == "text"]), 1)
+
+    def test_pin_refusal_in_recover_launch_kills_live_session(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path, alive=True)
+        self.assertEqual(len(self.kills()), 1)
+        self.assertEqual(self.sent, [])
+
+    def test_pin_refusal_without_session_does_not_kill(self):
+        cfg, path = self.pinned()
+        self.launching(cfg)
+        (cfg["run_dir"] / "waves.json").write_bytes(b"tampered")
+        self.recover(cfg, path, alive=False)
+        self.assertEqual(self.kills(), [])
+
+    def test_plan_pin_is_tunable(self):
+        cfg, _ = self.pinned()
+        other = dict(cfg, plan_sha256="1" * 64)
+        self.assertEqual(wab._identity(cfg), wab._identity(other))
+
+
+# ---------------------------------------------------------------- W5: gate.py (pure functions)
+import gate  # noqa: E402
+
+HEAD = "a" * 40
+OLD = "b" * 40
+FP = "f" * 64
+BOT = {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+HUMAN = {"login": "chatgpt-codex-connector[bot]", "type": "User"}
+CLEAN_BODY = "Codex Review: Didn't find any major issues. :rocket:\n\n**Reviewed commit:** `{short}`"
+
+
+def green_facts(**over):
+    facts = {
+        "pr": {"state": "open", "merged": False, "draft": False, "head": HEAD, "base": "main"},
+        "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}],
+        "reviews": [{"user": BOT, "commit_id": HEAD, "state": "COMMENTED"}],
+        "review_comments": [], "issue_comments": [], "triggers": [], "resolved": {}, "threads": [],
+    }
+    facts.update(over)
+    return facts
+
+
+def result(status="pass", head=HEAD, fp=FP, at="2026-10-01T10:05:00Z"):
+    return {"status": status, "head": head, "tree_fingerprint": fp, "recorded_at": at, "session_id": "s"}
+
+
+def green_manifest(**task):
+    entry = {"status": "ready_for_pr_review", "decisions": [],
+             "results": {"coder": result(), "tester": result(), "cross_provider_reviewer": result()}}
+    entry.update(task)
+    return {"head": HEAD, "tasks": {"T1": entry}}
+
+
+def summary(status="✅ **Completed**", short=HEAD[:7], user=BOT, extra=""):
+    """A Codex review summary comment as GitHub shows it (table rows of the review)."""
+    body = ("<!-- codex-pull-request-review-summary -->\n## Codex Review Summary\n\n"
+            "| Task | Status | Commit | Trigger |\n|---|---|---|---|\n"
+            f"| 📝 **Code Review** | {status} <relative-time datetime=\"2026-10-01T17:21:42Z\">2026-10-01T17:21:42Z"
+            f"</relative-time> | `{short}` | Manual request |\n{extra}")
+    return {"id": 3, "user": user, "body": body}
+
+
+WORK = {"clean": True, "head": HEAD, "fingerprint": FP}
+
+
+class GateVerdict(unittest.TestCase):
+    def ev(self, facts=None, manifest="green", work=None, head=HEAD):
+        return gate.evaluate(green_facts() if facts is None else facts, head,
+                             green_manifest() if manifest == "green" else manifest, WORK if work is None else work,
+                             "main")
+
+    def test_everything_in_order_passes(self):
+        v = self.ev()
+        self.assertEqual((v["verdict"], v["reasons"], v["unresolved"], v["draft"]), ("pass", [], [], False))
+
+    def test_stale_codex_review_waits(self):  # acceptance 1
+        v = self.ev(green_facts(reviews=[{"user": BOT, "commit_id": OLD, "state": "COMMENTED"}]))
+        self.assertEqual(v["verdict"], "wait")
+
+    def test_codex_review_pending_or_dismissed_on_head_waits(self):  # acceptance 1
+        for state in ("PENDING", "DISMISSED", ""):
+            with self.subTest(state=state):
+                v = self.ev(green_facts(reviews=[{"user": BOT, "commit_id": HEAD, "state": state}]))
+                self.assertEqual(v["verdict"], "wait")
+
+    def test_codex_review_states_that_finish(self):
+        for state in ("COMMENTED", "APPROVED", "CHANGES_REQUESTED"):
+            with self.subTest(state=state):
+                done = gate.codex_on_head(
+                    green_facts(reviews=[{"user": BOT, "commit_id": HEAD, "state": state}]), HEAD)
+                self.assertTrue(done["done"])
+
+    def test_a_human_with_the_bot_login_is_not_codex(self):
+        facts = green_facts(reviews=[{"user": HUMAN, "commit_id": HEAD, "state": "COMMENTED"}])
+        self.assertEqual(self.ev(facts)["verdict"], "wait")
+
+    def test_only_a_completed_summary_row_naming_head_finishes(self):  # D1
+        short = HEAD[:7]
+        cases = [
+            ("completed, head", summary(), {short: HEAD}, True),
+            ("completed, old sha", summary(short=OLD[:7]), {OLD[:7]: OLD, short: HEAD}, False),
+            ("in progress, head", summary(status="⏳ **In progress**"), {short: HEAD}, False),
+            ("completed, sha unresolved", summary(), {}, False),
+            ("completed, human with the bot login", summary(user=HUMAN), {short: HEAD}, False),
+            ("completed, other author", summary(user={"login": "someone", "type": "User"}), {short: HEAD}, False),
+            ("sha not alone in its cell", summary(short=short + "` and `" + short), {short: HEAD}, False),
+        ]
+        for name, comment, resolved, want in cases:
+            with self.subTest(case=name):
+                facts = green_facts(reviews=[], issue_comments=[comment], resolved=resolved)
+                self.assertEqual(gate.codex_on_head(facts, HEAD)["done"], want)
+                self.assertEqual(self.ev(facts)["verdict"], "pass" if want else "wait")
+
+    def test_a_row_is_judged_alone_a_completed_one_does_not_vouch_for_another(self):
+        mixed = summary(status="⏳ **In progress**", extra="| other | ✅ **Completed** | `1234567` | x |\n")
+        facts = green_facts(reviews=[], issue_comments=[mixed], resolved={HEAD[:7]: HEAD, "1234567": OLD})
+        self.assertFalse(gate.codex_on_head(facts, HEAD)["done"])
+
+    def test_clean_comment_thumbs_and_edited_triggers_are_no_evidence(self):  # D1
+        clean = {"user": BOT, "body": CLEAN_BODY.format(short=HEAD[:7])}
+        trigger = {"id": 7, "user": {"login": "me", "type": "User"},
+                   "body": f"@codex review\n<!-- superarmanda:codex-review head={HEAD} -->"}
+        facts = green_facts(reviews=[], issue_comments=[clean, trigger], resolved={HEAD[:7]: HEAD},
+                            pr_reactions=[{"content": "+1", "user": BOT, "created_at": "2099-01-01T00:00:00Z"}],
+                            triggers=[{"id": 7, "body": trigger["body"], "reactions": [{"content": "+1", "user": BOT}]}])
+        self.assertFalse(gate.codex_on_head(facts, HEAD)["done"])
+        self.assertEqual(self.ev(facts)["verdict"], "wait")
+    def test_pending_check_waits_and_failed_check_fails_without_a_merge(self):  # acceptance 2
+        pending = [{"name": "ci", "status": "completed", "conclusion": "success"},
+                   {"name": "e2e", "status": "in_progress", "conclusion": None}]
+        v = self.ev(green_facts(check_runs=pending))
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("e2e", v["reasons"][0])
+        failed = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
+        v = self.ev(green_facts(check_runs=failed))
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn("ci", v["reasons"][0])
+
+    def test_success_needs_completed_and_success_not_a_status_word(self):
+        for run in ({"name": "x", "status": "completed", "conclusion": "skipped"},
+                    {"name": "x", "status": "completed", "conclusion": "neutral"},
+                    {"name": "x", "status": "completed", "conclusion": None},
+                    {"name": "x", "status": "queued", "conclusion": "success"}):
+            with self.subTest(run=run):
+                got = gate.checks([run])
+                self.assertTrue(got["pending"] or got["failed"])
+        self.assertEqual(gate.checks([{"name": "x", "status": "completed", "conclusion": "success"}]),
+                         {"total": 1, "pending": [], "failed": []})
+
+    def test_no_check_runs_waits(self):
+        self.assertEqual(self.ev(green_facts(check_runs=[]))["verdict"], "wait")
+
+    def test_p1_and_p0_badges_on_head_fail_p2_does_not(self):  # acceptance 3
+        def inline(badge, commit=HEAD, user=BOT):
+            return {"user": user, "commit_id": HEAD, "original_commit_id": commit,
+                    "body": f"**![{badge} Badge](x)** text", "html_url": "u"}
+        for badge, want in (("P1", "fail"), ("P0", "fail"), ("P2", "pass")):
+            with self.subTest(badge=badge):
+                self.assertEqual(self.ev(green_facts(review_comments=[inline(badge)]))["verdict"], want)
+        # G1: GitHub moves `commit_id` of an open comment to the latest commit; `original_commit_id`
+        # says where it was written: a P1 written on an older commit is not a P1 of HEAD
+        old = green_facts(review_comments=[inline("P1", commit=OLD)])
+        self.assertEqual(self.ev(old)["verdict"], "pass")
+        self.assertEqual(gate.codex_on_head(old, HEAD)["findings"], 0)
+        self.assertEqual(gate.codex_on_head(green_facts(review_comments=[inline("P2")]), HEAD)["findings"], 1)
+        # and the other way round: written on HEAD, still counted when GitHub keeps commit_id elsewhere
+        moved = dict(inline("P1"), commit_id=OLD)
+        self.assertEqual(self.ev(green_facts(review_comments=[moved]))["verdict"], "fail")
+        self.assertEqual(self.ev(green_facts(review_comments=[inline("P1", user=HUMAN)]))["verdict"], "pass")
+
+    def test_old_open_p1_threads_do_not_fail_but_are_counted_for_the_owner(self):  # G1
+        threads = [{"id": "T1", "isResolved": False, "body": "**![P1 Badge](x)** old"},
+                   {"id": "T2", "isResolved": False, "body": "![P2 Badge](x) minor"},
+                   {"id": "T3", "isResolved": True, "body": "![P0 Badge](x) fixed"}]
+        old = {"user": BOT, "commit_id": HEAD, "original_commit_id": OLD, "body": "![P1 Badge](x) old"}
+        v = self.ev(green_facts(review_comments=[old], threads=threads))
+        self.assertEqual((v["verdict"], v["old_p01"], v["unresolved"]), ("pass", 1, ["T1", "T2"]))
+
+    def test_the_comment_anchor_is_part_of_the_second_collection(self):  # G1 / F2
+        a = green_facts(review_comments=[{"id": 1, "user": BOT, "commit_id": HEAD, "original_commit_id": OLD, "body": "x"}])
+        b = green_facts(review_comments=[{"id": 1, "user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "x"}])
+        self.assertNotEqual(gate.critical(a), gate.critical(b))
+
+    def test_manifest_without_a_coder_pass_on_head_fails(self):  # Codex P1: roles may be recorded out of order
+        no_coder = green_manifest()
+        del no_coder["tasks"]["T1"]["results"]["coder"]
+        v = self.ev(manifest=no_coder)
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn("нет coder pass на HEAD", "; ".join(v["reasons"]))
+        coder_findings = green_manifest()
+        coder_findings["tasks"]["T1"]["results"]["coder"] = result("findings")
+        self.assertEqual(self.ev(manifest=coder_findings)["verdict"], "fail")
+        coder_old = green_manifest()
+        coder_old["tasks"]["T1"]["results"]["coder"] = result(head=OLD)
+        self.assertEqual(self.ev(manifest=coder_old)["verdict"], "fail")
+        coder_tree = green_manifest()
+        coder_tree["tasks"]["T1"]["results"]["coder"] = result(fp="0" * 64)
+        self.assertEqual(self.ev(manifest=coder_tree)["verdict"], "fail")
+
+    def test_manifest_without_tester_pass_or_with_another_head_fails(self):  # acceptance 4
+        no_tester = green_manifest()
+        del no_tester["tasks"]["T1"]["results"]["tester"]
+        self.assertEqual(self.ev(manifest=no_tester)["verdict"], "fail")
+        tester_old_head = green_manifest()
+        tester_old_head["tasks"]["T1"]["results"]["tester"] = result(head=OLD)
+        self.assertEqual(self.ev(manifest=tester_old_head)["verdict"], "fail")
+        tester_findings = green_manifest()
+        tester_findings["tasks"]["T1"]["results"]["tester"] = result("findings")
+        self.assertEqual(self.ev(manifest=tester_findings)["verdict"], "fail")
+        other = green_manifest()
+        other["head"] = OLD
+        self.assertEqual(self.ev(manifest=other)["verdict"], "fail")
+        for broken in (None, [], {"head": HEAD}, {"head": HEAD, "tasks": {}}):
+            with self.subTest(manifest=broken):
+                self.assertEqual(self.ev(manifest=broken)["verdict"], "fail")
+
+    def test_task_statuses_needs_decision_and_blocked_fail(self):
+        for status in ("needs_decision", "blocked"):
+            with self.subTest(status=status):
+                self.assertEqual(self.ev(manifest=green_manifest(status=status))["verdict"], "fail")
+
+    def test_unfinished_fix_loop_statuses_fail(self):  # r6 HIGH
+        for status in ("needs_fix", "needs_verification", "pending", "in_progress", None):
+            with self.subTest(status=status):
+                v = self.ev(manifest=green_manifest(status=status))
+                self.assertEqual(v["verdict"], "fail")
+                self.assertTrue(any("цикл исправлений не завершён" in r for r in v["reasons"]), v["reasons"])
+        self.assertEqual(self.ev(manifest=green_manifest(status="ready_for_pr_review"))["verdict"], "pass")
+
+    def test_other_sources_findings_on_head_fail(self):  # r6 HIGH
+        for role in ("github_codex_review", "coderabbit"):
+            for status in ("findings", "fail"):
+                with self.subTest(role=role, status=status):
+                    m = green_manifest()
+                    m["tasks"]["T1"]["results"][role] = result(status)
+                    v = self.ev(manifest=m)
+                    self.assertEqual(v["verdict"], "fail")
+                    self.assertTrue(any(role in r for r in v["reasons"]), v["reasons"])
+            ok = green_manifest()
+            ok["tasks"]["T1"]["results"][role] = result("pass")
+            self.assertEqual(self.ev(manifest=ok)["verdict"], "pass")
+            old = green_manifest()
+            old["tasks"]["T1"]["results"][role] = result("findings", head=OLD)
+            self.assertEqual(self.ev(manifest=old)["verdict"], "pass")
+
+    def test_needs_fix_is_explained_only_by_the_accepted_limitation(self):  # r6 HIGH
+        def manifest(decisions, **task):
+            m = green_manifest(**dict({"status": "needs_fix", "decisions": decisions}, **task))
+            m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = result("findings", at="2026-10-01T10:05:00Z")
+            return m
+
+        def decision(**kw):
+            return dict({"source": "cross_provider_reviewer", "decision": "accept_limitation",
+                         "note": "n", "recorded_at": "2026-10-01T10:10:00Z"}, **kw)
+        self.assertEqual(self.ev(manifest=manifest([decision()]))["verdict"], "pass")
+        self.assertEqual(self.ev(manifest=manifest([decision()], fix_cycles=2,
+                                                   fix_sources={"cross_provider_reviewer": 2}))["verdict"], "pass")
+        # the last decision is not the accepted limitation of the reviewer
+        later = decision(source="tester", decision="invariant", recorded_at="2026-10-01T10:20:00Z")
+        self.assertEqual(self.ev(manifest=manifest([decision(), later]))["verdict"], "fail")
+        self.assertEqual(self.ev(manifest=manifest([]))["verdict"], "fail")
+        # a new failed fix-loop after the decision: another source, then the same one
+        self.assertEqual(self.ev(manifest=manifest([decision()], fix_cycles=3,
+                                                   fix_sources={"cross_provider_reviewer": 2, "tester": 1}))["verdict"],
+                         "fail")
+        self.assertEqual(self.ev(manifest=manifest([decision()], status="needs_decision"))["verdict"], "fail")
+        # reviewer result is pass: needs_fix is not explained by anything
+        m = manifest([decision()])
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = result("pass")
+        self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
+
+    def test_results_on_another_tree_or_a_dirty_copy_fail(self):  # acceptance 1a
+        dirty_result = green_manifest()
+        dirty_result["tasks"]["T1"]["results"]["tester"] = result(fp="0" * 64)
+        self.assertEqual(self.ev(manifest=dirty_result)["verdict"], "fail")
+        dirty_review = green_manifest()
+        dirty_review["tasks"]["T1"]["results"]["cross_provider_reviewer"] = result(fp="0" * 64)
+        self.assertEqual(self.ev(manifest=dirty_review)["verdict"], "fail")
+        self.assertEqual(self.ev(work={"clean": False, "head": HEAD, "fingerprint": FP})["verdict"], "fail")
+        self.assertEqual(self.ev(work={"clean": True, "head": OLD, "fingerprint": FP})["verdict"], "fail")
+        self.assertEqual(self.ev(work={"clean": True, "head": HEAD, "fingerprint": None})["verdict"], "fail")
+        self.assertEqual(self.ev(work={})["verdict"], "fail")
+
+    def test_reviewer_findings_need_a_decision_made_on_this_result(self):  # acceptance 1b
+        def manifest(decisions, at="2026-10-01T10:05:00Z"):
+            m = green_manifest(decisions=decisions)
+            m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = result("findings", at=at)
+            return m
+
+        def decision(**kw):
+            return dict({"source": "cross_provider_reviewer", "decision": "accept_limitation",
+                         "note": "n", "recorded_at": "2026-10-01T10:10:00Z"}, **kw)
+        cases = [
+            ("no decision", [], "fail"),
+            ("older than the result", [decision(recorded_at="2026-10-01T10:00:00Z")], "fail"),
+            ("another source", [decision(source="tester")], "fail"),
+            ("invariant", [decision(decision="invariant")], "fail"),
+            ("cut_surface", [decision(decision="cut_surface")], "fail"),
+            ("accept_limitation on this result", [decision()], "pass"),
+            ("same instant", [decision(recorded_at="2026-10-01T10:05:00Z")], "pass"),
+        ]
+        for name, decisions, want in cases:
+            with self.subTest(case=name):
+                self.assertEqual(self.ev(manifest=manifest(decisions))["verdict"], want)
+        other = manifest([decision()])
+        other["tasks"]["T1"]["results"]["cross_provider_reviewer"]["status"] = "unavailable"
+        self.assertEqual(self.ev(manifest=other)["verdict"], "fail")
+
+    def test_pr_head_other_than_the_gated_one_waits(self):
+        facts = green_facts()
+        facts["pr"]["head"] = OLD
+        self.assertEqual(self.ev(facts)["verdict"], "wait")
+
+    def test_closed_or_merged_pr_fails_and_a_collection_error_only_waits(self):
+        facts = green_facts()
+        facts["pr"]["state"] = "closed"
+        self.assertEqual(self.ev(facts)["verdict"], "fail")
+        facts["pr"]["merged"] = True
+        self.assertEqual(self.ev(facts)["verdict"], "fail")
+        v = self.ev({"error": "gh api: boom"})
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("boom", v["reasons"][0])
+
+    def test_a_redirected_pr_fails(self):  # r8 HIGH
+        facts = green_facts()
+        facts["pr"]["base"] = "release"
+        v = self.ev(facts)
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn("release", v["reasons"][0])
+        self.assertIn("main", v["reasons"][0])
+
+    def test_a_p1_badge_in_the_body_of_a_codex_review_on_head_fails(self):  # CodeRabbit on cf32fbd
+        def review(body, commit=HEAD, user=BOT):
+            return {"user": user, "commit_id": commit, "state": "COMMENTED", "body": body, "html_url": "r"}
+        on_head = green_facts(reviews=[review("**![P1 Badge](x)** in the body")])
+        self.assertEqual(self.ev(on_head)["verdict"], "fail")
+        self.assertEqual(gate.codex_on_head(on_head, HEAD)["findings"], 1)
+        self.assertIn("1 замечаний, P0/P1: 1", gate.alarm_text(5, HEAD, on_head))
+        for facts in (green_facts(reviews=[review("**![P1 Badge](x)** old", commit=OLD), review("clean")]),
+                      green_facts(reviews=[review("![P2 Badge](x) minor")]),
+                      green_facts(reviews=[review("clean"), review("**![P1 Badge](x)**", user=HUMAN)])):
+            with self.subTest(facts=facts["reviews"]):
+                self.assertNotEqual(self.ev(facts)["verdict"], "fail")
+
+    def test_the_review_body_is_critical(self):
+        later = green_facts(reviews=[dict(green_facts()["reviews"][0], body="**![P1 Badge](x)** added")])
+        self.assertNotEqual(gate.critical(green_facts()), gate.critical(later))
+
+    def test_an_unknown_base_waits_never_passes(self):
+        facts = green_facts()
+        del facts["pr"]["base"]
+        self.assertEqual(self.ev(facts)["verdict"], "wait")
+        self.assertEqual(gate.evaluate(green_facts(), HEAD, green_manifest(), WORK, None)["verdict"], "wait")
+
+    def test_the_base_is_critical(self):
+        other = green_facts()
+        other["pr"]["base"] = "release"
+        self.assertNotEqual(gate.critical(green_facts()), gate.critical(other))
+
+    def test_unresolved_threads_and_draft_are_reported_on_a_pass(self):
+        facts = green_facts(threads=[{"id": "T_1", "isResolved": False}, {"id": "T_2", "isResolved": True}])
+        facts["pr"]["draft"] = True
+        v = self.ev(facts)
+        self.assertEqual((v["verdict"], v["unresolved"], v["draft"]), ("pass", ["T_1"], True))
+
+
+class FakeGitHub:
+    """`api` and `graphql` over a table of responses; a list route is cut into pages of 100."""
+
+    def __init__(self, routes, threads=None):
+        self.routes, self.calls = routes, []
+        self.threads = threads if threads is not None else {"nodes": [], "pageInfo": {"hasNextPage": False}}
+
+    def api(self, path):
+        self.calls.append(path)
+        base, _, query = path.partition("?")
+        if base not in self.routes:
+            raise gate.CollectError(f"{path}: HTTP 404")
+        value = self.routes[base]
+        if "per_page=100" not in query:
+            return value
+        page = int(re.search(r"(?:^|&)page=(\d+)", query).group(1))
+        key, items = (None, value) if isinstance(value, list) else next(iter(value.items()))
+        part = items[(page - 1) * 100:page * 100]
+        return part if key is None else {key: part, "total_count": len(items)}
+
+    def graphql(self, query, variables):
+        self.calls.append(("graphql", variables))
+        return {"data": {"repository": {"pullRequest": {"reviewThreads": self.threads}}}}
+
+
+def routes_for(repo="o/r", number=5, **over):
+    r = {
+        f"repos/{repo}/pulls/{number}": {"state": "open", "merged": False, "draft": False, "head": {"sha": HEAD},
+                                       "base": {"ref": "main"}},
+        f"repos/{repo}/commits/{HEAD}/check-runs": {"check_runs": [
+            {"name": "ci", "status": "completed", "conclusion": "success"}]},
+        f"repos/{repo}/pulls/{number}/reviews": [{"user": BOT, "commit_id": HEAD, "state": "COMMENTED"}],
+        f"repos/{repo}/pulls/{number}/comments": [],
+        f"repos/{repo}/issues/{number}/comments": [],
+    }
+    r.update(over)
+    return r
+
+
+class GateCollect(unittest.TestCase):
+    def collect(self, fake, head=HEAD):
+        return gate.collect("o/r", 5, head, fake.api, fake.graphql)
+
+    def test_collects_every_fact_and_evaluates_to_pass(self):
+        fake = FakeGitHub(routes_for())
+        facts = self.collect(fake)
+        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK, "main")["verdict"], "pass")
+
+    def test_check_runs_are_read_page_by_page_and_a_pending_run_on_page_two_waits(self):
+        runs = [{"name": f"c{i}", "status": "completed", "conclusion": "success"} for i in range(100)]
+        runs.append({"name": "late", "status": "queued", "conclusion": None})
+        fake = FakeGitHub(routes_for(**{f"repos/o/r/commits/{HEAD}/check-runs": {"check_runs": runs}}))
+        facts = self.collect(fake)
+        self.assertEqual(len(facts["check_runs"]), 101)
+        self.assertEqual(sum("check-runs" in c for c in fake.calls if isinstance(c, str)), 2)
+        v = gate.evaluate(facts, HEAD, green_manifest(), WORK, "main")
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("late", v["reasons"][0])
+
+    def test_too_many_pages_is_a_collection_error(self):
+        runs = [{"name": "c", "status": "completed", "conclusion": "success"}] * (100 * gate.MAX_PAGES + 1)
+        fake = FakeGitHub(routes_for(**{f"repos/o/r/commits/{HEAD}/check-runs": {"check_runs": runs}}))
+        with self.assertRaises(gate.CollectError):
+            self.collect(fake)
+        self.assertIn("error", gate.gather("o/r", 5, HEAD, fake.api, fake.graphql))
+
+    def test_more_than_100_review_threads_is_a_collection_error(self):
+        fake = FakeGitHub(routes_for(), threads={"nodes": [], "pageInfo": {"hasNextPage": True}})
+        with self.assertRaises(gate.CollectError):
+            self.collect(fake)
+
+    def test_a_failing_api_call_is_an_error_fact_never_a_pass(self):
+        routes = routes_for()
+        del routes["repos/o/r/pulls/5/reviews"]
+        fake = FakeGitHub(routes)
+        facts = gate.gather("o/r", 5, HEAD, fake.api, fake.graphql)
+        self.assertIn("error", facts)
+        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK, "main")["verdict"], "wait")
+
+    def test_a_pr_with_another_head_returns_early(self):
+        fake = FakeGitHub(routes_for(**{"repos/o/r/pulls/5": {"state": "open", "head": {"sha": OLD}, "base": {"ref": "main"}}}))
+        facts = self.collect(fake)
+        self.assertEqual(list(facts), ["pr"])
+        self.assertEqual(gate.evaluate(facts, HEAD, green_manifest(), WORK, "main")["verdict"], "wait")
+
+    def test_the_base_of_the_pr_is_collected_even_on_an_early_return(self):
+        facts = self.collect(FakeGitHub(routes_for()))
+        self.assertEqual(facts["pr"]["base"], "main")
+        early = self.collect(FakeGitHub(routes_for(**{"repos/o/r/pulls/5": {
+            "state": "open", "head": {"sha": OLD}, "base": {"ref": "release"}}})))
+        self.assertEqual(early["pr"]["base"], "release")
+
+    def test_summary_commits_are_resolved_and_reactions_are_not_collected(self):  # D1
+        short = HEAD[:7]
+        comments = [dict(summary(), id=3),
+                    {"id": 4, "body": f"@codex review\n<!-- superarmanda:codex-review head={HEAD} -->"}]
+        fake = FakeGitHub(routes_for(**{"repos/o/r/issues/5/comments": comments,
+                                        f"repos/o/r/commits/{short}": {"sha": HEAD},
+                                        "repos/o/r/pulls/5/reviews": []}))
+        facts = self.collect(fake)
+        self.assertEqual(facts["resolved"], {short: HEAD})
+        self.assertNotIn("triggers", facts)
+        self.assertFalse(any("reactions" in c for c in fake.calls if isinstance(c, str)))
+        self.assertTrue(gate.codex_on_head(facts, HEAD)["done"])
+    def test_importing_gate_leaves_the_import_path_alone(self):
+        before = list(sys.path)
+        import importlib
+        importlib.reload(gate)
+        self.assertEqual(sys.path, before)
+        self.assertTrue(callable(gate.fingerprint))
+
+
+class GateCommands(unittest.TestCase):
+    def test_merge_argv_and_command(self):
+        argv = gate.merge_argv("o/r", 12, HEAD)
+        self.assertEqual(argv, ["gh", "pr", "merge", "12", "--repo", "o/r", "--squash", "--match-head-commit", HEAD])
+        self.assertEqual(gate.merge_command("o/r", 12, HEAD), " ".join(argv))
+
+    def test_unsafe_values_are_refused_before_a_command_is_built(self):
+        for repo, number, sha in (("o/r'; touch /tmp/x; '", 1, HEAD), ("o r", 1, HEAD), ("o/r", 0, HEAD),
+                                  ("o/r", "1", HEAD), ("o/r", 1, "abc"), ("o/r", 1, HEAD + "; x")):
+            with self.subTest(repo=repo, number=number, sha=sha):
+                with self.assertRaises(ValueError):
+                    gate.merge_argv(repo, number, sha)
+    def test_owner_script_only_execs_owner_merge_bound_to_run_and_sha(self):  # D3 / G2
+        script = gate.owner_script("/opt/my tools/wab.py", "/runs/it's/chain.json", "W1", "run-1", HEAD)
+        self.assertTrue(script.startswith("#!/usr/bin/env bash\n"))
+        self.assertIn("set -euo pipefail", script)
+        last = script.rstrip().splitlines()[-1]
+        self.assertEqual(shlex.split(last), ["exec", "python3", "/opt/my tools/wab.py", "owner-merge",
+                                             "/runs/it's/chain.json", "W1", "run-1", HEAD])
+        self.assertNotIn("gh ", script)  # no merge of its own: everything is decided by the fresh gate
+        done = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, encoding="utf-8")
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_owner_script_names_do_not_collide_across_runs(self):  # Codex P2 on a27908b
+        base = {"chain_file": "/r/chain.json", "chain": "a-b", "run_id": "c"}
+        names = {wab.owner_script_name(dict(base, **over), "W1", HEAD) for over in (
+            {}, {"chain": "a", "run_id": "b-c"}, {"chain_file": "/other/chain.json"}, {"run_id": "d"})}
+        self.assertEqual(len(names), 4)  # hyphen-joined parts used to give a-b-c for the first two
+        name = wab.owner_script_name(base, "W1", HEAD)
+        self.assertEqual(name, wab.owner_script_name(dict(base), "W1", HEAD))  # stable for the same run
+        self.assertNotEqual(name, wab.owner_script_name(base, "W2", HEAD))
+        self.assertNotEqual(name, wab.owner_script_name(base, "W1", OLD))
+        self.assertTrue(name.startswith(f"W1.{HEAD[:12]}.") and name.endswith(".merge"))
+        self.assertNotIn("/", name)
+
+    def test_owner_script_refuses_malformed_wave_run_or_sha(self):
+        for wave, run_id, sha in (("x'; touch /tmp/x #", "r", HEAD), ("a b", "r", HEAD), ("", "r", HEAD),
+                                  ("W1", "r; x", HEAD), ("W1", "", HEAD), ("W1", "r", "abc"),
+                                  ("W1", "r", HEAD + "\n"), ("W1", "r", None)):
+            with self.subTest(wave=wave, run_id=run_id, sha=sha):
+                with self.assertRaises(ValueError):
+                    gate.owner_script("/w/wab.py", "/c/chain.json", wave, run_id, sha)
+
+    def test_alarm_text(self):
+        facts = green_facts(
+            check_runs=[{"name": "ci", "status": "completed", "conclusion": "success"},
+                        {"name": "lint", "status": "completed", "conclusion": "failure"}],
+            review_comments=[{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) a"},
+                             {"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P2 Badge](x) b"}],
+            threads=[{"id": "T", "isResolved": False}])
+        text = gate.alarm_text(5, HEAD, facts)
+        for part in ("PR #5", HEAD[:12], "1 ok", "lint (failure)", "2 замечаний, P0/P1: 1", "тредов: 1"):
+            self.assertIn(part, text)
+        old = green_facts(threads=[{"id": "T", "isResolved": False, "body": "![P1 Badge](x) old"},
+                                   {"id": "U", "isResolved": False, "body": "plain"}])
+        self.assertIn("незакрытых тредов: 2 (из них с P0/P1: 1)", gate.alarm_text(5, HEAD, old))
+        # the alarm runs before any gate: an open P1 thread written on HEAD is not "from earlier commits"
+        on_head = green_facts(review_comments=[{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD,
+                                                "body": "![P1 Badge](x) now"}],
+                              threads=[{"id": "T", "isResolved": False, "body": "![P1 Badge](x) now"}])
+        self.assertNotIn("прошлых коммитов", gate.alarm_text(5, HEAD, on_head))
+        self.assertIn("незакрытых тредов: 1 (из них с P0/P1: 1)", gate.alarm_text(5, HEAD, on_head))
+        self.assertIn("чисто", gate.alarm_text(5, HEAD, green_facts()))
+
+    def test_alarm_ready_needs_completed_checks_and_codex(self):
+        self.assertTrue(gate.alarm_ready(green_facts(), HEAD))
+        pending = green_facts(check_runs=[{"name": "x", "status": "queued"}])
+        self.assertFalse(gate.alarm_ready(pending, HEAD))
+        self.assertFalse(gate.alarm_ready(green_facts(check_runs=[]), HEAD))
+        self.assertFalse(gate.alarm_ready(green_facts(reviews=[]), HEAD))
+        self.assertFalse(gate.alarm_ready({"error": "x"}, HEAD))
+        self.assertFalse(gate.alarm_ready({"pr": {"head": OLD}}, HEAD))
+
+
+# ---------------------------------------------------------------- W5: merge gate and alarm in wab.py
+def _cp(args, rc=0, out="", err=""):
+    return subprocess.CompletedProcess(args, rc, out, err)
+
+
+class GateBase(Base):
+    """A DONE/RUNNING wave of merge_gate "auto" whose GitHub facts, manifest and working copy are
+    fixtures; `gh` answers `pr view` (self.view), `pr merge` and `pr ready` (self.merge_rc/_err)."""
+
+    def setUp(self):
+        super().setUp()
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts()
+        self.manifest = green_manifest()
+        self.work = dict(WORK)
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "main"}
+        self.merge_rc, self.merge_err, self.ready_rc = 0, "", 0
+        self.find_calls = 0
+
+        def find_pr(cfg, cwd):
+            self.find_calls += 1
+            if isinstance(self.pr, Exception):
+                raise self.pr
+            return self.pr
+
+        def patch(name, **kw):
+            p = mock.patch.object(wab, name, **kw)
+            started = p.start()
+            self.addCleanup(p.stop)
+            return started
+        patch("find_pr", side_effect=find_pr)
+        patch("base_branch_of", return_value="main")
+        patch("gate_facts", side_effect=lambda cfg, pr: self.facts)
+        patch("read_manifest", side_effect=lambda cfg, wave: self.manifest)
+        patch("workdir_state", side_effect=lambda cwd: self.work)
+        patch("GATE_POLL_SECONDS", new=0)
+        patch("ALARM_POLL_SECONDS", new=0)
+        self.launch = patch("launch", return_value=True)
+        patch("drop_stale_btab")
+        self.gh_handler = self.handle
+
+    def handle(self, args):
+        if args[:3] == ("gh", "pr", "view"):
+            return _cp(args, out=json.dumps(self.view))
+        if args[:3] == ("gh", "pr", "merge"):
+            return _cp(args, self.merge_rc, "", self.merge_err)
+        if args[:3] == ("gh", "pr", "ready"):
+            return _cp(args, self.ready_rc, "", "cannot mark ready" if self.ready_rc else "")
+        return _cp(args, 1, "", "unexpected gh call")
+
+    def merges(self):
+        return [c for c in self.gh_calls if c[:3] == ("gh", "pr", "merge")]
+
+    def start(self, status="DONE", phase="running", **chain):
+        chain.setdefault("merge_gate", "auto")
+        cfg, path = self.chain(**chain)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase=phase)},
+                             "identity": wab._pinned_identity(cfg)})  # what the first launch saves
+        if status:
+            self.set_status(cfg, "W1", status)
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        (wab.wave_dir(cfg, "W1") / "result.md").write_text("PR #7\n", encoding="utf-8")
+        self.cfg, self.path = cfg, path
+        return cfg
+
+    def tick(self, cfg=None):
+        cfg = cfg or self.cfg
+        return wab.tick(cfg, wab.load_state(cfg))
+
+    def rec(self, wave="W1"):
+        return self.get_state(self.cfg)["waves"][wave]
+
+    def status(self, wave="W1"):
+        return (wab.wave_dir(self.cfg, wave) / "status").read_text(encoding="utf-8").strip()
+
+    def log(self):
+        return (self.cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+
+    def merge_it(self):
+        """One tick that passes the gate and calls merge."""
+        self.assertTrue(self.tick())
+        self.assertEqual(len(self.merges()), 1)
+
+
+class MergeGate(GateBase):
+    def test_wait_never_merges_and_is_logged_once_per_reason(self):  # acceptance 1, 2
+        pending = [{"name": "ci", "status": "completed", "conclusion": "success"},
+                   {"name": "e2e", "status": "in_progress", "conclusion": None}]
+        cfg = self.start()
+        self.facts = green_facts(check_runs=pending)
+        for _ in range(3):
+            self.assertTrue(self.tick())
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.log().count("merge gate waits"), 1)
+        self.assertEqual(self.rec()["phase"], "gate")
+        self.assertNotIn("pending_exit", self.rec())  # the window stays open
+        self.facts = green_facts(reviews=[])  # another reason
+        self.tick()
+        self.assertEqual(self.log().count("merge gate waits"), 2)
+        self.assertEqual(self.tg, [])
+
+    def test_done_taken_back_while_the_gate_collects_is_not_merged(self):  # Codex P1 on e6e70c6
+        red = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
+        for draft, back, facts in ((False, "RUNNING", None), (True, "RUNNING", None), (False, "", None),
+                                   (False, "RUNNING", red), (False, "", red)):  # Codex P2: the fail path too
+            with self.subTest(draft=draft, back=back, fail=facts is not None):
+                self.gh_calls.clear()
+                cfg = self.start()
+                self.pr = dict(self.pr, isDraft=draft)
+                self.facts = facts or green_facts()
+                self.facts["pr"]["draft"] = draft
+
+                def collect(cfg_, pr, back=back):  # the wave rewrites its status mid-collection
+                    (wab.wave_dir(cfg, "W1") / "status").write_text(back + ("\n" if back else ""), encoding="utf-8")
+                    return self.facts
+                with mock.patch.object(wab, "gate_facts", side_effect=collect):
+                    self.assertTrue(self.tick())
+                self.assertEqual(self.merges(), [])
+                self.assertEqual([c for c in self.gh_calls if c[:3] == ("gh", "pr", "ready")], [])
+                self.assertNotIn(self.rec()["phase"], ("merging", "done"))
+                self.assertEqual(self.rec()["phase"], "running" if back else "gate")
+                self.assertNotIn("gate_fail_msg", self.rec())  # no stale failure into a wave at work
+                self.assertEqual(self.status(), back)  # its new status is not overwritten with BLOCKED
+
+    def test_a_collection_error_or_another_head_waits(self):
+        cfg = self.start()
+        self.pr = gate.CollectError("gh: no network")
+        self.tick()
+        self.pr = {"number": 7, "headRefOid": OLD, "isDraft": False, "state": "OPEN"}  # PR moved on
+        self.tick()
+        self.assertEqual(self.merges(), [])
+        self.assertIn("no network", self.log())
+        self.assertEqual(self.rec()["phase"], "gate")
+
+    def test_stale_codex_review_is_not_merged(self):  # acceptance 1
+        self.start()
+        self.facts = green_facts(reviews=[{"user": BOT, "commit_id": OLD, "state": "COMMENTED"}])
+        self.tick()
+        self.assertEqual(self.merges(), [])
+
+    def test_gate_is_asked_at_most_once_per_interval(self):
+        self.start()
+        self.facts = green_facts(reviews=[])
+        with mock.patch.object(wab, "GATE_POLL_SECONDS", 60):
+            for _ in range(4):
+                self.tick()
+        self.assertEqual(self.find_calls, 1)
+
+    def test_pass_merges_once_then_waits_for_merged(self):  # acceptance 5
+        self.start()
+        self.merge_it()
+        self.assertEqual(self.merges()[0], tuple(gate.merge_argv("o/r", 7, HEAD)))
+        rec = self.rec()
+        self.assertEqual((rec["phase"], rec["gate_sha"], rec["gate_pr"]), ("merging", HEAD, 7))
+        for _ in range(3):  # still OPEN: nothing is merged again, nothing is launched
+            self.assertTrue(self.tick())
+        self.assertEqual(len(self.merges()), 1)
+        self.launch.assert_not_called()
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
+        self.assertTrue(self.tick())
+        self.launch.assert_called_once()
+        self.assertEqual(self.launch.call_args[0][1], "W2")
+        self.assertTrue(self.launch.call_args[1]["by_dispatcher"])
+        rec = self.rec()
+        self.assertEqual(rec["phase"], "done")
+        self.assertTrue(rec["pending_exit"])
+        self.assertEqual(len([t for t in self.tg if "волна W1 завершена" in t]), 1)
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_a_restarted_watch_in_merging_does_not_merge_again(self):
+        self.start()
+        self.merge_it()
+        for _ in range(2):
+            wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
+        wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(self.rec()["phase"], "done")
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_a_crash_after_the_merge_mark_never_merges_twice(self):
+        cfg = self.start()
+        real = wab.sh
+        state = {"boom": True}
+
+        def die_in_merge(*args, **kw):
+            if args[:3] == ("gh", "pr", "merge") and state["boom"]:
+                state["boom"] = False
+                raise KeyboardInterrupt
+            return real(*args, **kw)
+        with mock.patch.object(wab, "sh", side_effect=die_in_merge):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick()
+        self.assertEqual(self.rec()["merge_called"], HEAD)  # the mark was saved BEFORE the call
+        for _ in range(2):
+            wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(self.merges(), [])
+
+    def test_an_interrupted_merge_is_handed_to_the_owner_once(self):
+        cfg = self.start()
+        real = wab.sh
+
+        def die_in_merge(*args, **kw):
+            if args[:3] == ("gh", "pr", "merge"):
+                raise KeyboardInterrupt
+            return real(*args, **kw)
+        with mock.patch.object(wab, "sh", side_effect=die_in_merge):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick()
+        self.assertEqual(self.rec()["merge_called"], HEAD)
+        self.assertNotIn("merge_rc", self.rec())
+        shown = "~/.cache/wab/" + wab.owner_script_name(self.cfg, "W1", HEAD)
+        with mock.patch.object(wab, "GATE_POLL_SECONDS", 0):
+            for _ in range(3):
+                self.tick()
+        self.assertEqual(self.merges(), [])  # never a second automatic merge
+        self.assertEqual(self.status(), f"BLOCKED: merge gate passed; merge result unknown; owner runs {shown}")
+        said = [t for t in self.tg if "неизвестен (диспетчер" in t]
+        self.assertEqual(len(said), 1)
+        self.assertIn(f"Выполни: {shown}", said[0])
+        self.assertTrue((self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)).is_file())
+        self.assertEqual(self.log().count("merge result unknown"), 1)
+        # the owner merges: the wave completes as usual
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
+        with mock.patch.object(wab, "GATE_POLL_SECONDS", 0):
+            self.tick()
+        self.assertEqual(self.rec()["phase"], "done")
+        self.assertEqual(self.merges(), [])
+
+    def test_failed_check_blocks_with_the_reason_and_tells_the_window(self):  # acceptance 2
+        self.start()
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
+        self.assertTrue(self.tick())
+        self.assertEqual(self.merges(), [])
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: "))
+        self.assertIn("ci (failure)", self.status())
+        self.assertEqual(self.rec()["phase"], "running")
+        told = [s for s in self.sent if s[1] == "wv-w1" and "Гейт мерджа не пройден" in s[2]]
+        self.assertEqual(len(told), 1)
+        self.assertIn("ci (failure)", told[0][2])
+        self.tick()  # the usual BLOCKED notice: the reason, never a merge command
+        blocked = [t for t in self.tg if "ждёт тебя" in t]
+        self.assertEqual(len(blocked), 1)
+        self.assertIn("ci (failure)", blocked[0])
+        self.assertNotIn("gh pr merge", blocked[0])
+
+    def failing_send(self, *, typed):
+        calls = self.fail_calls = []
+
+        def send(name, text, on_typed=None):
+            calls.append(text)
+            if typed and on_typed:
+                on_typed()  # the text is in the window; Enter is what failed
+            raise subprocess.CalledProcessError(1, ["tmux"], stderr="boom")
+        return send
+
+    def gate_fail_facts(self, name="ci"):
+        return green_facts(check_runs=[{"name": name, "status": "completed", "conclusion": "failure"}])
+
+    def told(self):
+        return [s for s in self.sent if "Гейт мерджа не пройден" in s[2]]
+
+    def test_a_failed_delivery_of_the_gate_failure_is_retried(self):  # M1, before the paste
+        self.start()
+        self.facts = self.gate_fail_facts()
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = self.failing_send(typed=False)
+        self.assertTrue(self.tick())
+        self.assertEqual(self.told(), [])
+        self.assertFalse(self.rec()["gate_fail_msg"]["sent"])
+        wab.send_text.side_effect = real
+        self.tick()
+        self.assertEqual(len(self.told()), 1)
+        self.assertTrue(self.rec()["gate_fail_msg"]["sent"])
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(len(self.told()), 1)  # delivered once, never again
+
+    def test_a_failure_after_the_paste_presses_only_enter(self):  # M1, like the checkpoint request
+        self.start()
+        self.facts = self.gate_fail_facts()
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = self.failing_send(typed=True)
+        self.tick()
+        self.assertEqual(self.rec()["pending_enter"], "gate failure")
+        wab.send_text.side_effect = real
+        self.tick()
+        self.assertEqual(self.told(), [])  # not typed twice
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertTrue(self.rec()["gate_fail_msg"]["sent"])
+
+    def test_a_restarted_watch_delivers_the_pending_gate_failure(self):  # M1
+        self.start()
+        self.facts = self.gate_fail_facts()
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = self.failing_send(typed=False)
+        self.tick()
+        wab.send_text.side_effect = real
+        wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(len(self.told()), 1)
+        wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(len(self.told()), 1)
+
+    def test_a_new_episode_replaces_the_pending_text_and_a_moved_on_wave_gets_nothing_stale(self):  # M1
+        self.start()
+        self.facts = self.gate_fail_facts("old-check")
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = self.failing_send(typed=False)
+        self.tick()
+        self.assertIn("old-check", self.rec()["gate_fail_msg"]["text"])
+        wab.send_text.side_effect = real
+        self.set_status(self.cfg, "W1", "DONE")  # the wave wrote DONE again before the retry
+        self.facts = self.gate_fail_facts("new-check")
+        self.tick()
+        self.assertEqual(len(self.told()), 1)
+        self.assertIn("new-check", self.told()[0][2])
+        self.assertNotIn("old-check", self.told()[0][2])
+        # a wave that has moved on (RUNNING) is not sent an outdated failure
+        self.facts = self.gate_fail_facts("third")
+        wab.send_text.side_effect = self.failing_send(typed=False)
+        self.set_status(self.cfg, "W1", "DONE")
+        self.tick()
+        wab.send_text.side_effect = real
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.tick()
+        self.assertEqual(len(self.told()), 1)
+        self.assertNotIn("gate_fail_msg", self.rec())
+
+    def test_status_file_is_replaced_atomically(self):
+        self.start()
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
+        real = os.replace
+        seen = []
+        with mock.patch("os.replace", side_effect=lambda a, b: (seen.append(str(b)), real(a, b))[1]):
+            self.tick()
+        self.assertTrue(any(p.endswith("/W1/status") for p in seen), seen)
+        self.assertEqual([p for p in os.listdir(wab.wave_dir(self.cfg, "W1")) if p.startswith(".status.")], [])
+
+    def test_failures_that_must_block(self):  # acceptance 3, 4, 1a
+        p1 = [{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) bad", "html_url": "u"}]
+        no_tester = green_manifest()
+        del no_tester["tasks"]["T1"]["results"]["tester"]
+        other_head = green_manifest()
+        other_head["head"] = OLD
+        dirty_result = green_manifest()
+        dirty_result["tasks"]["T1"]["results"]["tester"] = result(fp="0" * 64)
+        cases = {
+            "P1 on head": (green_facts(review_comments=p1), green_manifest(), WORK),
+            "no tester pass": (green_facts(), no_tester, WORK),
+            "manifest head": (green_facts(), other_head, WORK),
+            "no manifest": (green_facts(), None, WORK),
+            "tester on another tree": (green_facts(), dirty_result, WORK),
+            "dirty working copy": (green_facts(), green_manifest(), {**WORK, "clean": False}),
+            "closed PR": (green_facts(pr={"state": "closed", "merged": False, "draft": False, "head": HEAD, "base": "main"}),
+                          green_manifest(), WORK),
+        }
+        for name, (facts, manifest, work) in cases.items():
+            with self.subTest(case=name):
+                self.facts, self.manifest, self.work = facts, manifest, work
+                self.start()
+                self.tick()
+                self.assertEqual(self.merges(), [], name)
+                self.assertTrue(self.status().startswith("BLOCKED: merge gate: "), (name, self.status()))
+                self.assertEqual(self.rec()["phase"], "running", name)
+
+    def test_no_pr_for_the_branch_blocks(self):
+        self.start()
+        self.pr = None
+        self.tick()
+        self.assertIn("PR ветки волны не найден", self.status())
+        self.assertEqual(self.merges(), [])
+
+    def test_a_blocked_wave_that_writes_done_again_is_gated_again(self):
+        self.start()
+        self.facts = green_facts(reviews=[])
+        self.facts["check_runs"] = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "running")
+        self.facts = green_facts()
+        self.set_status(self.cfg, "W1", "DONE")
+        self.merge_it()
+
+    def test_done_taken_back_while_waiting_returns_to_running(self):
+        self.start()
+        self.facts = green_facts(reviews=[])
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "gate")
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "running")
+
+    def test_open_threads_get_an_owner_script_and_no_merge(self):  # acceptance 6
+        self.start()
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False},
+                                          {"id": "PRRT_b", "isResolved": False},
+                                          {"id": "PRRT_c", "isResolved": True}])
+        self.assertTrue(self.tick())
+        self.assertEqual(self.merges(), [])
+        script = self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)
+        shown = "~/.cache/wab/" + wab.owner_script_name(self.cfg, "W1", HEAD)  # people see the `~` form
+        self.assertTrue(script.is_file())
+        self.assertEqual(script.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(os.access(script, os.X_OK))
+        text = script.read_text(encoding="utf-8")
+        self.assertIn("exec python3", text)
+        self.assertIn(" owner-merge ", text)
+        self.assertTrue(text.rstrip().endswith(f"W1 {RUN_ID} {HEAD}"))
+        done = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.status(), f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {shown}")
+        self.assertEqual(self.rec()["phase"], "merging")
+        said = [t for t in self.tg if "незакрытые треды" in t]
+        self.assertEqual(len(said), 1)
+        self.assertIn(f"Выполни: {shown}", said[0])
+        self.assertNotIn("gh pr merge", said[0])
+        # the owner runs it: MERGED at the gated head -> the next wave starts
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
+        self.tick()
+        self.launch.assert_called_once()
+        self.assertEqual(self.merges(), [])
+    def test_the_owner_notice_names_old_p0_p1_threads(self):  # G1
+        self.start()
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False, "body": "**![P1 Badge](x)** old"},
+                                          {"id": "PRRT_b", "isResolved": False, "body": "nit"}])
+        self.tick()
+        said = [t for t in self.tg if "незакрытые треды" in t]
+        self.assertEqual(len(said), 1)
+        self.assertIn("2 (из них P0/P1 из прошлых коммитов: 1)", said[0])
+
+    def test_refused_merge_sends_the_ready_command(self):  # acceptance 5
+        self.start()
+        self.merge_rc, self.merge_err = 1, "Pull request is not mergeable: required check missing"
+        self.assertTrue(self.tick())
+        self.assertEqual(len(self.merges()), 1)
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate passed; merge refused"))
+        self.assertEqual(self.rec()["phase"], "merging")
+        sent = [t for t in self.tg if "мердж отклонён" in t]
+        self.assertEqual(len(sent), 1)
+        shown = "~/.cache/wab/" + wab.owner_script_name(self.cfg, "W1", HEAD)
+        self.assertIn(f"Выполни: {shown}", sent[0])
+        self.assertNotIn("gh pr merge", sent[0])  # never the raw command: the owner script gates again
+        self.assertTrue((self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)).is_file())
+        self.assertIn("not mergeable", sent[0])
+        for _ in range(2):
+            self.tick()
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(len([t for t in self.tg if "мердж отклонён" in t]), 1)
+        # the owner merges by hand: the chain goes on
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
+        self.tick()
+        self.launch.assert_called_once()
+
+    def make_draft(self):
+        self.pr["isDraft"] = True
+        self.facts["pr"]["draft"] = True
+
+    def undraft(self):
+        self.pr["isDraft"] = False
+        self.facts["pr"]["draft"] = False
+
+    def readies(self):
+        return [c for c in self.gh_calls if c[:3] == ("gh", "pr", "ready")]
+
+    def test_a_draft_pr_is_only_made_ready_then_gated_again_before_the_merge(self):  # r6 HIGH
+        self.start()
+        self.make_draft()
+        self.assertTrue(self.tick())
+        self.assertEqual(self.readies(), [("gh", "pr", "ready", "7", "--repo", "o/r")])
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.rec()["phase"], "gate")
+        self.assertNotIn("merge_called", self.rec())
+        self.assertIn("переведён в ready", self.log())
+        # ready started new checks: a pending run is a wait, nothing is merged
+        self.undraft()
+        self.facts["check_runs"] = [{"name": "ci", "status": "in_progress", "conclusion": None}]
+        self.tick()
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.rec()["phase"], "gate")
+        # all green on a non-draft PR: the merge, and ready is not asked again
+        self.facts = green_facts()
+        self.tick()
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(len(self.readies()), 1)
+        self.assertEqual(self.rec()["phase"], "merging")
+
+    def test_a_pr_that_stays_draft_after_ready_does_not_loop(self):  # r6 HIGH
+        self.start()
+        self.make_draft()
+        for _ in range(5):
+            self.tick()
+        self.assertEqual(len(self.readies()), 1)
+        self.assertEqual(self.merges(), [])
+        sent = [t for t in self.tg if "draft" in t]
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Выполни: ~/.cache/wab/", sent[0])
+        self.assertEqual(self.rec()["phase"], "merging")
+
+    def test_a_failed_ready_goes_to_the_owner_script(self):
+        self.start()
+        self.pr["isDraft"] = True
+        self.facts["pr"]["draft"] = True
+        self.ready_rc = 1
+        self.tick()
+        self.assertEqual(self.merges(), [])
+        sent = [t for t in self.tg if "перевод в ready отклонён" in t]
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("gh pr merge", sent[0])
+        self.assertNotIn("gh pr ready", sent[0])
+        self.assertIn("Выполни: ~/.cache/wab/", sent[0])
+
+    def test_merged_with_another_head_blocks_and_launches_nothing(self):  # acceptance 1c
+        self.start()
+        self.merge_it()
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": OLD, "baseRefName": "main"}
+        self.assertFalse(self.tick())  # the watch hands the chain over
+        self.launch.assert_not_called()
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: PR #7 смержен с HEAD"))
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+        self.assertEqual(len([t for t in self.tg if "смержен с HEAD" in t]), 1)
+        self.assertIn("next wave NOT launched", self.log())
+
+    def test_merged_into_another_base_blocks_and_launches_nothing(self):
+        self.start()
+        self.merge_it()
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD,
+                     "baseRefName": "release"}
+        self.assertFalse(self.tick())
+        self.launch.assert_not_called()
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+        self.assertIn("смержен в release, цепочка ждёт main", self.status())
+        self.assertEqual(len([t for t in self.tg if "смержен в release" in t]), 1)
+
+    def test_the_last_wave_merged_into_another_base_does_not_end_the_chain(self):
+        cfg = self.start(waves=["W1"])
+        self.merge_it()
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD,
+                     "baseRefName": "release"}
+        self.tick()
+        self.assertEqual(self.get_state(cfg)["current"], "W1")
+        self.assertNotIn("chain finished", self.log())
+        self.assertEqual([t for t in self.tg if "цепочка завершена" in t], [])
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+
+    def test_merged_with_an_unknown_base_is_not_done(self):
+        self.start()
+        self.merge_it()
+        for base in (None, "missing"):
+            self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD}
+            if base is None:
+                self.view["baseRefName"] = None
+            self.assertTrue(self.tick())
+        self.launch.assert_not_called()
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.log().count("base not known"), 1)
+
+    def test_an_open_pr_redirected_to_another_base_goes_back_to_the_gate(self):
+        self.start()
+        self.merge_it()
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "release"}
+        self.assertTrue(self.tick())
+        self.assertEqual(self.rec()["phase"], "gate")
+        self.launch.assert_not_called()
+
+    def test_closed_pr_blocks_and_launches_nothing(self):
+        self.start()
+        self.merge_it()
+        self.view = {"state": "CLOSED", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "main"}
+        self.assertFalse(self.tick())
+        self.launch.assert_not_called()
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: PR #7 закрыт без мерджа"))
+
+    def test_an_unreadable_pr_state_waits(self):
+        self.start()
+        self.merge_it()
+        self.gh_handler = lambda args: _cp(args, 1, "", "HTTP 502")
+        self.assertTrue(self.tick())
+        self.assertTrue(self.tick())
+        self.launch.assert_not_called()
+        self.assertEqual(self.log().count("state not read"), 1)
+
+    def test_the_last_wave_ends_the_chain_after_the_merge(self):
+        cfg = self.start(waves=["W1"])
+        self.merge_it()
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
+        self.assertFalse(self.tick())
+        self.assertIsNone(self.get_state(cfg)["current"])
+        self.assertIn("chain finished", self.log())
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1)
+        self.launch.assert_not_called()
+
+    def test_without_merge_gate_nothing_is_gated_and_the_wave_is_handed_over(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(self.find_calls, 0)
+        self.assertEqual(self.gh_calls, [])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+
+    def test_auto_needs_a_repo(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.chain(merge_gate="auto", repo=None)
+        self.assertIn("repo", str(ctx.exception))
+
+    def test_merge_notices_are_episodes(self):
+        for key in ("merge_owner", "merge_refused", "merge_unknown", "merge_stopped"):
+            self.assertIn(key, wab.NOTICE_EPISODE_ENDS)
+
+
+class GateRecheck(GateBase):  # F2: a pass rests on two equal collections
+    def verdict(self, first, second):
+        self.start()
+        seq = [first, second]
+        with mock.patch.object(wab, "gate_facts", side_effect=lambda cfg, pr: seq.pop(0)):
+            return wab.gate_check(self.cfg, "W1", self.rec())
+
+    def test_equal_collections_pass(self):
+        self.assertEqual(self.verdict(green_facts(), green_facts())["verdict"], "pass")
+
+    def test_a_new_p1_between_the_reads_waits(self):
+        p1 = [{"id": 5, "user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) late", "html_url": "u"}]
+        v = self.verdict(green_facts(), green_facts(review_comments=p1))
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("факты изменились", v["reasons"][0])
+
+    def test_a_check_run_restarted_between_the_reads_waits(self):
+        again = [{"id": 1, "name": "ci", "status": "in_progress", "conclusion": None}]
+        first = green_facts(check_runs=[{"id": 1, "name": "ci", "status": "completed", "conclusion": "success"}])
+        self.assertEqual(self.verdict(first, green_facts(check_runs=again))["verdict"], "wait")
+
+    def test_a_failed_second_collection_waits(self):
+        self.assertEqual(self.verdict(green_facts(), {"error": "gh: boom"})["verdict"], "wait")
+
+    def test_other_changes_wait_too(self):
+        for name, change in (("thread", {"threads": [{"id": "T", "isResolved": False}]}),
+                             ("review", {"reviews": [{"id": 9, "user": BOT, "commit_id": HEAD, "state": "APPROVED"}]}),
+                             ("draft", {"pr": {"state": "open", "merged": False, "draft": True, "head": HEAD, "base": "main"}})):
+            with self.subTest(change=name):
+                self.assertEqual(self.verdict(green_facts(), green_facts(**change))["verdict"], "wait")
+
+
+class Regate(GateBase):  # D2: the head moved while the wave sat in `merging`
+    NEW = "e" * 40
+
+    def moved(self):
+        self.pr = {**self.pr, "headRefOid": self.NEW}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": self.NEW, "base": "main"},
+                                 reviews=[{"user": BOT, "commit_id": self.NEW, "state": "COMMENTED"}])
+        self.manifest = green_manifest()
+        self.manifest["head"] = self.NEW
+        for entry in self.manifest["tasks"].values():
+            for r in entry["results"].values():
+                r["head"] = self.NEW
+        self.work = {**WORK, "head": self.NEW}
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": self.NEW, "baseRefName": "main"}
+
+    def regate(self):
+        self.start()
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "merging")
+        old_merges = len(self.merges())
+        self.moved()
+        self.assertTrue(self.tick())
+        rec = self.rec()
+        self.assertEqual(rec["phase"], "gate")
+        for key in ("gate_sha", "gate_pr", "merge_called", "merge_rc"):
+            self.assertNotIn(key, rec)
+        self.assertEqual(self.status(), "DONE")
+        self.assertIn(f"HEAD сменился после гейта: {HEAD[:12]}→{self.NEW[:12]}, гейт заново", self.log())
+        self.assertEqual(len(self.merges()), old_merges)  # the regate itself merges nothing
+        return old_merges
+
+    def test_after_a_refused_merge_a_new_head_is_gated_and_merged_by_its_own_pass(self):
+        self.merge_rc, self.merge_err = 1, "not mergeable"
+        old = self.regate()
+        self.merge_rc = 0
+        self.tick()
+        self.assertEqual(self.merges()[old:], [tuple(gate.merge_argv("o/r", 7, self.NEW))])
+        self.assertEqual(self.rec()["gate_sha"], self.NEW)
+
+    def test_while_an_owner_script_waits_a_new_head_is_gated_again(self):
+        self.facts = green_facts(threads=[{"id": "T", "isResolved": False}])
+        old = self.regate()
+        self.moved()
+        self.facts["threads"] = [{"id": "T", "isResolved": False}]
+        self.tick()
+        self.assertEqual(len(self.merges()), old)  # open threads again: owner script, no merge
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.rec()["gate_sha"], self.NEW)
+
+    def test_the_old_sha_is_never_merged_after_the_head_moved(self):
+        self.start()
+        self.merge_rc = 1
+        self.tick()
+        self.moved()
+        self.facts["check_runs"] = [{"name": "ci", "status": "in_progress", "conclusion": None}]
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(len(self.merges()), 1)  # only the refused call at the old sha
+        self.assertEqual(self.rec()["phase"], "gate")  # waiting on the new head's CI
+        self.facts = green_facts(pr=self.facts["pr"], reviews=self.facts["reviews"])
+        self.tick()
+        self.assertEqual(len(self.merges()), 2)
+        self.assertIn(self.NEW, self.merges()[1])
+
+
+class OwnerMerge(GateBase):  # D3
+    def setUp(self):
+        super().setUp()
+        self.graphql_calls = []
+        self.order = []
+        self.graphql_answer = {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}
+        real = self.handle
+
+        def handle(args):
+            if args[:3] in (("gh", "pr", "ready"), ("gh", "pr", "merge")):
+                self.order.append(args[2])
+            return real(args)
+        self.gh_handler = handle
+
+        def graphql(query, variables):
+            self.graphql_calls.append(variables)
+            self.order.append("resolve")
+            self.on_resolve(variables)
+            return self.graphql_answer
+        p = mock.patch.object(wab, "gh_graphql", side_effect=graphql)
+        p.start()
+        self.addCleanup(p.stop)
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False},
+                                          {"id": "PRRT_b", "isResolved": True},
+                                          {"id": "PRRT_c", "isResolved": False}])
+        self.pr["isDraft"] = True
+        self.facts["pr"]["draft"] = True
+        self.start()
+        self.tick()  # the gate passes with open threads: the owner script is written
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.snapshot = json.dumps(self.rec(), sort_keys=True)
+        self.gated = HEAD
+
+    def on_resolve(self, variables):  # by default the closed thread is closed on GitHub too
+        for t in self.facts.get("threads", []):
+            if t["id"] == variables["id"]:
+                t["isResolved"] = True
+
+    def run_it(self):
+        return wab.owner_merge(wab.load_chain(self.path), "W1", RUN_ID, self.gated)
+
+    def test_facts_changing_while_threads_close_stop_the_merge(self):  # r13 HIGH
+        self.not_draft()
+        self.on_resolve = lambda v: self.facts.__setitem__(
+            "check_runs", [{"id": 1, "name": "ci", "status": "in_progress", "conclusion": None}])
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("гейт изменился после закрытия тредов", str(ctx.exception))
+        self.assertIn("ничего не смержено", str(ctx.exception))
+        self.assertEqual(self.merges(), [])
+        self.assertNotIn("merge", self.order)
+
+    def test_a_new_p1_while_threads_close_stops_the_merge(self):  # r13 HIGH
+        self.not_draft()
+        self.on_resolve = lambda v: self.facts.__setitem__("review_comments", [
+            {"id": 9, "user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) late", "html_url": "u"}])
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("гейт изменился после закрытия тредов", str(ctx.exception))
+        self.assertEqual(self.merges(), [])
+
+    def test_a_new_open_thread_while_threads_close_stops_the_merge(self):  # r13 HIGH
+        self.not_draft()
+        self.on_resolve = lambda v: self.facts["threads"].append({"id": "PRRT_new", "isResolved": False})
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("появились новые треды, запусти скрипт ещё раз", str(ctx.exception))
+        self.assertEqual(self.merges(), [])
+        self.assertNotIn("merge", self.order)
+
+    def test_unchanged_facts_after_closing_threads_merge_as_before(self):  # r13 HIGH
+        self.not_draft()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.run_it()
+        self.assertEqual(self.order, ["resolve", "resolve", "merge"])
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+
+    def not_draft(self):  # the owner made it ready earlier: the run that merges sees a non-draft PR
+        self.pr["isDraft"] = False
+        self.facts["pr"]["draft"] = False
+
+    def refused(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertEqual(self.order, [])
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.graphql_calls, [])
+        self.assertEqual(json.dumps(self.rec(), sort_keys=True), self.snapshot)
+        return str(ctx.exception)
+
+    def test_a_draft_is_resolved_and_made_ready_then_the_script_stops(self):  # r6 HIGH
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_it()
+        self.assertEqual(self.order, ["resolve", "resolve", "ready"])
+        self.assertEqual([v["id"] for v in self.graphql_calls], ["PRRT_a", "PRRT_c"])
+        self.assertEqual(self.merges(), [])
+        self.assertIn("PR #7 переведён в ready; дождись завершения проверок и запусти скрипт ещё раз", out.getvalue())
+        self.assertEqual(json.dumps(self.rec(), sort_keys=True), self.snapshot)  # the wave's record is untouched
+        # the second run: the PR is not draft any more, the gate passes again, the merge is pinned
+        self.pr["isDraft"] = False
+        self.facts = green_facts()
+        self.order.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.run_it()
+        self.assertEqual(self.order, ["merge"])
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+        self.assertEqual(json.dumps(self.rec(), sort_keys=True), self.snapshot)  # the wave's record is untouched
+
+    def test_a_new_p1_on_the_same_sha_stops_it(self):
+        self.facts = green_facts(threads=self.facts["threads"], review_comments=[
+            {"id": 9, "user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) late", "html_url": "u"}])
+        self.assertIn("fail", self.refused())
+
+    def test_a_pending_check_stops_it(self):
+        self.facts = green_facts(threads=self.facts["threads"],
+                                 check_runs=[{"id": 1, "name": "ci", "status": "in_progress", "conclusion": None}])
+        self.assertIn("wait", self.refused())
+
+    def test_another_head_stops_it(self):
+        other = "e" * 40
+        self.pr = {**self.pr, "headRefOid": other}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": True, "head": other, "base": "main"},
+                                 reviews=[{"user": BOT, "commit_id": other, "state": "COMMENTED"}])
+        self.manifest = {**green_manifest(), "head": other}
+        self.work = {**WORK, "head": other}
+        self.refused()
+
+    def test_it_needs_a_gated_wave_in_merging(self):
+        st = self.get_state(self.cfg)
+        st["waves"]["W1"]["phase"] = "running"
+        self.put_state(self.cfg, st)
+        self.snapshot = json.dumps(self.rec(), sort_keys=True)
+        self.assertIn("not in phase merging", self.refused())
+
+    def test_a_failing_merge_is_reported_with_rc(self):
+        self.merge_rc, self.merge_err = 1, "blocked by policy"
+        self.not_draft()
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("blocked by policy", str(ctx.exception))
+
+    def test_another_run_or_another_gated_sha_is_refused_before_anything(self):  # G2
+        cfg = wab.load_chain(self.path)
+        for name, run_id, sha, want in (("run", "2099-01-01", HEAD, "run"), ("sha", RUN_ID, "e" * 40, "gated sha")):
+            with self.subTest(case=name):
+                self.gh_calls.clear()
+                before = self.find_calls
+                with self.assertRaises(SystemExit) as ctx:
+                    wab.owner_merge(cfg, "W1", run_id, sha)
+                self.assertIn(want, str(ctx.exception))
+                self.assertEqual((self.gh_calls, self.order, self.graphql_calls), ([], [], []))
+                self.assertEqual(self.find_calls, before)  # not even the gate read GitHub
+        for bad in (("W1", "r; x", HEAD), ("W1", RUN_ID, "abc"), ("W1", None, None)):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                wab.owner_merge(cfg, *bad)
+
+    def test_a_changed_repo_is_refused_before_any_gh_call(self):  # H1
+        doc = json.loads(self.path.read_text(encoding="utf-8"))
+        doc["repo"] = "other/repo"  # same run_id, same PR number and sha, another repository
+        self.path.write_text(json.dumps(doc), encoding="utf-8")
+        self.gh_calls.clear()
+        before = self.find_calls
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("identity", str(ctx.exception))
+        self.assertEqual((self.gh_calls, self.order, self.graphql_calls, self.find_calls),
+                         ([], [], [], before))
+        self.assertEqual(json.dumps(self.rec(), sort_keys=True), self.snapshot)
+
+    def test_a_state_without_a_saved_identity_is_refused_and_not_pinned(self):  # H1
+        st = self.get_state(self.cfg)
+        del st["identity"]
+        self.put_state(self.cfg, st)
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it()
+        self.assertIn("identity", str(ctx.exception))
+        self.assertEqual((self.gh_calls, self.order, self.graphql_calls), ([], [], []))
+        self.assertNotIn("identity", self.get_state(self.cfg))  # owner-merge writes no pin
+
+    def test_an_unchanged_identity_works_as_before(self):  # H1
+        self.not_draft()
+        self.run_it()
+        self.assertEqual(self.order[-1], "merge")
+
+    def test_the_old_call_form_without_run_and_sha_is_refused(self):  # G2
+        for argv in (["wab.py", "owner-merge", str(self.path), "W1"],
+                     ["wab.py", "owner-merge", str(self.path), "W1", RUN_ID]):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit) as ctx:
+                wab.main(argv)
+            self.assertIn("run_id and sha are required", str(ctx.exception))
+        self.assertEqual((self.merges(), self.order), ([], []))
+
+    def test_scripts_of_two_runs_do_not_overwrite_each_other(self):  # G2
+        cfg_a = wab.load_chain(self.path)
+        cfg_b, _ = self.chain(run_id="2099-01-01", merge_gate="auto")
+        a = wab.write_owner_script(cfg_a, "W1", HEAD)
+        b = wab.write_owner_script(cfg_b, "W1", "e" * 40)
+        self.assertNotEqual(a, b)
+        self.assertEqual(a.name, wab.owner_script_name(cfg_a, "W1", HEAD))  # the run is in the hash of the name
+        self.assertEqual(b.name, wab.owner_script_name(cfg_b, "W1", "e" * 40))
+        self.assertNotEqual(wab.owner_script_name(cfg_a, "W1", HEAD), wab.owner_script_name(cfg_b, "W1", HEAD))
+        self.assertTrue(a.read_text(encoding="utf-8").rstrip().endswith(f"W1 {RUN_ID} {HEAD}"))
+        self.assertTrue(b.read_text(encoding="utf-8").rstrip().endswith("W1 2099-01-01 " + "e" * 40))
+
+    def test_a_thread_is_closed_only_when_the_answer_says_so(self):  # G3
+        for name, answer in (("null", {"data": {"resolveReviewThread": None}}),
+                             ("false", {"data": {"resolveReviewThread": {"thread": {"isResolved": False}}}}),
+                             ("no field", {"data": {}}),
+                             ("no data", {}),
+                             ("errors", {"errors": [{"message": "Resource not accessible"}], "data": None}),
+                             ("truthy string", {"data": {"resolveReviewThread": {"thread": {"isResolved": "true"}}}})):
+            with self.subTest(answer=name):
+                self.graphql_answer = answer
+                for t in self.facts["threads"]:  # an earlier subtest closed them in the fixture
+                    t["isResolved"] = t["id"] == "PRRT_b"
+                self.order.clear()
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_it()
+                self.assertIn("PRRT_a", str(ctx.exception))
+                self.assertEqual(self.merges(), [])
+                self.assertNotIn("ready", self.order)
+                self.assertNotIn("merge", self.order)
+
+    def test_cli_command_and_exit_code(self):
+        self.not_draft()
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab.main(["wab.py", "owner-merge", str(self.path), "W1", RUN_ID, HEAD])
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "queued"}])
+        with self.assertRaises(SystemExit) as ctx:
+            wab.main(["wab.py", "owner-merge", str(self.path), "W1", RUN_ID, HEAD])
+        self.assertNotEqual(ctx.exception.code, 0)
+
+
+class OwnerMergeHarness(GateBase):
+    """gate_check over fixtures; gh_graphql and the order of resolve / ready / merge are recorded."""
+
+    def setUp(self):
+        super().setUp()
+        self.graphql_calls, self.order = [], []
+        self.graphql_answer = {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}
+        real = self.handle
+
+        def handle(args):
+            if args[:3] in (("gh", "pr", "ready"), ("gh", "pr", "merge")):
+                self.order.append(args[2])
+            return real(args)
+        self.gh_handler = handle
+
+        def graphql(query, variables):
+            self.graphql_calls.append(variables)
+            self.order.append("resolve")
+            for t in self.facts.get("threads", []):  # a closed thread is closed on GitHub too
+                if t["id"] == variables["id"]:
+                    t["isResolved"] = True
+            return self.graphql_answer
+        p = mock.patch.object(wab, "gh_graphql", side_effect=graphql)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_owner_merge(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return wab.owner_merge(wab.load_chain(self.path), "W1", RUN_ID, HEAD)
+
+    def merged_view(self, head=HEAD):
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": head, "baseRefName": "main"}
+
+
+class GateBaseRedirect(OwnerMergeHarness):  # r8 HIGH: the PR base is checked at every collection
+    def redirected(self):
+        facts = green_facts()
+        facts["pr"]["base"] = "release"
+        return facts
+
+    def test_redirect_after_find_pr_fails_and_nothing_is_merged(self):
+        self.start()
+        self.facts = self.redirected()
+        v = wab.gate_check(self.cfg, "W1", self.rec())
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn("release", v["reasons"][0])
+        self.assertEqual(self.merges(), [])
+        self.tick()
+        self.assertEqual(self.merges(), [])
+
+    def test_a_base_change_between_two_collections_waits(self):
+        self.start()
+        seq = [green_facts(), self.redirected()]
+        with mock.patch.object(wab, "gate_facts", side_effect=lambda cfg, pr: seq.pop(0)):
+            v = wab.gate_check(self.cfg, "W1", self.rec())
+        self.assertEqual(v["verdict"], "wait")
+        self.assertIn("факты изменились", v["reasons"][0])
+        self.assertEqual(self.merges(), [])
+
+    def test_owner_merge_of_a_redirected_pr_is_refused(self):
+        self.start(phase="merging")
+        w = self.get_state(self.cfg)
+        w["waves"]["W1"]["gate_sha"], w["waves"]["W1"]["gate_pr"] = HEAD, 7
+        self.put_state(self.cfg, w)
+        self.facts = self.redirected()
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_owner_merge()
+        self.assertIn("release", str(ctx.exception))
+        self.assertEqual((self.order, self.merges(), self.graphql_calls), ([], [], []))
+
+    def test_the_right_base_still_passes(self):
+        self.start()
+        self.assertEqual(wab.gate_check(self.cfg, "W1", self.rec())["verdict"], "pass")
+
+
+class ExternalOwnerMerge(OwnerMergeHarness):  # R1: the script offered by an external hand-off must work
+    def handoff(self):
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
+        self.pr["isDraft"] = True
+        self.facts["pr"]["draft"] = True
+        cfg, path = self.chain(merge_gate="external")
+        self.cfg, self.path = cfg, path
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()},
+                             "identity": wab._pinned_identity(cfg)})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        rec = self.get_state(cfg)["waves"]["W1"]
+        self.assertEqual(rec["phase"], "awaiting_merge")
+        return rec
+
+    def test_the_handoff_keeps_the_gated_sha_and_pr(self):
+        rec = self.handoff()
+        self.assertEqual((rec["gate_sha"], rec["gate_pr"]), (HEAD, 7))
+
+    def test_owner_merge_after_an_external_handoff_resolves_and_readies(self):
+        self.handoff()
+        self.run_owner_merge()
+        self.assertEqual(self.order, ["resolve", "ready"])
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+
+    def test_owner_merge_after_an_external_handoff_refuses_a_moved_head(self):
+        self.handoff()
+        other = "e" * 40
+        self.pr = {**self.pr, "headRefOid": other}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": True, "head": other, "base": "main"},
+                                 reviews=[{"user": BOT, "commit_id": other, "state": "COMMENTED"}])
+        self.manifest = {**green_manifest(), "head": other}
+        self.work = {**WORK, "head": other}
+        with self.assertRaises(SystemExit):
+            self.run_owner_merge()
+        self.assertEqual((self.order, self.merges()), ([], []))
+
+    def test_a_regate_on_another_sha_keeps_the_old_script_and_it_refuses_to_merge(self):  # (c)
+        rec = self.handoff()
+        cfg = wab.load_chain(self.path)
+        other = "e" * 40
+        a = wab.write_owner_script(cfg, "W1", HEAD)  # what the hand-off wrote
+        b = wab.write_owner_script(cfg, "W1", other)  # the re-gate
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.is_file() and b.is_file())
+        self.assertTrue(a.read_text(encoding="utf-8").rstrip().endswith(f"W1 {RUN_ID} {HEAD}"))
+        self.assertTrue(b.read_text(encoding="utf-8").rstrip().endswith(f"W1 {RUN_ID} {other}"))
+        st = wab.load_state(cfg)
+        st["waves"]["W1"]["gate_sha"] = other
+        wab.save_state(cfg, st)
+        with self.assertRaises(SystemExit):
+            self.run_owner_merge()  # the script of the old sha
+        self.assertEqual((self.order, self.merges()), ([], []))
+
+
+class MergedByHand(OwnerMergeHarness):  # R2: a manual merge must not strand the chain
+    def refuse_then_merge_by_hand(self, **chain):
+        self.start(**chain)
+        self.merge_rc, self.merge_err = 1, "blocked by policy"
+        self.tick()
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate passed; merge refused"))
+        self.merged_view()
+
+    def test_a_refused_automerge_then_a_manual_merge_launches_the_next_wave(self):  # (a)
+        self.refuse_then_merge_by_hand()
+        self.assertTrue(self.tick())
+        self.launch.assert_called_once()
+        self.assertEqual(self.launch.call_args[0][1], "W2")
+
+    def test_owner_script_after_a_refused_merge_gates_again_and_merges(self):  # P1-b
+        self.start()
+        self.merge_rc, self.merge_err = 1, "Pull request is not mergeable"
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.merge_rc = 0
+        self.run_owner_merge()  # phase merging + gate_sha saved by the refusal: accepted, gated anew
+        self.assertEqual(len(self.merges()), 2)
+        self.assertIn("--match-head-commit", self.merges()[-1])
+
+    def test_owner_merge_then_the_next_wave_launches(self):  # (b)
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
+        self.start()
+        self.tick()
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate passed; 1 unresolved"))
+        self.run_owner_merge()
+        self.merged_view()
+        self.assertTrue(self.tick())
+        self.launch.assert_called_once()
+
+    def test_a_crash_between_done_and_launch_is_finished_by_the_next_watch_once(self):  # (c)
+        self.refuse_then_merge_by_hand()
+        calls = []
+
+        def die_once(*a, **kw):
+            calls.append(a[1])
+            if len(calls) == 1:
+                raise KeyboardInterrupt  # the process dies after the phase was saved
+            st = wab.load_state(a[0])  # a real launch makes W2 current
+            st["current"] = "W2"
+            st["waves"]["W2"] = self.wave_rec("W2")
+            self.put_state(a[0], st)
+            return True
+        self.launch.side_effect = die_once
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick()
+        self.assertEqual(self.rec()["phase"], "done")
+        self.assertTrue(self.status().startswith("BLOCKED"))  # still the dispatcher's old line
+        for _ in range(3):
+            wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertEqual(calls, ["W2", "W2"])  # the dead try and exactly one more
+        self.assertEqual(len([t for t in self.tg if "волна W1 завершена" in t]), 1)
+
+    def test_the_last_wave_after_a_manual_merge_ends_the_chain(self):  # (d)
+        self.refuse_then_merge_by_hand(waves=["W1"])
+        self.assertFalse(self.tick())
+        self.assertIsNone(self.get_state(self.cfg)["current"])
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1)
+        self.launch.assert_not_called()
+
+    def test_the_last_wave_cut_short_after_done_still_reports_the_chain_end(self):  # (d)
+        self.refuse_then_merge_by_hand(waves=["W1"])
+        with mock.patch.object(wab, "close_window", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick()
+        for _ in range(2):
+            wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        self.assertIsNone(self.get_state(self.cfg)["current"])
+        self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1)
+
+
+class ExternalHandoffVerdict(GateBase):
+    def handoff(self):
+        cfg, path = self.chain(merge_gate="external")
+        self.handoff_cfg = cfg
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        (wab.wave_dir(cfg, "W1") / "result.md").write_text("PR #7\n", encoding="utf-8")
+        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        self.assertEqual(len(self.tg), 1, self.tg)
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+        return self.tg[0]
+
+    def test_done_taken_back_while_the_handoff_gate_collects_is_not_handed_over(self):  # Codex P1 on 6c34840
+        for back in ("RUNNING", ""):
+            with self.subTest(back=back):
+                self.tg.clear()
+                cfg, path = self.chain(merge_gate="external")
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                self.set_status(cfg, "W1", "DONE")
+                (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+                (wab.wave_dir(cfg, "W1") / "result.md").write_text("PR #7\n", encoding="utf-8")
+
+                def collect(cfg_, pr, back=back, cfg=cfg):
+                    (wab.wave_dir(cfg, "W1") / "status").write_text(back + ("\n" if back else ""), encoding="utf-8")
+                    return self.facts
+                with mock.patch.object(wab, "gate_facts", side_effect=collect):
+                    self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))  # the watch goes on
+                rec = self.get_state(cfg)["waves"]["W1"]
+                self.assertNotEqual(rec.get("phase"), "awaiting_merge")
+                self.assertFalse(rec.get("pending_exit"))
+                self.assertEqual([t for t in self.tg if "сдала PR" in t], [])
+                self.assertEqual(self.merges(), [])
+
+    def test_pass_carries_the_merge_command(self):
+        text = self.handoff()
+        self.assertIn("Гейт мерджа пройден", text)
+        self.assertNotIn("gh pr merge", text)  # P1-b: only the owner script, which gates again
+        self.assertIn("Выполни: ~/.cache/wab/" + wab.owner_script_name(self.handoff_cfg, "W1", HEAD), text)
+        self.assertEqual(self.merges(), [])  # external never merges
+
+    def test_pass_with_open_threads_carries_the_owner_script(self):
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
+        text = self.handoff()
+        self.assertIn("Выполни: ~/.cache/wab/" + wab.owner_script_name(self.handoff_cfg, "W1", HEAD), text)
+
+    def test_fail_and_wait_and_error_are_said_plainly(self):
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
+        self.assertIn("Гейт мерджа не пройден: проверки неуспешны: ci (failure)", self.handoff())
+
+    def test_unreadable_facts_never_stop_the_handoff(self):
+        self.pr = gate.CollectError("gh: boom")
+        text = self.handoff()
+        self.assertIn("Гейт мерджа не проверен", text)
+        self.assertIn("boom", text)
+
+
+class Alarm(GateBase):
+    def running(self, **chain):
+        return self.start(status="RUNNING", **chain)
+
+    def alarms(self):
+        return [s for s in self.sent if "Будильник" in s[2]]
+
+    def test_one_message_per_head_after_checks_and_codex_finish(self):  # acceptance 9
+        self.running()
+        for _ in range(4):
+            self.assertTrue(self.tick())
+        self.assertEqual(len(self.alarms()), 1)
+        text = self.alarms()[0][2]
+        for part in ("PR #7", HEAD[:12], "1 ok", "чисто", "тредов: 0"):
+            self.assertIn(part, text)
+        self.assertEqual(self.alarms()[0][1], "wv-w1")
+        # a new head is a new alarm
+        new = "e" * 40
+        self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new, "base": "main"},
+                                 reviews=[{"user": BOT, "commit_id": new, "state": "COMMENTED"}])
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(len(self.alarms()), 2)
+        self.assertIn(new[:12], self.alarms()[1][2])
+
+    def test_pending_checks_or_codex_not_finished_send_nothing(self):  # acceptance 9
+        self.running()
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+        for _ in range(3):
+            self.tick()
+        self.facts = green_facts(reviews=[])
+        for _ in range(3):
+            self.tick()
+        self.facts = green_facts(check_runs=[])
+        self.tick()
+        self.assertEqual(self.alarms(), [])
+
+    def test_failed_checks_and_findings_are_reported(self):
+        self.running()
+        self.facts = green_facts(
+            check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}],
+            review_comments=[{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) x"}],
+            threads=[{"id": "T", "isResolved": False}])
+        self.tick()
+        text = self.alarms()[0][2]
+        for part in ("ci (failure)", "1 замечаний, P0/P1: 1", "тредов: 1"):
+            self.assertIn(part, text)
+
+    def test_only_a_running_wave_with_an_open_pr_is_watched(self):
+        for name, setup in (
+                ("closed PR", lambda: setattr(self, "pr", {**self.pr, "state": "CLOSED"})),
+                ("no PR", lambda: setattr(self, "pr", None)),
+                ("blocked wave", lambda: self.set_status(self.cfg, "W1", "BLOCKED: q")),
+                ("done wave", lambda: self.set_status(self.cfg, "W1", "STARTING"))):
+            with self.subTest(case=name):
+                self.running()
+                self.sent.clear()
+                setup()
+                self.tick()
+                self.assertEqual(self.alarms(), [], name)
+        self.running(repo=None, merge_gate=None)
+        self.find_calls = 0
+        self.tick()
+        self.assertEqual(self.find_calls, 0)  # no repo, no GitHub
+
+    def test_gate_errors_are_one_event_and_no_message(self):
+        self.running()
+        self.pr = gate.CollectError("gh: rate limited")
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.alarms(), [])
+        self.assertEqual(self.log().count("alarm: PR facts not collected"), 1)
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.facts = {"error": "gh api: boom"}
+        self.tick()
+        self.assertEqual(self.alarms(), [])
+        self.facts = green_facts()
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+
+    def test_one_error_episode_is_one_event_until_a_clean_collection(self):
+        self.running()
+        for _ in range(3):
+            self.facts = {"error": "gh api: boom"}
+            self.tick()
+        self.assertEqual(self.log().count("alarm: PR facts not collected"), 1)
+        self.facts = green_facts()
+        self.tick()  # a clean collection closes the episode
+        self.pr = gate.CollectError("gh: down")
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.log().count("alarm: PR facts not collected"), 2)
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.facts = {"error": "gh api: boom"}  # the same text again after a failure episode
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.log().count("alarm: PR facts not collected"), 3)
+
+    def test_github_is_asked_at_most_once_per_interval(self):
+        self.running()
+        with mock.patch.object(wab, "ALARM_POLL_SECONDS", 120):
+            for _ in range(5):
+                self.tick()
+        self.assertEqual(self.find_calls, 1)
+
+    def test_a_failed_delivery_is_retried_not_lost(self):
+        self.running()
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = lambda *a, **kw: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["tmux"]))
+        self.tick()
+        self.assertEqual(self.alarms(), [])
+        wab.send_text.side_effect = real
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+
+    def crashing_send(self, *, typed):
+        def send(name, text, on_typed=None):
+            if typed and on_typed:
+                on_typed()  # the text is in the window, Enter has not been pressed
+            raise KeyboardInterrupt  # the process dies here: nothing after this line runs
+        return send
+
+    def crash_tick(self, *, typed):
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = self.crashing_send(typed=typed)
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick()
+        wab.send_text.side_effect = real
+
+    def restart(self):
+        wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+
+    def test_a_crash_after_saving_the_intent_before_the_paste_is_delivered_after_restart(self):  # (a) 1
+        self.running()
+        self.crash_tick(typed=False)
+        msg = self.rec()["alarm_msg"]
+        self.assertEqual((msg["head"], msg["sent"]), (HEAD, False))
+        self.assertEqual(self.alarms(), [])
+        self.restart()
+        self.assertEqual(len(self.alarms()), 1)
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
+
+    def test_a_crash_after_the_paste_before_enter_restarts_with_enter_only(self):  # (a) 2
+        self.running()
+        self.crash_tick(typed=True)
+        self.assertEqual(self.rec()["pending_enter"], "alarm")
+        self.restart()
+        self.assertEqual(self.alarms(), [])  # the text is not typed a second time
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
+        self.assertNotIn("pending_enter", self.rec())
+
+    def test_a_delivered_alarm_is_never_repeated_even_after_restarts(self):  # (a) 3
+        self.running()
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
+        for _ in range(3):
+            self.tick()
+            self.restart()
+        self.assertEqual(len(self.alarms()), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_a_new_head_drops_the_undelivered_old_alarm_and_types_the_new_one(self):  # (a)
+        self.running()
+        self.crash_tick(typed=True)
+        new = "e" * 40
+        self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new, "base": "main"},
+                                 reviews=[{"user": BOT, "commit_id": new, "state": "COMMENTED"}])
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)  # only the new text is typed; the old one is not repeated
+        self.assertIn(new[:12], self.alarms()[0][2])
+        self.assertEqual(self.rec()["alarm_msg"]["head"], new)
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
+        self.assertNotIn("pending_enter", self.rec())
+
+    def test_a_wave_that_left_running_gets_no_undelivered_alarm(self):  # (a)
+        self.running()
+        self.crash_tick(typed=True)
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        self.restart()
+        self.assertEqual(self.alarms(), [])
+        self.assertEqual(self.enters, [])
+        self.assertNotIn("alarm_msg", self.rec())
+        self.assertNotIn("pending_enter", self.rec())
+
+    def test_a_head_that_moved_before_the_retry_never_gets_the_old_text(self):  # r6
+        self.running()
+        self.crash_tick(typed=False)
+        new = "e" * 40
+        self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new, "base": "main"},
+                                 reviews=[{"user": BOT, "commit_id": new, "state": "COMMENTED"}])
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+        self.assertIn(new[:12], self.alarms()[0][2])
+        self.assertNotIn(HEAD[:12], self.alarms()[0][2])
+        self.assertEqual(self.rec()["alarm_msg"]["head"], new)
+
+    def test_a_head_that_moved_and_is_not_ready_drops_the_old_intent_and_sends_nothing(self):  # r6
+        self.running()
+        self.crash_tick(typed=False)
+        new = "e" * 40
+        self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new, "base": "main"}, reviews=[])
+        self.tick()
+        self.assertEqual(self.alarms(), [])
+        self.assertNotIn("alarm_msg", self.rec())
+
+    def test_a_pr_closed_before_the_retry_gets_nothing_and_loses_the_intent(self):  # r6
+        self.running()
+        self.crash_tick(typed=False)
+        self.pr = {**self.pr, "state": "CLOSED"}
+        self.tick()
+        self.restart()
+        self.assertEqual(self.alarms(), [])
+        self.assertNotIn("alarm_msg", self.rec())
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.running()
+        self.crash_tick(typed=False)
+        self.pr = None  # not found at all
+        self.tick()
+        self.assertEqual(self.alarms(), [])
+        self.assertNotIn("alarm_msg", self.rec())
+
+    def test_a_collect_error_before_the_retry_defers_it_and_keeps_the_intent(self):  # r6
+        for name, setup in (("find_pr", lambda: setattr(self, "pr", gate.CollectError("gh: boom"))),
+                            ("facts", lambda: setattr(self, "facts", {"error": "gh api: boom"}))):
+            with self.subTest(case=name):
+                self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+                self.facts = green_facts()
+                self.sent.clear()
+                self.running()
+                self.crash_tick(typed=False)
+                setup()
+                self.tick()
+                self.restart()
+                self.assertEqual(self.alarms(), [], name)
+                msg = self.rec()["alarm_msg"]
+                self.assertEqual((msg["head"], msg["sent"]), (HEAD, False))
+                self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+                self.facts = green_facts()
+                self.tick()
+                self.assertEqual(len(self.alarms()), 1, name)
+                self.assertTrue(self.rec()["alarm_msg"]["sent"])
+
+    def test_a_retry_before_the_paste_at_the_same_head_carries_the_fresh_verdict(self):  # r5c
+        self.running()
+        self.crash_tick(typed=False)  # intent saved with the green verdict, nothing typed
+        self.assertIn("чисто", self.rec()["alarm_msg"]["text"])
+        self.facts = green_facts(
+            check_runs=[{"name": "lint", "status": "completed", "conclusion": "failure"}],
+            review_comments=[{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) a"}])
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+        text = self.alarms()[0][2]
+        self.assertIn("lint (failure)", text)
+        self.assertNotIn("чисто", text)
+        self.assertEqual(self.rec()["alarm_msg"]["text"], text)
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
+
+
+class GateWrappers(Base):
+    """gh_api, gh_graphql, find_pr, workdir_state, read_manifest, write_owner_script: the thin layer
+    between gate.py and the machine, over a fake `gh`."""
+
+    def setUp(self):
+        super().setUp()
+        self.find_pr = REAL_FIND_PR
+
+    def gh(self, handler):
+        self.gh_handler = handler
+
+    def test_gh_api_returns_json_and_raises_collect_error_otherwise(self):
+        self.gh(lambda a: _cp(a, out='{"x": 1}'))
+        self.assertEqual(wab.gh_api("repos/o/r/pulls/1?per_page=100&page=1"), {"x": 1})
+        self.assertEqual(self.gh_calls[-1], ("gh", "api", "repos/o/r/pulls/1?per_page=100&page=1"))
+        self.gh(lambda a: _cp(a, 1, "", "HTTP 404"))
+        with self.assertRaises(gate.CollectError) as ctx:
+            wab.gh_api("repos/o/r/x")
+        self.assertIn("404", str(ctx.exception))
+        self.gh(lambda a: _cp(a, out="<html>"))
+        with self.assertRaises(gate.CollectError):
+            wab.gh_api("repos/o/r/x")
+
+        def timeout(a):
+            raise subprocess.TimeoutExpired(a, 60)
+        self.gh(timeout)
+        with self.assertRaises(gate.CollectError):
+            wab.gh_api("repos/o/r/x")
+
+    def test_gh_graphql_types_the_number(self):
+        self.gh(lambda a: _cp(a, out='{"data": {}}'))
+        self.assertEqual(wab.gh_graphql("query{x}", {"owner": "o", "name": "r", "number": 5}), {"data": {}})
+        argv = self.gh_calls[-1]
+        self.assertEqual(argv[:3], ("gh", "api", "graphql"))
+        self.assertIn("number=5", argv)
+        self.assertEqual(argv[argv.index("number=5") - 1], "-F")
+        self.assertEqual(argv[argv.index("owner=o") - 1], "-f")
+
+    def git_branch(self, branch="feat/x"):
+        REAL_SH("git", "-C", self.cwd, "init", "-q", "-b", branch)
+        REAL_SH("git", "-C", self.cwd, "-c", "user.name=t", "-c", "user.email=t@example.com",
+                "commit", "-q", "--allow-empty", "-m", "c")
+
+    def test_find_pr_takes_the_open_pr_of_the_branch_else_the_newest(self):
+        cfg, _ = self.chain(base_branch="main")
+        self.git_branch()
+        prs = [{"number": 3, "headRefOid": "1" * 40, "isDraft": False, "state": "MERGED", "baseRefName": "main", **OWN_HEAD},
+               {"number": 9, "headRefOid": "2" * 40, "isDraft": False, "state": "CLOSED", "baseRefName": "main", **OWN_HEAD},
+               {"number": 5, "headRefOid": "3" * 40, "isDraft": True, "state": "OPEN", "baseRefName": "main", **OWN_HEAD}]
+        self.gh(lambda a: _cp(a, out=json.dumps(prs)))
+        self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 5)
+        argv = self.gh_calls[-1]
+        self.assertEqual(argv[:6], ("gh", "pr", "list", "--repo", "o/r", "--head"))
+        self.assertEqual(argv[argv.index("--head") + 1], "feat/x")
+        self.assertIn("--base", argv)
+        self.assertEqual(argv[argv.index("--base") + 1], "main")
+        self.assertIn("baseRefName", argv[argv.index("--json") + 1])
+        self.assertIn("all", argv)
+        self.gh(lambda a: _cp(a, out=json.dumps(prs[:2])))
+        self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 9)
+        self.gh(lambda a: _cp(a, out="[]"))
+        self.assertIsNone(self.find_pr(cfg, self.cwd))
+        self.gh(lambda a: _cp(a, 1, "", "boom"))
+        with self.assertRaises(gate.CollectError):
+            self.find_pr(cfg, self.cwd)
+
+    def test_find_pr_filters_by_the_base_branch(self):  # P1-a
+        cfg, _ = self.chain(base_branch="main")
+        self.git_branch()
+        prs = [{"number": 4, "headRefOid": "1" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "main", **OWN_HEAD},
+               {"number": 8, "headRefOid": "2" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "release", **OWN_HEAD}]
+        self.gh(lambda a: _cp(a, out=json.dumps(prs)))
+        self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 4)  # the newest one is in a foreign base
+        self.gh(lambda a: _cp(a, out=json.dumps(prs[1:])))
+        self.assertIsNone(self.find_pr(cfg, self.cwd))  # only a foreign base: no PR of this wave
+
+    def test_find_pr_takes_only_prs_from_the_chain_repository(self):  # Codex P1 on cf32fbd
+        cfg, _ = self.chain(base_branch="main")
+        self.git_branch()
+        own = {"number": 4, "headRefOid": "1" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "main", **OWN_HEAD}
+        fork = {"number": 8, "headRefOid": "2" * 40, "isDraft": False, "state": "OPEN", "baseRefName": "main",
+                "headRepositoryOwner": {"login": "stranger"}, "headRepository": {"name": "r"}}
+        self.gh(lambda a: _cp(a, out=json.dumps([own, fork])))
+        self.assertEqual(self.find_pr(cfg, self.cwd)["number"], 4)  # a newer PR of a fork's same-named branch
+        argv = self.gh_calls[-1]
+        fields = argv[argv.index("--json") + 1]
+        self.assertIn("headRepositoryOwner", fields)
+        self.assertIn("headRepository", fields)
+        # Codex P2 on e6e70c6: gh's default --limit 30 cuts the list before the head-repository filter
+        self.assertEqual(argv[argv.index("--limit") + 1], "1000")
+        self.gh(lambda a: _cp(a, out=json.dumps([fork])))
+        self.assertIsNone(self.find_pr(cfg, self.cwd))  # only a fork's PR: not the wave's
+        bare = {k: v for k, v in own.items()}
+        bare.pop("headRepositoryOwner"); bare.pop("headRepository")
+        self.gh(lambda a: _cp(a, out=json.dumps([bare])))
+        self.assertIsNone(self.find_pr(cfg, self.cwd))  # the head repository unknown: never guessed
+        twin = dict(own, number=6, headRefOid="3" * 40)
+        self.gh(lambda a: _cp(a, out=json.dumps([own, twin])))
+        with self.assertRaises(gate.CollectError):  # two open PRs of the wave's branch: ambiguous, not "newest"
+            self.find_pr(cfg, self.cwd)
+
+    def test_find_pr_with_an_unknown_base_is_a_collect_error(self):  # P1-a
+        cfg, _ = self.chain()  # no base_branch, no origin/HEAD in the working copy
+        self.git_branch()
+        self.gh(lambda a: _cp(a, out="[]"))
+        with self.assertRaises(gate.CollectError) as ctx:
+            self.find_pr(cfg, self.cwd)
+        self.assertIn("base", str(ctx.exception))
+        self.assertEqual([c for c in self.gh_calls if c[:3] == ("gh", "pr", "list")], [])
+
+    def test_find_pr_without_a_branch_or_a_repo(self):
+        cfg, _ = self.chain()
+        self.assertIsNone(self.find_pr(cfg, self.cwd))  # not even a git repository
+        cfg_no_repo, _ = self.chain(repo=None)
+        with self.assertRaises(gate.CollectError):
+            self.find_pr(cfg_no_repo, self.cwd)
+
+    def test_workdir_state_reads_cleanliness_head_and_fingerprint(self):
+        self.git_branch()
+        got = wab.workdir_state(self.cwd)
+        self.assertTrue(got["clean"])
+        self.assertEqual(got["head"], REAL_SH("git", "-C", self.cwd, "rev-parse", "HEAD").stdout.strip())
+        self.assertEqual(got["fingerprint"], gate.fingerprint(self.cwd))
+        (Path(self.cwd) / "dirty.txt").write_text("x\n", encoding="utf-8")
+        again = wab.workdir_state(self.cwd)
+        self.assertFalse(again["clean"])
+        self.assertNotEqual(again["fingerprint"], got["fingerprint"])
+
+    def test_workdir_state_of_a_non_repository_is_unknown_not_an_exception(self):
+        got = wab.workdir_state(self.cwd)
+        self.assertEqual((got["clean"], got["head"], got["fingerprint"]), (False, None, None))
+
+    def test_read_manifest(self):
+        cfg, _ = self.chain()
+        self.assertIsNone(wab.read_manifest(cfg, "W1"))
+        folder = wab.wave_dir(cfg, "W1") / "superarmanda"
+        folder.mkdir()
+        (folder / "manifest.json").write_text("{broken", encoding="utf-8")
+        self.assertIsNone(wab.read_manifest(cfg, "W1"))
+        (folder / "manifest.json").write_text("[1]", encoding="utf-8")
+        self.assertIsNone(wab.read_manifest(cfg, "W1"))
+        (folder / "manifest.json").write_text('{"head": "x", "tasks": {}}', encoding="utf-8")
+        self.assertEqual(wab.read_manifest(cfg, "W1")["head"], "x")
+
+    def test_home_form_shows_the_tilde_and_redact_keeps_it(self):  # (b)
+        home = Path.home()
+        p = home / ".cache" / "wab" / "c-r-W1-abc-merge"
+        self.assertEqual(wab.home_form(p), "~/.cache/wab/c-r-W1-abc-merge")
+        self.assertEqual(wab.home_form("/etc/x"), "/etc/x")
+        self.assertEqual(wab.redact("Выполни: ~/.cache/wab/chain-2026-10-01-W1-" + HEAD[:12] + "-merge"),
+                         "Выполни: ~/.cache/wab/chain-2026-10-01-W1-" + HEAD[:12] + "-merge")
+
+    def test_redact_keeps_the_path_of_a_written_owner_script_only(self):  # r20, r21
+        cfg, _ = self.chain()
+        for sha in ("18d21df306a4dcda4745c2ac1523d3d93c107c2d", "71234567890a" + "b" * 28, "8" * 40,
+                    "79123456789" + "c" * 29):
+            path = wab.write_owner_script(cfg, "W5", sha)  # a real sha12/id16 may look like a phone or a blob
+            line = f"Выполни: {wab.home_form(path)} (заново проверит гейт)"
+            self.assertEqual(wab.redact(line), line, path.name)
+            # a phone number next to it is still masked
+            self.assertIn("[скрыто]", wab.redact(f"{line}, тел. 8 912 345 67 89"))
+        # the same shape with no such file (e.g. quoted from the wave's own text) gets no exemption
+        secret = "0123456789abcdef0123456789abcdef"
+        for fake in (f"~/.cache/wab/{secret}.aaaaaaaaaaaa.bbbbbbbbbbbbbbbb.merge",
+                     "~/.cache/wab/W1.71234567890a.0123456789abcdef.merge"):
+            self.assertIn("[скрыто]", wab.redact(f"Выполни: {fake}"), fake)
+            self.assertNotIn(secret, wab.redact(f"Выполни: {fake}"))
+
+    def test_owner_script_file_is_private_and_replaced_not_appended(self):
+        cfg, _ = self.chain()
+        path = wab.write_owner_script(cfg, "W1", HEAD)
+        self.assertEqual(path.name, wab.owner_script_name(cfg, "W1", HEAD))
+        self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+        again = wab.write_owner_script(cfg, "W1", HEAD)
+        self.assertEqual(again, path)
+        self.assertEqual([p for p in os.listdir(path.parent) if p.startswith(".merge.")], [])
+        last = path.read_text(encoding="utf-8").rstrip().splitlines()[-1]
+        self.assertEqual(shlex.split(last)[1:], ["python3", str(Path(wab.__file__).resolve()), "owner-merge",
+                                                 cfg["chain_file"], "W1", RUN_ID, HEAD])
+    def test_redact_keeps_the_merge_command_readable(self):
+        command = gate.merge_command("o/r", 7, HEAD)
+        self.assertIn(command, wab.redact(f"Выполни: {command}", wab.TG_MESSAGE_LIMIT))
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
         mods = set(re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", src))
-        stdlib = set(sys.stdlib_module_names)
+        stdlib = set(sys.stdlib_module_names) | {"gate"}  # gate.py is the sibling module, stdlib-only itself
         self.assertFalse(mods - stdlib, mods - stdlib)
+        gate_src = (WAVES / "gate.py").read_text(encoding="utf-8")
+        gate_mods = set(re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", gate_src))
+        self.assertFalse(gate_mods - set(sys.stdlib_module_names), gate_mods)
         self.assertNotRegex(src, r"curl[^\n]*\|\s*python")
 
     def test_protocol_describes_the_waves_mode(self):
