@@ -2172,19 +2172,30 @@ def _gate_tick(cfg, st, wave, w, wdir, now):
         save_state(cfg, st)
         return True
     w.get("notified", {}).pop("gate_wait", None)
+    # collecting the facts takes a while: the wave may have taken its DONE back meanwhile, and `_tick`
+    # would only see it on the next tick, after `gh pr ready`/`gh pr merge` or after a stale BLOCKED
+    # overwrote its new status. Re-read it right before acting on either verdict.
+    if not _still_done(cfg, st, wave, w, wdir, f"merge gate {v['verdict']}"):
+        w["gate_at"] = 0
+        save_state(cfg, st)
+        return True
     if v["verdict"] == "fail":
         return _gate_failed(cfg, st, wave, w, wdir, reasons)
-    # collecting the facts takes a while: the wave may have taken its DONE back meanwhile, and `_tick`
-    # would only see it on the next tick, after `gh pr ready`/`gh pr merge`. Re-read it right before acting.
-    again = read(wdir / "status", on_error=None)
-    if again != "DONE":
-        if again:  # taken back: the wave goes on, its next DONE is gated afresh
-            w["last_status"], w["phase"] = again, "running"
-        w["gate_at"] = 0  # empty/unreadable: mid-rewrite, decide on the next tick
-        save_state(cfg, st)
-        event(cfg, f"{wave}: merge gate passed, but the status is «{_one_line(again or '', 80)}» now: nothing done")
-        return True
     return _gate_passed(cfg, st, wave, w, wdir, v)
+
+
+def _still_done(cfg, st, wave, w, wdir, what):
+    """Is the status file still DONE after a slow step? Another line: the wave took DONE back, it goes
+    on (phase `running`, its next DONE starts afresh); empty/unreadable: mid-rewrite, the next tick
+    decides. Either way the caller does nothing now; the state is saved, one event per occasion."""
+    again = read(wdir / "status", on_error=None)
+    if again == "DONE":
+        return True
+    if again:
+        w["last_status"], w["phase"] = again, "running"
+    save_state(cfg, st)
+    event(cfg, f"{wave}: {what}, but the status is «{_one_line(again or '', 80)}» now: nothing done")
+    return False
 
 
 def _gate_failed(cfg, st, wave, w, wdir, reasons):
@@ -2669,6 +2680,8 @@ def _tick(cfg, st):
         if why:  # present but refused by the same check as the launch: not handed over either
             return _stop_without_next(cfg, st, w, wave, now, why)
         gate_line = f"{handoff_gate_line(cfg, wave, w)}\n\n" if external else ""
+        if external and not _still_done(cfg, st, wave, w, wdir, "hand-off gate collected"):
+            return True  # the gate reading is slow: a DONE taken back meanwhile is not handed over
         # the phase and its notice in ONE save: a crash after it still owes the notice (at least once),
         # and the phase stops a second hand-off, so a restart does not queue it twice
         w["phase"] = "awaiting_merge"

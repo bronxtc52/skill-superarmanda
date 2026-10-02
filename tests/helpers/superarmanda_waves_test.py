@@ -7590,12 +7590,14 @@ class MergeGate(GateBase):
         self.assertEqual(self.tg, [])
 
     def test_done_taken_back_while_the_gate_collects_is_not_merged(self):  # Codex P1 on e6e70c6
-        for draft, back in ((False, "RUNNING"), (True, "RUNNING"), (False, "")):
-            with self.subTest(draft=draft, back=back):
+        red = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
+        for draft, back, facts in ((False, "RUNNING", None), (True, "RUNNING", None), (False, "", None),
+                                   (False, "RUNNING", red), (False, "", red)):  # Codex P2: the fail path too
+            with self.subTest(draft=draft, back=back, fail=facts is not None):
                 self.gh_calls.clear()
                 cfg = self.start()
                 self.pr = dict(self.pr, isDraft=draft)
-                self.facts = green_facts()
+                self.facts = facts or green_facts()
                 self.facts["pr"]["draft"] = draft
 
                 def collect(cfg_, pr, back=back):  # the wave rewrites its status mid-collection
@@ -7607,6 +7609,8 @@ class MergeGate(GateBase):
                 self.assertEqual([c for c in self.gh_calls if c[:3] == ("gh", "pr", "ready")], [])
                 self.assertNotIn(self.rec()["phase"], ("merging", "done"))
                 self.assertEqual(self.rec()["phase"], "running" if back else "gate")
+                self.assertNotIn("gate_fail_msg", self.rec())  # no stale failure into a wave at work
+                self.assertEqual(self.status(), back)  # its new status is not overwritten with BLOCKED
 
     def test_a_collection_error_or_another_head_waits(self):
         cfg = self.start()
@@ -8647,6 +8651,27 @@ class ExternalHandoffVerdict(GateBase):
         self.assertEqual(len(self.tg), 1, self.tg)
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
         return self.tg[0]
+
+    def test_done_taken_back_while_the_handoff_gate_collects_is_not_handed_over(self):  # Codex P1 on 6c34840
+        for back in ("RUNNING", ""):
+            with self.subTest(back=back):
+                self.tg.clear()
+                cfg, path = self.chain(merge_gate="external")
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                self.set_status(cfg, "W1", "DONE")
+                (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+                (wab.wave_dir(cfg, "W1") / "result.md").write_text("PR #7\n", encoding="utf-8")
+
+                def collect(cfg_, pr, back=back, cfg=cfg):
+                    (wab.wave_dir(cfg, "W1") / "status").write_text(back + ("\n" if back else ""), encoding="utf-8")
+                    return self.facts
+                with mock.patch.object(wab, "gate_facts", side_effect=collect):
+                    self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))  # the watch goes on
+                rec = self.get_state(cfg)["waves"]["W1"]
+                self.assertNotEqual(rec.get("phase"), "awaiting_merge")
+                self.assertFalse(rec.get("pending_exit"))
+                self.assertEqual([t for t in self.tg if "сдала PR" in t], [])
+                self.assertEqual(self.merges(), [])
 
     def test_pass_carries_the_merge_command(self):
         text = self.handoff()
