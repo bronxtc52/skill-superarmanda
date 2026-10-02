@@ -7711,6 +7711,8 @@ class MergeGate(GateBase):
         self.assertIn(f"Выполни: {shown}", said[0])
         self.assertTrue((self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)).is_file())
         self.assertEqual(self.log().count("merge result unknown"), 1)
+        self.assertEqual([q["text"] for q in self.rec()["questions"]],
+                         [f"BLOCKED: merge gate passed; merge result unknown; owner runs {shown}"])
         # the owner merges: the wave completes as usual
         self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
         with mock.patch.object(wab, "GATE_POLL_SECONDS", 0):
@@ -7726,6 +7728,8 @@ class MergeGate(GateBase):
         self.assertTrue(self.status().startswith("BLOCKED: merge gate: "))
         self.assertIn("ci (failure)", self.status())
         self.assertEqual(self.rec()["phase"], "running")
+        self.tick()
+        self.assertEqual(self.rec().get("questions", []), [])  # the wave fixes it itself: not the owner's
         told = [s for s in self.sent if s[1] == "wv-w1" and "Гейт мерджа не пройден" in s[2]]
         self.assertEqual(len(told), 1)
         self.assertIn("ci (failure)", told[0][2])
@@ -7900,6 +7904,8 @@ class MergeGate(GateBase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.status(), f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {shown}")
         self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual([q["text"] for q in self.rec()["questions"]],
+                         [f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {shown}"])
         said = [t for t in self.tg if "незакрытые треды" in t]
         self.assertEqual(len(said), 1)
         self.assertIn(f"Выполни: {shown}", said[0])
@@ -8060,6 +8066,8 @@ class MergeGate(GateBase):
         self.launch.assert_not_called()
         self.assertEqual(self.rec()["phase"], "awaiting_merge")
         self.assertTrue(self.status().startswith("BLOCKED: merge gate: PR #7 закрыт без мерджа"))
+        self.assertEqual(len(self.rec()["questions"]), 1)
+        self.assertIn("закрыт без мерджа", self.rec()["questions"][0]["text"])
 
     def test_an_unreadable_pr_state_waits(self):
         self.start()
@@ -9143,6 +9151,298 @@ class GateWrappers(Base):
     def test_redact_keeps_the_merge_command_readable(self):
         command = gate.merge_command("o/r", 7, HEAD)
         self.assertIn(command, wab.redact(f"Выполни: {command}", wab.TG_MESSAGE_LIMIT))
+
+
+class ManifestDashboard(Base):
+    """The dashboard reads the superarmanda manifest of the current wave through `state.py where`."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        self.dash = dash
+        dash.MANIFEST_CACHE.clear()
+        self.state_py = ROOT / "skills" / "superarmanda" / "scripts" / "state.py"
+
+    def state(self, manifest, *args):
+        proc = subprocess.run([sys.executable, str(self.state_py), args[0], "--manifest", str(manifest),
+                               *args[1:]], capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def make_manifest(self, cfg, wave="W1"):
+        repo = self.tmp / "gitrepo"
+        repo.mkdir()
+        git = ["git", "-C", str(repo), "-c", "user.email=a@b", "-c", "user.name=n"]
+        subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "i"], check=True)
+        head = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True,
+                              text=True).stdout.strip()
+        manifest = cfg["run_dir"] / wave / "superarmanda" / "manifest.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        art = self.tmp / "findings.json"
+        art.write_text(json.dumps({"findings": [{"severity": "high"}, {"severity": "medium"}]}),
+                       encoding="utf-8")
+        self.state(manifest, "init", "--repo", str(repo), "--base", head, "--head", head)
+        self.state(manifest, "task-result", "--task", "T1", "--role", "tester", "--status", "pass",
+                   "--session-id", "s1", "--head", head)
+        self.state(manifest, "task-result", "--task", "T1", "--role", "cross_provider_reviewer",
+                   "--status", "findings", "--session-id", "s2", "--head", head, "--artifact", str(art))
+        self.state(manifest, "fix-loop", "--task", "T1", "--outcome", "failed",
+                   "--source", "cross_provider_reviewer")
+        self.state(manifest, "mark", "--task", "T1", "--step", "5", "--safe-point", "true")
+        return manifest
+
+    def frame(self, cfg):
+        from rich.console import Console
+        con = Console(record=True, width=200, height=80, file=io.StringIO(), force_terminal=False)
+        con.print(self.dash.safe_render(cfg))
+        return con.export_text()
+
+    def running(self, **kw):
+        cfg, _ = self.chain(waves=["W1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(**kw)}})
+        self.set_status(cfg, "W1", "RUNNING")
+        return cfg
+
+    def test_frame_shows_the_manifest(self):
+        cfg = self.running(pr=31)
+        self.make_manifest(cfg)
+        text = self.frame(cfg)
+        for part in ("superarmanda", "T1", "needs_fix", "шаг 6", "coder", "1/2", "1/3",
+                     "tester", "pass", "cross_provider_reviewer", "findings", "high 1", "medium 1",
+                     "#31", "Codex", "нет результата", "step 6 coder: continue task T1"):
+            self.assertIn(part, text)
+
+    def test_pr_falls_back_to_gate_pr_and_the_table_has_a_pr_column(self):
+        cfg = self.running(gate_pr=44)
+        text = self.frame(cfg)
+        self.assertIn("PR", text)
+        self.assertIn("#44", text)
+
+    def test_no_manifest_yet(self):
+        cfg = self.running()
+        self.assertIn("manifest ещё нет", self.frame(cfg))
+
+    def test_broken_manifest_is_one_line_not_a_crash(self):
+        cfg = self.running()
+        manifest = cfg["run_dir"] / "W1" / "superarmanda" / "manifest.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{not json", encoding="utf-8")
+        text = self.frame(cfg)
+        self.assertNotIn("кадр не отрисован", text)
+        self.assertIn("W1", text)
+        self.assertIn("manifest: state: cannot read manifest", text)
+        self.assertNotIn("['", text)
+
+    def test_unreadable_artifact_is_a_question_mark(self):
+        cfg = self.running()
+        manifest = self.make_manifest(cfg)
+        (self.tmp / "findings.json").write_text("nope", encoding="utf-8")
+        joined = "\n".join(t.plain for t in self.dash.manifest_lines(cfg, "W1", self.wave_rec()))
+        self.assertIn("findings: ?", joined)
+        self.assertTrue(manifest.exists())
+
+    def test_a_failed_where_is_retried_after_the_interval(self):
+        cfg = self.running()
+        manifest = self.make_manifest(cfg)
+        real = subprocess.run
+        fail = [True]
+
+        def fake(*a, **kw):
+            if fail[0]:
+                raise subprocess.TimeoutExpired(a[0], 1)
+            return real(*a, **kw)
+
+        clock = [1000.0]
+        with mock.patch.object(self.dash.time, "time", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.dash.subprocess, "run", side_effect=fake) as run:
+            self.assertIn("error", self.dash.manifest_where(cfg, "W1"))
+            fail[0] = False
+            clock[0] += 5
+            self.assertIn("error", self.dash.manifest_where(cfg, "W1"))  # inside the interval: cached
+            self.assertEqual(run.call_count, 1)
+            clock[0] += self.dash.MANIFEST_POLL_SECONDS
+            self.assertEqual(self.dash.manifest_where(cfg, "W1")["task"], "T1")
+            self.assertEqual(run.call_count, 2)
+            self.dash.manifest_where(cfg, "W1")
+            self.assertEqual(run.call_count, 2)
+            clock[0] += self.dash.MANIFEST_POLL_SECONDS
+            self.dash.manifest_where(cfg, "W1")  # same manifest, but the repository may have moved on
+            self.assertEqual(run.call_count, 3)
+            manifest.write_text(manifest.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            self.dash.manifest_where(cfg, "W1")  # a changed manifest: at once
+            self.assertEqual(run.call_count, 4)
+
+    def counts_with_alarm(self, artifact):
+        import signal
+
+        def boom(*a):
+            raise AssertionError("finding_counts hangs")
+
+        old = signal.signal(signal.SIGALRM, boom)
+        signal.alarm(10)
+        try:
+            return self.dash.finding_counts(str(artifact))
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_fifo_artifact_does_not_hang_the_frame(self):
+        fifo = self.tmp / "fifo.json"
+        os.mkfifo(fifo)
+        self.assertIsNone(self.counts_with_alarm(fifo))
+
+    def test_huge_artifact_is_a_question_mark_and_a_regular_one_counts(self):
+        big = self.tmp / "big.json"
+        big.write_text('{"findings": [], "pad": "' + "x" * (self.dash.ARTIFACT_LIMIT + 10) + '"}',
+                       encoding="utf-8")
+        self.assertIsNone(self.counts_with_alarm(big))
+        ok = self.tmp / "ok.json"
+        ok.write_text(json.dumps({"findings": [{"severity": "high"}, {"priority": "P1"}]}), encoding="utf-8")
+        self.assertEqual(self.counts_with_alarm(ok), {"high": 1, "P1": 1})
+
+    def test_where_is_cached_by_mtime_and_size(self):
+        cfg = self.running()
+        self.make_manifest(cfg)
+        calls = []
+        real = subprocess.run
+
+        def spy(*a, **kw):
+            calls.append(a)
+            return real(*a, **kw)
+
+        with mock.patch.object(self.dash.subprocess, "run", side_effect=spy):
+            first = self.dash.manifest_where(cfg, "W1")
+            second = self.dash.manifest_where(cfg, "W1")
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 1)
+
+
+class ChainResult(Base):
+    def finished_record(self, **kw):
+        base = dict(pr=31, merged={"pr": 31, "sha": "a" * 40, "commit": "b" * 40, "at": time.time()},
+                    questions=[{"at": time.time() - 30, "text": "BLOCKED: pick a database"}],
+                    attempts=[self.wave_rec(started=time.time() - 600, finished=time.time() - 300)],
+                    restarts=2)
+        base.update(kw)
+        return self.wave_rec(**base)
+
+    def check_file(self, cfg, merged_text):
+        path = cfg["run_dir"] / "chain-result.md"
+        self.assertTrue(path.is_file())
+        text = path.read_text(encoding="utf-8")
+        for part in ("https://github.com/o/r/pull/31", merged_text, "pick a database", "BLOCKED",
+                     "перезапуск", "Время"):
+            self.assertIn(part, text)
+        self.assertEqual([p for p in os.listdir(path.parent) if p.endswith(".tmp")], [])
+        return text
+
+    def test_watch_writes_chain_result_and_one_message(self):
+        cfg, path = self.chain(waves=["W1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.finished_record()}})
+        self.set_status(cfg, "W1", "DONE")
+        wab.watch(cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        self.check_file(cfg, "bbbbbbbbbbbb")
+        msgs = [t for t in self.tg if "цепочка завершена" in t]
+        self.assertEqual(len(msgs), 1, self.tg)
+        self.assertIn("chain-result.md", msgs[0])
+
+    def test_done_writes_chain_result_and_one_message(self):
+        cfg, path = self.chain(waves=["W1"], merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.finished_record(
+            phase="awaiting_merge", merged=None)}})
+        wab.main(["wab.py", "done", str(path)])
+        wab.main(["wab.py", "done", str(path)])
+        text = self.check_file(cfg, "координатором")
+        self.assertIn("W1", text)
+        msgs = [t for t in self.tg if "цепочка завершена" in t]
+        self.assertEqual(len(msgs), 1, self.tg)
+        self.assertIn("chain-result.md", msgs[0])
+
+    def test_blocked_status_is_recorded_as_a_question_once(self):
+        cfg, path = self.chain(waves=["W1"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "BLOCKED: need a decision")
+        wab.watch(cfg, path, max_ticks=1)
+        wab.watch(cfg, path, max_ticks=1)
+        qs = self.get_state(cfg)["waves"]["W1"]["questions"]
+        self.assertEqual(len(qs), 1)
+        self.assertIn("need a decision", qs[0]["text"])
+
+    def render(self, cfg, st):
+        return wab.write_chain_result(cfg, st)[0].read_text(encoding="utf-8")
+
+    def test_questions_of_earlier_attempts_are_kept(self):
+        cfg, _ = self.chain(waves=["W1"])
+        old = self.wave_rec(questions=[{"at": 1000.0, "text": "BLOCKED: old question"}])
+        cur = self.wave_rec(phase="done", questions=[{"at": 2000.0, "text": "BLOCKED: new question"}],
+                            attempts=[old])
+        path, summary = wab.write_chain_result(cfg, {"waves": {"W1": cur}})
+        text = path.read_text(encoding="utf-8")
+        self.assertLess(text.index("old question"), text.index("new question"))
+        self.assertIn("вопросов 2", summary)
+
+    def test_merge_text_has_three_cases(self):
+        cfg, _ = self.chain(waves=["W1"])
+        sha = "c" * 40
+        cases = [({"merged": {"pr": 1, "sha": sha}}, "смержен (cccccccccccc)"),
+                 ({"merged_by": "coordinator"}, "смержен координатором"),
+                 ({}, "мердж: нет")]
+        for extra, want in cases:
+            text = self.render(cfg, {"waves": {"W1": self.wave_rec(phase="done", **extra)}})
+            self.assertIn(want, text)
+            if not extra:
+                self.assertNotIn("координатором", text)
+
+    def test_done_command_marks_the_coordinator(self):
+        cfg, path = self.chain(waves=["W1"], merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge")}})
+        wab.main(["wab.py", "done", str(path)])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"].get("merged_by"), "coordinator")
+        self.assertIn("смержен координатором", (cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8"))
+
+    def test_file_name_survives_redact_of_a_masked_run_dir(self):
+        cfg, _ = self.chain(waves=["W1"])
+        fake = Path("/var/folders/7x/k2j3h4l5m6n7p8q9r0s1t2v3w4x5y6z7/T/runs/chain/r1")
+        self.assertNotIn("r1", wab.redact(str(fake), wab.TG_MESSAGE_LIMIT))  # the premise: it is masked
+        with mock.patch.object(wab, "write_chain_result", return_value=(fake / "chain-result.md", "сводка")):
+            text = wab.chain_done_text(cfg, {"waves": {}})
+        sent = wab.redact(text, wab.TG_MESSAGE_LIMIT)
+        self.assertIn("chain-result.md", sent)
+        self.assertIn("цепочка завершена", sent)
+
+    def test_unrepresentable_times_do_not_stop_the_chain(self):
+        for how in ("watch", "done"):
+            self.tg.clear()
+            cfg, path = self.chain(waves=["W1"], merge_gate="external")
+            rec = self.finished_record(
+                started=1e300, finished=1e300, phase="awaiting_merge" if how == "done" else "running",
+                merged=None, questions=[{"at": 1e300, "text": "BLOCKED: q"}],
+                attempts=[self.wave_rec(started=1e300, finished=1e300)])
+            self.put_state(cfg, {"current": "W1", "waves": {"W1": rec}})
+            if how == "watch":
+                cfg, path = self.chain(waves=["W1"])
+                self.set_status(cfg, "W1", "DONE")
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": rec}})
+                wab.watch(cfg, path, max_ticks=1)
+            else:
+                wab.main(["wab.py", "done", str(path)])
+            self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1, (how, self.tg))
+            self.assertIsNone(self.get_state(cfg)["current"])
+
+    def test_chain_done_text_survives_any_failure(self):
+        cfg, _ = self.chain(waves=["W1"])
+        with mock.patch.object(wab, "write_chain_result", side_effect=RuntimeError("boom")):
+            self.assertIn("цепочка завершена", wab.chain_done_text(cfg, {"waves": {}}))
+
+    def test_pure_helpers_live_in_wab(self):
+        w = self.wave_rec(restarts=1, attempts=[self.wave_rec(restarts=2)])
+        self.assertEqual(wab.wave_restarts(w), 3)
+        self.assertEqual(len(wab.wave_attempts(w)), 1)
 
 
 class Packaging(unittest.TestCase):
