@@ -9267,6 +9267,34 @@ class ManifestDashboard(Base):
             self.dash.manifest_where(cfg, "W1")  # a changed manifest: at once
             self.assertEqual(run.call_count, 4)
 
+    def counts_with_alarm(self, artifact):
+        import signal
+
+        def boom(*a):
+            raise AssertionError("finding_counts hangs")
+
+        old = signal.signal(signal.SIGALRM, boom)
+        signal.alarm(10)
+        try:
+            return self.dash.finding_counts(str(artifact))
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_fifo_artifact_does_not_hang_the_frame(self):
+        fifo = self.tmp / "fifo.json"
+        os.mkfifo(fifo)
+        self.assertIsNone(self.counts_with_alarm(fifo))
+
+    def test_huge_artifact_is_a_question_mark_and_a_regular_one_counts(self):
+        big = self.tmp / "big.json"
+        big.write_text('{"findings": [], "pad": "' + "x" * (self.dash.ARTIFACT_LIMIT + 10) + '"}',
+                       encoding="utf-8")
+        self.assertIsNone(self.counts_with_alarm(big))
+        ok = self.tmp / "ok.json"
+        ok.write_text(json.dumps({"findings": [{"severity": "high"}, {"priority": "P1"}]}), encoding="utf-8")
+        self.assertEqual(self.counts_with_alarm(ok), {"high": 1, "P1": 1})
+
     def test_where_is_cached_by_mtime_and_size(self):
         cfg = self.running()
         self.make_manifest(cfg)

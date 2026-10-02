@@ -10,6 +10,7 @@ import os
 import pathlib
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -261,6 +262,7 @@ WHERE_TIMEOUT = 10
 MANIFEST_CACHE = {}  # manifest path -> (signature, taken at, result)
 STATE_PY = pathlib.Path(__file__).resolve().parent.parent / "state.py"
 VERDICT_ROLES = ("tester", "cross_provider_reviewer", "github_codex_review", "coderabbit")
+ARTIFACT_LIMIT = 2 * 1024 * 1024  # bytes of a findings artifact read for the frame
 SEVERITIES = ("critical", "high", "medium", "low", "P0", "P1", "P2", "P3")
 
 
@@ -302,7 +304,21 @@ def finding_counts(artifact):
     try:
         if not isinstance(artifact, str) or "://" in artifact:
             return None
-        data = json.loads(pathlib.Path(artifact).read_text(encoding="utf-8"))
+        fd = os.open(artifact, os.O_RDONLY | os.O_NONBLOCK)  # bytes (decoded below, encoding utf-8); a FIFO without a writer must not block
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            raw = b""
+            while len(raw) <= ARTIFACT_LIMIT:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            os.close(fd)
+        if len(raw) > ARTIFACT_LIMIT:
+            return None
+        data = json.loads(raw.decode("utf-8"))
         items = data["findings"] if isinstance(data, dict) else data
         counts = {}
         for item in items:
