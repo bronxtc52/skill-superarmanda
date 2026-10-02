@@ -2048,7 +2048,7 @@ def gate_facts(cfg, pr):
 def workdir_state(cwd):
     """{clean, head, fingerprint} of the wave's working copy; what cannot be read is False/None."""
     try:
-        r = sh("git", "-C", str(cwd), "status", "--porcelain", check=False, timeout=GIT_TIMEOUT)
+        r = sh("git", "-C", str(cwd), "status", "--porcelain", "--untracked-files=all", check=False, timeout=GIT_TIMEOUT)
         clean = r.returncode == 0 and not r.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         clean = False
