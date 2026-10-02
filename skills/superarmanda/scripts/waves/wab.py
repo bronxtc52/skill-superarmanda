@@ -588,9 +588,20 @@ def session_marker(cfg, wave):
     return f"[wab:{cfg['chain']}/{cfg['run_id']}/{wave}]"
 
 
+# What Claude Code itself writes into a fresh transcript after /clear, before the first real
+# message: an isMeta caveat, the echo of /clear and its (empty) stdout. Not a wave message.
+_CLEAR_SCAFFOLD = re.compile(
+    r"\s*(?:<local-command-caveat>.*</local-command-caveat>"
+    r"|<local-command-stdout>.*</local-command-stdout>"
+    r"|<command-name>/clear</command-name>\s*<command-message>clear</command-message>"
+    r"\s*<command-args>\s*</command-args>)\s*", re.S)
+
+
 def _first_user_text(path):
     """Text of the first main-thread user message in the first 256 KB of a transcript
-    (a string, or the text blocks of a content list; tool_result blocks do not count)."""
+    (a string, or the text blocks of a content list; tool_result blocks do not count).
+    The scaffolding Claude Code writes on /clear (isMeta lines, the /clear echo and its
+    stdout) is skipped: after /clear the marker sits in the /update that follows it."""
     try:
         with open(path, "rb") as fh:
             head = fh.read(FIRST_MESSAGE_BYTES)
@@ -604,17 +615,20 @@ def _first_user_text(path):
             d = json.loads(raw)
         except ValueError:
             continue
-        if not isinstance(d, dict) or d.get("type") != "user" or d.get("isSidechain"):
+        if not isinstance(d, dict) or d.get("type") != "user" or d.get("isSidechain") or d.get("isMeta"):
             continue
         msg = d.get("message")
         content = msg.get("content") if isinstance(msg, dict) else None
+        text = None
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
+            text = content
+        elif isinstance(content, list):
             texts = [c.get("text", "") for c in content
                      if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str)]
             if texts:
-                return "\n".join(texts)
+                text = "\n".join(texts)
+        if text is not None and not _CLEAR_SCAFFOLD.fullmatch(text):
+            return text
     return ""
 
 

@@ -433,6 +433,28 @@ class SessionBinding(Base):
                                       user([{"type": "tool_result", "content": "x"}, {"type": "text", "text": m}])])
         self.assertEqual(wab.find_new_session(cfg, st, "W1"), "pos-mixed")
 
+    def test_marker_after_the_scaffolding_claude_writes_on_clear(self):
+        # The real shape of a transcript after /clear (Claude Code 2.1.287, run 2026-10-02-wab):
+        # an isMeta caveat and the /clear echo precede the /update that carries the marker.
+        cfg, _ = self.chain()
+        m = self.marker(cfg, "W1")
+        user = lambda c, **kw: json.dumps({"type": "user", **kw, "message": {"content": c}})  # noqa: E731
+        caveat = user("<local-command-caveat>The command below was run directly in Claude Code, not sent "
+                      "to you as a request.</local-command-caveat>", isMeta=True)
+        clear = user("<command-name>/clear</command-name>\n            <command-message>clear</command-message>"
+                     "\n            <command-args></command-args>")
+        stdout = user("<local-command-stdout></local-command-stdout>")
+        update = user(f"<command-message>update</command-message>\n<command-name>/update</command-name>\n"
+                      f"<command-args>{m} Продолжаем волну W1.</command-args>")
+        head = [json.dumps({"type": "custom-title"}), json.dumps({"type": "attachment", "isSidechain": False})]
+        st = {"waves": {"W1": self.wave_rec("W1", sessions=["old"])}}
+        # negative first: scaffolding is skipped, but the first real message still decides
+        self.transcript("neg-plain-first", head + [caveat, clear, stdout, user("plain"), update])
+        self.transcript("neg-marker-only-in-meta", head + [user(m, isMeta=True), clear, user("plain")])
+        self.assertIsNone(wab.find_new_session(cfg, st, "W1"))
+        self.transcript("after-clear", head + [caveat, clear, stdout, update])
+        self.assertEqual(wab.find_new_session(cfg, st, "W1"), "after-clear")
+
     def test_sessions_of_earlier_attempts_are_never_adopted(self):
         cfg, _ = self.chain()
         m = self.marker(cfg, "W1")
