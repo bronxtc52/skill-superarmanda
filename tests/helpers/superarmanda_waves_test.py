@@ -9467,6 +9467,146 @@ class ChainResult(Base):
         self.assertEqual(len(wab.wave_attempts(w)), 1)
 
 
+class OwnerHandover(GateBase):  # #36 п.2: the owner merged the wave's PR himself, outside the gate
+    def git(self, *args, cwd=None):
+        r = REAL_SH("git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", str(cwd or self.cwd), *args,
+                    check=False, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def setUp(self):
+        super().setUp()
+        origin = self.tmp / "origin.git"
+        self.git("init", "-q", "--bare", "-b", "main", str(origin), cwd=self.tmp)
+        self.git("init", "-q", "-b", "main")
+        Path(self.cwd, "a.txt").write_text("base\n", encoding="utf-8")
+        self.git("add", "a.txt")
+        self.git("commit", "-q", "-m", "base")
+        self.git("remote", "add", "origin", str(origin))
+        self.git("push", "-q", "origin", "main")
+        self.git("switch", "-q", "-c", "feat")
+        Path(self.cwd, "a.txt").write_text("wave\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "wave")
+        self.head = self.git("rev-parse", "HEAD")
+        # the owner's squash merge lands on origin/main only (the working copy has not fetched it)
+        self.merge = self.git("commit-tree", "HEAD^{tree}", "-p", "origin/main", "-m", "squash")
+        self.git("push", "-q", "origin", f"{self.merge}:refs/heads/main")
+        self.pr = {"number": 7, "headRefOid": self.head, "isDraft": False, "state": "MERGED"}
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": self.merge}, "headRefOid": self.head,
+                     "baseRefName": "main"}
+        self.facts = green_facts(pr={"state": "merged", "merged": True, "draft": False, "head": self.head,
+                                     "base": "main"})
+        self.start()
+
+    def run_it(self, run_id=RUN_ID, wave="W1"):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            wab.owner_handover(wab.load_chain(self.path), wave, run_id)
+        return out.getvalue()
+
+    def refused(self, needle, **kw):
+        before = wab.state_path(self.cfg).read_bytes()
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_it(**kw)
+        self.assertIn(needle, str(ctx.exception))
+        self.assertEqual(wab.state_path(self.cfg).read_bytes(), before)  # nothing written
+        return str(ctx.exception)
+
+    def test_handover_hands_the_chain_on(self):
+        out = self.run_it()
+        rec = self.rec()
+        self.assertEqual(rec["phase"], "awaiting_merge")
+        self.assertEqual(rec["owner_handover"]["pr"], 7)
+        self.assertEqual(rec["owner_handover"]["head"], self.head)
+        self.assertEqual(rec["owner_handover"]["merge_commit"], self.merge)
+        self.assertTrue(rec["pending_exit"])
+        self.assertTrue(any("/exit" in c for c in self.tmux_calls))  # the live window is asked to close
+        self.assertIn(f"W1: owner-handover: PR #7 смержен владельцем (head {self.head[:12]}, "
+                      f"merge {self.merge[:12]})", self.log())
+        self.assertIn(" launch ", out)
+        self.assertIn(" W2 ", out)
+        self.assertIn(str(self.cfg["run_dir"] / "W1" / "next-prompt.md"), out)
+        self.assertIn(" watch ", out)
+        st = wab.load_state(self.cfg)
+        wab._check_launch_allowed(self.cfg, st, "W2", "wv-w2")  # no refusal: the next wave may follow
+
+    def test_handover_drops_stale_notices_of_the_wave(self):
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["outbox"] = {"blocked": {"text": "old", "next_at": 0}}
+        self.put_state(self.cfg, st)
+        self.run_it()
+        self.assertNotIn("outbox", self.rec())
+
+    def test_the_last_wave_is_finished_with_done(self):
+        self.start(waves=["W1"])
+        out = self.run_it()
+        self.assertIn(" done ", out)
+        self.assertNotIn(" launch ", out)
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+
+    def test_a_dead_wave_without_window_is_handed_over_without_exit(self):
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["phase"] = "dead"
+        self.put_state(self.cfg, st)
+        self.alive = False
+        self.run_it()
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+        self.assertNotIn("pending_exit", self.rec())
+
+    def test_refused_when_the_pr_is_not_merged(self):
+        self.view["state"] = "OPEN"
+        self.refused("not MERGED")
+
+    def test_refused_when_the_pr_head_is_not_the_wave_head(self):
+        self.view["headRefOid"] = "e" * 40
+        msg = self.refused("is not the HEAD of the wave")
+        self.assertIn(self.head[:12], msg)
+        self.assertIn("e" * 12, msg)
+
+    def test_refused_when_the_merge_commit_is_not_in_the_base(self):
+        self.view["mergeCommit"] = {"oid": self.head}  # exists, but never reached origin/main
+        self.refused("is not an ancestor of origin/main")
+
+    def test_refused_for_another_run(self):
+        self.refused("is run", run_id="2026-01-01")
+
+    def test_refused_for_a_wave_that_is_not_current(self):
+        self.refused("is not the current wave", wave="W2")
+
+    def test_refused_while_a_dispatcher_holds_the_lock(self):
+        DispatcherLock.hold_elsewhere(self, self.cfg)
+        self.refused("останови watch")
+
+    def test_refused_in_phase_merging(self):
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["phase"] = "merging"
+        self.put_state(self.cfg, st)
+        self.refused("merging")
+
+    def test_refused_when_already_handed_over(self):
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["phase"] = "awaiting_merge"
+        self.put_state(self.cfg, st)
+        self.refused("awaiting_merge")
+
+    def test_refused_without_a_saved_identity(self):
+        st = wab.load_state(self.cfg)
+        st.pop("identity")
+        self.put_state(self.cfg, st)
+        self.refused("identity")
+
+    def test_cli_entry(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab.main(["wab.py", "owner-handover", str(self.path), "W1", RUN_ID])
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+
+    def test_blocked_line_of_a_pr_merged_outside_the_gate_names_owner_handover(self):
+        self.tick()
+        status = self.status()
+        self.assertTrue(status.startswith("BLOCKED: merge gate: PR уже смержен вне гейта"), status)
+        self.assertIn(f"owner-handover {self.path} W1 {RUN_ID}", status)
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")

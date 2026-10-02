@@ -7,6 +7,7 @@ Commands:
   wab.py status <chain.json>                        one-screen status
   wab.py done   <chain.json> [<wave>]               after the LAST wave's PR is merged: finish the chain
   wab.py owner-merge <chain.json> <wave> <run_id> <sha>  gated merge by the owner (run by the generated script)
+  wab.py owner-handover <chain.json> <wave> <run_id>  the owner merged the wave's PR himself: hand the chain on
   wab.py notify <chain.json> <text>                 Telegram message to the owner
   wab.py current-tmux <chain.json>                  tmux session name of the current wave
 
@@ -213,9 +214,10 @@ class _RunLock:
     """One dispatcher per run: flock on <run_dir>/dispatcher.lock. Taken by `watch` for its
     whole life and by the CLI `launch`; a launch inside a running watch reuses the held lock."""
 
-    def __init__(self, cfg, what):
+    def __init__(self, cfg, what, busy="запусти волну через watch или останови диспетчер"):
         self.path = cfg["run_dir"] / "dispatcher.lock"
         self.what = what
+        self.busy = busy
         self.fh = None
 
     def __enter__(self):
@@ -227,8 +229,7 @@ class _RunLock:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             fh.close()
-            raise SystemExit(f"wab: another dispatcher holds {self.path} ({self.what}); "
-                             f"запусти волну через watch или останови диспетчер")
+            raise SystemExit(f"wab: another dispatcher holds {self.path} ({self.what}); {self.busy}")
         self.fh = fh
         _HELD.add(str(self.path))
         return self
@@ -2214,8 +2215,18 @@ def _still_done(cfg, st, wave, w, wdir, what):
     return False
 
 
+def owner_handover_cmd(cfg, wave):
+    """The ready line for the owner after a merge outside the gate (see owner_handover)."""
+    return (f"python3 {shlex.quote(str(pathlib.Path(__file__).resolve()))} owner-handover "
+            f"{shlex.quote(str(cfg['chain_file']))} {wave} {cfg['run_id']}")
+
+
 def _gate_failed(cfg, st, wave, w, wdir, reasons):
-    w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate: {reasons}")
+    blocked = f"BLOCKED: merge gate: {reasons}"
+    if gate.MERGED_OUTSIDE in reasons:  # the gate can never pass again: the owner's way out, ready to run
+        blocked += (f"; если PR смержил владелец — останови watch и выполни: "
+                    f"{owner_handover_cmd(cfg, wave)}")
+    w["last_status"] = _write_status(wdir, blocked)
     w["phase"] = "running"  # the wave goes on; its next DONE is gated again
     if w.get("pending_enter") == "gate failure":
         w.pop("pending_enter")  # a new episode: its text is typed afresh, not just confirmed with Enter
@@ -2444,6 +2455,91 @@ def owner_merge(cfg, wave, run_id, sha):
                          f"{_one_line(r.stderr or r.stdout or r.returncode, 200)}")
     print(f"wab: owner-merge: PR #{number} merge requested at {sha[:12]} "
           f"({len(v['unresolved'])} threads resolved)", flush=True)
+
+
+def owner_handover(cfg, wave, run_id):
+    """`wab.py owner-handover <chain.json> <wave> <run_id>`: the owner merged the current wave's PR
+    himself (outside the gate, which then fails «PR уже смержен вне гейта» forever) and confirms it.
+    Checked before anything is written: the run, the identity, the run lock (watch stopped), the wave
+    is current and not handed over / not `merging`, its PR (found as the gate finds it) is MERGED at
+    exactly the wave's HEAD, and the merge commit is in the fetched origin/<base>. Then, in one save:
+    phase awaiting_merge (the next `launch` is allowed), /exit intent for a live window, the record
+    `owner_handover`, stale notices dropped. Any refusal is SystemExit before state.json is touched."""
+    what = "owner-handover"
+    if not (isinstance(run_id, str) and gate.RUN_ID.fullmatch(run_id)):
+        raise SystemExit(f"wab: {what}: run_id is required and must be well-formed; nothing done")
+    if cfg["run_id"] != run_id:
+        raise SystemExit(f"wab: {what}: the command is for run {run_id}, chain.json is run {cfg['run_id']}; "
+                         f"nothing done")
+    with _RunLock(cfg, what, busy="останови watch этого прогона и повтори; nothing done"):
+        st = load_state(cfg)
+        if not st.get("identity"):
+            raise SystemExit(f"wab: {what}: state.json has no saved run identity; nothing done "
+                             f"(run `launch` or `watch` first)")
+        check_identity(cfg, st, what)
+        if wave != st.get("current"):
+            raise SystemExit(f"wab: {what}: wave {wave} is not the current wave ({st.get('current')}); nothing done")
+        w = st["waves"].get(wave)
+        phase = w.get("phase") if isinstance(w, dict) else None
+        if not isinstance(w, dict) or phase in HANDED_OVER or phase == "merging":
+            raise SystemExit(f"wab: {what}: wave {wave} is {phase}; nothing done (awaiting_merge/done: already "
+                             f"handed over; merging: the dispatcher sees MERGED itself)")
+        cwd = w.get("cwd")
+        if not cwd:
+            raise SystemExit(f"wab: {what}: wave {wave} has no working copy in state.json; nothing done")
+        repo = str(cfg["repo"])
+        try:
+            pr = find_pr(cfg, cwd)  # the same search as the gate (branch, base, head repository)
+            if pr is None:
+                raise SystemExit(f"wab: {what}: no PR of the wave's branch found; nothing done")
+            info = _json(_gh("pr", "view", str(pr["number"]), "--repo", repo, "--json",
+                             "state,mergeCommit,headRefOid,baseRefName"), "gh pr view")
+        except gate.CollectError as e:
+            raise SystemExit(f"wab: {what}: PR not read: {e}; nothing done")
+        number = pr["number"]
+        if not isinstance(info, dict) or info.get("state") != "MERGED":
+            got = info.get("state") if isinstance(info, dict) else None
+            raise SystemExit(f"wab: {what}: PR #{number} is {got}, not MERGED; nothing done")
+        merge = (info.get("mergeCommit") or {}).get("oid") if isinstance(info.get("mergeCommit"), dict) else None
+        if not (isinstance(merge, str) and gate.SHA.fullmatch(merge)):
+            raise SystemExit(f"wab: {what}: PR #{number} has no merge commit; nothing done")
+        pr_head, head = info.get("headRefOid"), head_rev(cwd)
+        if not head or pr_head != head:
+            raise SystemExit(f"wab: {what}: PR #{number} head {str(pr_head)[:12]} is not the HEAD of the wave "
+                             f"{str(head)[:12]} ({cwd}); nothing done (merged is not what the wave handed in)")
+        base = base_branch_of(cfg, cwd)
+        if not base:
+            raise SystemExit(f"wab: {what}: the base branch is unknown (base_branch in chain.json); nothing done")
+        git = lambda *a: sh("git", "-C", str(cwd), *a, check=False, timeout=GIT_TIMEOUT)
+        fetch = git("fetch", "origin", base)
+        if fetch.returncode != 0:
+            raise SystemExit(f"wab: {what}: git fetch origin {base} failed: "
+                             f"{_one_line(fetch.stderr, 200)}; nothing done")
+        if git("merge-base", "--is-ancestor", merge, f"refs/remotes/origin/{base}").returncode != 0:
+            raise SystemExit(f"wab: {what}: merge commit {merge[:12]} of PR #{number} is not an ancestor of "
+                             f"origin/{base}; nothing done")
+        now = time.time()
+        w["phase"] = "awaiting_merge"
+        w["pr"] = number
+        name = w.get("tmux")
+        if isinstance(name, str) and name and tmux_alive(name):
+            w["pending_exit"] = True  # the intent to close the window, in the same save as the phase
+        w["owner_handover"] = {"pr": number, "head": head, "merge_commit": merge, "at": now}
+        ack_wave_notices(w)  # confirmed by the owner: notices about its past state are stale
+        save_state(cfg, st)
+        event(cfg, f"{wave}: owner-handover: PR #{number} смержен владельцем (head {head[:12]}, merge {merge[:12]})")
+        close_pending_windows(cfg, st)
+    waves = cfg["waves"]
+    idx = waves.index(wave)
+    wab_py = f"python3 {shlex.quote(str(pathlib.Path(__file__).resolve()))}"
+    chain_file = shlex.quote(str(cfg["chain_file"]))
+    if idx + 1 < len(waves):
+        nxt = cfg["run_dir"] / wave / "next-prompt.md"
+        print(f"wab: {what}: волна {wave} передана. Дальше: {wab_py} launch {chain_file} {waves[idx + 1]} "
+              f"{shlex.quote(str(nxt))} && {wab_py} watch {chain_file}", flush=True)
+    else:
+        print(f"wab: {what}: волна {wave} передана, это последняя волна. Дальше: {wab_py} done {chain_file} {wave}",
+              flush=True)
 
 
 def _merging_tick(cfg, st, wave, w, wdir, now):
@@ -3384,6 +3480,8 @@ def main(argv):
     elif cmd == "owner-merge":
         sys.exit("wab: owner-merge <chain.json> <wave> <run_id> <sha>: run_id and sha are required "
                  "(an old script without them is refused; use the script the dispatcher wrote last)")
+    elif cmd == "owner-handover" and len(argv) == 5:
+        owner_handover(load_chain(path, create=False), argv[3], argv[4])
     elif cmd == "notify":
         notify(load_chain(path), " ".join(argv[3:]))
     else:
