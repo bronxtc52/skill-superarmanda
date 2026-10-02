@@ -649,19 +649,30 @@ def session_owners(data):
     return owners
 
 
+def result_digest(result):
+    """Identity of one recorded role result: sha256 of its canonical JSON. A
+    deferral names the exact result it covers, so a rerun of the same reviewer
+    (even on the same head within the same second) needs its own deferral."""
+    raw = json.dumps(result, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def is_deferred(entry, role, result):
     """A findings result counts as passed only through a deferral of the same
-    role recorded no earlier than the result itself (and on its head)."""
+    role bound to exactly this result (its digest) and its head. The single
+    rule for state.py and the wave gate."""
+    if role not in DEFER_SOURCES:
+        return False
     if not isinstance(result, dict) or result.get("status") != "findings":
         return False
-    made = result.get("recorded_at")
+    digest = result_digest(result)
     for deferral in (entry or {}).get("deferrals") or []:
-        if not isinstance(deferral, dict) or deferral.get("source") != role:
-            continue
-        if deferral.get("head") not in (None, result.get("head")):
-            continue
-        when = deferral.get("recorded_at")
-        if isinstance(made, str) and isinstance(when, str) and when >= made:
+        if (
+            isinstance(deferral, dict)
+            and deferral.get("source") == role
+            and deferral.get("head") == result.get("head")
+            and deferral.get("result_sha256") == digest
+        ):
             return True
     return False
 
@@ -1101,6 +1112,7 @@ def record_deferral(args, entry, data, location):
             "source": args.source,
             "note": args.note,
             "head": result_entry["head"],
+            "result_sha256": result_digest(result_entry),
             "result_recorded_at": result_entry["recorded_at"],
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }

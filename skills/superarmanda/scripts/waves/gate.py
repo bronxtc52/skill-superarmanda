@@ -306,19 +306,8 @@ def _needs_fix_explained(entry, review, head, fingerprint_now):
 
 def _deferred(entry, role, result):
     """`fix-loop --defer` on THIS result: low/P3-only findings of `role` moved to the next wave's
-    remainder, recorded no earlier than the result. Older deferrals and other roles: no."""
-    if role not in ("cross_provider_reviewer", "github_codex_review", "coderabbit"):
-        return False
-    if not isinstance(result, dict) or result.get("status") != "findings":
-        return False
-    made = _ts(result.get("recorded_at"))
-    for deferral in entry.get("deferrals") or []:
-        if not isinstance(deferral, dict) or deferral.get("source") != role:
-            continue
-        when = _ts(deferral.get("recorded_at"))
-        if made and when and when >= made:
-            return True
-    return False
+    remainder. The rule is state.is_deferred (bound to the exact result and its head), not a copy."""
+    return state.is_deferred(entry, role, result)
 
 
 def _accepted(entry, review):

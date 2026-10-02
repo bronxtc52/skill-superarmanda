@@ -12,13 +12,14 @@
   `fix_sources` и `decision_required_for` не меняются, запись идёт в новое поле `deferrals`, а не в
   `decisions`. Только для `cross_provider_reviewer`, `github_codex_review`, `coderabbit` (tester —
   нет) и только на результате `findings` текущего head; не в `blocked`/`needs_decision`. Готовность
-  задачи и гейт диспетчера засчитывают `findings` с deferral той же роли не раньше результата;
+  задачи и гейт диспетчера (одна функция `state.is_deferred`) засчитывают `findings`, только если
+  deferral привязан ровно к этому результату (sha256 его записи) и его head;
   `where` показывает счётчик `deferred`.
   ([#36](https://github.com/bronxtc52/skill-superarmanda/issues/36), п. 3)
 
 ### Исправлено
 
-- `wab.py`: `refresh_workdir` и `owner-handover` проверяют чистоту дерева через
+- `wab.py`: `refresh_workdir`, `owner-handover` и `workdir_state` проверяют чистоту дерева через
   `git status --porcelain --untracked-files=all` — неотслеживаемый файл больше не прячется за
   `status.showUntrackedFiles no`. ([#36](https://github.com/bronxtc52/skill-superarmanda/issues/36), п. 7)
 

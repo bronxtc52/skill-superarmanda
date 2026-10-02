@@ -7276,34 +7276,41 @@ class GateVerdict(unittest.TestCase):
         other["tasks"]["T1"]["results"]["cross_provider_reviewer"]["status"] = "unavailable"
         self.assertEqual(self.ev(manifest=other)["verdict"], "fail")
 
-    def test_deferred_low_findings_count_as_passed_by_role_and_time(self):  # #36 defect 3
-        def deferral(source="cross_provider_reviewer", at="2026-10-01T10:10:00Z"):
-            return {"source": source, "note": "low -> next wave", "head": HEAD,
-                    "result_recorded_at": "2026-10-01T10:05:00Z", "recorded_at": at}
+    def test_deferred_low_findings_count_only_for_the_exact_result(self):  # #36 defect 3
+        state = wab.gate.state
 
-        def manifest(deferrals, role="cross_provider_reviewer"):
-            m = green_manifest(deferrals=deferrals)
-            m["tasks"]["T1"]["results"][role] = result("findings")
+        def deferral(res, source="cross_provider_reviewer", head=HEAD, digest=None):
+            return {"source": source, "note": "low -> next wave", "head": head,
+                    "result_sha256": digest or state.result_digest(res),
+                    "result_recorded_at": res.get("recorded_at"), "recorded_at": res.get("recorded_at")}
+
+        def manifest(deferrals_of, role="cross_provider_reviewer"):
+            m = green_manifest()
+            res = result("findings")
+            m["tasks"]["T1"]["results"][role] = res
+            m["tasks"]["T1"]["deferrals"] = deferrals_of(res)
             return m
         for role in ("cross_provider_reviewer", "github_codex_review", "coderabbit"):
             cases = [
-                ("no deferral", [], "fail"),
-                ("deferral of this role", [deferral(role)], "pass"),
-                ("same instant", [deferral(role, at="2026-10-01T10:05:00Z")], "pass"),
-                ("deferral older than the result", [deferral(role, at="2026-10-01T10:00:00Z")], "fail"),
-                ("deferral of another role", [deferral("tester")], "fail"),
+                ("no deferral", lambda r: [], "fail"),
+                ("deferral of this exact result", lambda r, role=role: [deferral(r, role)], "pass"),
+                # a rerun of the same reviewer on the same head in the same second: another result
+                ("deferral of another result, same head and second",
+                 lambda r, role=role: [deferral(dict(r, session_id="rerun"), role)], "fail"),
+                ("deferral on another head", lambda r, role=role: [deferral(r, role, head=OLD)], "fail"),
+                ("deferral of another role", lambda r: [deferral(r, "tester")], "fail"),
             ]
-            for name, deferrals, want in cases:
+            for name, deferrals_of, want in cases:
                 with self.subTest(role=role, case=name):
-                    v = self.ev(manifest=manifest(deferrals, role))
+                    v = self.ev(manifest=manifest(deferrals_of, role))
                     self.assertEqual(v["verdict"], want, v["reasons"])
         # deferral never turns coder/tester findings into pass
         for role in ("coder", "tester"):
             with self.subTest(role=role):
-                m = manifest([deferral(role)], role)
+                m = manifest(lambda r, role=role: [deferral(r, role)], role)
                 self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
         # a deferral does not excuse a non-findings status
-        m = manifest([deferral()])
+        m = manifest(lambda r: [deferral(r)])
         m["tasks"]["T1"]["results"]["cross_provider_reviewer"]["status"] = "error"
         self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
 

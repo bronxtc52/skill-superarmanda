@@ -3428,5 +3428,27 @@ class WhereDerivationExhaustive(unittest.TestCase):
         )
 
 
+
+class DeferralIdentity(unittest.TestCase):  # #36 п.3: a deferral covers one exact result
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("state_deferral_identity", STATE)
+        self.state = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.state)
+
+    def test_rerun_on_the_same_head_and_second_needs_its_own_deferral(self):
+        st = self.state
+        first = {"status": "findings", "head": "a" * 40, "session_id": "s1",
+                 "recorded_at": "2026-10-02T18:00:00Z"}
+        rerun = dict(first, session_id="s2")  # same head, same second, another result
+        entry = {"deferrals": [{"source": "cross_provider_reviewer", "head": first["head"],
+                                "result_sha256": st.result_digest(first), "note": "low",
+                                "recorded_at": first["recorded_at"]}]}
+        self.assertTrue(st.is_deferred(entry, "cross_provider_reviewer", first))
+        self.assertFalse(st.is_deferred(entry, "cross_provider_reviewer", rerun))
+        self.assertFalse(st.is_deferred(entry, "github_codex_review", first))  # another role
+        self.assertFalse(st.is_deferred(entry, "tester", dict(first)))  # tester is never deferred
+        moved = dict(first, head="b" * 40)
+        self.assertFalse(st.is_deferred(entry, "cross_provider_reviewer", moved))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

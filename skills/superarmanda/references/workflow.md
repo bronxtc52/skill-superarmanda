@@ -87,7 +87,8 @@ assert its continued existence; coordinator validates the artifact and adapter r
 `gate_ready: true` before recording a pass.
 The script rejects a session ID used by another task or role anywhere in the run and rejects a changed worktree
 until `resume`. A task becomes `ready_for_pr_review` only when current coder, tester and
-cross-provider reviewer results all pass. GitHub Codex review remains a separate PR gate;
+cross-provider reviewer results all pass; a reviewer `findings` result counts as passed only
+through a `fix-loop --defer` bound to exactly that result (its digest and head). GitHub Codex review remains a separate PR gate;
 CodeRabbit cannot satisfy either gate. `fix-loop --outcome failed --source <source>` persists each
 failed round and increments both the task-wide `fix_cycles` and the per-source `fix_sources[source]`
 counter; `--source` is required with `--outcome failed`, rejected with `--outcome pass`, and must be
