@@ -2718,7 +2718,8 @@ def chain_done_text(cfg, st):
         path, summary = write_chain_result(cfg, st)
     except (OSError, ValueError, TypeError, KeyError) as e:
         return f"wave-autobot: цепочка завершена, все волны готовы (chain-result.md не записан: {e})."
-    return f"wave-autobot: цепочка завершена, все волны готовы.\n{summary}\nИтог: {path}"
+    return (f"wave-autobot: цепочка завершена, все волны готовы.\n{summary}\n"
+            f"Итог: chain-result.md в каталоге прогона {home_form(path.parent)}")
 
 
 def _complete_wave(cfg, st, wave, w, wdir, now):

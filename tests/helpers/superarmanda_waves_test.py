@@ -9397,6 +9397,16 @@ class ChainResult(Base):
         self.assertEqual(self.get_state(cfg)["waves"]["W1"].get("merged_by"), "coordinator")
         self.assertIn("смержен координатором", (cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8"))
 
+    def test_file_name_survives_redact_of_a_masked_run_dir(self):
+        cfg, _ = self.chain(waves=["W1"])
+        fake = Path("/var/folders/7x/k2j3h4l5m6n7p8q9r0s1t2v3w4x5y6z7/T/runs/chain/r1")
+        self.assertNotIn("r1", wab.redact(str(fake), wab.TG_MESSAGE_LIMIT))  # the premise: it is masked
+        with mock.patch.object(wab, "write_chain_result", return_value=(fake / "chain-result.md", "сводка")):
+            text = wab.chain_done_text(cfg, {"waves": {}})
+        sent = wab.redact(text, wab.TG_MESSAGE_LIMIT)
+        self.assertIn("chain-result.md", sent)
+        self.assertIn("цепочка завершена", sent)
+
     def test_pure_helpers_live_in_wab(self):
         w = self.wave_rec(restarts=1, attempts=[self.wave_rec(restarts=2)])
         self.assertEqual(wab.wave_restarts(w), 3)
