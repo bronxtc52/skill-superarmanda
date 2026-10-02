@@ -281,14 +281,15 @@ def manifest_where(cfg, wave):
         proc = subprocess.run([sys.executable, str(STATE_PY), "where", "--manifest", str(path)],
                               capture_output=True, text=True, encoding="utf-8", timeout=WHERE_TIMEOUT)
         if proc.returncode != 0:
-            raise ValueError((proc.stderr or proc.stdout).strip().splitlines()[-1:] or ["rc " + str(proc.returncode)])
+            lines = [l.strip() for l in (proc.stderr or proc.stdout).splitlines() if l.strip()]
+            raise ValueError(lines[-1] if lines else f"rc {proc.returncode}")
         result = json.loads(proc.stdout)
         if not isinstance(result, dict):
             raise ValueError("where: not an object")
     except subprocess.TimeoutExpired:
         result = {"error": f"state.py where: таймаут {WHERE_TIMEOUT} с"}
     except (OSError, ValueError) as e:
-        result = {"error": str(e.args[0] if e.args and isinstance(e.args[0], list) else e)[:150]}
+        result = {"error": str(e)[:150]}
     MANIFEST_CACHE[path] = (sig, now, result)
     return result
 

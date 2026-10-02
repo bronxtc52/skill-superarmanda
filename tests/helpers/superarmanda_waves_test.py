@@ -9225,7 +9225,8 @@ class ManifestDashboard(Base):
         text = self.frame(cfg)
         self.assertNotIn("кадр не отрисован", text)
         self.assertIn("W1", text)
-        self.assertIn("manifest:", text)
+        self.assertIn("manifest: state: cannot read manifest", text)
+        self.assertNotIn("['", text)
 
     def test_unreadable_artifact_is_a_question_mark(self):
         cfg = self.running()
@@ -9304,6 +9305,38 @@ class ChainResult(Base):
         qs = self.get_state(cfg)["waves"]["W1"]["questions"]
         self.assertEqual(len(qs), 1)
         self.assertIn("need a decision", qs[0]["text"])
+
+    def render(self, cfg, st):
+        return wab.write_chain_result(cfg, st)[0].read_text(encoding="utf-8")
+
+    def test_questions_of_earlier_attempts_are_kept(self):
+        cfg, _ = self.chain(waves=["W1"])
+        old = self.wave_rec(questions=[{"at": 1000.0, "text": "BLOCKED: old question"}])
+        cur = self.wave_rec(phase="done", questions=[{"at": 2000.0, "text": "BLOCKED: new question"}],
+                            attempts=[old])
+        path, summary = wab.write_chain_result(cfg, {"waves": {"W1": cur}})
+        text = path.read_text(encoding="utf-8")
+        self.assertLess(text.index("old question"), text.index("new question"))
+        self.assertIn("вопросов 2", summary)
+
+    def test_merge_text_has_three_cases(self):
+        cfg, _ = self.chain(waves=["W1"])
+        sha = "c" * 40
+        cases = [({"merged": {"pr": 1, "sha": sha}}, "смержен (cccccccccccc)"),
+                 ({"merged_by": "coordinator"}, "смержен координатором"),
+                 ({}, "мердж: нет")]
+        for extra, want in cases:
+            text = self.render(cfg, {"waves": {"W1": self.wave_rec(phase="done", **extra)}})
+            self.assertIn(want, text)
+            if not extra:
+                self.assertNotIn("координатором", text)
+
+    def test_done_command_marks_the_coordinator(self):
+        cfg, path = self.chain(waves=["W1"], merge_gate="external")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="awaiting_merge")}})
+        wab.main(["wab.py", "done", str(path)])
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"].get("merged_by"), "coordinator")
+        self.assertIn("смержен координатором", (cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8"))
 
     def test_pure_helpers_live_in_wab(self):
         w = self.wave_rec(restarts=1, attempts=[self.wave_rec(restarts=2)])

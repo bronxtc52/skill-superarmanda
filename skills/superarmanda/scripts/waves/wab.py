@@ -1398,6 +1398,7 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     prev = st.get("current")
     if prev and prev != wave and st["waves"].get(prev, {}).get("phase") == "awaiting_merge":
         st["waves"][prev]["phase"] = "done"  # merged by the coordinator; saved with the launch intent
+        st["waves"][prev]["merged_by"] = "coordinator"
     idx = cfg["waves"].index(wave)
     before = cfg["waves"][idx - 1] if idx > 0 and not restart else None
     if not by_dispatcher and before and isinstance(st["waves"].get(before), dict):
@@ -2672,11 +2673,13 @@ def write_chain_result(cfg, st):
         if isinstance(merged, dict):
             sha = merged.get("commit") or merged.get("sha") or ""
             merge_text = f"смержен ({str(sha)[:12]})" if sha else "смержен"
-        elif w.get("phase") == "done":
+        elif w.get("merged_by") == "coordinator":
             merge_text = "смержен координатором"
         else:
             merge_text = "нет"
-        qs = [q for q in w.get("questions") or [] if isinstance(q, dict)]
+        qs = [q for r in [*wave_attempts(w), w] if isinstance(r.get("questions"), list)
+              for q in r["questions"] if isinstance(q, dict)]
+        qs.sort(key=lambda q: num(q.get("at")) or 0)
         questions += [(wave, q) for q in qs]
         rows.append(
             f"### {wave}\n\n- итог: {w.get('phase') or '?'}\n- PR: {pr_text}\n- мердж: {merge_text}\n"
@@ -3286,6 +3289,7 @@ def done_cmd(cfg, wave=None):
                              f"(awaiting_merge)")
         if w.get("phase") == "awaiting_merge":
             w["phase"] = "done"
+            w["merged_by"] = "coordinator"
             w.setdefault("finished", time.time())
             ack_wave_notices(w)  # confirmed by this call; chain_done below must still get through
             if st.get("current") == wave:
