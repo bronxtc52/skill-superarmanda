@@ -28,6 +28,7 @@ SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
 COMMIT_CELL = re.compile(r"`([0-9a-f]{7,40})`")
 WAVE = re.compile(r"[A-Za-z0-9_-]+")
 RUN_ID = re.compile(r"[A-Za-z0-9._-]+")
+MERGED_OUTSIDE = "PR уже смержен вне гейта"  # wab.py names `owner-handover` in the BLOCKED line of this reason
 THREADS_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
     "{pullRequest(number:$number){reviewThreads(first:100){pageInfo{hasNextPage}"
@@ -336,7 +337,7 @@ def evaluate(facts, head, manifest, workdir_state, base):
         return _verdict("wait", [f"сбор фактов: {facts['error']}"], head, facts)
     pr = facts.get("pr") or {}
     if pr.get("merged"):
-        return _verdict("fail", ["PR уже смержен вне гейта"], head, facts)
+        return _verdict("fail", [MERGED_OUTSIDE], head, facts)
     if pr.get("state") != "open":
         return _verdict("fail", [f"PR закрыт без мерджа (state={pr.get('state')})"], head, facts)
     if not base:
