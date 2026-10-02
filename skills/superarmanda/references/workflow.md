@@ -43,6 +43,9 @@ worktree с собственным origin пользователя. Устано
    этого источника. Общий кап в три неудачных цикла не меняется и имеет приоритет: если он
    достигнут в том же вызове, задача блокируется, а не уходит в повторный `needs_decision`.
    Изменение head инвалидирует результаты старого SHA, но не сбрасывает `needs_decision`.
+   Исключение — мелочь: если ВСЕ находки результата ревьюера low/P3 (nit, minor), coordinator
+   вместо `--outcome failed` пишет `fix-loop --defer --source <ревьюер> --note "<что и куда>"` и
+   переносит их в остаток следующей волны/задачи; кап и счётчики источника не тратятся.
 6. После всех task reviews создаётся draft PR. GitHub Codex должен завершить review именно
    текущего HEAD. Повторные запросы на тот же head идемпотентны и не опрашиваются бесконечно.
    CodeRabbit необязателен, но существенные полученные findings разбираются.
@@ -105,7 +108,17 @@ returns status to `needs_fix`; one decision buys exactly one more round for that
 failed round from the same source can raise `needs_decision` again only if the unchanged 3-cycle
 global cap has not already fired first. `fix-loop --outcome pass` never substitutes for required
 role results. Legacy manifests without `fix_sources`/`decisions`/`decision_required_for` get them
-defaulted via `setdefault` on first touch. Task IDs are coordinator-approved identifiers: renaming a
+defaulted via `setdefault` on first touch. `fix-loop --defer --source <source> --note <text>`
+(mutually exclusive with `--outcome`/`--decision`) records a deferral of low/P3-only findings into the
+remainder of the next wave/task: `--source` must be `cross_provider_reviewer`, `github_codex_review`
+or `coderabbit` (never `tester`), the task must hold a `findings` result of that role on the current
+head and tree, `--note` follows the `--decision` rules, and the task must not be `blocked` or
+`needs_decision`. It appends `{source, note, head, result_recorded_at, recorded_at}` to `deferrals`
+(not to `decisions`) and leaves `fix_cycles`, `fix_sources` and `decision_required_for` untouched.
+A reviewer `findings` result counts as passed for readiness (and for the wave merge gate) only with
+a deferral of the same role recorded no earlier than the result; coder and tester still need `pass`.
+After `resume` new results are not covered by older deferrals. Severity is not parsed: deferring
+only low/P3 findings is coordinator discipline. `where` reports the count as `deferred`. Task IDs are coordinator-approved identifiers: renaming a
 blocked task is not a reset. v1 supplies no reset command; any human decision to resume work
 requires a new, explicitly documented run rather than editing the manifest.
 

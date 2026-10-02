@@ -16,6 +16,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2004,6 +2005,162 @@ class StateContract(unittest.TestCase):
         )
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertFalse(lock.exists() or lock.is_symlink())
+
+    # ---- fix-loop --defer (#36 defect 3): low/P3 findings do not burn the cap ----
+
+    def defer(self, source="cross_provider_reviewer", note="low: event text -> next wave", check=True):
+        return self.cli(
+            "fix-loop", "--task", "implement", "--defer", "--source", source,
+            "--note", note, check=check,
+        )
+
+    def commit_change(self, text):
+        (self.repo / "tracked.txt").write_text(text, encoding="utf-8")
+        self.git("commit", "-qam", text.strip())
+        self.resume()
+
+    def test_defer_reviewer_findings_keeps_counters_and_makes_task_ready(self):
+        self.record("coder", session="coder-1")
+        self.record("tester", session="tester-1")
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        before = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(before["status"], "in_progress")
+        entry = json.loads(self.defer().stdout)
+        self.assertEqual(entry["fix_cycles"], 0)
+        self.assertEqual(entry["fix_sources"], {})
+        self.assertIsNone(entry["decision_required_for"])
+        self.assertEqual(entry["decisions"], [])
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        [deferral] = entry["deferrals"]
+        self.assertEqual(deferral["source"], "cross_provider_reviewer")
+        self.assertEqual(deferral["note"], "low: event text -> next wave")
+        self.assertEqual(
+            deferral["result_recorded_at"],
+            entry["results"]["cross_provider_reviewer"]["recorded_at"],
+        )
+        self.assertGreaterEqual(deferral["recorded_at"], deferral["result_recorded_at"])
+
+    def test_defer_for_optional_reviewers_is_accepted(self):
+        for role in ("github_codex_review", "coderabbit"):
+            self.record(role, status="findings", session=f"{role}-1")
+            entry = json.loads(self.defer(source=role).stdout)
+            self.assertEqual(entry["fix_cycles"], 0)
+            self.assertEqual(entry["deferrals"][-1]["source"], role)
+
+    def test_defer_rejections(self):
+        self.record("coder", session="coder-1")
+        self.record("tester", status="findings", session="tester-1")
+        tester = self.defer(source="tester", check=False)
+        self.assertNotEqual(tester.returncode, 0, tester.stdout)
+        # no reviewer result at all
+        missing = self.defer(check=False)
+        self.assertNotEqual(missing.returncode, 0, missing.stdout)
+        self.assertIn("findings", missing.stderr)
+        for status in ("pass", "error"):
+            kwargs = {}
+            if status == "pass":
+                kwargs = {"reviewed_head": self.head(), "packet_hash": "sha256:" + "e" * 64}
+            self.record("cross_provider_reviewer", status=status, session=f"r-{status}", **kwargs)
+            wrong = self.defer(check=False)
+            self.assertNotEqual(wrong.returncode, 0, f"{status}: {wrong.stdout}")
+        self.record("cross_provider_reviewer", status="findings", session="r-findings")
+        for note in ("", "   ", "x" * 501, "two\nlines", "two\rlines"):
+            bad = self.defer(note=note, check=False)
+            self.assertNotEqual(bad.returncode, 0, repr(note))
+        no_note = self.cli(
+            "fix-loop", "--task", "implement", "--defer", "--source",
+            "cross_provider_reviewer", check=False,
+        )
+        self.assertNotEqual(no_note.returncode, 0)
+        no_source = self.cli(
+            "fix-loop", "--task", "implement", "--defer", "--note", "n", check=False,
+        )
+        self.assertNotEqual(no_source.returncode, 0)
+        both = self.cli(
+            "fix-loop", "--task", "implement", "--defer", "--outcome", "failed",
+            "--source", "cross_provider_reviewer", "--note", "n", check=False,
+        )
+        self.assertNotEqual(both.returncode, 0, both.stdout)
+        with_decision = self.cli(
+            "fix-loop", "--task", "implement", "--defer", "--decision", "invariant",
+            "--source", "cross_provider_reviewer", "--note", "n", check=False,
+        )
+        self.assertNotEqual(with_decision.returncode, 0, with_decision.stdout)
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry.get("deferrals", []), [])
+        self.assertEqual(entry["fix_cycles"], 0)
+
+    def test_defer_rejects_result_from_a_previous_head(self):
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        self.commit_change("next head\n")
+        stale = self.defer(check=False)
+        self.assertNotEqual(stale.returncode, 0, stale.stdout)
+
+    def test_defer_rejected_in_needs_decision_and_blocked(self):
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        for _ in range(2):
+            self.cli("fix-loop", "--task", "implement", "--outcome", "failed",
+                     "--source", "cross_provider_reviewer")
+        self.assertEqual(self.manifest_data()["tasks"]["implement"]["status"], "needs_decision")
+        refused = self.defer(check=False)
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        data = self.manifest_data()
+        data["tasks"]["implement"]["status"] = "blocked"
+        self.manifest.write_text(json.dumps(data), encoding="utf-8")
+        refused = self.defer(check=False)
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        self.assertEqual(self.manifest_data()["tasks"]["implement"].get("deferrals", []), [])
+
+    def test_old_deferral_does_not_cover_findings_after_resume(self):
+        self.record("coder", session="coder-1")
+        self.record("tester", session="tester-1")
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        self.defer()
+        self.commit_change("second head\n")
+        self.record("coder", session="coder-1")
+        self.record("tester", session="tester-1")
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "in_progress")
+
+    def test_deferral_older_than_a_rerun_result_on_same_head_does_not_cover_it(self):
+        self.record("coder", session="coder-1")
+        self.record("tester", session="tester-1")
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        self.defer()
+        time.sleep(1.1)
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "in_progress")
+
+    def test_three_deferred_findings_in_a_row_do_not_block(self):
+        # Regression for W2 of the wave-autobot run: cap 3/3 on a low finding.
+        for index in range(3):
+            if index:
+                self.commit_change(f"round {index}\n")
+            self.record("coder", session="coder-1")
+            self.record("tester", session="tester-1")
+            self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+            entry = json.loads(self.defer(note=f"low #{index} -> next wave").stdout)
+            self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(entry["fix_cycles"], 0)
+        self.assertEqual(entry["fix_sources"], {})
+        self.assertEqual(len(entry["deferrals"]), 3)
+
+    def test_where_counts_deferrals_and_reports_done(self):
+        self.record("coder", session="coder-1")
+        self.record("tester", session="tester-1")
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        self.record("github_codex_review", status="findings", session="codex-1")
+        self.defer()
+        self.defer(source="github_codex_review")
+        info = json.loads(self.cli("where").stdout)
+        self.assertEqual(info["deferred"], 2)
+        self.assertEqual(info["task_status"], "ready_for_pr_review")
+        self.assertIsNone(info["role"])
+        self.assertTrue(info["next_action"].startswith("done"), info["next_action"])
+        status = json.loads(self.cli("status").stdout)
+        self.assertEqual(len(status["tasks"]["implement"]["deferrals"]), 2)
 
 
 V060_KEYS = {

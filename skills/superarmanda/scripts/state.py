@@ -24,6 +24,10 @@ ROLES = {
 STATUSES = {"pass", "findings", "incomplete", "error", "unavailable"}
 FIX_SOURCES = {"cross_provider_reviewer", "github_codex_review", "coderabbit", "tester"}
 DECISIONS = {"invariant", "cut_surface", "accept_limitation"}
+# Reviewer channels whose low/P3-only findings may be deferred to the remainder
+# of the next wave/task without spending the fix cap (#36). Tester is excluded:
+# a failed check is never a nit.
+DEFER_SOURCES = {"cross_provider_reviewer", "github_codex_review", "coderabbit"}
 MAX_DECISION_NOTE_LENGTH = 500
 MAX_PLAN_BYTES = 1024 * 1024
 NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
@@ -611,6 +615,7 @@ def task(data, name):
     entry.setdefault("fix_sources", {})
     entry.setdefault("decisions", [])
     entry.setdefault("decision_required_for", None)
+    entry.setdefault("deferrals", [])
     for role, result in entry.get("results", {}).items():
         entry["session_roles"].setdefault(result["session_id"], role)
     return entry
@@ -644,12 +649,37 @@ def session_owners(data):
     return owners
 
 
+def is_deferred(entry, role, result):
+    """A findings result counts as passed only through a deferral of the same
+    role recorded no earlier than the result itself (and on its head)."""
+    if not isinstance(result, dict) or result.get("status") != "findings":
+        return False
+    made = result.get("recorded_at")
+    for deferral in (entry or {}).get("deferrals") or []:
+        if not isinstance(deferral, dict) or deferral.get("source") != role:
+            continue
+        if deferral.get("head") not in (None, result.get("head")):
+            continue
+        when = deferral.get("recorded_at")
+        if isinstance(made, str) and isinstance(when, str) and when >= made:
+            return True
+    return False
+
+
+def effective_status(entry, role):
+    result = entry["results"].get(role, {})
+    if is_deferred(entry, role, result):
+        return "pass"
+    return result.get("status")
+
+
 def update_task_status(entry):
-    """Only coder, tester and cross-provider review can make a task PR-ready."""
+    """Only coder, tester and cross-provider review can make a task PR-ready.
+    Coder and tester need pass; the reviewer may also be findings + deferral."""
     if entry["status"] == "blocked":
         return
     required = ("coder", "tester", "cross_provider_reviewer")
-    if all(entry["results"].get(role, {}).get("status") == "pass" for role in required):
+    if all(effective_status(entry, role) == "pass" for role in required):
         entry["status"] = "ready_for_pr_review"
     elif entry["results"]:
         entry["status"] = "in_progress"
@@ -1013,13 +1043,70 @@ def fix_loop(args):
     entry = task(data, args.task)
     if entry["status"] == "blocked":
         fail("task is blocked after three fix cycles; explicit human reset is required")
-    if args.decision is not None:
+    if args.defer:
+        record_deferral(args, entry, data, location)
+    elif args.decision is not None:
         record_decision(args, entry)
     else:
         record_fix_outcome(args, entry, data, location)
     data["updated_at"] = now()
     write(path, data)
     print(json.dumps(entry, sort_keys=True))
+
+
+def check_note(note, flag):
+    if note is None or not note.strip():
+        fail(f"{flag} requires a non-empty --note")
+    if len(note) > MAX_DECISION_NOTE_LENGTH:
+        fail(f"--note must be at most {MAX_DECISION_NOTE_LENGTH} characters")
+    if "\n" in note or "\r" in note:
+        fail("--note must not contain line breaks")
+
+
+def record_deferral(args, entry, data, location):
+    """Defer low/P3-only findings of a reviewer to the next wave/task remainder.
+    Spends no fix cycle, touches no per-source counter and is not a decision."""
+    if entry["status"] == "needs_decision":
+        fail(
+            "decision required for source "
+            f"{entry['decision_required_for']}: run fix-loop --decision ..."
+        )
+    if args.source is None:
+        fail("--defer requires --source")
+    if args.source not in DEFER_SOURCES:
+        fail(
+            f"--defer is only allowed for {', '.join(sorted(DEFER_SOURCES))}; "
+            f"{args.source} findings go through --outcome failed"
+        )
+    check_note(args.note, "--defer")
+    if (
+        data["repo"] != location
+        or commit(location, "HEAD") != data["head"]
+        or fingerprint(location) != data["tree_fingerprint"]
+    ):
+        fail("working tree changed; run resume before recording a deferral")
+    result_entry = entry["results"].get(args.source)
+    if not isinstance(result_entry, dict) or (
+        result_entry.get("head") != data["head"]
+        or result_entry.get("tree_fingerprint") != data["tree_fingerprint"]
+    ):
+        fail(f"--defer requires a {args.source} findings result on the current head")
+    if result_entry.get("status") != "findings":
+        fail(
+            f"--defer requires {args.source} status findings, "
+            f"got {result_entry.get('status')}"
+        )
+    entry["deferrals"].append(
+        {
+            "source": args.source,
+            "note": args.note,
+            "head": result_entry["head"],
+            "result_recorded_at": result_entry["recorded_at"],
+            "recorded_at": max(now(), result_entry["recorded_at"]),
+        }
+    )
+    if entry["status"] != "needs_fix":
+        update_task_status(entry)
 
 
 def record_decision(args, entry):
@@ -1033,12 +1120,7 @@ def record_decision(args, entry):
             f"{entry['decision_required_for']}"
         )
     note = args.note
-    if note is None or not note.strip():
-        fail("--decision requires a non-empty --note")
-    if len(note) > MAX_DECISION_NOTE_LENGTH:
-        fail(f"--note must be at most {MAX_DECISION_NOTE_LENGTH} characters")
-    if "\n" in note or "\r" in note:
-        fail("--note must not contain line breaks")
+    check_note(note, "--decision")
     entry["decisions"].append(
         {
             "source": entry["decision_required_for"],
@@ -1112,8 +1194,9 @@ def mark(args):
 
 
 def current_verdicts(entry, head, tree):
+    """Verdicts on the current tree; deferred findings read as pass."""
     return {
-        role: item["status"]
+        role: "pass" if is_deferred(entry, role, item) else item["status"]
         for role, item in sorted((entry or {}).get("results", {}).items())
         if item.get("head") == head and item.get("tree_fingerprint") == tree
     }
@@ -1237,13 +1320,20 @@ def where(args):
         and item.get("tree_fingerprint") == current_tree
     }
     verdicts = {role: item["status"] for role, item in sorted(current.items())}
+    deferred_roles = {
+        role for role, item in current.items() if is_deferred(entry, role, item)
+    }
     open_findings = [
         {"role": role, "status": item["status"], "artifact": item.get("artifact")}
         for role, item in sorted(current.items())
-        if item["status"] != "pass"
+        if item["status"] != "pass" and role not in deferred_roles
     ]
     status_value = entry.get("status", "pending") if entry else None
-    step, role, note = derive_step(entry, verdicts)
+    effective = {
+        role: "pass" if role in deferred_roles else verdict
+        for role, verdict in verdicts.items()
+    }
+    step, role, note = derive_step(entry, effective)
     position = data.get("position")
     precode = (
         entry is not None
@@ -1315,6 +1405,7 @@ def where(args):
                 "verdicts": verdicts,
                 "open_findings": open_findings,
                 "decision_required_for": required,
+                "deferred": len((entry or {}).get("deferrals") or []),
                 "safe_point": None
                 if position is None or position["task"] != name
                 else position["safe_point"] is True
@@ -1362,6 +1453,7 @@ def parser():
     outcome_or_decision = q.add_mutually_exclusive_group(required=True)
     outcome_or_decision.add_argument("--outcome", choices=["pass", "failed"])
     outcome_or_decision.add_argument("--decision", choices=sorted(DECISIONS))
+    outcome_or_decision.add_argument("--defer", action="store_true")
     q.add_argument("--source", choices=sorted(FIX_SOURCES))
     q.add_argument("--note")
     q.set_defaults(func=fix_loop)
