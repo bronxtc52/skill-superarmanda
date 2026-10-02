@@ -9236,6 +9236,37 @@ class ManifestDashboard(Base):
         self.assertIn("findings: ?", joined)
         self.assertTrue(manifest.exists())
 
+    def test_a_failed_where_is_retried_after_the_interval(self):
+        cfg = self.running()
+        manifest = self.make_manifest(cfg)
+        real = subprocess.run
+        fail = [True]
+
+        def fake(*a, **kw):
+            if fail[0]:
+                raise subprocess.TimeoutExpired(a[0], 1)
+            return real(*a, **kw)
+
+        clock = [1000.0]
+        with mock.patch.object(self.dash.time, "time", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.dash.subprocess, "run", side_effect=fake) as run:
+            self.assertIn("error", self.dash.manifest_where(cfg, "W1"))
+            fail[0] = False
+            clock[0] += 5
+            self.assertIn("error", self.dash.manifest_where(cfg, "W1"))  # inside the interval: cached
+            self.assertEqual(run.call_count, 1)
+            clock[0] += self.dash.MANIFEST_POLL_SECONDS
+            self.assertEqual(self.dash.manifest_where(cfg, "W1")["task"], "T1")
+            self.assertEqual(run.call_count, 2)
+            self.dash.manifest_where(cfg, "W1")
+            self.assertEqual(run.call_count, 2)
+            clock[0] += self.dash.MANIFEST_POLL_SECONDS
+            self.dash.manifest_where(cfg, "W1")  # same manifest, but the repository may have moved on
+            self.assertEqual(run.call_count, 3)
+            manifest.write_text(manifest.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            self.dash.manifest_where(cfg, "W1")  # a changed manifest: at once
+            self.assertEqual(run.call_count, 4)
+
     def test_where_is_cached_by_mtime_and_size(self):
         cfg = self.running()
         self.make_manifest(cfg)

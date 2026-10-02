@@ -266,16 +266,18 @@ SEVERITIES = ("critical", "high", "medium", "low", "P0", "P1", "P2", "P3")
 
 def manifest_where(cfg, wave):
     """`state.py where` of the wave's superarmanda manifest (never parsed here): None when there is
-    no manifest yet, {"error": ...} when it cannot be read, else the printed JSON object. Cached by
-    (mtime, size) and not recomputed within MANIFEST_POLL_SECONDS."""
+    no manifest yet, {"error": ...} when it cannot be read, else the printed JSON object. An entry
+    (a failure too) is reused only while the manifest is unchanged (mtime, size) AND younger than
+    MANIFEST_POLL_SECONDS: `where` also depends on the repository, so it is asked again after the
+    interval; a changed manifest is asked at once."""
     path = cfg["run_dir"] / wave / "superarmanda" / "manifest.json"
     try:
         stat = path.stat()
     except OSError:
         return None
-    sig, now = (stat.st_mtime_ns, stat.st_size), time.monotonic()
+    sig, now = (stat.st_mtime_ns, stat.st_size), time.time()
     hit = MANIFEST_CACHE.get(path)
-    if hit and (hit[0] == sig or now - hit[1] < MANIFEST_POLL_SECONDS):
+    if hit and hit[0] == sig and 0 <= now - hit[1] < MANIFEST_POLL_SECONDS:
         return hit[2]
     try:
         proc = subprocess.run([sys.executable, str(STATE_PY), "where", "--manifest", str(path)],
