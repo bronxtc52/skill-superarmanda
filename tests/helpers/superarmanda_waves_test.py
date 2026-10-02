@@ -7711,6 +7711,8 @@ class MergeGate(GateBase):
         self.assertIn(f"Выполни: {shown}", said[0])
         self.assertTrue((self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)).is_file())
         self.assertEqual(self.log().count("merge result unknown"), 1)
+        self.assertEqual([q["text"] for q in self.rec()["questions"]],
+                         [f"BLOCKED: merge gate passed; merge result unknown; owner runs {shown}"])
         # the owner merges: the wave completes as usual
         self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
         with mock.patch.object(wab, "GATE_POLL_SECONDS", 0):
@@ -7726,6 +7728,8 @@ class MergeGate(GateBase):
         self.assertTrue(self.status().startswith("BLOCKED: merge gate: "))
         self.assertIn("ci (failure)", self.status())
         self.assertEqual(self.rec()["phase"], "running")
+        self.tick()
+        self.assertEqual(self.rec().get("questions", []), [])  # the wave fixes it itself: not the owner's
         told = [s for s in self.sent if s[1] == "wv-w1" and "Гейт мерджа не пройден" in s[2]]
         self.assertEqual(len(told), 1)
         self.assertIn("ci (failure)", told[0][2])
@@ -7900,6 +7904,8 @@ class MergeGate(GateBase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.status(), f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {shown}")
         self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual([q["text"] for q in self.rec()["questions"]],
+                         [f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {shown}"])
         said = [t for t in self.tg if "незакрытые треды" in t]
         self.assertEqual(len(said), 1)
         self.assertIn(f"Выполни: {shown}", said[0])
@@ -8060,6 +8066,8 @@ class MergeGate(GateBase):
         self.launch.assert_not_called()
         self.assertEqual(self.rec()["phase"], "awaiting_merge")
         self.assertTrue(self.status().startswith("BLOCKED: merge gate: PR #7 закрыт без мерджа"))
+        self.assertEqual(len(self.rec()["questions"]), 1)
+        self.assertIn("закрыт без мерджа", self.rec()["questions"][0]["text"])
 
     def test_an_unreadable_pr_state_waits(self):
         self.start()
@@ -9406,6 +9414,30 @@ class ChainResult(Base):
         sent = wab.redact(text, wab.TG_MESSAGE_LIMIT)
         self.assertIn("chain-result.md", sent)
         self.assertIn("цепочка завершена", sent)
+
+    def test_unrepresentable_times_do_not_stop_the_chain(self):
+        for how in ("watch", "done"):
+            self.tg.clear()
+            cfg, path = self.chain(waves=["W1"], merge_gate="external")
+            rec = self.finished_record(
+                started=1e300, finished=1e300, phase="awaiting_merge" if how == "done" else "running",
+                merged=None, questions=[{"at": 1e300, "text": "BLOCKED: q"}],
+                attempts=[self.wave_rec(started=1e300, finished=1e300)])
+            self.put_state(cfg, {"current": "W1", "waves": {"W1": rec}})
+            if how == "watch":
+                cfg, path = self.chain(waves=["W1"])
+                self.set_status(cfg, "W1", "DONE")
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": rec}})
+                wab.watch(cfg, path, max_ticks=1)
+            else:
+                wab.main(["wab.py", "done", str(path)])
+            self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1, (how, self.tg))
+            self.assertIsNone(self.get_state(cfg)["current"])
+
+    def test_chain_done_text_survives_any_failure(self):
+        cfg, _ = self.chain(waves=["W1"])
+        with mock.patch.object(wab, "write_chain_result", side_effect=RuntimeError("boom")):
+            self.assertIn("цепочка завершена", wab.chain_done_text(cfg, {"waves": {}}))
 
     def test_pure_helpers_live_in_wab(self):
         w = self.wave_rec(restarts=1, attempts=[self.wave_rec(restarts=2)])

@@ -2245,6 +2245,7 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
             return _gate_failed(cfg, st, wave, w, wdir, f"скрипт владельца не записан: {e}")
         w["last_status"] = _write_status(
             wdir, f"BLOCKED: merge gate passed; {len(unresolved)} unresolved review threads; owner runs {home_form(path)}")
+        note_question(w, w["last_status"], time.time())
         put_notice(w, "merge_owner", sha,
                    f"wave-autobot: волна {wave}: гейт мерджа пройден (PR #{number}, {sha[:12]}), но есть "
                    f"незакрытые треды ревью: {len(unresolved)}{gate.threads_note(v['old_p01'])}. Сам не мержу.\nВыполни: {home_form(path)}\n"
@@ -2309,6 +2310,7 @@ def _hand_to_owner(cfg, st, wave, w, wdir, number, sha, text, log_text):
     except (OSError, ValueError) as e:
         command = f"(скрипт владельца не записан: {_one_line(e, 100)}; проверь PR #{number} вручную)"
     w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate passed; {log_text}")
+    note_question(w, w["last_status"], time.time())
     put_notice(w, "merge_refused", sha, f"wave-autobot: волна {wave}: {text}. Выполни: {command}")
     save_state(cfg, st)
     event(cfg, f"{wave}: merge gate passed, {log_text}")
@@ -2320,6 +2322,7 @@ def _merge_stopped(cfg, st, wave, w, wdir, why, now):
     """The PR was merged with another head or closed: the next wave is not launched by the
     dispatcher; the coordinator takes over (awaiting_merge) and decides."""
     w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate: {why}")
+    note_question(w, w["last_status"], now)
     w["phase"] = "awaiting_merge"
     w["finished"] = now
     w["pending_exit"] = True
@@ -2486,6 +2489,7 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         w["merge_rc"] = None  # marker: handed to the owner
         w["last_status"] = _write_status(
             wdir, f"BLOCKED: merge gate passed; merge result unknown; owner runs {command}")
+        note_question(w, w["last_status"], now)
         put_notice(w, "merge_unknown", sha,
                    f"wave-autobot: волна {wave}: гейт пройден, но результат вызова мерджа PR #{number} "
                    f"неизвестен (диспетчер прерывался). Сам повторно не мержу. Выполни: {command}")
@@ -2625,12 +2629,27 @@ def wave_restarts(w):
 QUESTIONS_CAP = 50  # BLOCKED questions kept per wave
 
 
+def note_question(w, text, now):
+    """Record a question to the owner (an owner-facing BLOCKED line) for the chain result: redacted,
+    the same text twice in a row once, capped. In memory only: the caller saves it with its change."""
+    qs = w.setdefault("questions", [])
+    text = redact(str(text), 300)
+    if not qs or qs[-1].get("text") != text:
+        qs.append({"at": now, "text": text})
+        del qs[:-QUESTIONS_CAP]
+
+
 def _utc(ts):
     ts = num(ts)
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + "Z" if ts is not None else "?"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + "Z" if ts is not None else "?"
+    except (OverflowError, OSError, ValueError):  # finite but not a representable time
+        return "?"
 
 
 def _human_dur(sec):
+    if not (isinstance(sec, (int, float)) and 0 <= sec < 10 ** 9):
+        return "?"
     sec = int(sec)
     h, m = divmod(sec // 60, 60)
     return f"{h}ч{m:02d}м" if h else f"{m}м{sec % 60:02d}с"
@@ -2716,8 +2735,8 @@ def chain_done_text(cfg, st):
     costs the file, never the message or the watch."""
     try:
         path, summary = write_chain_result(cfg, st)
-    except (OSError, ValueError, TypeError, KeyError) as e:
-        return f"wave-autobot: цепочка завершена, все волны готовы (chain-result.md не записан: {e})."
+    except Exception as e:  # noqa: BLE001 - the end of the chain is always reported and saved
+        return f"wave-autobot: цепочка завершена, все волны готовы (chain-result.md не записан: {_one_line(e, 100)})."
     return (f"wave-autobot: цепочка завершена, все волны готовы.\n{summary}\n"
             f"Итог: chain-result.md в каталоге прогона {home_form(path.parent)}")
 
@@ -2888,9 +2907,8 @@ def _tick(cfg, st):
     if status.startswith("BLOCKED"):
         fresh = once_per(w, "blocked", status)
         if fresh:
-            qs = w.setdefault("questions", [])
-            qs.append({"at": now, "text": redact(status, 300)})
-            del qs[:-QUESTIONS_CAP]
+            if not status.startswith("BLOCKED: merge gate:"):  # the wave fixes a gate failure itself
+                note_question(w, status, now)
             put_notice(w, "blocked", status,
                        f"wave-autobot: волна {wave} ждёт тебя.\n\n{redact(status)}\n\nОтветить: {attach}")
         save_state(cfg, st)
