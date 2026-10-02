@@ -7448,22 +7448,6 @@ class GateCommands(unittest.TestCase):
         self.assertNotEqual(name, wab.owner_script_name(base, "W1", OLD))
         self.assertTrue(name.startswith(f"W1.{HEAD[:12]}.") and name.endswith(".merge"))
         self.assertNotIn("/", name)
-        # the path the owner is told survives `redact` with a real (not word-like) sha
-        real = "18d21df306a4dcda4745c2ac1523d3d93c107c2d"
-        for cfg in (base, {"chain_file": "/r/chain.json", "chain": "superarmanda-waves", "run_id": "2026-10-01"}):
-            line = "Выполни: ~/.cache/wab/" + wab.owner_script_name(cfg, "W5", real)
-            self.assertEqual(wab.redact(line), line)
-        # r20: a sha12/id16 that looks like a phone number or a long digit run is not masked either
-        for name in ("W1.71234567890a.0123456789abcdef.merge", "W1.89123456789b.8912345678901234.merge",
-                     "W12.a" + "0" * 11 + ".7" + "9" * 15 + ".merge"):
-            line = f"Выполни: ~/.cache/wab/{name} (заново проверит гейт)"
-            self.assertEqual(wab.redact(line), line, name)
-        for sha in ("71234567890a" + "b" * 28, "8" * 40, "79123456789" + "c" * 29):
-            line = "Выполни: ~/.cache/wab/" + wab.owner_script_name(base, "W1", sha)
-            self.assertEqual(wab.redact(line), line)
-        # the exemption is only for that exact name shape: a phone number next to it is still masked
-        self.assertIn("[скрыто]", wab.redact("Выполни: ~/.cache/wab/W1.71234567890a.0123456789abcdef.merge, тел. 8 912 345 67 89"))
-        self.assertIn("[скрыто]", wab.redact("~/.cache/wab/W1.71234567890a.merge"))
 
     def test_owner_script_refuses_malformed_wave_run_or_sha(self):
         for wave, run_id, sha in (("x'; touch /tmp/x #", "r", HEAD), ("a b", "r", HEAD), ("", "r", HEAD),
@@ -9103,6 +9087,22 @@ class GateWrappers(Base):
         self.assertEqual(wab.home_form("/etc/x"), "/etc/x")
         self.assertEqual(wab.redact("Выполни: ~/.cache/wab/chain-2026-10-01-W1-" + HEAD[:12] + "-merge"),
                          "Выполни: ~/.cache/wab/chain-2026-10-01-W1-" + HEAD[:12] + "-merge")
+
+    def test_redact_keeps_the_path_of_a_written_owner_script_only(self):  # r20, r21
+        cfg, _ = self.chain()
+        for sha in ("18d21df306a4dcda4745c2ac1523d3d93c107c2d", "71234567890a" + "b" * 28, "8" * 40,
+                    "79123456789" + "c" * 29):
+            path = wab.write_owner_script(cfg, "W5", sha)  # a real sha12/id16 may look like a phone or a blob
+            line = f"Выполни: {wab.home_form(path)} (заново проверит гейт)"
+            self.assertEqual(wab.redact(line), line, path.name)
+            # a phone number next to it is still masked
+            self.assertIn("[скрыто]", wab.redact(f"{line}, тел. 8 912 345 67 89"))
+        # the same shape with no such file (e.g. quoted from the wave's own text) gets no exemption
+        secret = "0123456789abcdef0123456789abcdef"
+        for fake in (f"~/.cache/wab/{secret}.aaaaaaaaaaaa.bbbbbbbbbbbbbbbb.merge",
+                     "~/.cache/wab/W1.71234567890a.0123456789abcdef.merge"):
+            self.assertIn("[скрыто]", wab.redact(f"Выполни: {fake}"), fake)
+            self.assertNotIn(secret, wab.redact(f"Выполни: {fake}"))
 
     def test_owner_script_file_is_private_and_replaced_not_appended(self):
         cfg, _ = self.chain()

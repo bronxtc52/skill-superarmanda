@@ -669,7 +669,8 @@ TG_MESSAGE_LIMIT = 1200  # whole message; quoted text is capped at TG_LIMIT firs
 #     /commits/ or /tree/. The query and fragment of the URL are not exempt.
 #  3. Explicit exceptions only: a bare 40-64 hex after a SHA label (`commit`, `sha`, `head`, ...),
 #     the github SHA above, an _OPAQUE run made only of word-like parts (_readable_dashed), and the
-#     owner's merge script path `.cache/wab/<wave>.<sha12>.<id16>.merge` (_OWNER_SCRIPT).
+#     owner's merge script path `.cache/wab/<wave>.<sha12>.<id16>.merge` when that file exists
+#     (_OWNER_SCRIPT, _owner_script_spans).
 # A long run of base64/base64url characters. Without a dash any 40+ run is a blob; with a dash
 # it stays readable only when every part between -, /, _ and + looks like a word (see
 # _readable_dashed): `kebab-case-words`, paths, dates stay, base64url and UUID-like keys go.
@@ -711,10 +712,24 @@ _TOKEN_END = "\\s?#,()\\[\\]<>\"'`"
 _GITHUB_PATH = re.compile(r"(?i)(?<![^\s\"'`(\[<,])(?:https?://[^/" + _TOKEN_END + r"]+|(?:www\.)?github\.com)"
                           r"/[^" + _TOKEN_END + r"]*")
 _GITHUB_HOSTS = ("github.com", "www.github.com")
-# The owner's merge script (owner_script_name) in a notice: our own generated name, never a secret.
-# Its sha12 and id16 may look like a phone number (`.71234567890a.`) or a blob to the heuristics,
-# and a masked path is a useless command, so the whole `.cache/wab/<name>` is exempt from HEURISTIC.
-_OWNER_SCRIPT = re.compile(r"\.cache/wab/[A-Za-z0-9_-]+\.[0-9a-f]{12}\.[0-9a-f]{16}\.merge(?![\w.])")
+# The owner's merge script (owner_script_name) in a notice: its sha12 and id16 may look like a phone
+# number (`.71234567890a.`) or a blob to the heuristics, and a masked path is a useless command. Only
+# a path of that shape whose file EXISTS in ~/.cache/wab (written by write_owner_script) is exempt
+# from HEURISTIC: a secret dressed up as such a path in the wave's own text names no file and is
+# masked as before. The check survives a restart of the dispatcher (no in-memory registry).
+_OWNER_SCRIPT = re.compile(r"\.cache/wab/([A-Za-z0-9_-]+\.[0-9a-f]{12}\.[0-9a-f]{16}\.merge)(?![\w.])")
+
+
+def _owner_script_spans(text):
+    folder = pathlib.Path.home() / ".cache" / "wab"
+    spans = []
+    for m in _OWNER_SCRIPT.finditer(text):
+        try:
+            if (folder / m.group(1)).is_file():
+                spans.append(m.span())
+        except OSError:
+            pass
+    return spans
 _GITHUB_SHA = re.compile(r"/(?:commit|commits|tree)/$")
 
 
@@ -764,7 +779,7 @@ def redact(text, limit=TG_LIMIT):
         text = rx.sub(_mask_structured, text)
     for rx in _HEURISTIC:
         spans = [m.span() for m in _GITHUB_PATH.finditer(text) if _github_host(m.group(0))]
-        own = [m.span() for m in _OWNER_SCRIPT.finditer(text)]
+        own = _owner_script_spans(text)
 
         def keep(m, rx=rx, spans=spans, own=own):
             if _labelled_sha(m) or any(a <= m.start() and m.end() <= b for a, b in own):
