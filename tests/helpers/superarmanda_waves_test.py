@@ -7453,6 +7453,17 @@ class GateCommands(unittest.TestCase):
         for cfg in (base, {"chain_file": "/r/chain.json", "chain": "superarmanda-waves", "run_id": "2026-10-01"}):
             line = "Выполни: ~/.cache/wab/" + wab.owner_script_name(cfg, "W5", real)
             self.assertEqual(wab.redact(line), line)
+        # r20: a sha12/id16 that looks like a phone number or a long digit run is not masked either
+        for name in ("W1.71234567890a.0123456789abcdef.merge", "W1.89123456789b.8912345678901234.merge",
+                     "W12.a" + "0" * 11 + ".7" + "9" * 15 + ".merge"):
+            line = f"Выполни: ~/.cache/wab/{name} (заново проверит гейт)"
+            self.assertEqual(wab.redact(line), line, name)
+        for sha in ("71234567890a" + "b" * 28, "8" * 40, "79123456789" + "c" * 29):
+            line = "Выполни: ~/.cache/wab/" + wab.owner_script_name(base, "W1", sha)
+            self.assertEqual(wab.redact(line), line)
+        # the exemption is only for that exact name shape: a phone number next to it is still masked
+        self.assertIn("[скрыто]", wab.redact("Выполни: ~/.cache/wab/W1.71234567890a.0123456789abcdef.merge, тел. 8 912 345 67 89"))
+        self.assertIn("[скрыто]", wab.redact("~/.cache/wab/W1.71234567890a.merge"))
 
     def test_owner_script_refuses_malformed_wave_run_or_sha(self):
         for wave, run_id, sha in (("x'; touch /tmp/x #", "r", HEAD), ("a b", "r", HEAD), ("", "r", HEAD),
