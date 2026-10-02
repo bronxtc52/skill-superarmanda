@@ -1412,8 +1412,8 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
         refresh_workdir(cfg, wave, cwd)
     prev = st.get("current")
     if prev and prev != wave and st["waves"].get(prev, {}).get("phase") == "awaiting_merge":
-        st["waves"][prev]["phase"] = "done"  # merged by the coordinator; saved with the launch intent
-        st["waves"][prev]["merged_by"] = "coordinator"
+        st["waves"][prev]["phase"] = "done"  # merged by the coordinator (or the owner); saved with the launch intent
+        st["waves"][prev]["merged_by"] = merged_by(st["waves"][prev])
     idx = cfg["waves"].index(wave)
     before = cfg["waves"][idx - 1] if idx > 0 and not restart else None
     if not by_dispatcher and before and isinstance(st["waves"].get(before), dict):
@@ -2215,6 +2215,11 @@ def _still_done(cfg, st, wave, w, wdir, what):
     return False
 
 
+def merged_by(w):
+    """Who merged a handed-over wave: the owner after `owner-handover`, otherwise the coordinator."""
+    return "owner" if isinstance(w.get("owner_handover"), dict) else "coordinator"
+
+
 def owner_handover_cmd(cfg, wave):
     """The ready line for the owner after a merge outside the gate (see owner_handover)."""
     return (f"python3 {shlex.quote(str(pathlib.Path(__file__).resolve()))} owner-handover "
@@ -2507,6 +2512,12 @@ def owner_handover(cfg, wave, run_id):
         if not head or pr_head != head:
             raise SystemExit(f"wab: {what}: PR #{number} head {str(pr_head)[:12]} is not the HEAD of the wave "
                              f"{str(head)[:12]} ({cwd}); nothing done (merged is not what the wave handed in)")
+        idx = cfg["waves"].index(wave)
+        if idx + 1 < len(cfg["waves"]):  # the next wave starts from this file: refuse now, not after the hand-off
+            problem = next_prompt_problem(cfg["run_dir"] / wave / "next-prompt.md")
+            if problem:
+                raise SystemExit(f"wab: {what}: next-prompt.md of {wave} is not usable for "
+                                 f"{cfg['waves'][idx + 1]}: {problem}; nothing done")
         base = base_branch_of(cfg, cwd)
         if not base:
             raise SystemExit(f"wab: {what}: the base branch is unknown (base_branch in chain.json); nothing done")
@@ -2802,6 +2813,9 @@ def write_chain_result(cfg, st):
         if isinstance(merged, dict):
             sha = merged.get("commit") or merged.get("sha") or ""
             merge_text = f"смержен ({str(sha)[:12]})" if sha else "смержен"
+        elif w.get("merged_by") == "owner":
+            sha = (w.get("owner_handover") or {}).get("merge_commit") if isinstance(w.get("owner_handover"), dict) else None
+            merge_text = f"смержен владельцем ({str(sha)[:12]})" if sha else "смержен владельцем"
         elif w.get("merged_by") == "coordinator":
             merge_text = "смержен координатором"
         else:
@@ -3418,7 +3432,7 @@ def done_cmd(cfg, wave=None):
                              f"(awaiting_merge)")
         if w.get("phase") == "awaiting_merge":
             w["phase"] = "done"
-            w["merged_by"] = "coordinator"
+            w["merged_by"] = merged_by(w)
             w.setdefault("finished", time.time())
             ack_wave_notices(w)  # confirmed by this call; chain_done below must still get through
             if st.get("current") == wave:

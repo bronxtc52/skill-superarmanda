@@ -9497,6 +9497,8 @@ class OwnerHandover(GateBase):  # #36 п.2: the owner merged the wave's PR himse
         self.facts = green_facts(pr={"state": "merged", "merged": True, "draft": False, "head": self.head,
                                      "base": "main"})
         self.start()
+        (self.cfg["run_dir"] / "W1").mkdir(parents=True, exist_ok=True)
+        (self.cfg["run_dir"] / "W1" / "next-prompt.md").write_text("/superarmanda --wave W2\n", encoding="utf-8")
 
     def run_it(self, run_id=RUN_ID, wave="W1"):
         out = io.StringIO()
@@ -9604,7 +9606,37 @@ class OwnerHandover(GateBase):  # #36 п.2: the owner merged the wave's PR himse
         self.tick()
         status = self.status()
         self.assertTrue(status.startswith("BLOCKED: merge gate: PR уже смержен вне гейта"), status)
-        self.assertIn(f"owner-handover {self.path} W1 {RUN_ID}", status)
+        # macOS: /var is /private/var — the line carries the resolved chain path
+        self.assertIn(f"owner-handover {self.cfg['chain_file']} W1 {RUN_ID}", status)
+
+    def test_refused_when_next_prompt_is_missing_or_empty(self):
+        nxt = self.cfg["run_dir"] / "W1" / "next-prompt.md"
+        nxt.unlink()
+        self.refused("next-prompt.md of W1 is not usable for W2")
+        nxt.write_text("   \n", encoding="utf-8")
+        self.refused("next-prompt.md of W1 is not usable for W2")
+
+    def test_last_wave_needs_no_next_prompt(self):
+        self.start(waves=["W1"])
+        (self.cfg["run_dir"] / "W1" / "next-prompt.md").unlink(missing_ok=True)
+        self.assertIn(" done ", self.run_it())
+
+    def test_owner_attribution_survives_launch_done_and_chain_result(self):
+        self.run_it()
+        st = wab.load_state(self.cfg)
+        w = st["waves"]["W1"]
+        self.assertEqual(wab.merged_by(w), "owner")
+        w.pop("owner_handover")
+        self.assertEqual(wab.merged_by(w), "coordinator")
+        # the last-wave path: `done` keeps the owner's attribution and chain-result.md reports it
+        self.start(waves=["W1"])
+        self.run_it()
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab.done_cmd(wab.load_chain(self.path), "W1")
+        self.assertEqual(self.rec()["merged_by"], "owner")
+        result = (self.cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8")
+        self.assertIn(f"смержен владельцем ({self.merge[:12]})", result)
+        self.assertNotIn("смержен координатором", result)
 
 
 class Packaging(unittest.TestCase):
