@@ -9030,7 +9030,9 @@ class Alarm(GateBase):
         with mock.patch.object(wab, "ALARM_POLL_SECONDS", 120):
             for _ in range(5):
                 self.tick()
-        self.assertEqual(self.find_calls, 1)
+        # one poll of the interval + one re-read under the input lock of the single delivery (r2 P1: the
+        # price of not sending an alarm about a PR that changed while the lock was awaited); no more
+        self.assertEqual(self.find_calls, 2)
 
     def test_a_failed_delivery_is_retried_not_lost(self):
         self.running()
@@ -11035,6 +11037,56 @@ class InputClear(GateBase):
         self.tick()
         self.assertEqual(self.enters, ["wv-w1"])
 
+    # ----- r2 P1: the FIRST delivery of an alarm looks at the PR again under the lock too -----
+    def test_fresh_alarm_head_moved_while_waiting_for_the_lock_types_nothing(self):
+        self.running()
+        self.ansi = EMPTY_ANSI
+        with self.flip_pr_when_the_lock_is_taken(
+                {"number": 7, "headRefOid": "e" * 40, "isDraft": False, "state": "OPEN"}):
+            self.tick()
+        self.assertEqual((self.alarms(), self.enters), ([], []))
+        self.assertNotIn("pending_enter", self.rec())
+        self.assertNotIn("alarm_msg", self.rec())  # outdated: dropped
+
+    def test_fresh_alarm_pr_closed_while_waiting_for_the_lock_types_nothing(self):
+        self.running()
+        self.ansi = EMPTY_ANSI
+        with self.flip_pr_when_the_lock_is_taken(
+                {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "CLOSED"}):
+            self.tick()
+        self.assertEqual((self.alarms(), self.enters), ([], []))
+        self.assertNotIn("alarm_msg", self.rec())
+
+    def test_fresh_alarm_with_unreadable_pr_under_the_lock_types_nothing_and_retries(self):
+        self.running()
+        self.ansi = EMPTY_ANSI
+        with self.flip_pr_when_the_lock_is_taken(gate.CollectError("gh: down")):
+            self.tick()
+        self.assertEqual((self.alarms(), self.enters), ([], []))
+        self.assertIn("alarm_msg", self.rec())  # the intent stays
+        self.assertNotIn("pending_enter", self.rec())
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+
+    # ----- r2 P2: no input box (a dialog, an empty capture) is not a go for /exit -----
+    TRUST = "Do you trust the files in this folder?\n\n❯ 1. Yes, I trust this folder\n  2. No, exit\n"
+
+    def test_exit_is_not_sent_without_an_input_box_and_goes_when_it_appears(self):
+        self.running()
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["pending_exit"] = True
+        for screen in (self.TRUST, ""):  # a dialog; a failed capture-pane
+            self.ansi = screen
+            self.assertFalse(wab.close_window(self.cfg, st, st["waves"]["W1"]))
+            self.assertFalse(wab.close_window(self.cfg, st, st["waves"]["W1"]))
+            self.assertEqual(self.exits(), [])
+            self.assertTrue(st["waves"]["W1"].get("pending_exit"))
+        self.assertEqual(self.log().count("/exit not sent: no input box"), 1)  # once per episode
+        self.ansi = EMPTY_ANSI
+        self.assertTrue(wab.close_window(self.cfg, st, st["waves"]["W1"]))
+        self.assertEqual(len(self.exits()), 1)
+
     def test_close_window_survives_a_clearing_that_raises(self):
         self.done_with_typed_alarm()
         self.clear_works = False
@@ -11210,6 +11262,27 @@ class InputClearPolicy(Base):
         wab.write_owner_answered(cfg, "W1")
         self.tick(cfg)
         self.assertEqual(self.answers(), [])
+
+    def test_status_rewritten_between_the_reads_gives_a_marker_of_no_episode(self):
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        path = cfg["run_dir"] / "W1" / "status"
+        real_read = wab.read
+
+        def read_then_rewrite(p, *a, **kw):
+            text = real_read(p, *a, **kw)
+            if Path(p) == path:  # the wave rewrites the line right after the text was read
+                st0 = os.stat(path)
+                path.write_text(self.ASK + " (new)", encoding="utf-8")
+                os.utime(path, ns=(st0.st_atime_ns, st0.st_mtime_ns + 7_000_000))
+            return text
+        with mock.patch.object(wab, "read", read_then_rewrite):
+            wab.write_owner_answered(cfg, "W1")
+        self.assertFalse(wab.owner_answered(cfg, "W1", self.ASK))
+        self.assertFalse(wab.owner_answered(cfg, "W1", self.ASK + " (new)"))
+        self.assertIn("rewritten while the marker was taken", self.log(cfg))
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 1)  # the new episode is answered by the policy
 
     def test_a_broken_marker_is_no_marker(self):
         cfg, _ = self.mandate(max_auto_answers=20)

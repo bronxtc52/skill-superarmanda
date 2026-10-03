@@ -1151,7 +1151,14 @@ def write_owner_answered(cfg, wave):
     The marker is not state.json: `say` takes no run lock and never writes the state. Called under the
     window's input lock, when the owner's text is already in the window."""
     wdir = wave_dir(cfg, wave)
-    doc = {"status": read(wdir / "status", on_error=None), "stamp": _status_stamp(cfg, wave), "at": _utc(time.time())}
+    # one snapshot: stamp -> text -> stamp. A rewrite in between would glue the old text to the new stamp and
+    # mute the policy on a NEW episode; then the stamp is None (matches nothing: the error is toward «new episode»)
+    stamp = _status_stamp(cfg, wave)
+    text = read(wdir / "status", on_error=None)
+    if _status_stamp(cfg, wave) != stamp:
+        stamp = None
+        event(cfg, f"{wave}: say: status rewritten while the marker was taken; the marker answers no episode")
+    doc = {"status": text, "stamp": stamp, "at": _utc(time.time())}
     fd, tmp = tempfile.mkstemp(dir=wdir, prefix=".owner-answered.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2346,9 +2353,8 @@ def close_window(cfg, st, w):
                 if w.get("pending_clear"):
                     left = "the earlier input is not cleared"
                 else:
-                    left = clear_input(name)  # None: empty now; «no input box»: nothing typed to append to
-                    if left == NO_INPUT_BOX:
-                        left = None
+                    left = clear_input(name)  # None: empty now; «no input box» (a dialog, a failed capture) is
+                    # NOT a go: the Enter after /exit could press a button of the dialog; held, retried
                 if left is not None:
                     if once_per(w, "exit_blocked", left):
                         event(cfg, f"{wave}: /exit not sent: {left}; retried next tick")
@@ -3373,8 +3379,8 @@ def _send_alarm(cfg, st, wave, w):
     if not isinstance(msg, dict) or msg.get("sent"):
         return
     def current():  # under the input lock, right before typing or the Enter: is the alarm still about this PR
-        if w.get("pending_enter") != "alarm":
-            return True  # a fresh text: the facts were collected by this very tick, before the lock
+        # fresh text too: the tick collected its facts BEFORE the lock, and the wait for the lock (behind
+        # `say`) can be long; one extra request under the lock is the price of not sending a stale alarm
         pr = find_pr(cfg, w["cwd"])  # CollectError: _deliver holds everything and retries
         return bool(pr) and pr.get("state") == "OPEN" and pr.get("headRefOid") == msg.get("head")
     sent = _deliver(cfg, st, wave, "alarm", send_text, str(msg.get("text") or ""), precheck=current)
