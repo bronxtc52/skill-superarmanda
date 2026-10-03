@@ -11772,7 +11772,7 @@ class W3Quote(Base):
     TOKEN = "sk-ant-abcdefghijklmnopqrstuvwx1234"
 
     def test_a_control_character_cannot_glue_a_token_to_a_letter(self):
-        for ctl in ("\x00", "\x02", "\x03", "\x07", "\x1b", "\x9b", "\u2028"):
+        for ctl in ("\x00", "\x02", "\x03", "\x07", "\x1b", "\x9b", "\u2028", "\r"):
             with self.subTest(ctl=repr(ctl)):
                 q = wab.quote(f"a{ctl}{self.TOKEN}")
                 self.assertNotIn("ant-abcdefgh", q)
@@ -11786,6 +11786,11 @@ class W3Quote(Base):
         q = wab.quote("key sk-\x00ant-abcdefghijklmnopqrstuvwx1234")
         self.assertNotIn("abcdefghijkl", q)
         self.assertNotIn("abcdefghijkl", wab.render_notice("sk-\x01ant-abcdefghijklmnopqrstuvwx1234"))
+
+    def test_crlf_text_keeps_its_lines_and_a_lone_cr_separates(self):
+        out = wab.render_notice(wab.quote("первая\r\nвторая\rтретья"))
+        self.assertEqual(out.splitlines()[1:], ["> первая", "> вторая", "> третья"])
+        self.assertNotIn("\r", out)
 
     def test_two_secrets_one_glued_one_split_by_controls_both_masked(self):
         both = "a\x00sk-ant-abcdefghijklmnopqrstuvwx1234 и sk-\x00ant-zyxwvutsrqponmlkjihgfed9876 конец\r\nвторая"

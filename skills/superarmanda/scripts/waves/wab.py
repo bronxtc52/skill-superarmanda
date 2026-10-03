@@ -1107,7 +1107,7 @@ def _clean_redact(text, limit, owner_paths):
     choice heuristic: a token (a run between spaces, tabs and line breaks) that holds a control
     character is masked whole, since a control character glues (`a\\x00sk-...`) or splits
     (`sk-\\x00...`) a secret and no word of the wave holds one; the rest goes through redact()."""
-    text = _CTRL_WORD.sub("[скрыто]", text.replace("\r", ""))
+    text = _CTRL_WORD.sub("[скрыто]", text.replace("\r\n", "\n").replace("\r", "\n"))
     return _clip(redact(text, 10 ** 9, owner_paths), limit)
 
 
@@ -1142,7 +1142,7 @@ def render_notice(text, limit=TG_MESSAGE_LIMIT):
         out.append(_render_quote(m.group(1), "".join(out)))
         pos = m.end()
     out.append(_clean_redact(text[pos:], 10 ** 9, True))
-    return _clip("".join(out).replace(QUOTE_OPEN, ""), limit)
+    return _clip("".join(out), limit)
 
 
 def _first_line(text, limit):
