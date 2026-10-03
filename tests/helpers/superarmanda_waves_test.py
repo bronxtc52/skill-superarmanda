@@ -3122,6 +3122,16 @@ class W4Round24(Base):
         self.assertIn("not clean", str(ctx.exception))
         self.assertEqual(self.get_state(cfg)["current"], "W1")
 
+    def test_untracked_file_refuses_even_with_show_untracked_files_off(self):  # #36 defect 7
+        _, clone = self.repos()
+        cfg = self.next_wave_cfg(clone)
+        self.git(clone, "config", "status.showUntrackedFiles", "no")
+        (clone / "junk.txt").write_text("x\n", encoding="utf-8")
+        with self.assertRaises(SystemExit) as ctx:
+            wab.launch(cfg, "W2", self.prompt())
+        self.assertIn("not clean", str(ctx.exception))
+        self.assertEqual(self.get_state(cfg)["current"], "W1")
+
     def test_clean_workdir_goes_detached_to_origin_base(self):
         origin, clone = self.repos()
         self.git(clone, "checkout", "-q", "-b", "wave-1")
@@ -7266,6 +7276,44 @@ class GateVerdict(unittest.TestCase):
         other["tasks"]["T1"]["results"]["cross_provider_reviewer"]["status"] = "unavailable"
         self.assertEqual(self.ev(manifest=other)["verdict"], "fail")
 
+    def test_deferred_low_findings_count_only_for_the_exact_result(self):  # #36 defect 3
+        state = wab.gate.state
+
+        def deferral(res, source="cross_provider_reviewer", head=HEAD, digest=None):
+            return {"source": source, "note": "low -> next wave", "head": head,
+                    "result_sha256": digest or state.result_digest(res),
+                    "result_recorded_at": res.get("recorded_at"), "recorded_at": res.get("recorded_at")}
+
+        def manifest(deferrals_of, role="cross_provider_reviewer"):
+            m = green_manifest()
+            res = result("findings")
+            m["tasks"]["T1"]["results"][role] = res
+            m["tasks"]["T1"]["deferrals"] = deferrals_of(res)
+            return m
+        for role in ("cross_provider_reviewer", "github_codex_review", "coderabbit"):
+            cases = [
+                ("no deferral", lambda r: [], "fail"),
+                ("deferral of this exact result", lambda r, role=role: [deferral(r, role)], "pass"),
+                # a rerun of the same reviewer on the same head in the same second: another result
+                ("deferral of another result, same head and second",
+                 lambda r, role=role: [deferral(dict(r, session_id="rerun"), role)], "fail"),
+                ("deferral on another head", lambda r, role=role: [deferral(r, role, head=OLD)], "fail"),
+                ("deferral of another role", lambda r: [deferral(r, "tester")], "fail"),
+            ]
+            for name, deferrals_of, want in cases:
+                with self.subTest(role=role, case=name):
+                    v = self.ev(manifest=manifest(deferrals_of, role))
+                    self.assertEqual(v["verdict"], want, v["reasons"])
+        # deferral never turns coder/tester findings into pass
+        for role in ("coder", "tester"):
+            with self.subTest(role=role):
+                m = manifest(lambda r, role=role: [deferral(r, role)], role)
+                self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
+        # a deferral does not excuse a non-findings status
+        m = manifest(lambda r: [deferral(r)])
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"]["status"] = "error"
+        self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
+
     def test_pr_head_other_than_the_gated_one_waits(self):
         facts = green_facts()
         facts["pr"]["head"] = OLD
@@ -9624,6 +9672,14 @@ class OwnerHandover(GateBase):  # #36 п.2: the owner merged the wave's PR himse
         self.refused("is not clean")
         Path(self.cwd, "new.txt").unlink()
         self.run_it()  # clean again: handed over
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+
+    def test_refused_on_untracked_file_with_show_untracked_files_off(self):  # #36 defect 7
+        self.git("config", "status.showUntrackedFiles", "no")
+        Path(self.cwd, "new.txt").write_text("untracked\n", encoding="utf-8")
+        self.refused("is not clean")
+        Path(self.cwd, "new.txt").unlink()
+        self.run_it()
         self.assertEqual(self.rec()["phase"], "awaiting_merge")
 
     def test_last_wave_needs_no_next_prompt(self):

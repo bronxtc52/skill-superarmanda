@@ -1210,12 +1210,13 @@ def refresh_workdir(cfg, wave, cwd):
     base = base_branch_of(cfg, cwd)
     if not base:
         raise SystemExit(f"wave {wave} refused: base_branch is not set in chain.json and origin/HEAD is unknown")
-    dirty = git("status", "--porcelain")
+    dirty = git("status", "--porcelain", "--untracked-files=all")
     if dirty.returncode != 0:
         raise SystemExit(f"wave {wave} refused: git status failed in {cwd}: {dirty.stderr.strip()}")
     if dirty.stdout.strip():
-        raise SystemExit(f"wave {wave} refused: workdir {cwd} is not clean (git status --porcelain is not "
-                         f"empty); commit, stash or remove the changes of the previous wave")
+        raise SystemExit(f"wave {wave} refused: workdir {cwd} is not clean (git status --porcelain "
+                         f"--untracked-files=all is not empty); commit, stash or remove the changes "
+                         f"of the previous wave")
     fetch = git("fetch", "origin", base)
     if fetch.returncode != 0:
         raise SystemExit(f"wave {wave} refused: git fetch origin {base} failed: {fetch.stderr.strip()}")
@@ -2047,7 +2048,7 @@ def gate_facts(cfg, pr):
 def workdir_state(cwd):
     """{clean, head, fingerprint} of the wave's working copy; what cannot be read is False/None."""
     try:
-        r = sh("git", "-C", str(cwd), "status", "--porcelain", check=False, timeout=GIT_TIMEOUT)
+        r = sh("git", "-C", str(cwd), "status", "--porcelain", "--untracked-files=all", check=False, timeout=GIT_TIMEOUT)
         clean = r.returncode == 0 and not r.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         clean = False
@@ -2524,7 +2525,7 @@ def owner_handover(cfg, wave, run_id):
         git = lambda *a: sh("git", "-C", str(cwd), *a, check=False, timeout=GIT_TIMEOUT)
         # the next launch refreshes this working copy and refuses a dirty tree: refuse it here, before
         # the hand-off, not after (the same check as refresh_workdir)
-        dirty = git("status", "--porcelain")
+        dirty = git("status", "--porcelain", "--untracked-files=all")
         if dirty.returncode != 0:
             raise SystemExit(f"wab: {what}: git status failed in {cwd}: {_one_line(dirty.stderr, 200)}; nothing done")
         if dirty.stdout.strip():
