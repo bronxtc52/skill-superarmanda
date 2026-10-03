@@ -10711,6 +10711,28 @@ class InputEmpty(unittest.TestCase):
             with self.subTest(screen=screen[:10]):
                 self.assertEqual(wab.input_empty_reason(screen), "no input box on the screen")
 
+    def test_a_two_inside_a_compound_colour_is_not_dim(self):  # task review: a false «empty» is worse than a spare round
+        rule = "\x1b[38;5;244m" + "─" * 30
+        for sgr in ("38;2;255;2;255", "38;5;2", "48;5;2", "58;5;2", "38;2;2;2;2", "38:2::255:2:255", "38:5:2",
+                    "1;38;5;2", "48;2;0;2;0", "38;9;2"):
+            with self.subTest(sgr=sgr):
+                screen = "\n".join(["история", rule, f"\x1b[39m❯\u00a0\x1b[{sgr}mответ\x1b[0m", rule])
+                self.assertIn("text in the input line", wab.input_empty_reason(screen))
+
+    def test_a_real_dim_placeholder_with_other_attributes_is_still_dim(self):
+        rule = "─" * 30
+        for sgr in ("2", "1;2", "38;5;244;2", "2;38;5;2"):
+            with self.subTest(sgr=sgr):
+                screen = "\n".join(["история", rule, f"❯\u00a0\x1b[{sgr}mTry \"x\"\x1b[0m", rule])
+                self.assertIsNone(wab.input_empty_reason(screen))
+
+    def test_a_reset_ends_dim(self):
+        rule = "─" * 30
+        for off in ("0", "22", ""):
+            with self.subTest(off=off):
+                screen = "\n".join(["история", rule, f"❯\u00a0\x1b[2mTry\x1b[{off}mтекст", rule])
+                self.assertIn("text in the input line", wab.input_empty_reason(screen))
+
     def test_boxed_prompt_with_a_text_or_blank(self):
         rule = "╭" + "─" * 30 + "╮"
         self.assertIsNone(wab.input_empty_reason("\n".join(["история", rule, "│ ❯          │"])))
@@ -10905,6 +10927,52 @@ class InputClear(GateBase):
         self.assertEqual(self.clear_keys, [])
         self.assertIn("no input box", self.log())
         self.assertIn("pending_clear", self.rec())
+
+    # ----- closing the window must not send /exit into a dirty input line -----
+    def done_with_typed_alarm(self):
+        self.running(merge_gate="external")  # DONE hands the PR over and closes the window at once
+        self.crash_tick()
+        self.assertEqual(self.rec()["pending_enter"], "alarm")
+        self.ansi = live("19-folded.ansi")
+        self.set_status(self.cfg, "W1", "DONE")
+        (wab.wave_dir(self.cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+
+    def exits(self):
+        return [c for c in self.tmux_calls if c[1:2] == ("send-keys",) and "/exit" in c]
+
+    def test_exit_waits_for_a_cleared_input(self):
+        self.done_with_typed_alarm()
+        self.tick()
+        w = self.rec()
+        self.assertNotIn("pending_enter", w)
+        order = [s[0] for s in self.sent if s[0] == "clear"]
+        self.assertTrue(order, "the input line was not cleared before /exit")
+        self.assertEqual(len(self.exits()), 1)
+        first_exit = next(i for i, c in enumerate(self.tmux_calls) if "/exit" in c)
+        first_clear = next(i for i, c in enumerate(self.tmux_calls) if c[1:2] == ("send-keys",) and "C-u" in c)
+        self.assertLess(first_clear, first_exit)
+
+    def test_exit_is_not_sent_while_the_clear_fails(self):
+        self.done_with_typed_alarm()
+        self.clear_works = False
+        self.tick()
+        self.assertEqual(self.exits(), [])
+        self.assertTrue(self.rec().get("pending_exit"))  # the intent stays
+        self.assertIn("input NOT cleared", self.log())
+        self.tick()
+        self.assertEqual(self.exits(), [])
+        self.clear_works = True
+        self.tick()
+        self.assertEqual(len(self.exits()), 1)
+
+    def test_exit_is_not_sent_over_a_dirty_screen_without_any_pending(self):
+        self.running()
+        self.ansi = live("19-folded.ansi")
+        self.clear_works = False
+        w = wab.load_state(self.cfg)
+        w["waves"]["W1"]["pending_exit"] = True
+        wab.close_window(self.cfg, w, w["waves"]["W1"])
+        self.assertEqual(self.exits(), [])
 
     # ----- #31 -----
     def test_pending_alarm_on_a_moved_head_is_cleared_not_entered(self):

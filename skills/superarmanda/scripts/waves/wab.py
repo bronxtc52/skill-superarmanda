@@ -489,7 +489,7 @@ def unsent_reason(screen, text):
     return None
 
 
-_SGR = re.compile(r"\x1b\[([0-9;]*)m")
+_SGR = re.compile(r"\x1b\[([0-9;:]*)m")
 _ESC_OTHER = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[@-Z\\-_])")
 CLEAR_ROUNDS = 4        # rounds of C-e C-u C-k BSpace before clearing counts as failed
 CLEAR_PAUSE = 0.7       # seconds between a round and the look at the screen
@@ -510,18 +510,42 @@ def send_clear_keys(name):
     tmux("send-keys", "-t", pane_target(name), "C-e", "C-u", "C-k", "BSpace")
 
 
+def _sgr_dim_after(params, dim):
+    """The dim state after one SGR sequence. Only a standalone parameter 2 turns dim on; 0, 22 and an
+    empty list turn it off. The arguments of the extended colours (38/48/58 ; 5 ; n  or  ; 2 ; r ; g ; b,
+    and the colon forms 38:2::r:g:b) are consumed whole: a «2» inside them is a colour component, not dim.
+    Anything not understood after 38/48/58 swallows the rest of the sequence (when in doubt, no dim:
+    a false «empty input» is worse than a spare clearing round)."""
+    items = params.split(";")
+    if items == [""]:
+        return False
+    i = 0
+    while i < len(items):
+        p = items[i]
+        head = p.split(":")[0]
+        if ":" in p:  # a colon group is one parameter with its sub-parameters (38:2::r:g:b, 4:3)
+            i += 1
+            continue
+        if head in ("38", "48", "58"):
+            mode = items[i + 1] if i + 1 < len(items) else ""
+            i += 3 if mode == "5" else 5 if mode == "2" else len(items)
+            continue
+        if head == "2":
+            dim = True
+        elif head in ("0", "22", ""):
+            dim = False
+        i += 1
+    return dim
+
+
 def _undimmed(line):
-    """The text of an ANSI line without the dim (SGR 2) segments and without any escape."""
+    """The text of an ANSI line without the dim segments and without any escape."""
     out, dim, pos = [], False, 0
     for m in _SGR.finditer(line):
         if not dim:
             out.append(line[pos:m.start()])
         pos = m.end()
-        for code in (m.group(1) or "0").split(";"):
-            if code == "2":
-                dim = True
-            elif code in ("0", "22", ""):
-                dim = False
+        dim = _sgr_dim_after(m.group(1), dim)
     if not dim:
         out.append(line[pos:])
     return _ESC_OTHER.sub("", "".join(out))
@@ -2293,13 +2317,40 @@ EXIT_WAIT = 30  # seconds the next launch waits for the previous wave's window a
 def close_window(cfg, st, w):
     """Carry out a saved intent to close a finished wave's window (`pending_exit`): /exit while
     the window is alive; the flag is dropped (and saved) once the window is gone. Repeatable, so
-    a dispatcher that died between the save and /exit sends it after the restart."""
+    a dispatcher that died between the save and /exit sends it after the restart. /exit is typed
+    under the window's input lock and only into an EMPTY input line: a text that is still waiting for
+    its Enter (`pending_enter`, `pending_clear`) or shows on the screen is cleared first (as everywhere:
+    _abandon_input), otherwise /exit would be appended to it and sent together. Not cleared: no /exit,
+    an event with the reason, the intent stays for the next tick."""
     if not isinstance(w, dict) or not w.get("pending_exit"):
         return False
     name = w.get("tmux")
     if isinstance(name, str) and name and tmux_alive(name):
-        tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
-        tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
+        wave = next((k for k, r in (st.get("waves") or {}).items() if r is w), None) or name
+        try:
+            with _InputLock(cfg, wave):
+                if w.get("pending_enter"):
+                    _abandon_input(cfg, st, wave, w, "the window is being closed", locked=True)
+                elif w.get("pending_clear"):
+                    _settle_clear(cfg, st, wave, w, locked=True)
+                if w.get("pending_clear"):
+                    left = "the earlier input is not cleared"
+                else:
+                    left = clear_input(name)  # None: empty now; «no input box»: nothing typed to append to
+                    if left == NO_INPUT_BOX:
+                        left = None
+                if left is not None:
+                    if once_per(w, "exit_blocked", left):
+                        event(cfg, f"{wave}: /exit not sent: {left}; retried next tick")
+                    save_state(cfg, st)
+                    return False
+                w.get("notified", {}).pop("exit_blocked", None)
+                tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
+                tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
+        except NotSubmitted as e:
+            if once_per(w, "exit_blocked", str(e)):
+                event(cfg, f"{wave}: /exit not sent: {e}; retried next tick")
+            return False
         return True
     w.pop("pending_exit", None)
     save_state(cfg, st)
