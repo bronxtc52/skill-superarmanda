@@ -10005,6 +10005,197 @@ class Submit(Base):
         self.assertIsNone(wab.unsent_reason(self.EMPTY, self.TEXT))
 
 
+# ---------------------------------------------------------------- #41: decision policy in mandate.md
+class DecisionPolicy(Base):
+    """A labelled BLOCKED line whose class (and rec) the pinned «Политика решений» of mandate.md
+    allows, outside the red zone, is answered by the dispatcher itself — once per episode, capped."""
+    POLICY = ("## Политика решений\n"
+              "- auto: class=needs_decision\n"
+              "- auto: class=blocked_cap rec=new_run\n"
+              "- auto: class=question rec=A\n")
+    ASK = "BLOCKED: [class=needs_decision rec=invariant red=no] needs_decision T3: гонка; варианты: invariant | cut_surface"
+
+    def mandate(self, policy=None, **over):
+        body = (f"Прогон: {RUN_ID}\nМердж при зелёном CI.\n\n" + (self.POLICY if policy is None else policy)).encode("utf-8")
+        cfg, path = self.chain(mandate_sha256=hashlib.sha256(body).hexdigest(), **over)
+        (cfg["run_dir"] / "mandate.md").write_bytes(body)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1")}})
+        return cfg, path
+
+    def tick(self, cfg, status=None):
+        if status is not None:
+            self.set_status(cfg, "W1", status)
+        st = wab.load_state(cfg)
+        wab.tick(cfg, st)
+        return wab.load_state(cfg)
+
+    def answers(self):
+        return [t for kind, n, t in self.sent if "РЕШЕНИЕ ПО ПОЛИТИКЕ" in t]
+
+    def log(self, cfg):
+        p = cfg["run_dir"] / "events.log"
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+
+    def decisions(self, cfg):
+        p = cfg["run_dir"] / "W1" / "policy-decisions.log"
+        return p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+
+    def owner_asked(self):
+        return [t for t in self.tg if "ждёт тебя" in t]
+
+    # ----- the label -----
+    def test_label_is_parsed(self):
+        got = wab.parse_blocked_label(self.ASK)
+        self.assertEqual((got["class"], got["rec"], got["red"]), ("needs_decision", "invariant", False))
+        self.assertTrue(got["question"].startswith("needs_decision T3"))
+        self.assertTrue(wab.parse_blocked_label("BLOCKED: [class=question rec=A red=yes] q")["red"])
+
+    def test_no_label_or_garbage_is_none(self):
+        for bad in ("BLOCKED: needs_decision T3: рекомендую invariant",
+                    "BLOCKED: merge gate: checks red",
+                    "BLOCKED: [class=needs_decision rec=invariant] нет red",
+                    "BLOCKED: [class=nonsense rec=A red=no] q",
+                    "BLOCKED: [class=question rec=A red=maybe] q",
+                    "BLOCKED: [class=question rec=A red=no extra=1] q",
+                    "BLOCKED: [class=question class=question rec=A red=no] q",
+                    "BLOCKED: [class=question rec=$(rm) red=no] q",
+                    "BLOCKED: [class=question rec=A red=no q",
+                    "RUNNING", ""):
+            with self.subTest(bad=bad):
+                self.assertIsNone(wab.parse_blocked_label(bad))
+
+    # ----- the policy -----
+    def test_policy_rules_are_parsed(self):
+        rules = wab.parse_policy("Прогон: x\n" + self.POLICY + "\n## Другое\n- auto: class=nonsense\n")
+        self.assertEqual(rules, [{"class": "needs_decision", "rec": None},
+                                 {"class": "blocked_cap", "rec": "new_run"},
+                                 {"class": "question", "rec": "A"}])
+        self.assertEqual(wab.parse_policy("Прогон: x\nтекст без раздела\n"), [])
+
+    def test_unknown_key_class_red_or_merge_gate_is_refused(self):
+        for rule in ("- auto: class=bogus", "- auto: class=question color=red",
+                     "- auto: class=question red=no", "- auto: class=merge_gate",
+                     "- auto: rec=A", "- manual: class=question", "* auto: class=question",
+                     "- auto: class=question rec=A rec=B"):
+            with self.subTest(rule=rule):
+                with self.assertRaises(ValueError):
+                    wab.parse_policy(f"Прогон: x\n## Политика решений\n{rule}\n")
+                cfg, _ = self.mandate(policy=f"## Политика решений\n{rule}\n")
+                with self.assertRaises(SystemExit) as cm:
+                    wab.system_prompt(cfg)
+                self.assertIn("Политика решений", str(cm.exception))
+
+    def test_policy_is_pinned_by_the_mandate_digest(self):
+        cfg, _ = self.mandate()
+        self.assertEqual(len(wab.decision_policy(cfg)), 3)
+        m = cfg["run_dir"] / "mandate.md"
+        m.write_bytes(m.read_bytes() + "- auto: class=plan_mismatch\n".encode("utf-8"))
+        with self.assertRaises(SystemExit) as cm:
+            wab.decision_policy(cfg)
+        self.assertIn("mandate_sha256", str(cm.exception))
+        # and the tick does not answer on a tampered policy: the owner gets the usual notice
+        self.tick(cfg, self.ASK)
+        self.assertEqual(self.answers(), [])
+        self.assertEqual(len(self.owner_asked()), 1, self.tg)
+
+    def test_watch_refuses_to_start_on_a_bad_policy(self):
+        cfg, path = self.mandate(policy="## Политика решений\n- auto: class=bogus\n")
+        with self.assertRaises(SystemExit):
+            wab.watch(cfg, path, max_ticks=1)
+
+    def test_max_auto_answers_is_checked(self):
+        cfg, _ = self.chain()
+        self.assertEqual(cfg["max_auto_answers"], 3)
+        for bad in (-1, "3", True, 1.5, None, 10_001):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit):
+                    self.chain(max_auto_answers=bad) if bad is not None else wab.load_chain(
+                        self._chain_with_null())
+
+    def _chain_with_null(self):
+        _, path = self.chain()
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["max_auto_answers"] = None
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path
+
+    # ----- the auto-answer -----
+    def test_allowed_class_is_answered_once(self):
+        cfg, _ = self.mandate()
+        st = self.tick(cfg, self.ASK)
+        self.assertEqual(len(self.answers()), 1, self.sent)
+        self.assertIn("вариант invariant", self.answers()[0])
+        self.assertIn("W1: policy auto-answer: class=needs_decision rec=invariant", self.log(cfg))
+        [line] = self.decisions(cfg)
+        self.assertRegex(line, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ class=needs_decision rec=invariant needs_decision T3")
+        self.assertEqual(len([t for t in self.tg if "по политике" in t]), 1, self.tg)
+        self.assertEqual(self.owner_asked(), [])
+        self.assertEqual(st["waves"]["W1"]["auto_answers"], 1)
+        self.tick(cfg)  # the same episode
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 1, self.sent)
+        self.assertEqual(len(self.decisions(cfg)), 1)
+        self.assertEqual(self.owner_asked(), [])
+
+    def test_rec_named_by_the_rule_must_match(self):
+        cfg, _ = self.mandate()
+        self.tick(cfg, "BLOCKED: [class=blocked_cap rec=new_run red=no] кап 3/3 T2")
+        self.assertEqual(len(self.answers()), 1)
+
+    def test_no_answer_cases(self):
+        cases = {
+            "red zone": (None, "BLOCKED: [class=needs_decision rec=A red=yes] мердж без мандата?"),
+            "class outside the policy": (None, "BLOCKED: [class=plan_mismatch rec=fix red=no] план"),
+            "other rec": (None, "BLOCKED: [class=question rec=B red=no] вопрос"),
+            "merge_gate": ("## Политика решений\n- auto: class=needs_decision\n",
+                           "BLOCKED: [class=merge_gate rec=A red=no] gate"),
+            "no label": (None, "BLOCKED: needs_decision T3: рекомендую invariant"),
+            "no policy": ("", self.ASK),
+        }
+        for name, (policy, status) in cases.items():
+            with self.subTest(name):
+                self.sent.clear()
+                self.tg.clear()
+                cfg, _ = self.mandate(policy=policy)
+                self.tick(cfg, status)
+                self.assertEqual(self.answers(), [], self.sent)
+                self.assertEqual(len(self.owner_asked()), 1, self.tg)
+                self.assertEqual(self.decisions(cfg), [])
+
+    def test_failed_delivery_is_retried_once(self):
+        cfg, _ = self.mandate()
+        calls = []
+
+        def flaky(n, t, **kw):
+            calls.append(t)
+            if len(calls) == 1:
+                raise wab.NotSubmitted("the text is still in the input line")
+            self.sent.append(("text", n, t))
+        wab.send_text.side_effect = flaky
+        self.tick(cfg, self.ASK)
+        self.assertEqual(self.answers(), [])
+        self.assertEqual(len(self.owner_asked()), 1, self.tg)
+        self.assertEqual(self.decisions(cfg), [])
+        self.tick(cfg)
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 1, self.sent)
+        self.assertEqual(len(self.decisions(cfg)), 1)
+
+    def test_cap_sends_the_fourth_episode_to_the_owner(self):
+        cfg, _ = self.mandate()
+        for i in range(5):
+            self.tick(cfg, f"BLOCKED: [class=question rec=A red=no] вопрос {i}")
+        self.assertEqual(len(self.answers()), 3, self.sent)
+        self.assertEqual(self.log(cfg).count("policy cap reached"), 1, self.log(cfg))
+        self.assertEqual(len(self.owner_asked()), 2, self.tg)
+
+    def test_cap_is_tuned_live(self):
+        cfg, _ = self.mandate(max_auto_answers=0)
+        self.tick(cfg, self.ASK)
+        self.assertEqual(self.answers(), [])
+        self.assertIn("policy cap reached", self.log(cfg))
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")

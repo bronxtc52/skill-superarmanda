@@ -147,6 +147,11 @@ def load_chain(path, create=True):
             raise SystemExit(f"chain.json: {key} must be a positive number, got {v!r}")
         if v > NUM_LIMITS[key]:  # time.sleep(1e10) raises OverflowError and kills `watch`
             raise SystemExit(f"chain.json: {key} must be at most {NUM_LIMITS[key]}, got {v!r}")
+    cfg.setdefault("max_auto_answers", MAX_AUTO_ANSWERS)
+    v = cfg["max_auto_answers"]
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 10_000:
+        raise SystemExit(f"chain.json: max_auto_answers must be a whole number 0..10000 "
+                         f"(0 = no automatic answers), got {v!r}")
     tg = cfg.get("telegram")
     if tg and not isinstance(tg, dict):
         raise SystemExit("chain.json: telegram must be an object")
@@ -991,6 +996,12 @@ def _status(w):
     return str(w.get("last_status") or "")
 
 
+def _answered(w):
+    """The BLOCKED line the dispatcher answered by the decision policy (the episode's mark), or None."""
+    notified = w.get("notified")
+    return notified.get("policy_answer") if isinstance(notified, dict) else None
+
+
 # Every notice is about an episode, and it is stale once the episode is over. Key -> the end of
 # its episode as a predicate on the wave record (applied by drop_ended_episodes on EVERY save and
 # before every send), None = ended only by the coordinator's confirmation (ack_wave_notices).
@@ -1005,6 +1016,7 @@ def _status(w):
 #   tmux_failed         window gone   # + the next successful action (_act)
 #   dead                the phase left dead (the window is back); + ack on a relaunch
 #   blocked             the status is no longer BLOCKED, or window gone
+#   policy_answer       the status is no longer the answered BLOCKED line, or window gone
 #   permission, idle, auto_off   window gone   # + SCREEN_EPISODE_ENDS: the prompt left the screen /
 #                                              #   the pane moved / auto mode is back
 #   handoff             the phase left awaiting_merge (the coordinator confirmed it); + ack
@@ -1023,6 +1035,7 @@ NOTICE_EPISODE_ENDS = {
     "unverified_enter": _gone,  # a delivery of an older-version state pressed Enter unverified
     "dead": lambda w: w.get("phase") != "dead",
     "blocked": lambda w: _gone(w) or not _status(w).startswith("BLOCKED"),
+    "policy_answer": lambda w: _gone(w) or _status(w) != _answered(w),
     "permission": _gone,
     "idle": _gone,
     "auto_off": _gone,
@@ -1110,7 +1123,7 @@ def ack_wave_notices(w):
 
 # Notices that ask nothing of anybody: shown by display-message, but they open no ATTENTION signal
 # (`started` lasts as long as the window, `chain_done` forever: `attention` would never go quiet).
-INFO_NOTICES = ("started", "chain_done")
+INFO_NOTICES = ("started", "chain_done", "policy_answer")  # policy_answer: told, nothing to answer
 
 
 def note_attention(w, key, text, now):
@@ -1400,6 +1413,112 @@ def refresh_workdir(cfg, wave, cwd):
 
 MANDATE_HEADER = "Прогон: "
 
+# ---------- decision policy (#41) ----------
+# A wave that writes BLOCKED puts a machine label first: `BLOCKED: [class=<c> rec=<r> red=<yes|no>] ...`.
+# The optional «## Политика решений» section of mandate.md (pinned by mandate_sha256 with the rest of
+# the bytes) lists `- auto: class=<c> [rec=<r>]` rules: the episodes the dispatcher answers itself.
+# A line without a (valid) label, red=yes, merge_gate and anything the policy does not name go to the
+# owner as before.
+LABEL_CLASSES = ("needs_decision", "blocked_cap", "plan_mismatch", "question", "merge_gate")
+POLICY_CLASSES = tuple(c for c in LABEL_CLASSES if c != "merge_gate")  # merge_gate: written by the dispatcher
+POLICY_HEADING = re.compile(r"##\s+Политика решений\s*")
+REC_TOKEN = re.compile(r"[A-Za-z0-9_.-]{1,40}")
+_LABEL = re.compile(r"BLOCKED:[ \t]*\[([^\]\n]*)\][ \t]*(.*)", re.S)
+_POLICY_RULE = re.compile(r"-\s+auto:(?:\s+(.*))?")
+POLICY_ANSWER = ("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (mandate.md): вариант {rec}. Действуй по своей рекомендации, "
+                 "затем запиши RUNNING в status. Находки low/P3 — fix-loop --defer в остаток.")
+MAX_AUTO_ANSWERS = 3  # chain.json `max_auto_answers` default: automatic answers per wave
+
+
+def parse_blocked_label(status):
+    """The machine label of a BLOCKED line as {class, rec, red, question}, or None: no label, or any
+    deviation from exactly `class=<known> rec=<token> red=<yes|no>` (unknown or repeated key, unknown
+    class, a rec that is not a short token). None means «no automatic answer», never a guess."""
+    m = _LABEL.match(status or "")
+    if not m:
+        return None
+    fields = {}
+    for tok in m.group(1).split():
+        key, sep, value = tok.partition("=")
+        if not sep or key not in ("class", "rec", "red") or key in fields:
+            return None
+        fields[key] = value
+    if (set(fields) != {"class", "rec", "red"} or fields["class"] not in LABEL_CLASSES
+            or not REC_TOKEN.fullmatch(fields["rec"]) or fields["red"] not in ("yes", "no")):
+        return None
+    return {"class": fields["class"], "rec": fields["rec"], "red": fields["red"] == "yes",
+            "question": m.group(2).strip()}
+
+
+def parse_policy(body):
+    """The rules of the «## Политика решений» section of a mandate text: a list of {class, rec}
+    (rec None = any). No section -> []. The section runs to the next heading; prose lines are
+    allowed, every bullet must be a rule. ValueError on anything else: an unknown key or class,
+    `red` (the red zone always goes to the owner), merge_gate, a second section."""
+    rules, inside, seen = [], False, False
+    for n, line in enumerate(body.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("#"):
+            if POLICY_HEADING.fullmatch(s):
+                if seen:
+                    raise ValueError(f"line {n}: a second «## Политика решений» section")
+                inside = seen = True
+            else:
+                inside = False
+            continue
+        if not inside or not s or s[0] not in "-*+":
+            continue
+        m = _POLICY_RULE.fullmatch(s)
+        if not m:
+            raise ValueError(f"line {n}: a rule must be «- auto: class=<класс> [rec=<вариант>]», got {s!r}")
+        fields = {}
+        for tok in (m.group(1) or "").split():
+            key, sep, value = tok.partition("=")
+            if key == "red":
+                raise ValueError(f"line {n}: `red` is not a policy key: the red zone always goes to the owner")
+            if not sep or not value or key not in ("class", "rec") or key in fields:
+                raise ValueError(f"line {n}: unknown or repeated key in {s!r} (allowed: class, rec)")
+            fields[key] = value
+        cls = fields.get("class")
+        if cls == "merge_gate":
+            raise ValueError(f"line {n}: merge_gate is never answered automatically")
+        if cls not in POLICY_CLASSES:
+            raise ValueError(f"line {n}: class must be one of {', '.join(POLICY_CLASSES)}, got {cls!r}")
+        if "rec" in fields and not REC_TOKEN.fullmatch(fields["rec"]):
+            raise ValueError(f"line {n}: rec must match [A-Za-z0-9_.-]{{1,40}}, got {fields['rec']!r}")
+        rules.append({"class": cls, "rec": fields.get("rec")})
+    return rules
+
+
+def _policy_rules(path, body):
+    try:
+        return parse_policy(body)
+    except ValueError as e:
+        raise SystemExit(f"{path}: «## Политика решений»: {e}")
+
+
+def decision_policy(cfg):
+    """The rules of THIS run's pinned mandate.md (see system_prompt for the pin): [] without a
+    mandate.md or with a foreign first line (that mandate is ignored altogether). SystemExit when
+    the file is unreadable, not UTF-8, its bytes differ from mandate_sha256 or the section is bad."""
+    mandate = cfg["run_dir"] / "mandate.md"
+    try:
+        raw = mandate.read_bytes() if mandate.exists() else b""
+    except OSError as e:
+        raise SystemExit(f"{mandate}: cannot read the mandate ({e.strerror or e})")
+    try:
+        body = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SystemExit(f"{mandate} is not valid UTF-8")
+    first = body.splitlines()[:1]
+    if not (first and first[0].strip() == MANDATE_HEADER + cfg["run_id"]):
+        return []
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != cfg.get("mandate_sha256"):
+        raise SystemExit(f"mandate.md sha256 {digest} != chain.json mandate_sha256 "
+                         f"{cfg.get('mandate_sha256')}: mandate changed after approval, no policy answers")
+    return _policy_rules(mandate, body)
+
 
 def system_prompt(cfg):
     """Generic protocol plus the mandate of THIS run only (run_dir/mandate.md, approved in
@@ -1435,6 +1554,7 @@ def system_prompt(cfg):
         if digest != cfg.get("mandate_sha256"):
             raise SystemExit(f"mandate.md sha256 {digest} != chain.json mandate_sha256 "
                              f"{cfg.get('mandate_sha256')}: mandate changed after approval")
+        _policy_rules(mandate, body)  # a bad «Политика решений» refuses the launch like a bad pin
         text += (f"\n## Мандат прогона `{cfg['chain']}` (из {mandate})\n\n" + body.strip() + "\n")
     out = cfg["run_dir"] / "system-prompt.md"
     out.write_text(text, encoding="utf-8")
@@ -3144,6 +3264,58 @@ def _complete_wave(cfg, st, wave, w, wdir, now):
     return started
 
 
+def _policy_answer(cfg, st, wave, w, status, now, attach):
+    """Answer a BLOCKED episode by the decision policy of mandate.md. True when it is answered (now
+    or earlier in this episode): the owner is then informed (`policy_answer`), not asked. False sends
+    the episode down the usual BLOCKED path: no or bad label, red=yes, merge_gate, a class/rec the
+    policy does not allow, no or tampered policy, the cap reached, or a failed delivery (the next
+    tick tries again; `pending_enter` makes the retry Enter-only, so the answer is never typed twice)."""
+    if _answered(w) == status:
+        return True
+    label = parse_blocked_label(status)
+    if label is None or label["red"] or label["class"] == "merge_gate":
+        return False
+    try:
+        rules = decision_policy(cfg)
+    except SystemExit as e:
+        if once_per(w, "policy_error", str(e)[:200]):
+            save_state(cfg, st)
+            event(cfg, f"{wave}: decision policy not applied: {e}")
+        return False
+    if not any(r["class"] == label["class"] and r["rec"] in (None, label["rec"]) for r in rules):
+        return False
+    used = w.get("auto_answers")
+    used = used if isinstance(used, int) and not isinstance(used, bool) and used > 0 else 0
+    cap = cfg.get("max_auto_answers", MAX_AUTO_ANSWERS)
+    if used >= cap:
+        if not w.get("policy_cap_reached"):
+            w["policy_cap_reached"] = True
+            save_state(cfg, st)
+            event(cfg, f"{wave}: policy cap reached ({used}/{cap}): class={label['class']} "
+                       f"rec={label['rec']} goes to the owner")
+        return False
+    w["policy_pending"] = status
+    if not _deliver(cfg, st, wave, "policy answer", send_text, POLICY_ANSWER.format(rec=label["rec"])):
+        save_state(cfg, st)
+        return False
+    w.pop("policy_pending", None)
+    w.setdefault("notified", {})["policy_answer"] = status
+    w["auto_answers"] = used + 1
+    question = redact((label["question"].splitlines() or [""])[0], 200)
+    try:
+        with open(wave_dir(cfg, wave) / "policy-decisions.log", "a", encoding="utf-8") as f:
+            f.write(f"{_utc(now)} class={label['class']} rec={label['rec']} {question}\n")
+    except OSError as e:
+        event(cfg, f"{wave}: policy-decisions.log not written ({e.strerror or e})")
+    put_notice(w, "policy_answer", status,
+               f"wave-autobot: волна {wave}: развилка закрыта по политике mandate.md "
+               f"(class={label['class']}, вариант {label['rec']}), ответ не нужен.\n\n"
+               f"{redact(status)}\n\nСмотреть: {attach}")
+    save_state(cfg, st)  # the mark, the counter and the notice together
+    event(cfg, f"{wave}: policy auto-answer: class={label['class']} rec={label['rec']}")
+    return True
+
+
 def tick(cfg, st):
     try:
         alive = _tick(cfg, st)
@@ -3264,6 +3436,14 @@ def _tick(cfg, st):
             w.pop("pending_enter")
         save_state(cfg, st)
 
+    if w.get("pending_enter") == "policy answer" and w.get("policy_pending") != status:
+        for key in ("pending_enter", "pending_text_head", "policy_pending"):
+            w.pop(key, None)  # the wave left that BLOCKED line: the half-sent answer is outdated
+        save_state(cfg, st)
+
+    if status.startswith("BLOCKED") and _policy_answer(cfg, st, wave, w, status, now, attach):
+        flush_notices(cfg, st, w)
+        return True
     if status.startswith("BLOCKED"):
         fresh = once_per(w, "blocked", status)
         if fresh:
@@ -3603,6 +3783,7 @@ def watch(cfg, path, max_ticks=None):
 
 def _watch(cfg, path, max_ticks=None):
     require_tmux()
+    decision_policy(cfg)  # a bad or tampered «Политика решений» refuses the watch, like the launch
     event(cfg, f"watch started, ctx_limit={cfg['ctx_limit']}")
     drop_stale_btab(cfg, TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET") or "")
     st = _state_or_event(cfg)
