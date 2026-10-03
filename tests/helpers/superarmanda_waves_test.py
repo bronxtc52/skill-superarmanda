@@ -10083,6 +10083,19 @@ class DecisionPolicy(Base):
         self.assertEqual(self.answers(), [])
         self.assertIn("changed while waiting for the input", self.log(cfg))
 
+    def test_identical_blocked_rewritten_after_an_unseen_running_is_a_new_episode(self):  # Codex P2, #49
+        cfg, _ = self.policy_chain() if hasattr(self, "policy_chain") else self.mandate()
+        self.tick(cfg, self.ASK)
+        self.assertEqual(len(self.answers()), 1)
+        # the wave took the answer, wrote RUNNING and then the same BLOCKED line before the next poll
+        path = cfg["run_dir"] / "W1" / "status"
+        path.write_text("RUNNING", encoding="utf-8")
+        st0 = os.stat(path)
+        path.write_text(self.ASK, encoding="utf-8")
+        os.utime(path, ns=(st0.st_atime_ns, st0.st_mtime_ns + 5_000_000))
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 2)  # answered again, not left waiting silently
+
     def test_label_is_parsed(self):
         got = wab.parse_blocked_label(self.ASK)
         self.assertEqual((got["class"], got["rec"], got["red"]), ("needs_decision", "invariant", False))

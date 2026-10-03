@@ -1012,6 +1012,15 @@ def _status(w):
     return str(w.get("last_status") or "")
 
 
+def _status_stamp(cfg, wave):
+    """Identity of the status file's current content write: [inode, mtime_ns], or None."""
+    try:
+        s = os.stat(wave_dir(cfg, wave) / "status")
+    except OSError:
+        return None
+    return [s.st_ino, s.st_mtime_ns]
+
+
 def _answered(w):
     """The BLOCKED line the dispatcher answered by the decision policy (the episode's mark), or None."""
     notified = w.get("notified")
@@ -3276,8 +3285,14 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     tick tries again; `pending_enter` makes the retry Enter-only, so the answer is never typed twice).
     None: the status file changed between the tick's read and the delivery: nothing is sent and the
     tick ends; the next tick starts the new episode."""
+    stamp = _status_stamp(cfg, wave)
     if _answered(w) == status:
-        return True
+        if w.get("policy_answered_stamp") in (None, stamp):
+            return True
+        # the same text, but the file was rewritten since the answer (e.g. RUNNING in between, unseen by
+        # the poll): a NEW episode, not the answered one — otherwise the wave would wait silently
+        w.get("notified", {}).pop("policy_answer", None)
+        w.pop("policy_answered_stamp", None)
     label = parse_blocked_label(status)
     if label is None or label["red"] or label["class"] == "merge_gate":
         return False
@@ -3314,6 +3329,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         return False
     w.pop("policy_pending", None)
     w.setdefault("notified", {})["policy_answer"] = status
+    w["policy_answered_stamp"] = _status_stamp(cfg, wave)  # tells a rewritten identical line apart
     w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
     drop_notice(w, "blocked")  # a usual BLOCKED signal of a failed first try asks nothing any more
     w.setdefault("notified", {})["blocked"] = status  # ...and is not raised again in this episode
