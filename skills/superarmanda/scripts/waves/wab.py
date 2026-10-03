@@ -554,7 +554,10 @@ def auto_mode_off(text):
 # ---------- transcripts ----------
 
 def transcript_dir(cwd):
-    return projects_dir() / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    """Claude Code names the directory after the REAL cwd (getcwd resolves symlinks): on macOS
+    a clone under /tmp lives in -private-tmp-... . Without realpath the dispatcher read no
+    transcript at all: context 0k, no WAB-CHECKPOINT, no /clear rebinding."""
+    return projects_dir() / re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(str(cwd)))
 
 
 def transcript_path(cwd, session_id):
