@@ -10162,6 +10162,13 @@ class DecisionPolicy(Base):
                 self.assertEqual(len(self.owner_asked()), 1, self.tg)
                 self.assertEqual(self.decisions(cfg), [])
 
+    def test_merge_gate_is_never_answered_even_if_a_rule_slipped_through(self):
+        cfg, _ = self.mandate()
+        with mock.patch.object(wab, "decision_policy", return_value=[{"class": "merge_gate", "rec": None}]):
+            self.tick(cfg, "BLOCKED: [class=merge_gate rec=A red=no] gate")
+        self.assertEqual(self.answers(), [])
+        self.assertEqual(len(self.owner_asked()), 1, self.tg)
+
     def test_failed_delivery_is_retried_once(self):
         cfg, _ = self.mandate()
         calls = []
@@ -10190,6 +10197,12 @@ class DecisionPolicy(Base):
         self.assertEqual(len(self.owner_asked()), 2, self.tg)
 
     def test_cap_is_tuned_live(self):
+        # tunable, not identity: a state pinned without the field (or with another value) is the same run
+        self.assertIn("max_auto_answers", wab.TUNABLE)
+        cfg, _ = self.mandate()
+        ident = wab._pinned_identity(cfg)
+        cfg2, _ = self.chain(mandate_sha256=cfg["mandate_sha256"], max_auto_answers=7)
+        self.assertEqual(wab._pinned_identity(cfg2), ident)
         cfg, _ = self.mandate(max_auto_answers=0)
         self.tick(cfg, self.ASK)
         self.assertEqual(self.answers(), [])

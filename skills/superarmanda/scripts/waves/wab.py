@@ -3683,7 +3683,7 @@ def _state_or_event(cfg):
 
 
 TUNABLE = ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds", "telegram",
-           "titles", "model", "plan_sha256")
+           "titles", "model", "plan_sha256", "max_auto_answers")
 
 
 def _identity(cfg):

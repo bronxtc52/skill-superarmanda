@@ -3,6 +3,25 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 0.11.0 — 2026-10-03
+
+### Добавлено
+
+- Машинная метка строки `BLOCKED` от волны: `BLOCKED: [class=<класс> rec=<вариант> red=<yes|no>] …`
+  (классы `needs_decision`, `blocked_cap`, `plan_mismatch`, `question`; `merge_gate` — только
+  диспетчер). Строка без метки или с испорченной меткой обрабатывается как раньше.
+  ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
+- Раздел «Политика решений» в `mandate.md` (`- auto: class=<класс> [rec=<вариант>]`), пинится тем
+  же `mandate_sha256`; строгий разбор: неизвестный ключ/класс, `red`, `merge_gate` — отказ `launch`
+  и `watch`. ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
+- Автоответ диспетчера на разрешённую политикой развилку вне красной зоны: текст в окно волны путём
+  `say`, строка в `<волна>/policy-decisions.log`, событие и информирующее уведомление
+  `policy_answer`; один ответ на эпизод, повтор после неудачной доставки.
+  ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
+- `max_auto_answers` в `chain.json` (по умолчанию 3, настраивается на лету): после него — обычный
+  `BLOCKED` владельцу и событие `policy cap reached`.
+  ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
+
 ## 0.10.0 — 2026-10-03
 
 ### Добавлено
