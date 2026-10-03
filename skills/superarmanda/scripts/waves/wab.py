@@ -1096,10 +1096,21 @@ def redact(text, limit=TG_LIMIT, owner_paths=True):
 # could name a secret as the <wave> segment of such a path and quote it.
 QUOTE_OPEN, QUOTE_CLOSE = "\x02", "\x03"
 _QUOTE_SPAN = re.compile("\x02(.*?)(?:\x03|$)", re.S)
-_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")  # all but \n and \t
+def _chars_of(categories):
+    """Characters of the given Unicode categories (planes 0-2 and 14 hold every Cf/Zs/Zl/Zp there is),
+    as the inside of a regex class: computed, so the set follows the interpreter's Unicode tables."""
+    return "".join(re.escape(c) for c in map(chr, [*range(0x30000), *range(0xE0000, 0xE0200)])
+                   if unicodedata.category(c) in categories)
 
 
-_CTRL_WORD = re.compile("[^ \\n\\t\\r]*[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029][^ \\n\\t\\r]*")
+# A character that is invisible or breaks a line glues (`a<ZWSP>sk-...`) or splits (`sk-<ZWSP>...`) a
+# secret past redact(): controls (Cc, all but \n \t, \r is handled apart), format characters (Cf: zero
+# width, bidi marks, soft hyphen, tags...), line and paragraph separators (Zl, Zp). Any token that holds
+# one is masked whole. Unicode spaces (Zs) are separators like a plain space, never part of a token.
+_INVISIBLE = "\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f" + _chars_of({"Cf", "Zl", "Zp"})
+_SPACES = " \\n\\t\\r" + _chars_of({"Zs"})
+_CONTROL = re.compile(f"[{_INVISIBLE}]")
+_CTRL_WORD = re.compile(f"[^{_SPACES}]*[{_INVISIBLE}][^{_SPACES}]*")
 
 
 def _clean_redact(text, limit, owner_paths):
@@ -1148,7 +1159,12 @@ def render_notice(text, limit=TG_MESSAGE_LIMIT):
 def _first_line(text, limit):
     """The first non-empty line of a rendered notice, capped (display-message, ATTENTION, events)."""
     lines = [l for l in render_notice(text, 10 ** 9).splitlines() if l.strip()]
-    return _clip(lines[0], limit) if lines else ""
+    if not lines:
+        return ""
+    if lines[0].strip() == "Цитата волны:" and len(lines) > 1:
+        # the heading alone says nothing in ATTENTION / display-message: add the quote's first line
+        return _clip(f"{lines[0].strip()} {lines[1].lstrip('> ').strip()}", limit)
+    return _clip(lines[0], limit)
 
 
 AZ_TIMEOUT = 30  # seconds: a hung `az` must not block the watch loop
@@ -4085,6 +4101,7 @@ def _tick(cfg, st):
             event(cfg, f"{wave}: new session {sid} bound by marker")
     if awaiting:
         tokens = w.get("tokens", 0)  # old session: not measured, no checkpoint requested
+        watch_context(cfg, st, wave, w, tokens)  # the unbound session is exactly what #44 looks for
     else:
         tokens = context_tokens(w)
         w["tokens"] = tokens

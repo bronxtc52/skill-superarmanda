@@ -11529,8 +11529,10 @@ class W3FrozenContext(Base):
             sessions=["s1"], pane_digest=wab.pane_digest(self.pane), pane_changed=time.time())}})
         self.set_status(self.cfg, "W1", "RUNNING")
 
+    MAX_TICKS = 40  # a mutated CTX_FROZEN_TICKS (10**9) must fail an assert, not hang the run
+
     def tick(self, n=1, grow=None):
-        for _ in range(n):
+        for _ in range(min(n, self.MAX_TICKS)):
             if grow is not None:
                 with open(grow, "a", encoding="utf-8") as f:
                     f.write(asst(inp=7) + "\n")
@@ -11593,10 +11595,53 @@ class W3FrozenContext(Base):
         self.put_state(self.cfg, st)
         self.neighbor.unlink()
         self.tick()
-        for _ in range(wab.CTX_FROZEN_TICKS + 4):
+        for _ in range(min(wab.CTX_FROZEN_TICKS + 4, self.MAX_TICKS)):
             for p in (theirs, old):
                 with open(p, "a", encoding="utf-8") as f:
                     f.write(asst(inp=9) + "\n")
+            self.tick()
+        self.assertEqual(_frozen_events(self.cfg), [])
+        self.assertFalse(self.rec().get("ctx_frozen"))
+
+    def await_rebind(self):
+        """/clear was sent, the marker of the new session is not found (yet): await_session stays true."""
+        st = self.get_state(self.cfg)
+        st["waves"]["W1"]["await_session"] = True
+        st["waves"]["W1"]["tokens"] = 1000
+        self.put_state(self.cfg, st)
+
+    def test_the_watch_works_while_the_rebinding_is_awaited(self):
+        self.await_rebind()
+        self.tick()  # seeds the watch
+        self.tick(wab.CTX_FROZEN_TICKS - 1, grow=self.neighbor)
+        self.assertEqual(_frozen_events(self.cfg), [])
+        self.tick(1, grow=self.neighbor)
+        events = _frozen_events(self.cfg)
+        self.assertEqual(len(events), 1, events)
+        self.assertTrue(self.rec().get("await_session"))  # still unbound
+        self.assertTrue(self.rec().get("ctx_frozen"))
+        self.tick(4, grow=self.neighbor)  # the same episode: nothing new
+        self.assertEqual(len(_frozen_events(self.cfg)), 1)
+        # the new session is bound by its marker: the episode is over, the mark is gone
+        self.transcript("s2", [asst(inp=50)], marker=wab.session_marker(self.cfg, "W1"))
+        self.tick(1)
+        rec = self.rec()
+        self.assertFalse(rec.get("await_session"))
+        self.assertEqual(rec["sessions"][-1], "s2")
+        self.assertFalse(rec.get("ctx_frozen"))
+        self.assertEqual(len(_frozen_events(self.cfg)), 1)
+
+    def test_a_journal_of_another_wave_while_awaiting_is_no_event(self):
+        self.await_rebind()
+        theirs = self.transcript("w2s", [asst(inp=9)])
+        st = self.get_state(self.cfg)
+        st["waves"]["W2"] = self.wave_rec("W2", phase="done", sessions=["w2s"])
+        self.put_state(self.cfg, st)
+        self.neighbor.unlink()
+        self.tick()
+        for _ in range(min(wab.CTX_FROZEN_TICKS + 4, self.MAX_TICKS)):
+            with open(theirs, "a", encoding="utf-8") as f:
+                f.write(asst(inp=9) + "\n")
             self.tick()
         self.assertEqual(_frozen_events(self.cfg), [])
         self.assertFalse(self.rec().get("ctx_frozen"))
@@ -11631,6 +11676,11 @@ class W3FrozenContext(Base):
         st["waves"]["W1"]["ctx_frozen"] = False
         self.put_state(self.cfg, st)
         self.assertNotIn("не меряется", render())
+
+
+def unicodedata_category(ch):
+    import unicodedata
+    return unicodedata.category(ch)
 
 
 class W3Quote(Base):
@@ -11786,6 +11836,73 @@ class W3Quote(Base):
         q = wab.quote("key sk-\x00ant-abcdefghijklmnopqrstuvwx1234")
         self.assertNotIn("abcdefghijkl", q)
         self.assertNotIn("abcdefghijkl", wab.render_notice("sk-\x01ant-abcdefghijklmnopqrstuvwx1234"))
+
+    # one representative per class that must never glue or split a secret past the mask
+    GLUERS = {
+        "Cc": ["\x00", "\x0b", "\x1b", "\x85", "\x9b"],
+        "Cf": ["\u200b", "\u200c", "\u200d", "\u200e", "\u202a", "\u202e", "\u2060", "\u2066",
+               "\u2069", "\ufeff", "\u00ad", "\u061c", "\u180e", "\U000e0020"],
+        "Zl/Zp": ["\u2028", "\u2029"],
+        "CR": ["\r", "\r\n"],
+    }
+    HEAD, TAIL = "sk-ant-api03-AbCdEf", "1234567890xyzQWERTY"
+
+    def secret_gone(self, out):
+        self.assertNotIn("AbCdEf", out)
+        self.assertNotIn("1234567890", out)
+        self.assertNotIn("xyzQWERTY", out)
+
+    def test_invisible_and_control_characters_cannot_glue_or_split_a_secret(self):
+        for cls, chars in self.GLUERS.items():
+            for ch in chars:
+                if cls == "CR":
+                    continue  # a line break is a separator, covered by its own test
+                with self.subTest(cls=cls, ch=repr(ch)):
+                    glued = f"a{ch}{self.HEAD}{self.TAIL}"
+                    split = f"ключ {self.HEAD}{ch}{self.TAIL} конец"
+                    for raw in (glued, split):
+                        self.secret_gone(wab.quote(raw))
+                        self.secret_gone(wab.render_notice(wab.quote(raw)))
+                        self.secret_gone(wab.render_notice(raw))  # an older entry without markers
+                        self.secret_gone(wab.render_notice(f"x\x02{raw}\x03 y"))
+                        self.secret_gone(wab._first_line(raw, 300))
+                    self.assertIn("конец", wab.render_notice(split))
+
+    def test_every_format_character_of_unicode_masks_its_token(self):
+        import sys
+        import unicodedata
+        planes = [*range(0x20000), *range(0xE0000, 0xE0200)]
+        cf = [chr(c) for c in planes if unicodedata.category(chr(c)) == "Cf"]
+        self.assertGreater(len(cf), 100)
+        for ch in cf:
+            out = wab.render_notice(f"{self.HEAD}{ch}{self.TAIL}")
+            if "1234567890" in out or "AbCdEf" in out:
+                self.fail(f"U+{ord(ch):04X} is not neutralised")
+
+    def test_unicode_spaces_separate_tokens_like_a_plain_space(self):
+        for ch in ("\u00a0", "\u1680", "\u2000", "\u2003", "\u200a", "\u202f", "\u205f", "\u3000"):
+            with self.subTest(ch=repr(ch)):
+                self.assertEqual(unicodedata_category(ch), "Zs")
+                # a word next to the space is NOT swallowed by a masked neighbour
+                out = wab.render_notice(f"слово{ch}\u200bплохо{ch}нормально")
+                self.assertIn("слово", out)
+                self.assertIn("нормально", out)
+                self.assertNotIn("плохо", out)  # only the token with the invisible character is masked
+                self.secret_gone(wab.render_notice(f"a{ch}{self.HEAD}{self.TAIL}"))
+                self.secret_gone(wab.quote(f"{self.HEAD}{self.TAIL}{ch}x"))
+                # a space cuts a word in two, a plain one and a Unicode one alike
+                self.assertEqual(wab.quote(f"{self.HEAD}{ch}{self.TAIL}").replace(ch, " "),
+                                 wab.quote(f"{self.HEAD} {self.TAIL}"))
+
+    def test_the_first_line_of_a_quoted_message_keeps_the_quote(self):
+        msg = f"wave-autobot: волна W1 завершена.\n{wab.quote('первая строка итога' + chr(10) + 'вторая')}"
+        self.assertEqual(wab._first_line(msg, 300), "wave-autobot: волна W1 завершена.")
+        only = wab._first_line(wab.quote("Итог: всё хорошо\nвторая"), 300)
+        self.assertEqual(only, "Цитата волны: Итог: всё хорошо")
+        secret = wab._first_line(wab.quote(f"a\u200b{self.HEAD}{self.TAIL}\nx"), 300)
+        self.assertTrue(secret.startswith("Цитата волны: "), secret)
+        self.secret_gone(secret)
+        self.assertEqual(wab._first_line("", 300), "")
 
     def test_crlf_text_keeps_its_lines_and_a_lone_cr_separates(self):
         out = wab.render_notice(wab.quote("первая\r\nвторая\rтретья"))
