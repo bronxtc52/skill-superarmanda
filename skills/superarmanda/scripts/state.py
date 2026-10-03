@@ -1084,19 +1084,29 @@ def init(args):
             "created_at": now(),
             "plan_sha256": plan["sha256"],
         }
-        write(path, data)
+        # Fail-safe order: the counter is written FIRST (a reservation), the manifest second.
+        # A kill (SIGKILL, power loss) between the writes leaves a counted run without a
+        # manifest, which only lowers the remaining budget; the reverse order would leave an
+        # uncounted manifest and let the next init exceed the cap.
+        write(
+            runs_file,
+            {
+                "version": RUNS_FILE_VERSION,
+                "wave": plan["wave"],
+                "runs": runs + [record],
+            },
+        )
         try:
-            write(
-                runs_file,
-                {
-                    "version": RUNS_FILE_VERSION,
-                    "wave": plan["wave"],
-                    "runs": runs + [record],
-                },
-            )
+            write(path, data)
         except BaseException:
-            # the counter did not move, so the manifest must not exist either
-            path.unlink(missing_ok=True)
+            # an ordinary failure: give the reservation back (atomically) and re-raise
+            if runs:
+                write(
+                    runs_file,
+                    {"version": RUNS_FILE_VERSION, "wave": plan["wave"], "runs": runs},
+                )
+            else:
+                runs_file.unlink(missing_ok=True)
             raise
     print(json.dumps(data, sort_keys=True))
 

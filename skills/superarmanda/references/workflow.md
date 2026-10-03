@@ -139,7 +139,7 @@ the older records stay in the manifest as history but are neither counted in `ac
 runs of a wave when `WAB_DIR` or `--runs-file` names a counter file (`runs.json`): the limit is
 `--max-runs`, else the file `$WAB_DIR/max-runs` (the live value kept by the dispatcher; damaged or
 not a whole number 1..1000 is a closed refusal), else `WAB_MAX_RUNS`, else 2; beyond it `init` refuses and creates no manifest; the
-manifest gets `run: {index, max}`, and `where` reports `run` and `last_run`. Task IDs are coordinator-approved identifiers: renaming a
+manifest gets `run: {index, max}`, and `where` reports `run` and `last_run`. The counter is written before the manifest, so a process killed between the two writes leaves a counted run without a manifest (the cap is never exceeded; the budget only shrinks). Task IDs are coordinator-approved identifiers: renaming a
 blocked task is not a reset. v1 supplies no reset command; any human decision to resume work
 requires a new, explicitly documented run rather than editing the manifest.
 

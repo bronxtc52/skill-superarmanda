@@ -3522,6 +3522,49 @@ class RunCounter(unittest.TestCase):
         self.assertFalse(self.runs.exists())
         self.assertEqual(self.init_run("ok", extra=flags)[1].returncode, 0)
 
+    DRIVER = """
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("state_kill", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+mode, target = sys.argv[2], sys.argv[3]
+real = module.write
+def patched(path, value):
+    if mode == "kill_after_first":
+        real(path, value)
+        os._exit(9)  # like SIGKILL: no except/finally runs
+    if str(path) == target:  # the manifest write fails with an ordinary error
+        raise OSError("disk full")
+    real(path, value)
+module.write = patched
+module.init(module.parser().parse_args(sys.argv[4:]))
+"""
+
+    def run_driver(self, mode, name, flags):
+        manifest = Path(self.tmp.name) / f"{name}.json"
+        argv = ["python3", "-c", self.DRIVER, str(STATE), mode, str(manifest), "init",
+                "--manifest", str(manifest),
+                *map(str, self.init_args(f"{self.plan}#w1")), *map(str, flags)]
+        return manifest, subprocess.run(argv, text=True, capture_output=True)
+
+    def test_process_killed_between_the_two_writes_cannot_exceed_the_cap(self):
+        flags = ["--max-runs", 1, "--runs-file", self.runs]
+        _killed, proc = self.run_driver("kill_after_first", "killed", flags)
+        self.assertEqual(proc.returncode, 9, proc.stderr)
+        again, proc = self.init_run("again", extra=flags)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("run cap reached", proc.stderr)
+        self.assertFalse(again.exists())
+
+    def test_ordinary_manifest_write_error_restores_the_previous_counter(self):
+        flags = ["--max-runs", 3, "--runs-file", self.runs]
+        self.assertEqual(self.init_run("a", extra=flags)[1].returncode, 0)
+        before = self.runs.read_text(encoding="utf-8")
+        broken, proc = self.run_driver("fail_manifest", "broken", flags)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.runs.read_text(encoding="utf-8"), before)
+        self.assertFalse(broken.exists())
+
     def test_invalid_max_runs_is_refused(self):
         for value in ("0", "-1", "x", "", "1.5", "true", "+2", " 2", "1001"):
             with self.subTest(flag=value):
