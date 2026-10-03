@@ -9977,6 +9977,20 @@ class Submit(Base):
         self.assertIn("delivery NOT verified", log)
         self.assertIn("unverified_enter", st["waves"]["W1"].get("outbox", {}))
 
+    def test_say_refuses_while_the_dispatcher_owes_an_enter(self):  # Codex P2 on #47, round 3
+        cfg, path, f = self.say()
+        st = self.m.load_state(cfg)
+        st["waves"]["W1"]["pending_enter"] = "alarm"
+        st["waves"]["W1"]["pending_text_head"] = "будильник"
+        self.m.save_state(cfg, st)
+        self.screens = [self.EMPTY]
+        with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.m.main(["wab.py", "say", str(path), "W1", str(f)])
+        self.assertNotIn(e.exception.code, (0, None))
+        self.assertFalse(any("paste-buffer" in c for c in self.m_calls), self.m_calls)
+        self.assertIn("owes an Enter", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
     def test_unsent_reason_on_screens(self):
         self.assertIsNotNone(wab.unsent_reason(self.PREVIEW, self.TEXT))
         self.assertIsNotNone(wab.unsent_reason(self.TYPED, self.TEXT))

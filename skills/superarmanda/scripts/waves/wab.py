@@ -3713,6 +3713,12 @@ def say_cmd(cfg, wave, text_file):
         return False
     try:
         with _InputLock(cfg, wave):  # never interleaves with a dispatcher delivery into the same input
+            # the input stays reserved while the dispatcher still owes an Enter: its text is in the
+            # input line, and a paste now would merge with it (read under the lock, after any delivery)
+            pending = load_state(cfg)["waves"].get(wave, {})
+            if isinstance(pending, dict) and pending.get("pending_enter"):
+                raise NotSubmitted(f"the dispatcher still owes an Enter for «{pending['pending_enter']}» "
+                                   f"in this input; retry after it is delivered")
             send_text(name, text)
     except (subprocess.CalledProcessError, OSError, NotSubmitted) as e:
         why = str(e) if isinstance(e, NotSubmitted) else type(e).__name__
