@@ -9847,10 +9847,11 @@ class Submit(Base):
         return self.screens[max(i, 0)] if self.screens else ""
 
     TEXT = "Решение A: делай миграцию сначала, потом API"
-    PREVIEW = "\n".join(["история", PROMPT_LINE.format("[Pasted text #1 +3 lines]"),
+    RULE = "╭" + "─" * 40 + "╮"
+    PREVIEW = "\n".join(["история", RULE, PROMPT_LINE.format("[Pasted text #1 +3 lines]"),
                          "  paste again to expand"])
-    TYPED = "\n".join(["история", PROMPT_LINE.format("Решение A: делай миграцию сначала, по")])
-    EMPTY = "\n".join(["история", "> Решение A: делай миграцию сначала, потом API", PROMPT_LINE.format(" ")])
+    TYPED = "\n".join(["история", RULE, PROMPT_LINE.format("Решение A: делай миграцию сначала, по")])
+    EMPTY = "\n".join(["история", "> Решение A: делай миграцию сначала, потом API", RULE, PROMPT_LINE.format(" ")])
 
     def say(self, text=None):
         cfg, path = self.chain(telegram=None)
@@ -9911,7 +9912,7 @@ class Submit(Base):
 
     def test_preview_phrase_in_history_does_not_count_as_unsent(self):  # Codex P2 on #47
         history = "\n".join(["> обсуждали «paste again to expand» в прошлом ответе", "история",
-                              PROMPT_LINE.format(" ")])
+                              self.RULE, PROMPT_LINE.format(" ")])
         self.assertIsNone(wab.unsent_reason(history, self.TEXT))
         self.assertIsNotNone(wab.unsent_reason(self.PREVIEW, self.TEXT))  # the real footer still counts
 
@@ -9998,6 +9999,15 @@ class Submit(Base):
             self.m.main(["wab.py", "say", str(path), "W2", str(f)])  # W2 never launched in this run
         self.assertIn("no launched session", str(e.exception.code))
         self.assertFalse(any("paste-buffer" in c for c in self.m_calls), self.m_calls)
+
+    def test_sent_prompt_in_history_is_not_the_input_line(self):  # live regression W4, 2026-10-03
+        sent = "❯ Решение A: делай миграцию сначала, потом API"  # Claude Code draws sent prompts with ❯
+        no_box_yet = "\n".join(["история", sent, "✻ Thinking…"])
+        self.assertIsNone(wab.unsent_reason(no_box_yet, self.TEXT))
+        with_box = "\n".join(["история", sent, "─" * 40, "❯ ", "─" * 40])
+        self.assertIsNone(wab.unsent_reason(with_box, self.TEXT))
+        still_typed = "\n".join(["история", "─" * 40, "❯ Решение A: делай миграцию", "─" * 40])
+        self.assertIsNotNone(wab.unsent_reason(still_typed, self.TEXT))
 
     def test_unsent_reason_on_screens(self):
         self.assertIsNotNone(wab.unsent_reason(self.PREVIEW, self.TEXT))

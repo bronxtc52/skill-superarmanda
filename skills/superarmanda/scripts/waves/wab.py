@@ -439,20 +439,32 @@ def _text_head(text, n=20):
     return ""
 
 
+_RULE_CHARS = set("─━═╭╮╰╯┌┐└┘├┤┬┴┼│ ")
+
+
+def _is_rule(line):
+    """A horizontal border line of the input box (box-drawing characters only, with a «─» run)."""
+    s = line.strip()
+    return bool(s) and "─" in s and set(s) <= _RULE_CHARS
+
+
 def unsent_reason(screen, text):
     """Why `text` evidently was NOT submitted on this screen, or None. Not submitted: the paste
     preview hint is on the screen, or the input line (the LAST line with «❯», the box sits below
     the history) still holds a folded paste or the start of the text. A screen without an input
     line (a dialog, an empty capture) gives no evidence against the delivery: None."""
     all_lines = screen.splitlines()
-    marks = [i for i, l in enumerate(all_lines) if INPUT_MARK in l]
+    # the input line is a «❯» line right under the input box's top rule. Claude Code also draws
+    # SENT prompts in the history with «❯» (no rule above them): right after a submit, while the box
+    # is not redrawn yet, such a history line must not read as text still in the input (W4, 2026-10-03)
+    marks = [i for i, l in enumerate(all_lines) if INPUT_MARK in l and i > 0 and _is_rule(all_lines[i - 1])]
     # only the active input region counts: the last «❯» line and the footer below it (or, without
     # an input line, the last few lines). History above may quote the hint or the text itself.
-    region = all_lines[marks[-1]:] if marks else all_lines[-4:]
+    if not marks:
+        return None  # no input box on the screen (a dialog, a redraw): no evidence against the delivery
+    region = all_lines[marks[-1]:]  # the input line and the footer under it; the paste preview lives there
     if any(PASTE_PREVIEW in l for l in region):
         return f"the paste preview is on the screen («{PASTE_PREVIEW}»)"
-    if not marks:
-        return None
     rest = " ".join(all_lines[marks[-1]].split(INPUT_MARK, 1)[1].replace("\u2502", " ").split())
     if "[Pasted text" in rest:
         return "the folded paste is still in the input line"
