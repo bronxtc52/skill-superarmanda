@@ -1099,12 +1099,23 @@ _QUOTE_SPAN = re.compile("\x02(.*?)(?:\x03|$)", re.S)
 _CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")  # all but \n and \t
 
 
+_CTRL_WORD = re.compile("[^ \\n\\t\\r]*[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029][^ \\n\\t\\r]*")
+
+
+def _clean_redact(text, limit, owner_paths):
+    """redact() of text with control characters (quote markers included) neutralised WITHOUT a
+    choice heuristic: a token (a run between spaces, tabs and line breaks) that holds a control
+    character is masked whole, since a control character glues (`a\\x00sk-...`) or splits
+    (`sk-\\x00...`) a secret and no word of the wave holds one; the rest goes through redact()."""
+    text = _CTRL_WORD.sub("[скрыто]", text.replace("\r", ""))
+    return _clip(redact(text, 10 ** 9, owner_paths), limit)
+
+
 def quote(text, limit=TG_LIMIT):
     """The wave's (or any outside) text for a notice: control characters (and so the quote markers) are
     removed, secrets masked WITHOUT the owner-script exemption, the length capped at `limit`, the whole
     wrapped in the quote markers. See render_notice."""
-    clean = _CONTROL.sub("", str(text))
-    return QUOTE_OPEN + redact(clean.strip(), limit, owner_paths=False) + QUOTE_CLOSE
+    return QUOTE_OPEN + _clean_redact(str(text).strip(), limit, False).strip() + QUOTE_CLOSE
 
 
 def _clip(text, limit):
@@ -1113,7 +1124,7 @@ def _clip(text, limit):
 
 def _render_quote(inner, before):
     """One quote as it is shown: a block when it holds lines or starts a line, else inline."""
-    inner = redact(_CONTROL.sub("", inner), 10 ** 9, owner_paths=False)  # again, idempotent
+    inner = _clean_redact(inner, 10 ** 9, False)  # again, idempotent
     lines = inner.splitlines() or [""]
     if len(lines) == 1 and before and not before.endswith("\n"):
         return f"«цитата волны: {lines[0]}»"
@@ -1127,10 +1138,10 @@ def render_notice(text, limit=TG_MESSAGE_LIMIT):
     without markers (an older entry of the outbox) is redacted as a whole, as before."""
     out, pos = [], 0
     for m in _QUOTE_SPAN.finditer(text):
-        out.append(redact(text[pos:m.start()].replace(QUOTE_CLOSE, ""), 10 ** 9))
-        out.append(_render_quote(m.group(1).replace(QUOTE_OPEN, ""), "".join(out)))
+        out.append(_clean_redact(text[pos:m.start()], 10 ** 9, True))
+        out.append(_render_quote(m.group(1), "".join(out)))
         pos = m.end()
-    out.append(redact(text[pos:].replace(QUOTE_CLOSE, ""), 10 ** 9))
+    out.append(_clean_redact(text[pos:], 10 ** 9, True))
     return _clip("".join(out).replace(QUOTE_OPEN, ""), limit)
 
 

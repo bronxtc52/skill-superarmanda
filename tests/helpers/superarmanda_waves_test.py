@@ -11563,6 +11563,15 @@ class W3FrozenContext(Base):
         self.assertEqual(len(_frozen_events(self.cfg)), 2)
         self.assertTrue(self.rec().get("ctx_frozen"))
 
+    def test_the_threshold_is_exact(self):
+        self.tick()  # seeds the watch (ticks = 0)
+        self.tick(wab.CTX_FROZEN_TICKS - 1, grow=self.neighbor)
+        self.assertEqual(_frozen_events(self.cfg), [])
+        self.assertFalse(self.rec().get("ctx_frozen"))
+        self.tick(1, grow=self.neighbor)  # the CTX_FROZEN_TICKS-th unchanged tick
+        self.assertEqual(len(_frozen_events(self.cfg)), 1)
+        self.assertTrue(self.rec().get("ctx_frozen"))
+
     def test_a_quiet_neighbor_is_no_event(self):
         self.tick(wab.CTX_FROZEN_TICKS + 5)
         self.assertEqual(_frozen_events(self.cfg), [])
@@ -11759,6 +11768,33 @@ class W3Quote(Base):
             self.assertNotIn(ch, inner)
         self.assertEqual((q[0], q[-1]), ("\x02", "\x03"))
         self.assertNotIn(self.SECRET, q)
+
+    TOKEN = "sk-ant-abcdefghijklmnopqrstuvwx1234"
+
+    def test_a_control_character_cannot_glue_a_token_to_a_letter(self):
+        for ctl in ("\x00", "\x02", "\x03", "\x07", "\x1b", "\x9b", "\u2028"):
+            with self.subTest(ctl=repr(ctl)):
+                q = wab.quote(f"a{ctl}{self.TOKEN}")
+                self.assertNotIn("ant-abcdefgh", q)
+                self.assertNotIn("ant-abcdefgh", wab.render_notice(q))
+                cfg, _ = self.chain_for(True)
+                for raw in (f"старая запись a{ctl}{self.TOKEN}", f"x\x02a{ctl}{self.TOKEN}\x03 y"):
+                    self.assertNotIn("ant-abcdefgh", wab.render_notice(raw))
+                    self.assertNotIn("ant-abcdefgh", wab._first_line(raw, 300))
+
+    def test_a_control_character_inside_a_token_does_not_hide_it(self):
+        q = wab.quote("key sk-\x00ant-abcdefghijklmnopqrstuvwx1234")
+        self.assertNotIn("abcdefghijkl", q)
+        self.assertNotIn("abcdefghijkl", wab.render_notice("sk-\x01ant-abcdefghijklmnopqrstuvwx1234"))
+
+    def test_two_secrets_one_glued_one_split_by_controls_both_masked(self):
+        both = "a\x00sk-ant-abcdefghijklmnopqrstuvwx1234 и sk-\x00ant-zyxwvutsrqponmlkjihgfed9876 конец\r\nвторая"
+        for out in (wab.quote(both), wab.render_notice(both), wab.render_notice(wab.quote(both)),
+                    wab.render_notice("old " + both)):
+            self.assertNotIn("abcdefghijkl", out)
+            self.assertNotIn("zyxwvutsrqpo", out)
+            self.assertIn("конец", out)
+            self.assertIn("вторая", out)  # \r\n is a line break, not a control inside a word
 
     def test_the_second_redaction_inside_notify_ignores_the_owner_exemption(self):
         cfg, _ = self.chain_for(True)
