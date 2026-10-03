@@ -244,6 +244,8 @@ def manifest_problems(manifest, head, cwd_fingerprint):
     if not isinstance(manifest, dict):
         return ["manifest отсутствует или нечитаем"]
     problems = []
+    for key in sorted(k for k in manifest if k not in state.MANIFEST_KEYS):
+        problems.append(f"manifest: unknown record type {key!r}: this gate cannot judge it")
     if manifest.get("head") != head:
         problems.append(f"manifest.head {str(manifest.get('head'))[:12]} ≠ HEAD PR {head[:12]}")
     tasks = manifest.get("tasks")
@@ -253,6 +255,8 @@ def manifest_problems(manifest, head, cwd_fingerprint):
         problems.append("отпечаток дерева рабочей копии не получен")
     for name, entry in sorted(tasks.items()):
         entry = entry if isinstance(entry, dict) else {}
+        for key in sorted(k for k in entry if k not in state.TASK_KEYS):
+            problems.append(f"manifest: unknown record type {key!r} in task {name}: this gate cannot judge it")
         results = entry.get("results") if isinstance(entry.get("results"), dict) else {}
         status = entry.get("status")
         review = results.get("cross_provider_reviewer")
@@ -261,7 +265,7 @@ def manifest_problems(manifest, head, cwd_fingerprint):
         for role, other in sorted(results.items()):  # github_codex_review, coderabbit, ...
             if (role not in ("coder", "tester", "cross_provider_reviewer") and isinstance(other, dict)
                     and other.get("head") == head and other.get("status") != "pass"
-                    and not _deferred(entry, role, other)):
+                    and not _covered(entry, role, other)):
                 problems.append(f"задача {name}: {role} {other.get('status')}")
         coder = results.get("coder")
         if not (isinstance(coder, dict) and coder.get("status") == "pass" and coder.get("head") == head):
@@ -310,13 +314,36 @@ def _deferred(entry, role, result):
     return state.is_deferred(entry, role, result)
 
 
+def _covered(entry, role, result):
+    """Deferred or accepted (`fix-loop --accept`) on THIS result: state.is_covered, not a copy."""
+    return state.is_covered(entry, role, result)
+
+
+def accepted_notes(manifest, head):
+    """`accepted <severity> <source>: <note>` for each medium/high acceptance that covers a current
+    findings result of the manifest, so the verdict reports what the merge carries as a limitation."""
+    notes = []
+    tasks = manifest.get("tasks") if isinstance(manifest, dict) else None
+    for name, entry in sorted((tasks or {}).items()):
+        if not isinstance(entry, dict) or not isinstance(entry.get("results"), dict):
+            continue
+        for role, res in sorted(entry["results"].items()):
+            if not (isinstance(res, dict) and res.get("head") == head):
+                continue
+            record = state.accepted_record(entry, role, res)
+            if record and record.get("severity") in ("medium", "high"):
+                notes.append(f"accepted {record['severity']} {role}: {record.get('note')}")
+    return notes
+
+
 def _accepted(entry, review):
     """A decision made on THIS result: source cross_provider_reviewer, accept_limitation, recorded
     no earlier than the result. Older decisions, other sources, invariant/cut_surface: no.
-    A deferral of the reviewer on this result (`fix-loop --defer`) counts the same way."""
+    A deferral (`fix-loop --defer`) or an acceptance (`fix-loop --accept`) of the reviewer on this
+    result counts the same way."""
     if review.get("status") != "findings":
         return False
-    if _deferred(entry, "cross_provider_reviewer", review):
+    if _covered(entry, "cross_provider_reviewer", review):
         return True
     made = _ts(review.get("recorded_at"))
     for decision in entry.get("decisions") or []:
@@ -378,9 +405,10 @@ def evaluate(facts, head, manifest, workdir_state, base):
     if work.get("head") != head:
         problems.append(f"HEAD рабочей копии {str(work.get('head'))[:12]} ≠ HEAD PR {head[:12]}")
     problems += manifest_problems(manifest, head, work.get("fingerprint"))
+    accepted = accepted_notes(manifest, head)
     if problems:
-        return _verdict("fail", problems, head, facts)
-    return _verdict("pass", [], head, facts)
+        return _verdict("fail", problems, head, facts, accepted=accepted)
+    return _verdict("pass", list(accepted), head, facts, accepted=accepted)
 
 
 # ---------- merge and owner script ----------

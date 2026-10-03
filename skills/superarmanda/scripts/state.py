@@ -30,6 +30,19 @@ DECISIONS = {"invariant", "cut_surface", "accept_limitation"}
 # a failed check is never a nit.
 DEFER_SOURCES = {"cross_provider_reviewer", "github_codex_review", "coderabbit"}
 MAX_DECISION_NOTE_LENGTH = 500
+# Every key state.py writes into a manifest. The merge gate refuses a manifest
+# carrying a key outside these sets: it cannot judge a record type it does not know.
+MANIFEST_KEYS = {
+    "version", "run_id", "repo", "base", "head", "tree_fingerprint", "tasks",
+    "created_at", "updated_at", "plan", "wave", "position", "run",
+}
+TASK_KEYS = {
+    "status", "fix_cycles", "results", "session_roles", "fix_sources", "decisions",
+    "decision_required_for", "deferrals", "acceptances", "blocked_reason",
+}
+DEFAULT_MAX_RUNS = 2
+MAX_RUNS_LIMIT = 1000
+RUNS_FILE_VERSION = 1
 MAX_PLAN_BYTES = 1024 * 1024
 NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
 REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -617,6 +630,7 @@ def task(data, name):
     entry.setdefault("decisions", [])
     entry.setdefault("decision_required_for", None)
     entry.setdefault("deferrals", [])
+    entry.setdefault("acceptances", [])
     for role, result in entry.get("results", {}).items():
         entry["session_roles"].setdefault(result["session_id"], role)
     return entry
@@ -658,36 +672,59 @@ def result_digest(result):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _bound_record(records, role, result):
+    """The record that names exactly this result of `role` (its digest and head),
+    or None. Shared by deferrals and acceptances."""
+    if role not in DEFER_SOURCES:
+        return None
+    if not isinstance(result, dict) or result.get("status") != "findings":
+        return None
+    digest = result_digest(result)
+    for record in records or []:
+        if (
+            isinstance(record, dict)
+            and record.get("source") == role
+            and record.get("head") == result.get("head")
+            and record.get("result_sha256") == digest
+        ):
+            return record
+    return None
+
+
 def is_deferred(entry, role, result):
     """A findings result counts as passed only through a deferral of the same
     role bound to exactly this result (its digest) and its head. The single
     rule for state.py and the wave gate."""
-    if role not in DEFER_SOURCES:
-        return False
-    if not isinstance(result, dict) or result.get("status") != "findings":
-        return False
-    digest = result_digest(result)
-    for deferral in (entry or {}).get("deferrals") or []:
-        if (
-            isinstance(deferral, dict)
-            and deferral.get("source") == role
-            and deferral.get("head") == result.get("head")
-            and deferral.get("result_sha256") == digest
-        ):
-            return True
-    return False
+    return _bound_record((entry or {}).get("deferrals"), role, result) is not None
+
+
+def accepted_record(entry, role, result):
+    """The `fix-loop --accept` record bound to exactly this result, or None."""
+    return _bound_record((entry or {}).get("acceptances"), role, result)
+
+
+def is_accepted(entry, role, result):
+    """Findings of any severity accepted by the coordinator (`fix-loop --accept`),
+    bound to the exact result and head like a deferral."""
+    return accepted_record(entry, role, result) is not None
+
+
+def is_covered(entry, role, result):
+    """A findings result counts as passed when it is deferred or accepted: the
+    single readiness rule for effective_status, current_verdicts, where and the gate."""
+    return is_deferred(entry, role, result) or is_accepted(entry, role, result)
 
 
 def effective_status(entry, role):
     result = entry["results"].get(role, {})
-    if is_deferred(entry, role, result):
+    if is_covered(entry, role, result):
         return "pass"
     return result.get("status")
 
 
 def update_task_status(entry):
     """Only coder, tester and cross-provider review can make a task PR-ready.
-    Coder and tester need pass; the reviewer may also be findings + deferral."""
+    Coder and tester need pass; the reviewer may also be findings + deferral/acceptance."""
     if entry["status"] == "blocked":
         return
     required = ("coder", "tester", "cross_provider_reviewer")
@@ -919,6 +956,68 @@ def plan_check(data):
         return "changed"
 
 
+def parse_max_runs(value, origin):
+    if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value) is None:
+        fail(f"{origin} must be a positive integer, got {value!r}")
+    number = int(value)
+    if number > MAX_RUNS_LIMIT:
+        fail(f"{origin} must be at most {MAX_RUNS_LIMIT}")
+    return number
+
+
+def run_counter_settings(args):
+    """(runs_file, max_runs) when the wave run counter applies, else None. It applies
+    only to `init --from-plan` and only when --runs-file or $WAB_DIR names where the
+    counter lives; an ordinary /superarmanda run is never counted."""
+    explicit = args.max_runs is not None or args.runs_file is not None
+    if args.from_plan is None:
+        if explicit:
+            fail("--max-runs and --runs-file require --from-plan")
+        return None
+    directory = os.environ.get("WAB_DIR")
+    if args.runs_file is not None:
+        runs_file = Path(args.runs_file)
+    elif directory:
+        runs_file = Path(directory) / "runs.json"
+    else:
+        if args.max_runs is not None:
+            fail("--max-runs requires --runs-file or WAB_DIR")
+        return None
+    if args.max_runs is not None:
+        limit = parse_max_runs(args.max_runs, "--max-runs")
+    elif "WAB_MAX_RUNS" in os.environ:
+        limit = parse_max_runs(os.environ["WAB_MAX_RUNS"], "WAB_MAX_RUNS")
+    else:
+        limit = DEFAULT_MAX_RUNS
+    return runs_file, limit
+
+
+def read_runs(path, wave_id):
+    """The wave's recorded runs; a missing file is an empty record, a damaged one
+    or one of another wave is a closed refusal."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError) as exc:
+        fail(f"cannot read runs file {path}: {exc}")
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        fail(f"runs file {path} is not valid JSON: {exc}")
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != RUNS_FILE_VERSION
+        or not isinstance(value.get("wave"), str)
+        or not isinstance(value.get("runs"), list)
+        or not all(isinstance(item, dict) for item in value["runs"])
+    ):
+        fail(f"runs file {path} has an unsupported format")
+    if value["wave"] != wave_id:
+        fail(f"runs file {path} belongs to wave {value['wave']}, not {wave_id}")
+    return value["runs"]
+
+
 def init(args):
     path = safe_manifest_path(Path(args.manifest), repo(args.repo))
     if path.exists():
@@ -929,6 +1028,7 @@ def init(args):
             fail("--expect-sha256 requires --from-plan")
         if not re.fullmatch(r"[0-9a-f]{64}", args.expect_sha256):
             fail("--expect-sha256 must be 64 lowercase hex characters")
+    counter = run_counter_settings(args)
     base, head = validate_revision_pair(location, args.base, args.head)
     plan = wave_copy = None
     if args.from_plan is not None:
@@ -952,7 +1052,42 @@ def init(args):
     if plan is not None:
         data["plan"] = plan
         data["wave"] = wave_copy
-    write(path, data)
+    if counter is None:
+        write(path, data)
+        print(json.dumps(data, sort_keys=True))
+        return
+    runs_file, limit = counter
+    with lock(runs_file):
+        runs = read_runs(runs_file, plan["wave"])
+        if len(runs) >= limit:
+            listed = ", ".join(str(item.get("manifest")) for item in runs)
+            fail(
+                f"run cap reached for wave {plan['wave']}: {len(runs)}/{limit} runs "
+                f"(manifests: {listed}); write BLOCKED: [class=blocked_cap rec=owner "
+                "red=no] the wave used all its permitted runs; the owner decides "
+                "whether to raise the cap or accept the result"
+            )
+        data["run"] = {"index": len(runs) + 1, "max": limit}
+        record = {
+            "index": data["run"]["index"],
+            "manifest": str(path),
+            "created_at": now(),
+            "plan_sha256": plan["sha256"],
+        }
+        write(path, data)
+        try:
+            write(
+                runs_file,
+                {
+                    "version": RUNS_FILE_VERSION,
+                    "wave": plan["wave"],
+                    "runs": runs + [record],
+                },
+            )
+        except BaseException:
+            # the counter did not move, so the manifest must not exist either
+            path.unlink(missing_ok=True)
+            raise
     print(json.dumps(data, sort_keys=True))
 
 
@@ -1058,7 +1193,11 @@ def fix_loop(args):
     entry = task(data, args.task)
     if entry["status"] == "blocked":
         fail("task is blocked after three fix cycles; explicit human reset is required")
-    if args.defer:
+    if args.severity is not None and not args.accept:
+        fail("--severity is only allowed with --accept")
+    if args.accept:
+        record_acceptance(args, entry, data, location)
+    elif args.defer:
         record_deferral(args, entry, data, location)
     elif args.decision is not None:
         record_decision(args, entry)
@@ -1078,42 +1217,71 @@ def check_note(note, flag):
         fail("--note must not contain line breaks")
 
 
-def record_deferral(args, entry, data, location):
-    """Defer low/P3-only findings of a reviewer to the next wave/task remainder.
-    Spends no fix cycle, touches no per-source counter and is not a decision."""
+def coverable_result(args, entry, data, location, flag):
+    """Preconditions shared by --defer and --accept: a reviewer's findings result on
+    the current head and tree, in a task that is not waiting for a decision."""
     if entry["status"] == "needs_decision":
         fail(
             "decision required for source "
             f"{entry['decision_required_for']}: run fix-loop --decision ..."
         )
     if args.source is None:
-        fail("--defer requires --source")
+        fail(f"{flag} requires --source")
     if args.source not in DEFER_SOURCES:
         fail(
-            f"--defer is only allowed for {', '.join(sorted(DEFER_SOURCES))}; "
+            f"{flag} is only allowed for {', '.join(sorted(DEFER_SOURCES))}; "
             f"{args.source} findings go through --outcome failed"
         )
-    check_note(args.note, "--defer")
+    check_note(args.note, flag)
     if (
         data["repo"] != location
         or commit(location, "HEAD") != data["head"]
         or fingerprint(location) != data["tree_fingerprint"]
     ):
-        fail("working tree changed; run resume before recording a deferral")
+        fail(f"working tree changed; run resume before recording {flag[2:]}")
     result_entry = entry["results"].get(args.source)
     if not isinstance(result_entry, dict) or (
         result_entry.get("head") != data["head"]
         or result_entry.get("tree_fingerprint") != data["tree_fingerprint"]
     ):
-        fail(f"--defer requires a {args.source} findings result on the current head")
+        fail(f"{flag} requires a {args.source} findings result on the current head")
     if result_entry.get("status") != "findings":
         fail(
-            f"--defer requires {args.source} status findings, "
+            f"{flag} requires {args.source} status findings, "
             f"got {result_entry.get('status')}"
         )
+    return result_entry
+
+
+def record_deferral(args, entry, data, location):
+    """Defer low/P3-only findings of a reviewer to the next wave/task remainder.
+    Spends no fix cycle, touches no per-source counter and is not a decision."""
+    result_entry = coverable_result(args, entry, data, location, "--defer")
     entry["deferrals"].append(
         {
             "source": args.source,
+            "note": args.note,
+            "head": result_entry["head"],
+            "result_sha256": result_digest(result_entry),
+            "result_recorded_at": result_entry["recorded_at"],
+            "recorded_at": max(now(), result_entry["recorded_at"]),
+        }
+    )
+    if entry["status"] != "needs_fix":
+        update_task_status(entry)
+
+
+def record_acceptance(args, entry, data, location):
+    """Accept a reviewer's findings of any severity as a known limitation (#54).
+    Like a deferral it spends no fix cycle and is bound to the exact result; unlike
+    a deferral it records the severity so medium/high ones reach the PR body."""
+    if args.severity is None:
+        fail("--accept requires --severity <low|medium|high>")
+    result_entry = coverable_result(args, entry, data, location, "--accept")
+    entry.setdefault("acceptances", []).append(
+        {
+            "source": args.source,
+            "severity": args.severity,
             "note": args.note,
             "head": result_entry["head"],
             "result_sha256": result_digest(result_entry),
@@ -1210,9 +1378,9 @@ def mark(args):
 
 
 def current_verdicts(entry, head, tree):
-    """Verdicts on the current tree; deferred findings read as pass."""
+    """Verdicts on the current tree; deferred or accepted findings read as pass."""
     return {
-        role: "pass" if is_deferred(entry, role, item) else item["status"]
+        role: "pass" if is_covered(entry, role, item) else item["status"]
         for role, item in sorted((entry or {}).get("results", {}).items())
         if item.get("head") == head and item.get("tree_fingerprint") == tree
     }
@@ -1256,8 +1424,10 @@ REVIEW_ORDER = (
 )
 
 
-def derive_step(entry, verdicts):
-    """Return (step, role, note); note overrides the default next_action."""
+def derive_step(entry, verdicts, last_run=False):
+    """Return (step, role, note); note overrides the default next_action.
+    On the last permitted run of a wave a reviewer's open findings are disposed with
+    --defer/--accept rather than a new fix round."""
     status = entry.get("status") if entry else None
     if status == "blocked":
         return None, None, None
@@ -1274,6 +1444,14 @@ def derive_step(entry, verdicts):
     # error/unavailable/incomplete are recorded and ignored.
     if verdicts.get("coderabbit") == "findings":
         disposition.append("coderabbit")
+    if disposition and last_run and disposition[0] != "tester":
+        return (
+            6,
+            "coordinator",
+            f"last run of the wave: record fix-loop --defer or --accept --source "
+            f"{disposition[0]} --note <text> (--accept needs --severity) "
+            "instead of a new fix round",
+        )
     if disposition:
         return (
             6,
@@ -1337,7 +1515,7 @@ def where(args):
     }
     verdicts = {role: item["status"] for role, item in sorted(current.items())}
     deferred_roles = {
-        role for role, item in current.items() if is_deferred(entry, role, item)
+        role for role, item in current.items() if is_covered(entry, role, item)
     }
     open_findings = [
         {"role": role, "status": item["status"], "artifact": item.get("artifact")}
@@ -1349,7 +1527,10 @@ def where(args):
         role: "pass" if role in deferred_roles else verdict
         for role, verdict in verdicts.items()
     }
-    step, role, note = derive_step(entry, effective)
+    run = data.get("run") if isinstance(data.get("run"), dict) else None
+    run_label = f"{run['index']}/{run['max']}" if run else None
+    last_run = bool(run) and run["index"] == run["max"]
+    step, role, note = derive_step(entry, effective, last_run)
     position = data.get("position")
     precode = (
         entry is not None
@@ -1407,6 +1588,7 @@ def where(args):
     else:
         action = f"step {step} {role}: continue task {name}"
     action = one_line(action)
+    acceptances = (entry or {}).get("acceptances") or []
     print(
         json.dumps(
             {
@@ -1422,6 +1604,14 @@ def where(args):
                 "open_findings": open_findings,
                 "decision_required_for": required,
                 "deferred": len((entry or {}).get("deferrals") or []),
+                "accepted": len(acceptances),
+                "accepted_limitations": [
+                    {key: item.get(key) for key in ("source", "severity", "note", "head")}
+                    for item in acceptances
+                    if isinstance(item, dict) and item.get("severity") in ("medium", "high")
+                ],
+                "run": run_label,
+                "last_run": last_run,
                 "safe_point": None
                 if position is None or position["task"] != name
                 else position["safe_point"] is True
@@ -1446,6 +1636,8 @@ def parser():
     q.add_argument("--run-id", default=None)
     q.add_argument("--from-plan", default=None)
     q.add_argument("--expect-sha256", default=None)
+    q.add_argument("--max-runs", default=None)
+    q.add_argument("--runs-file", default=None)
     q.set_defaults(func=init)
     q = sub.add_parser("status", parents=[common])
     q.set_defaults(func=status)
@@ -1470,6 +1662,8 @@ def parser():
     outcome_or_decision.add_argument("--outcome", choices=["pass", "failed"])
     outcome_or_decision.add_argument("--decision", choices=sorted(DECISIONS))
     outcome_or_decision.add_argument("--defer", action="store_true")
+    outcome_or_decision.add_argument("--accept", action="store_true")
+    q.add_argument("--severity", choices=sorted(RISKS))
     q.add_argument("--source", choices=sorted(FIX_SOURCES))
     q.add_argument("--note")
     q.set_defaults(func=fix_loop)

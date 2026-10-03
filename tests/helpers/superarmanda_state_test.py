@@ -25,6 +25,11 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / "skills" / "superarmanda" / "scripts" / "state.py"
 
+# A wave dispatcher exports WAB_DIR/WAB_MAX_RUNS; the run counter of `init --from-plan`
+# must not leak into fixtures that did not ask for it.
+for _key in ("WAB_DIR", "WAB_MAX_RUNS"):
+    os.environ.pop(_key, None)
+
 
 class StateContract(unittest.TestCase):
     def setUp(self):
@@ -2167,6 +2172,144 @@ class StateContract(unittest.TestCase):
         self.assertEqual(len(status["tasks"]["implement"]["deferrals"]), 2)
 
 
+    # ---- fix-loop --accept (#54): findings of any severity accepted with a note ----
+
+    def accept(self, source="cross_provider_reviewer", severity="medium",
+               note="no prod path reaches this", check=True, extra=()):
+        args = ["fix-loop", "--task", "implement", "--accept", "--source", source,
+                "--note", note]
+        if severity is not None:
+            args += ["--severity", severity]
+        return self.cli(*args, *extra, check=check)
+
+    def reviewed(self, status="findings", session="reviewer-1"):
+        self.record("coder", session="coder-1")
+        self.record("tester", session="tester-1")
+        self.record("cross_provider_reviewer", status=status, session=session)
+
+    def test_accept_records_acceptance_and_where_lists_it(self):
+        self.reviewed()
+        entry = json.loads(self.accept().stdout)
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(entry["fix_cycles"], 0)
+        self.assertEqual(entry["fix_sources"], {})
+        self.assertEqual(entry["decisions"], [])
+        self.assertEqual(entry["deferrals"], [])
+        self.assertIsNone(entry["decision_required_for"])
+        [item] = entry["acceptances"]
+        result = entry["results"]["cross_provider_reviewer"]
+        self.assertEqual(item["source"], "cross_provider_reviewer")
+        self.assertEqual(item["severity"], "medium")
+        self.assertEqual(item["note"], "no prod path reaches this")
+        self.assertEqual(item["head"], result["head"])
+        self.assertRegex(item["result_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(item["result_recorded_at"], result["recorded_at"])
+        self.assertGreaterEqual(item["recorded_at"], item["result_recorded_at"])
+        info = json.loads(self.cli("where").stdout)
+        self.assertEqual(info["accepted"], 1)
+        self.assertEqual(info["deferred"], 0)
+        self.assertEqual(info["open_findings"], [])
+        self.assertEqual(info["task_status"], "ready_for_pr_review")
+        self.assertEqual(
+            info["accepted_limitations"],
+            [{"source": "cross_provider_reviewer", "severity": "medium",
+              "note": "no prod path reaches this", "head": result["head"]}],
+        )
+
+    def test_accept_low_counts_but_is_not_listed_as_limitation(self):
+        self.reviewed()
+        self.accept(severity="low", note="nit")
+        info = json.loads(self.cli("where").stdout)
+        self.assertEqual(info["accepted"], 1)
+        self.assertEqual(info["accepted_limitations"], [])
+
+    def test_old_acceptance_does_not_cover_findings_after_resume(self):
+        self.reviewed()
+        self.accept(severity="high")
+        self.commit_change("second head\n")
+        self.reviewed()
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry["status"], "in_progress")
+        info = json.loads(self.cli("where").stdout)
+        self.assertEqual(
+            [item["role"] for item in info["open_findings"]], ["cross_provider_reviewer"]
+        )
+        # the identical rerun on the same head and second is another result too
+        self.commit_change("third head\n")
+        self.reviewed()
+        self.accept()
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        self.assertEqual(self.manifest_data()["tasks"]["implement"]["status"], "in_progress")
+
+    def test_accept_rejections(self):
+        self.record("coder", session="coder-1")
+        self.record("tester", status="findings", session="tester-1")
+        refused = self.accept(source="tester", check=False)
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        self.assertIn("tester", refused.stderr)
+        # no reviewer result, then a non-findings one
+        missing = self.accept(check=False)
+        self.assertNotEqual(missing.returncode, 0, missing.stdout)
+        self.assertIn("findings", missing.stderr)
+        self.record("cross_provider_reviewer", status="error", session="r-error")
+        self.assertNotEqual(self.accept(check=False).returncode, 0)
+        self.record("cross_provider_reviewer", status="findings", session="r-findings")
+        no_severity = self.accept(severity=None, check=False)
+        self.assertNotEqual(no_severity.returncode, 0, no_severity.stdout)
+        self.assertIn("--severity", no_severity.stderr)
+        bad_severity = self.accept(severity="critical", check=False)
+        self.assertNotEqual(bad_severity.returncode, 0)
+        for note in ("", "   ", "x" * 501, "two\nlines"):
+            self.assertNotEqual(self.accept(note=note, check=False).returncode, 0, repr(note))
+        for flags in (
+            ["--outcome", "failed"],
+            ["--decision", "invariant"],
+            ["--defer"],
+        ):
+            both = self.accept(check=False, extra=flags)
+            self.assertNotEqual(both.returncode, 0, f"{flags}: {both.stdout}")
+        # --severity without --accept is refused
+        loose = self.cli(
+            "fix-loop", "--task", "implement", "--defer", "--source",
+            "cross_provider_reviewer", "--note", "n", "--severity", "low", check=False,
+        )
+        self.assertNotEqual(loose.returncode, 0, loose.stdout)
+        self.assertIn("--severity", loose.stderr)
+        entry = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(entry.get("acceptances", []), [])
+        self.assertEqual(entry["fix_cycles"], 0)
+
+    def test_accept_rejects_result_from_a_previous_head(self):
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        self.commit_change("next head\n")
+        stale = self.accept(check=False)
+        self.assertNotEqual(stale.returncode, 0, stale.stdout)
+
+    def test_accept_rejected_in_needs_decision_and_blocked(self):
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        for _ in range(2):
+            self.cli("fix-loop", "--task", "implement", "--outcome", "failed",
+                     "--source", "cross_provider_reviewer")
+        refused = self.accept(check=False)
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        self.assertIn("--decision", refused.stderr)
+        data = self.manifest_data()
+        data["tasks"]["implement"]["status"] = "blocked"
+        self.manifest.write_text(json.dumps(data), encoding="utf-8")
+        self.assertNotEqual(self.accept(check=False).returncode, 0)
+        self.assertEqual(self.manifest_data()["tasks"]["implement"].get("acceptances", []), [])
+
+    def test_old_manifest_without_acceptances_still_reads(self):
+        self.reviewed()
+        data = self.manifest_data()
+        data["tasks"]["implement"].pop("acceptances", None)
+        self.manifest.write_text(json.dumps(data), encoding="utf-8")
+        info = json.loads(self.cli("where").stdout)
+        self.assertEqual(info["accepted"], 0)
+        entry = json.loads(self.accept().stdout)
+        self.assertEqual(len(entry["acceptances"]), 1)
+
+
 V060_KEYS = {
     "version",
     "run_id",
@@ -3286,6 +3429,172 @@ class WavesContract(unittest.TestCase):
         self.assertNotIn("plan", self.manifest_data())
 
 
+class RunCounter(unittest.TestCase):
+    """#39: a durable per-wave run counter outside the worktree (init --from-plan)."""
+
+    # the fixture helpers of WavesContract, without inheriting its tests
+    git = WavesContract.git
+    head = WavesContract.head
+    write_plan = WavesContract.write_plan
+    run_state = WavesContract.run_state
+    cli = WavesContract.cli
+    init_args = WavesContract.init_args
+    where = WavesContract.where
+    record = WavesContract.record
+
+    def setUp(self):
+        WavesContract.setUp(self)
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("WAB_DIR", "WAB_MAX_RUNS"):
+            os.environ.pop(key, None)
+        self.runs = Path(self.tmp.name) / "wabdir" / "runs.json"
+        self.write_plan()
+
+    def init_run(self, name, wave_id="w1", extra=(), env=None):
+        manifest = Path(self.tmp.name) / f"{name}.json"
+        argv = ["python3", str(STATE), "init", "--manifest", str(manifest),
+                *map(str, self.init_args(f"{self.plan}#{wave_id}")), *map(str, extra)]
+        environment = dict(os.environ, **(env or {}))
+        proc = subprocess.run(argv, text=True, capture_output=True, env=environment)
+        return manifest, proc
+
+    def runs_data(self):
+        return json.loads(self.runs.read_text(encoding="utf-8"))
+
+    def test_cap_refuses_the_third_run_with_different_manifest_paths(self):
+        flags = ["--max-runs", 2, "--runs-file", self.runs]
+        first, proc = self.init_run("a", extra=flags)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["run"], {"index": 1, "max": 2})
+        second, proc = self.init_run("b", extra=flags)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(second.read_text())["run"], {"index": 2, "max": 2})
+        third, proc = self.init_run("c", extra=flags)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("run cap reached for wave w1: 2/2 runs", proc.stderr)
+        self.assertIn("BLOCKED: [class=blocked_cap rec=owner red=no]", proc.stderr)
+        self.assertIn(str(first), proc.stderr)
+        self.assertFalse(third.exists())
+        runs = self.runs_data()["runs"]
+        self.assertEqual([item["index"] for item in runs], [1, 2])
+        self.assertEqual([item["manifest"] for item in runs], [str(first), str(second)])
+        for item in runs:
+            self.assertEqual(set(item), {"index", "manifest", "created_at", "plan_sha256"})
+            self.assertRegex(item["plan_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_a_new_process_does_not_reset_the_counter(self):
+        env = {"WAB_DIR": str(self.runs.parent), "WAB_MAX_RUNS": "1"}
+        _manifest, proc = self.init_run("a", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.runs.exists())  # $WAB_DIR/runs.json by default
+        again, proc = self.init_run("a2", env=env)  # a restarted session: fresh process
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("run cap reached", proc.stderr)
+        self.assertFalse(again.exists())
+
+    def test_default_cap_is_two_and_flag_beats_environment(self):
+        env = {"WAB_DIR": str(self.runs.parent)}
+        for name in ("a", "b"):
+            self.assertEqual(self.init_run(name, env=env)[1].returncode, 0)
+        self.assertNotEqual(self.init_run("c", env=env)[1].returncode, 0)
+        env = {"WAB_DIR": str(self.runs.parent / "other"), "WAB_MAX_RUNS": "1"}
+        self.assertEqual(self.init_run("d", extra=["--max-runs", 3], env=env)[1].returncode, 0)
+        self.assertEqual(self.init_run("e", extra=["--max-runs", 3], env=env)[1].returncode, 0)
+
+    def test_a_failed_manifest_creation_does_not_count(self):
+        flags = ["--max-runs", 1, "--runs-file", self.runs]
+        _manifest, proc = self.init_run("bad", wave_id="nope", extra=flags)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(self.runs.exists())
+        self.assertEqual(self.init_run("ok", extra=flags)[1].returncode, 0)
+
+    def test_invalid_max_runs_is_refused(self):
+        for value in ("0", "-1", "x", "", "1.5", "true", "+2", " 2", "1001"):
+            with self.subTest(flag=value):
+                manifest, proc = self.init_run(
+                    "f", extra=["--max-runs", value, "--runs-file", self.runs])
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertFalse(manifest.exists())
+            with self.subTest(env=value):
+                manifest, proc = self.init_run(
+                    "g", env={"WAB_DIR": str(self.runs.parent), "WAB_MAX_RUNS": value})
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertFalse(manifest.exists())
+        self.assertFalse(self.runs.exists())
+
+    def test_flags_require_from_plan_and_a_runs_file(self):
+        manifest = Path(self.tmp.name) / "plain.json"
+        base = ["python3", str(STATE), "init", "--manifest", str(manifest), "--repo", self.repo,
+                "--base", self.base, "--head", self.head()]
+        for flags in (["--max-runs", "2"], ["--runs-file", str(self.runs)]):
+            proc = subprocess.run([*map(str, base), *flags], text=True, capture_output=True)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("--from-plan", proc.stderr)
+            self.assertFalse(manifest.exists())
+        manifest, proc = self.init_run("nofile", extra=["--max-runs", 2])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertFalse(manifest.exists())
+
+    def test_without_wab_dir_and_flags_init_is_unchanged(self):
+        manifest, proc = self.init_run("plain")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("run", json.loads(manifest.read_text()))
+        self.assertFalse(self.runs.exists())
+        # WAB_DIR without --from-plan: an ordinary run, the counter is not applied
+        plain = Path(self.tmp.name) / "ordinary.json"
+        proc = subprocess.run(
+            ["python3", str(STATE), "init", "--manifest", str(plain), "--repo", str(self.repo),
+             "--base", self.base, "--head", self.head()],
+            text=True, capture_output=True,
+            env=dict(os.environ, WAB_DIR=str(self.runs.parent)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.runs.exists())
+        self.assertNotIn("run", json.loads(plain.read_text()))
+        self.manifest = manifest
+        self.assertIsNone(self.where()["run"])
+        self.assertFalse(self.where()["last_run"])
+
+    def test_runs_file_of_another_wave_or_a_damaged_one_is_refused(self):
+        flags = ["--max-runs", 3, "--runs-file", self.runs]
+        self.assertEqual(self.init_run("a", wave_id="w1", extra=flags)[1].returncode, 0)
+        other, proc = self.init_run("b", wave_id="w2", extra=flags)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("w1", proc.stderr)
+        self.assertFalse(other.exists())
+        for raw in ("not json", "[]", json.dumps({"version": 2, "wave": "w1", "runs": []}),
+                    json.dumps({"version": 1, "wave": "w1", "runs": "x"}),
+                    json.dumps({"version": 1, "wave": "w1", "runs": [1]})):
+            with self.subTest(raw=raw):
+                self.runs.write_text(raw, encoding="utf-8")
+                manifest, proc = self.init_run("c", wave_id="w1", extra=flags)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertFalse(manifest.exists())
+                self.assertEqual(self.runs.read_text(encoding="utf-8"), raw)
+
+    def test_where_reports_the_run_and_the_last_run_hint(self):
+        flags = ["--max-runs", 2, "--runs-file", self.runs]
+        first, _ = self.init_run("a", extra=flags)
+        second, _ = self.init_run("b", extra=flags)
+        self.manifest = first
+        self.record("coder")
+        self.record("tester")
+        self.record("cross_provider_reviewer", status="findings")
+        info = self.where()
+        self.assertEqual((info["run"], info["last_run"]), ("1/2", False))
+        self.assertIn("--outcome failed", info["next_action"])
+        self.manifest = second
+        self.record("coder")
+        self.record("tester")
+        self.record("cross_provider_reviewer", status="findings")
+        info = self.where()
+        self.assertEqual((info["run"], info["last_run"]), ("2/2", True))
+        self.assertIn("--defer", info["next_action"])
+        self.assertIn("--accept", info["next_action"])
+        self.assertNotIn("--outcome failed", info["next_action"])
+
+
 class WhereDerivationExhaustive(unittest.TestCase):
     """derive_step against an independent reference of the normative order."""
 
@@ -3431,6 +3740,30 @@ class WhereDerivationExhaustive(unittest.TestCase):
             (6, "coordinator", False, "tester"),
         )
 
+
+
+class AcceptanceIdentity(unittest.TestCase):  # #54: an acceptance covers one exact result
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("state_acceptance_identity", STATE)
+        self.st = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.st)
+
+    def test_is_covered_is_deferral_or_acceptance_of_the_same_result(self):
+        st = self.st
+        first = {"status": "findings", "head": "h", "recorded_at": "t", "session_id": "s"}
+        rerun = dict(first, session_id="other")
+        record = {"source": "cross_provider_reviewer", "head": "h",
+                  "result_sha256": st.result_digest(first)}
+        for key in ("acceptances", "deferrals"):
+            entry = {key: [record]}
+            self.assertTrue(st.is_covered(entry, "cross_provider_reviewer", first), key)
+            self.assertFalse(st.is_covered(entry, "cross_provider_reviewer", rerun), key)
+            self.assertFalse(st.is_covered(entry, "github_codex_review", first), key)
+            self.assertFalse(st.is_covered(entry, "tester", first), key)
+        self.assertTrue(st.is_accepted({"acceptances": [record]}, "cross_provider_reviewer", first))
+        self.assertFalse(st.is_accepted({"deferrals": [record]}, "cross_provider_reviewer", first))
+        self.assertFalse(st.is_covered({"acceptances": [record]}, "cross_provider_reviewer",
+                                       dict(first, status="pass")))
 
 
 class DeferralIdentity(unittest.TestCase):  # #36 п.3: a deferral covers one exact result

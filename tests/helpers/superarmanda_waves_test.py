@@ -7314,6 +7314,85 @@ class GateVerdict(unittest.TestCase):
         m["tasks"]["T1"]["results"]["cross_provider_reviewer"]["status"] = "error"
         self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
 
+    def test_accepted_findings_count_only_for_the_exact_result_and_are_printed(self):  # #54
+        state = wab.gate.state
+
+        def acceptance(res, source="cross_provider_reviewer", severity="medium", head=HEAD, digest=None):
+            return {"source": source, "severity": severity, "note": f"{severity} limitation",
+                    "head": head, "result_sha256": digest or state.result_digest(res),
+                    "result_recorded_at": res.get("recorded_at"), "recorded_at": res.get("recorded_at")}
+
+        def manifest(acceptances_of, role="cross_provider_reviewer"):
+            m = green_manifest()
+            res = result("findings")
+            m["tasks"]["T1"]["results"][role] = res
+            m["tasks"]["T1"]["acceptances"] = acceptances_of(res)
+            return m
+        for role in ("cross_provider_reviewer", "github_codex_review", "coderabbit"):
+            for severity in ("low", "medium", "high"):
+                with self.subTest(role=role, severity=severity):
+                    v = self.ev(manifest=manifest(lambda r: [acceptance(r, role, severity)], role))
+                    self.assertEqual(v["verdict"], "pass", v["reasons"])
+                    printed = [r for r in v["reasons"] if "accepted" in r]
+                    if severity == "low":
+                        self.assertEqual(printed, [])
+                    else:
+                        self.assertEqual(printed, [f"accepted {severity} {role}: {severity} limitation"])
+                        self.assertEqual(v["accepted"], printed)
+            cases = [
+                ("no acceptance", lambda r: []),
+                ("acceptance of another result, same head and second",
+                 lambda r: [acceptance(dict(r, session_id="rerun"), role)]),
+                ("acceptance on another head", lambda r: [acceptance(r, role, head=OLD)]),
+                ("acceptance of another role", lambda r: [acceptance(r, "tester")]),
+            ]
+            for name, acceptances_of in cases:
+                with self.subTest(role=role, case=name):
+                    v = self.ev(manifest=manifest(acceptances_of, role))
+                    self.assertEqual(v["verdict"], "fail", v["reasons"])
+        # an acceptance never turns coder/tester findings into pass, nor a non-findings status
+        for role in ("coder", "tester"):
+            with self.subTest(role=role):
+                m = manifest(lambda r, role=role: [acceptance(r, role)], role)
+                self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
+        m = manifest(lambda r: [acceptance(r)])
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"]["status"] = "error"
+        self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
+
+    def test_manifest_forms_of_0_11_0_keep_their_verdict(self):  # #54 compatibility
+        state = wab.gate.state
+        res = result("findings")
+        m = green_manifest(decisions=[{"source": "cross_provider_reviewer", "decision": "accept_limitation",
+                                       "note": "n", "recorded_at": "2026-10-01T10:06:00Z"}])
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = res
+        self.assertEqual(self.ev(manifest=m)["verdict"], "pass")
+        m = green_manifest(deferrals=[{"source": "cross_provider_reviewer", "note": "low", "head": HEAD,
+                                       "result_sha256": state.result_digest(res),
+                                       "result_recorded_at": res["recorded_at"],
+                                       "recorded_at": res["recorded_at"]}])
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = res
+        self.assertEqual(self.ev(manifest=m)["verdict"], "pass")
+        # everything state.py writes is known to the gate
+        full = green_manifest(fix_cycles=0, session_roles={}, fix_sources={}, decision_required_for=None,
+                              deferrals=[], acceptances=[], blocked_reason="x")
+        full.update({"version": 1, "run_id": "r", "repo": "/r", "base": OLD, "tree_fingerprint": FP,
+                     "created_at": "t", "updated_at": "t", "plan": {}, "wave": {}, "position": None,
+                     "run": {"index": 1, "max": 2}})
+        v = self.ev(manifest=full)
+        self.assertEqual((v["verdict"], v["reasons"]), ("pass", []))
+
+    def test_an_unknown_record_type_is_a_closed_refusal(self):  # #54
+        m = green_manifest(vetoes=[{"by": "owner"}])
+        v = self.ev(manifest=m)
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn("manifest: unknown record type 'vetoes' in task T1: this gate cannot judge it",
+                      v["reasons"])
+        m = green_manifest()
+        m["waivers"] = []
+        v = self.ev(manifest=m)
+        self.assertEqual(v["verdict"], "fail")
+        self.assertTrue(any("unknown record type 'waivers'" in r for r in v["reasons"]), v["reasons"])
+
     def test_pr_head_other_than_the_gated_one_waits(self):
         facts = green_facts()
         facts["pr"]["head"] = OLD
