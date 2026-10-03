@@ -489,6 +489,95 @@ def unsent_reason(screen, text):
     return None
 
 
+_SGR = re.compile(r"\x1b\[([0-9;]*)m")
+_ESC_OTHER = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[@-Z\\-_])")
+CLEAR_ROUNDS = 4        # rounds of C-e C-u C-k BSpace before clearing counts as failed
+CLEAR_PAUSE = 0.7       # seconds between a round and the look at the screen
+CLEAR_FOOTER_POLLS = 15  # the folded-paste footer lingers after clearing: polls (1 s) before giving up
+NO_INPUT_BOX = "no input box on the screen"
+
+
+def pane_ansi(name):
+    """The screen WITH its SGR (`capture-pane -p -e`): Claude Code draws the placeholder of an empty
+    input («Try "..."») dim, and only the escapes tell it from typed text."""
+    r = tmux("capture-pane", "-p", "-e", "-t", pane_target(name), check=False)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def send_clear_keys(name):
+    """One round that empties Claude Code's input line: end of line, erase to the start, erase to the
+    end (the following lines of a multiline text), join with the previous line."""
+    tmux("send-keys", "-t", pane_target(name), "C-e", "C-u", "C-k", "BSpace")
+
+
+def _undimmed(line):
+    """The text of an ANSI line without the dim (SGR 2) segments and without any escape."""
+    out, dim, pos = [], False, 0
+    for m in _SGR.finditer(line):
+        if not dim:
+            out.append(line[pos:m.start()])
+        pos = m.end()
+        for code in (m.group(1) or "0").split(";"):
+            if code == "2":
+                dim = True
+            elif code in ("0", "22", ""):
+                dim = False
+    if not dim:
+        out.append(line[pos:])
+    return _ESC_OTHER.sub("", "".join(out))
+
+
+def input_empty_reason(screen_ansi):
+    """None when the input line of the screen (read with SGR, see pane_ansi) is empty: after «❯» and on
+    the continuation lines down to the bottom rule there are only blanks/NBSP or dim text (the
+    placeholder), and no paste-preview footer. Otherwise the reason it is not."""
+    raw = screen_ansi.splitlines()
+    plain = [_ESC_OTHER.sub("", _SGR.sub("", l)) for l in raw]
+    marks = [i for i, l in enumerate(plain) if INPUT_MARK in l and i > 0 and _is_rule(plain[i - 1])]
+    if not marks:
+        return NO_INPUT_BOX
+    top = marks[-1]
+    bottom = next((i for i in range(top + 1, len(plain)) if _is_rule(plain[i])), len(plain))
+    rows = [_undimmed(l).replace("\u2502", " ") for l in raw[top:bottom]]
+    rows[0] = rows[0].split(INPUT_MARK, 1)[1] if INPUT_MARK in rows[0] else ""
+    typed = [" ".join(r.split()) for r in rows]
+    if any("[Pasted text" in r for r in typed):
+        return "the folded paste is in the input"
+    if any(typed):
+        return "text in the input line"
+    if any(PASTE_PREVIEW in l for l in plain[top:]):
+        return f"the paste preview is on the screen («{PASTE_PREVIEW}»)"
+    return None
+
+
+def clear_input(name):
+    """Empty the input line of the window; None on success, else the reason. Success only by the screen
+    (input_empty_reason on `-e` snapshots), never by the keys sent. No input box on the screen (a dialog
+    is up): not a single key. Already empty: no keys. The footer of a folded paste lingers for seconds
+    after the clearing: waited out, without keys. Call it under the caller's _InputLock."""
+    why = input_empty_reason(pane_ansi(name))
+    rounds = 0
+    while why is not None:
+        if why == NO_INPUT_BOX:
+            return why
+        if "paste preview" in why:  # the input is empty, only the footer is still there
+            for _ in range(CLEAR_FOOTER_POLLS):
+                time.sleep(1)
+                why = input_empty_reason(pane_ansi(name))
+                if why is None or "paste preview" not in why:
+                    break
+            if why is None or "paste preview" in why:
+                return why
+            continue
+        if rounds >= CLEAR_ROUNDS:
+            return why
+        rounds += 1
+        send_clear_keys(name)
+        time.sleep(CLEAR_PAUSE)
+        why = input_empty_reason(pane_ansi(name))
+    return None
+
+
 def submit(name, text):
     """Press Enter and check on the screen that `text` left the input line; up to SUBMIT_RETRIES
     more Enters with a pause, then NotSubmitted with the reason. The one «was it sent» check of the
@@ -1863,7 +1952,11 @@ def _plan_pin_refused(cfg, st, wave, drop_pending=False):
         (wave_dir(cfg, wave) / "status").write_text(why + "\n", encoding="utf-8")
         w["phase"] = "not_ready"
         if drop_pending:
-            w.pop("pending_enter", None)
+            if left:  # the session lives on: its input holds the stale prompt, clear it (screen-checked)
+                _abandon_input(cfg, st, wave, w, "the plan pin refused, the session was not closed")
+            else:  # no session: nothing to clear
+                w.pop("pending_enter", None)
+                w.pop("pending_text_head", None)
         extra = f" ({closed or left})" if closed or left else ""
         if once_per(w, "not_ready", "plan_pin"):
             put_notice(w, "not_ready", "plan_pin",
@@ -1981,10 +2074,19 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None):
     except NotSubmitted as e:  # `say` is typing right now: nothing sent, the next tick retries
         event(cfg, f"{wave}: {what} postponed: {e}")
         return False
-    if precheck is not None and w.get("pending_enter") != what and not precheck():
-        lock.__exit__(None, None, None)  # checked under the lock, right before typing: stale, not sent
-        return None
     try:
+        if w.get("pending_clear") and not _settle_clear(cfg, st, wave, w, locked=True):
+            # an earlier text may still sit in the input line: nothing is typed over it
+            if once_per(w, "input_postponed", str(w["pending_clear"].get("what"))):
+                event(cfg, f"{wave}: {what} postponed: the input line is not cleared yet")
+            return False
+        w.get("notified", {}).pop("input_postponed", None)
+        if precheck is not None and not precheck():
+            # checked under the lock, right before typing or pressing Enter: stale, not sent. A typed
+            # text waiting for its Enter (the retry) must not stay in the input line
+            if w.get("pending_enter") == what:
+                _abandon_input(cfg, st, wave, w, f"{what}: stale before its Enter", locked=True)
+            return None
         if w.get("pending_enter") == what:
             if send is send_text:
                 # after a restart the caller may not have the text any more: check against the head
@@ -2012,6 +2114,58 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None):
         w.pop("pending_enter", None)
         w.pop("pending_text_head", None)
     return ok
+
+
+def _abandon_input(cfg, st, wave, w, why, locked=False):
+    """The single point where a typed text that is waiting for its Enter (`pending_enter`) is given up
+    WITHOUT delivery. It is not just forgotten: the fact moves to the reserve `pending_clear`, the input
+    line is cleared and the SCREEN must show it empty (_settle_clear). Until then nothing new is typed
+    into this window (_deliver, `say`). `locked`: the caller already holds the window's input lock."""
+    what = w.get("pending_enter")
+    if what:
+        w["pending_clear"] = {"what": what, "why": why}
+        w.pop("pending_enter", None)
+        w.pop("pending_text_head", None)
+        save_state(cfg, st)
+    return _settle_clear(cfg, st, wave, w, locked=locked)
+
+
+def _settle_clear(cfg, st, wave, w, locked=False):
+    """Try to finish the clearing reserved in `pending_clear`; True when nothing is reserved any more.
+    Success: the screen shows an empty input (event `input cleared`). Failure: the reserve stays and the
+    next tick tries again; one `input NOT cleared` event per episode and reason. A gone window needs
+    no clearing (no keys)."""
+    reserve = w.get("pending_clear")
+    if not isinstance(reserve, dict):
+        w.pop("pending_clear", None)
+        return True
+    what, why = str(reserve.get("what")), str(reserve.get("why"))
+    name = w.get("tmux")
+    if not name or not tmux_alive(name):
+        w.pop("pending_clear", None)
+        save_state(cfg, st)
+        event(cfg, f"{wave}: input clearing dropped: no window ({what}; {why})")
+        return True
+    try:
+        if locked:
+            left = clear_input(name)
+        else:
+            with _InputLock(cfg, wave):
+                left = clear_input(name)
+    except NotSubmitted as e:
+        left = str(e)
+    except (subprocess.SubprocessError, OSError) as e:
+        left = type(e).__name__
+    if left is None:
+        w.pop("pending_clear", None)
+        w.get("notified", {}).pop("input_clear", None)
+        save_state(cfg, st)
+        event(cfg, f"{wave}: input cleared: {what} ({why})")
+        return True
+    if once_per(w, "input_clear", f"{what}: {left}"):
+        event(cfg, f"{wave}: input NOT cleared: {what}: {left} ({why})")
+    save_state(cfg, st)
+    return False
 
 
 def deliver_first_prompt(cfg, st, wave):
@@ -2614,7 +2768,8 @@ def _gate_failed(cfg, st, wave, w, wdir, reasons):
     w["phase"] = "running"  # the wave goes on; its next DONE is gated again
     w.pop("done_head", None)  # fixing after a failed gate is lawful: not an after-DONE edit
     if w.get("pending_enter") == "gate failure":
-        w.pop("pending_enter")  # a new episode: its text is typed afresh, not just confirmed with Enter
+        # a new episode: its text is typed afresh, not just confirmed with Enter — and not over the old text
+        _abandon_input(cfg, st, wave, w, "a new merge gate failure")
     # the message to the window is saved WITH the status, like the checkpoint request: a tmux failure
     # (before the paste, or between the paste and Enter) is retried by the next ticks and restarts
     w["gate_fail_msg"] = {"sent": False, "text": (
@@ -3022,16 +3177,17 @@ def _alarm_tick(cfg, st, wave, w, now):
     a restarted watch (after a paste, with Enter only); `sent` is saved after the delivery."""
     msg = w.get("alarm_msg")
     if isinstance(msg, dict) and not msg.get("sent") and w.get("pending_enter") == "alarm":
-        # the text is already in the window: finish what was started (there is no way to clear the
-        # input line here), otherwise the typed text hangs there; nothing new is typed
-        _send_alarm(cfg, st, wave, w)
+        # the text is already in the window: its Enter is pressed only while the PR is still open at the
+        # head the text was built for (checked now, not at the next poll); otherwise the input is cleared
+        if not _pending_alarm_enter(cfg, st, wave, w):
+            return
     if now - (w.get("alarm_at") or 0) < ALARM_POLL_SECONDS:
         return
     w["alarm_at"] = now
     try:
         pr = find_pr(cfg, w["cwd"])
         if not pr or pr.get("state") != "OPEN":
-            _drop_stale_alarm(w)  # closed, merged or gone: a saved message is outdated
+            _drop_stale_alarm(cfg, st, wave, w, "the PR is not open")  # a saved message is outdated
             save_state(cfg, st)
             return
         head = pr["headRefOid"]
@@ -3049,7 +3205,7 @@ def _alarm_tick(cfg, st, wave, w, now):
     w.get("notified", {}).pop("alarm_error", None)  # a clean collection closes the error episode
     msg = w.get("alarm_msg")
     if isinstance(msg, dict) and msg.get("head") != head and not msg.get("sent"):
-        _drop_stale_alarm(w)  # outdated: the head moved before it was delivered
+        _drop_stale_alarm(cfg, st, wave, w, "the head moved")  # outdated: before it was delivered
         msg = None
     if not gate.alarm_ready(facts, head):
         save_state(cfg, st)
@@ -3065,19 +3221,41 @@ def _alarm_tick(cfg, st, wave, w, now):
         return  # delivered: one message per head
     w["alarm_msg"] = {"head": head, "sent": False, "text": gate.alarm_text(pr["number"], head, facts)}
     if w.get("pending_enter") == "alarm":
-        w.pop("pending_enter")  # a new message: typed afresh
+        _abandon_input(cfg, st, wave, w, "a new alarm message")  # a new message: typed afresh, not over the old
     save_state(cfg, st)  # the intent first: a crash before the paste does not lose it
     event(cfg, f"{wave}: alarm: PR #{pr['number']} checks completed and Codex finished at {head[:12]}")
     _send_alarm(cfg, st, wave, w)
 
 
-def _drop_stale_alarm(w):
-    """An undelivered alarm whose PR is not open or whose head moved is dropped before any delivery."""
+def _pending_alarm_enter(cfg, st, wave, w):
+    """The alarm text is typed and only its Enter is owed: check the PR and its head FIRST (the poll
+    throttle does not apply). Same head, PR open: Enter-only retry. PR not open or the head moved: the
+    text is outdated, the input is cleared instead of an Enter. PR facts not collected: neither Enter nor
+    clearing, the reserve holds. True: the normal path may go on (the owed Enter is settled or dropped)."""
+    msg = w.get("alarm_msg")
+    try:
+        pr = find_pr(cfg, w["cwd"])
+    except gate.CollectError as e:
+        if once_per(w, "alarm_error", str(e)[:150]):
+            event(cfg, f"{wave}: alarm: PR facts not collected: {e}")
+        return False
+    if not pr or pr.get("state") != "OPEN":
+        _drop_stale_alarm(cfg, st, wave, w, "the PR is not open")
+    elif msg.get("head") != pr.get("headRefOid"):
+        _drop_stale_alarm(cfg, st, wave, w, "the head moved")
+    else:
+        _send_alarm(cfg, st, wave, w)
+    return w.get("pending_enter") != "alarm"
+
+
+def _drop_stale_alarm(cfg, st, wave, w, why):
+    """An undelivered alarm whose PR is not open or whose head moved is dropped before any delivery;
+    its text, if already typed, is cleared out of the input line."""
     msg = w.get("alarm_msg")
     if isinstance(msg, dict) and not msg.get("sent"):
         w.pop("alarm_msg")
         if w.get("pending_enter") == "alarm":
-            w.pop("pending_enter")
+            _abandon_input(cfg, st, wave, w, f"stale alarm: {why}")
 
 
 def _send_alarm(cfg, st, wave, w):
@@ -3344,6 +3522,13 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
         used -= 1  # the Enter-only retry of THIS answer: it is the one in flight, already charged
     cap = cfg.get("max_auto_answers", MAX_AUTO_ANSWERS)
+    if used >= cap and w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
+        # the cap was lowered under an answer that is typed and waits for its Enter: it may already be
+        # submitted (charged, like on a status change); never leave its text in the input line
+        w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
+        w.pop("policy_pending", None)
+        _abandon_input(cfg, st, wave, w, "policy answer: the cap was lowered")
+        used = auto_answers_used(w)
     if used >= cap:
         if not w.get("policy_cap_reached"):
             w["policy_cap_reached"] = True
@@ -3359,11 +3544,14 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     if not still():  # the wave (or the owner in its window) moved on since the tick read it
         event(cfg, f"{wave}: policy answer not sent: the status changed before delivery")
         return None
+    retry = w.get("pending_enter") == "policy answer"  # typed earlier: only its Enter is owed
     w["policy_pending"] = status
     sent = _deliver(cfg, st, wave, "policy answer", send_text, POLICY_ANSWER.format(rec=label["rec"]),
                     precheck=still)  # re-read again UNDER the input lock: `say` may have answered meanwhile
     if sent is None:
         w.pop("policy_pending", None)
+        if retry:  # the typed answer was given up, possibly already submitted: charged to the cap
+            w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
         save_state(cfg, st)
         event(cfg, f"{wave}: policy answer not sent: the status changed while waiting for the input")
         return None
@@ -3502,26 +3690,29 @@ def _tick(cfg, st):
         advance_pending(cfg, st)
         return True
 
+    if w.get("pending_clear"):
+        _settle_clear(cfg, st, wave, w)  # an earlier clearing that the screen did not confirm: again
+
     if isinstance(w.get("gate_fail_msg"), dict):
         if status.startswith("BLOCKED: merge gate:"):
             _send_gate_failure(cfg, st, wave, w)  # a retry of a delivery that failed or was cut short
         else:  # the wave has moved on: an outdated failure is not sent
             w.pop("gate_fail_msg")
             if w.get("pending_enter") == "gate failure":
-                w.pop("pending_enter")
+                _abandon_input(cfg, st, wave, w, "the wave moved on from the gate failure")
 
     if isinstance(w.get("alarm_msg"), dict) and not w["alarm_msg"].get("sent") and status != "RUNNING":
         w.pop("alarm_msg")  # the wave left RUNNING: an undelivered alarm is outdated
         if w.get("pending_enter") == "alarm":
-            w.pop("pending_enter")
+            _abandon_input(cfg, st, wave, w, "the wave left RUNNING")
         save_state(cfg, st)
 
     if w.get("pending_enter") == "policy answer" and w.get("policy_pending") != status:
         # the wave left that BLOCKED line: the half-sent answer is outdated. It may already have been
         # submitted (watch died before its final save), so it is charged to the cap: never one free
         w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
-        for key in ("pending_enter", "pending_text_head", "policy_pending"):
-            w.pop(key, None)
+        w.pop("policy_pending", None)
+        _abandon_input(cfg, st, wave, w, "the wave left the BLOCKED line of the answer")
         save_state(cfg, st)
 
     answered = _policy_answer(cfg, st, wave, w, status, now, attach) if status.startswith("BLOCKED") else False
@@ -3988,6 +4179,9 @@ def say_cmd(cfg, wave, text_file):
             if isinstance(pending, dict) and pending.get("pending_enter"):
                 raise NotSubmitted(f"the dispatcher still owes an Enter for «{pending['pending_enter']}» "
                                    f"in this input; retry after it is delivered")
+            if isinstance(pending, dict) and pending.get("pending_clear"):
+                raise NotSubmitted(f"the dispatcher has not yet cleared the input of «{pending['pending_clear'].get('what')}» "
+                                   f"(its text may still be there); retry after it is cleared")
             send_text(name, text)
     except (subprocess.CalledProcessError, OSError, NotSubmitted) as e:
         why = str(e) if isinstance(e, NotSubmitted) else type(e).__name__

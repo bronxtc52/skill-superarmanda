@@ -134,6 +134,17 @@ def asst(inp=0, create=0, read=0, out=0, tools=0, side=False):
     return json.dumps(d)
 
 
+SCREENS = Path(__file__).resolve().parent.parent / "fixtures" / "screens"
+
+
+def live(name):
+    """A real Claude Code 2.1.288 screen captured in tmux (tests/fixtures/screens/README.md)."""
+    return (SCREENS / name).read_text(encoding="utf-8")
+
+
+EMPTY_ANSI = live("18-cleared.ansi")  # the input box with its dim placeholder: nothing typed
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="wabtest-"))
@@ -151,6 +162,9 @@ class Base(unittest.TestCase):
         self.alive = True
         self.kill_closes = True  # a mocked `tmux kill-session` really closes the session
         self.pane = ""
+        self.ansi = EMPTY_ANSI  # what `capture-pane -p -e` shows (the input-emptiness check reads it)
+        self.clear_works = True  # a mocked clearing round (C-e C-u C-k BSpace) really empties the input
+        self.clear_keys = []
         self.ready = True
         self.tg = []
         self.cwd = str(self.tmp / "clone")
@@ -165,6 +179,11 @@ class Base(unittest.TestCase):
                 self.tmux_calls.append(args)
                 if args[1:2] == ("kill-session",) and self.kill_closes:
                     self.alive = False
+                if args[1:2] == ("send-keys",) and "C-u" in args:
+                    self.clear_keys.append(args)
+                    self.sent.append(("clear", args[-1], ""))
+                    if self.clear_works:
+                        self.ansi = EMPTY_ANSI
                 return subprocess.CompletedProcess(args, 0, "", "")
             if args and args[0] == "gh" and not self.gh_real:
                 self.gh_calls.append(args)
@@ -181,6 +200,7 @@ class Base(unittest.TestCase):
         patch("sh", side_effect=fake_sh)
         patch("tmux_alive", side_effect=lambda name: self.alive)
         patch("pane_text", side_effect=lambda name: self.pane)
+        patch("pane_ansi", side_effect=lambda name: self.ansi)
         patch("send_text", side_effect=lambda n, t, **kw: self.sent.append(("text", n, t)))
         patch("send_command", side_effect=lambda n, t, **kw: self.sent.append(("cmd", n, t)))
         self.enters = []
@@ -10656,6 +10676,324 @@ class W1AcceptedOnPass(GateBase):  # pass verdict carries accepted limitations
         self.start()
         self.tick()
         self.assertNotIn("accepted limitations", self.log())
+
+
+# ---------------------------------------------------------------- #48 #31 #50 #53: clearing the input line
+class InputEmpty(unittest.TestCase):
+    """`input_empty_reason` on REAL Claude Code screens (tests/fixtures/screens): the placeholder of an
+    empty input is dim text, the typed text is not."""
+
+    def test_empty_screens_are_empty(self):
+        for name in ("03-after-cu.ansi", "18-cleared.ansi", "22-folded-cleared-late.ansi"):
+            with self.subTest(name):
+                self.assertIsNone(wab.input_empty_reason(live(name)))
+
+    def test_screens_with_text_are_not_empty(self):
+        for name, part in (("04-folded.ansi", "folded paste"), ("19-folded.ansi", "folded paste")):
+            with self.subTest(name):
+                self.assertIn(part, wab.input_empty_reason(live(name)))
+
+    def test_plain_screens_cannot_tell_the_placeholder_from_text(self):
+        # `capture-pane -p` has no SGR: the placeholder reads as typed text, hence the check reads -e
+        self.assertIn("text in the input line", wab.input_empty_reason(live("01-empty.txt")))
+        for name in ("02-typed.txt", "07-multiline.txt", "15-multi3-up.txt", "16-iter4.txt"):
+            with self.subTest(name):
+                self.assertIn("text in the input line", wab.input_empty_reason(live(name)))
+
+    def test_a_remnant_on_a_continuation_line_is_text(self):  # 16-iter4: the first line is empty, the third stays
+        self.assertIn("text in the input line", wab.input_empty_reason(live("16-iter4.txt")))
+
+    def test_folded_footer_alone_is_not_success_yet(self):  # 20: empty input, the footer lingers for seconds
+        self.assertIn("paste preview", wab.input_empty_reason(live("20-folded-cleared-1s.ansi")))
+
+    def test_no_input_box_is_its_own_reason(self):
+        for screen in ("", "Do you trust this folder?\n❯ 1. Yes\n  2. No\n"):
+            with self.subTest(screen=screen[:10]):
+                self.assertEqual(wab.input_empty_reason(screen), "no input box on the screen")
+
+    def test_boxed_prompt_with_a_text_or_blank(self):
+        rule = "╭" + "─" * 30 + "╮"
+        self.assertIsNone(wab.input_empty_reason("\n".join(["история", rule, "│ ❯          │"])))
+        self.assertIn("text in the input line",
+                      wab.input_empty_reason("\n".join(["история", rule, "│ ❯ Решение A │"])))
+
+
+class ClearInput(unittest.TestCase):
+    """`clear_input`: success only when the SCREEN shows an empty input; no key on a screen without a box."""
+
+    def setUp(self):
+        self.screens = []
+        self.keys = 0
+        self.polls = 0
+
+        def pane_ansi(name):
+            self.polls += 1
+            return self.screens[min(self.keys, len(self.screens) - 1)] if self.screens else ""
+
+        def keys(name):
+            self.keys += 1
+        for attr, kw in (("pane_ansi", {"side_effect": pane_ansi}), ("send_clear_keys", {"side_effect": keys})):
+            p = mock.patch.object(wab, attr, **kw)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch("time.sleep")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_already_empty_presses_nothing(self):
+        self.screens = [live("18-cleared.ansi")]
+        self.assertIsNone(wab.clear_input("wv-w1"))
+        self.assertEqual(self.keys, 0)
+
+    def test_no_box_presses_nothing(self):
+        self.screens = ["Do you trust this folder?\n❯ 1. Yes\n  2. No\n"]
+        self.assertEqual(wab.clear_input("wv-w1"), "no input box on the screen")
+        self.assertEqual(self.keys, 0)
+
+    def test_text_is_cleared_by_a_round(self):
+        self.screens = [live("19-folded.ansi"), live("18-cleared.ansi")]
+        self.assertIsNone(wab.clear_input("wv-w1"))
+        self.assertEqual(self.keys, 1)
+
+    def test_a_stuck_input_is_a_failure_after_the_rounds(self):
+        self.screens = [live("19-folded.ansi")]
+        why = wab.clear_input("wv-w1")
+        self.assertIn("folded paste", why)
+        self.assertEqual(self.keys, wab.CLEAR_ROUNDS)
+
+    def test_the_box_vanishing_mid_way_stops_the_keys(self):
+        self.screens = [live("19-folded.ansi"), "Do you trust this folder?\n❯ 1. Yes\n"]
+        self.assertEqual(wab.clear_input("wv-w1"), "no input box on the screen")
+        self.assertEqual(self.keys, 1)
+
+    def test_the_footer_is_waited_out_without_keys(self):  # 20 then 22
+        self.screens = [live("20-folded-cleared-1s.ansi")]
+        polls = []
+
+        def pane_ansi(name):
+            polls.append(1)
+            return live("22-folded-cleared-late.ansi") if len(polls) > 3 else live("20-folded-cleared-1s.ansi")
+        with mock.patch.object(wab, "pane_ansi", side_effect=pane_ansi):
+            self.assertIsNone(wab.clear_input("wv-w1"))
+        self.assertEqual(self.keys, 0)
+
+    def test_a_footer_that_stays_is_not_success(self):
+        self.screens = [live("20-folded-cleared-1s.ansi")]
+        self.assertIn("paste preview", wab.clear_input("wv-w1"))
+        self.assertEqual(self.keys, 0)
+
+
+class InputClear(GateBase):
+    """#48: a pending_enter is never dropped silently — the input line is cleared and the screen proves it."""
+
+    def running(self, **chain):
+        return self.start(status="RUNNING", **chain)
+
+    def alarms(self):
+        return [s for s in self.sent if s[0] == "text" and "Будильник" in s[2]]
+
+    def crash_tick(self):
+        def send(name, text, on_typed=None):
+            if on_typed:
+                on_typed()  # the text is in the window, Enter has not been pressed
+            raise KeyboardInterrupt
+        real = wab.send_text.side_effect
+        wab.send_text.side_effect = send
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick()
+        wab.send_text.side_effect = real
+
+    def typed_alarm(self):
+        self.running()
+        self.crash_tick()
+        self.assertEqual(self.rec()["pending_enter"], "alarm")
+        self.ansi = live("19-folded.ansi")  # the alarm sits in the input line as a folded paste
+
+    def say(self, text="ответ"):
+        f = self.tmp / "say.md"
+        f.write_text(text, encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            return wab.say_cmd(self.cfg, "W1", f)
+
+    # ----- #48 -----
+    def test_status_change_clears_the_typed_alarm(self):
+        self.typed_alarm()
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        self.assertEqual(len(self.clear_keys), 1)
+        rec = self.rec()
+        self.assertNotIn("pending_enter", rec)
+        self.assertNotIn("pending_clear", rec)
+        self.assertIn("input cleared: alarm", self.log())
+
+    def test_no_empty_line_on_the_screen_is_not_a_success(self):  # the criterion
+        self.typed_alarm()
+        self.clear_works = False
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        rec = self.rec()
+        self.assertEqual(rec["pending_clear"]["what"], "alarm")
+        self.assertNotIn("pending_enter", rec)
+        self.assertIn("input NOT cleared: alarm", self.log())
+        self.assertNotIn("input cleared", self.log())
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.log().count("input NOT cleared"), 1)  # one event per episode, not per tick
+        self.assertGreater(len(self.clear_keys), 1)  # ...but every tick tries again
+
+    def test_say_refuses_while_the_input_is_not_cleared_and_works_after(self):
+        self.typed_alarm()
+        self.clear_works = False
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        self.assertFalse(self.say())
+        self.assertEqual([s for s in self.sent if s[0] == "text"], [])
+        self.clear_works = True
+        self.tick()
+        self.assertNotIn("pending_clear", self.rec())
+        self.assertTrue(self.say())
+        self.assertEqual([s[0] for s in self.sent if s[0] == "text"], ["text"])
+        self.assertEqual(self.sent[-1][0], "text")  # typed after the successful clear
+
+    def test_new_alarm_is_typed_only_after_a_successful_clear(self):
+        self.typed_alarm()
+        self.clear_works = False
+        new = "e" * 40
+        self.pr = {"number": 7, "headRefOid": new, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": new, "base": "main"},
+                                 reviews=[{"user": BOT, "commit_id": new, "state": "COMMENTED"}])
+        self.tick()
+        self.tick()
+        self.assertEqual(self.alarms(), [])  # not pasted over the old text
+        self.assertIn("pending_clear", self.rec())
+        self.clear_works = True
+        self.tick()
+        self.assertEqual(len(self.alarms()), 1)
+        kinds = [s[0] for s in self.sent if s[0] in ("clear", "text")]
+        self.assertEqual(kinds[-2:], ["clear", "text"])  # the paste comes right after the clear
+        self.assertNotIn("pending_clear", self.rec())
+
+    def test_gate_failure_of_a_new_episode_is_not_typed_over_the_old_one(self):
+        self.start()
+        cfg, st = self.cfg, wab.load_state(self.cfg)
+        w = st["waves"]["W1"]
+        w.update(pending_enter="gate failure", pending_text_head="[wab] Гейт")
+        wab.save_state(cfg, st)
+        self.ansi = live("19-folded.ansi")
+        wab._gate_failed(cfg, st, "W1", w, wab.wave_dir(cfg, "W1"), "проверки красные")
+        kinds = [s[0] for s in self.sent if s[0] in ("clear", "text")]
+        self.assertEqual(kinds, ["clear", "text"], self.sent)
+
+    def test_a_closed_window_drops_the_reserve_without_keys(self):
+        self.typed_alarm()
+        self.clear_works = False
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        self.assertIn("pending_clear", self.rec())
+        keys = len(self.clear_keys)
+        self.alive = False
+        st = wab.load_state(self.cfg)
+        self.assertTrue(wab._settle_clear(self.cfg, st, "W1", st["waves"]["W1"]))
+        self.assertEqual(len(self.clear_keys), keys)
+        self.assertNotIn("pending_clear", st["waves"]["W1"])
+
+    def test_no_keys_when_a_dialog_is_on_the_screen(self):
+        self.typed_alarm()
+        self.ansi = "Do you want to proceed?\n❯ 1. Yes\n  2. No\n"
+        self.set_status(self.cfg, "W1", "BLOCKED: q")
+        self.tick()
+        self.assertEqual(self.clear_keys, [])
+        self.assertIn("no input box", self.log())
+        self.assertIn("pending_clear", self.rec())
+
+    # ----- #31 -----
+    def test_pending_alarm_on_a_moved_head_is_cleared_not_entered(self):
+        self.typed_alarm()
+        self.pr = {"number": 7, "headRefOid": "e" * 40, "isDraft": False, "state": "OPEN"}
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+        self.tick()
+        self.assertEqual(self.enters, [])
+        self.assertEqual(len(self.clear_keys), 1)
+        self.assertNotIn("pending_enter", self.rec())
+
+    def test_pending_alarm_of_a_closed_pr_is_cleared_not_entered(self):
+        self.typed_alarm()
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "MERGED"}
+        self.tick()
+        self.assertEqual(self.enters, [])
+        self.assertEqual(len(self.clear_keys), 1)
+        self.assertNotIn("pending_enter", self.rec())
+
+    def test_pending_alarm_on_the_same_head_is_enter_only(self):
+        self.typed_alarm()
+        self.ansi = EMPTY_ANSI
+        self.tick()
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertEqual(self.clear_keys, [])
+        self.assertTrue(self.rec()["alarm_msg"]["sent"])
+
+    def test_pending_alarm_with_unreadable_pr_gets_neither_enter_nor_clear(self):
+        self.typed_alarm()
+        self.pr = gate.CollectError("gh: down")
+        self.tick()
+        self.assertEqual((self.enters, self.clear_keys), ([], []))
+        self.assertEqual(self.rec()["pending_enter"], "alarm")
+
+
+class InputClearPolicy(Base):
+    """#50, #53: a policy answer sitting in the input line when its episode cannot go on."""
+    POLICY = DecisionPolicy.POLICY
+    ASK = DecisionPolicy.ASK
+    mandate = DecisionPolicy.mandate
+    tick = DecisionPolicy.tick
+    answers = DecisionPolicy.answers
+    log = DecisionPolicy.log
+
+    def pend(self, cfg, **over):
+        st = wab.load_state(cfg)
+        st["waves"]["W1"].update(pending_enter="policy answer", pending_text_head="[wab] РЕШЕНИЕ",
+                                 policy_pending=self.ASK, **over)
+        self.put_state(cfg, st)
+        self.ansi = live("19-folded.ansi")
+
+    def test_lowered_cap_clears_the_pending_answer(self):  # #50
+        cfg, _ = self.mandate(max_auto_answers=1)
+        self.pend(cfg, auto_answers=1)
+        st = self.tick(cfg, self.ASK)
+        w = st["waves"]["W1"]
+        self.assertEqual(self.enters, [])
+        self.assertEqual(len(self.clear_keys), 1)
+        self.assertNotIn("pending_enter", w)
+        self.assertNotIn("policy_pending", w)
+        self.assertEqual(wab.auto_answers_used(w), 2)  # it may have gone: charged
+        self.assertIn("input cleared: policy answer", self.log(cfg))
+        self.assertIn("policy cap reached", self.log(cfg))
+
+    def test_precheck_runs_on_the_enter_only_retry(self):  # #53
+        cfg, _ = self.mandate()
+        self.pend(cfg)
+        real_lock = wab._InputLock.__enter__
+
+        def enter_then_status_moves(lock):  # the wave moved on while this writer waited for the lock
+            got = real_lock(lock)
+            self.set_status(cfg, "W1", "RUNNING")
+            return got
+        with mock.patch.object(wab._InputLock, "__enter__", enter_then_status_moves):
+            self.tick(cfg, self.ASK)
+        w = wab.load_state(cfg)["waves"]["W1"]
+        self.assertEqual(self.enters, [])
+        self.assertEqual(len(self.clear_keys), 1)
+        self.assertNotIn("pending_enter", w)
+        self.assertNotIn("policy_pending", w)
+        self.assertEqual(wab.auto_answers_used(w), 1)  # charged to the cap
+
+    def test_status_change_before_the_retry_clears_the_input(self):
+        cfg, _ = self.mandate()
+        self.pend(cfg)
+        st = self.tick(cfg, "RUNNING")
+        self.assertEqual(len(self.clear_keys), 1)
+        self.assertEqual(wab.auto_answers_used(st["waves"]["W1"]), 1)
+        self.assertNotIn("pending_enter", st["waves"]["W1"])
 
 
 class Packaging(unittest.TestCase):
