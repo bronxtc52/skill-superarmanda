@@ -12,7 +12,7 @@
   диспетчер). Строка без метки или с испорченной меткой обрабатывается как раньше.
   ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
 - Раздел «Политика решений» в `mandate.md` (`- auto: class=<класс> [rec=<вариант>]`), пинится тем
-  же `mandate_sha256`; строгий разбор: неизвестный ключ/класс, `red`, `merge_gate` — отказ `launch`
+  же `mandate_sha256`; строгий разбор: неизвестный ключ/класс, `red`, `merge_gate`, `plan_mismatch` — отказ `launch`
   и `watch`. ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
 - Автоответ диспетчера на разрешённую политикой развилку вне красной зоны: текст в окно волны путём
   `say`, строка в `<волна>/policy-decisions.log`, событие и информирующее уведомление
@@ -21,6 +21,20 @@
 - `max_auto_answers` в `chain.json` (по умолчанию 3, настраивается на лету): после него — обычный
   `BLOCKED` владельцу и событие `policy cap reached`.
   ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
+
+### Исправлено по ревью
+
+- Кап `max_auto_answers` считается по волне целиком (текущая попытка и все `attempts`):
+  перезапуск волны его не сбрасывает. ([#49](https://github.com/bronxtc52/skill-superarmanda/pull/49))
+- При заданном `mandate_sha256` отсутствующий, пустой или с чужой первой строкой `mandate.md`
+  отвергается до вывода «политики нет»: `watch` не стартует. ([#49](https://github.com/bronxtc52/skill-superarmanda/pull/49))
+- Перед вводом автоответа `status` перечитывается: строка сменилась — ответ не шлётся.
+  ([#49](https://github.com/bronxtc52/skill-superarmanda/pull/49))
+- Успешный повтор автоответа снимает обычный сигнал `blocked` этого эпизода и ATTENTION.
+  ([#49](https://github.com/bronxtc52/skill-superarmanda/pull/49))
+- `plan_mismatch` исключён из классов политики (поправка плана требует «ок» владельца и нового
+  пина): правило отвергается разбором, метка допустима и всегда идёт владельцу.
+  ([#49](https://github.com/bronxtc52/skill-superarmanda/pull/49))
 
 ## 0.10.0 — 2026-10-03
 
