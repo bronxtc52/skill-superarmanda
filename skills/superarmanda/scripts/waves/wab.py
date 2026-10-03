@@ -788,6 +788,29 @@ def context_tokens(w):
     return CACHE.read(transcript_path(w["cwd"], sessions[-1]))["ctx"]
 
 
+def transcript_activity(w):
+    """mtime of every transcript of the wave's CURRENT session: the main one and its subagents'
+    (`<session>/subagents/*.jsonl`), as {path: mtime}; {} when there is none. A wave waiting for
+    its background coder/tester keeps a still screen while the subagent works: idleness counts
+    a changed file as activity (per file, so one future-dated file cannot hide the others)."""
+    sessions = w.get("sessions") or []
+    if not sessions:
+        return {}
+    main = transcript_path(w["cwd"], sessions[-1])
+    files = [main]
+    try:
+        files += list((main.parent / sessions[-1] / "subagents").glob("*.jsonl"))
+    except OSError:
+        pass
+    out = {}
+    for f in files:
+        try:
+            out[str(f)] = f.stat().st_mtime
+        except OSError:
+            continue
+    return out
+
+
 def session_marker(cfg, wave):
     return f"[wab:{cfg['chain']}/{cfg['run_id']}/{wave}]"
 
@@ -1298,6 +1321,37 @@ def end_screen_episodes(w, txt, now):
         w["auto_off_ticks"] = 0
         w["auto_alerted"] = False
     return screen
+
+
+def note_transcript_activity(w, now, idle_s=0):
+    """A still screen over a working subagent is not silence: a NEW write to any transcript file of
+    the session counts as activity at the moment it is seen and ends an idle episode already
+    reported, so the next silence is reported again. The first look at a session (a new session
+    after /clear, or a record from a version without this bookkeeping) only seeds the baseline from
+    the files' own mtimes (a future one clamped); a write later than the moment an idle notice could
+    have been raised (`pane_changed` + `idle_s`) makes that notice stale. Runs next to
+    end_screen_episodes, before any branch of the tick returns. In memory only; True when the
+    record changed (the caller saves at once: some branches return without saving)."""
+    files = transcript_activity(w)
+    sessions = w.get("sessions") or []
+    sid = sessions[-1] if sessions else None
+    seen = w.get("activity_files")
+    first = not isinstance(seen, dict) or w.get("activity_session") != sid
+    before = (seen, w.get("activity_session"), w.get("activity_at"), "idle" in (w.get("notified") or {}))
+    if first:
+        if files:
+            latest = max(files.values())
+            w["activity_at"] = max(w.get("activity_at") or 0, min(latest, now))
+            # only a real past write proves activity after the old notice; a future mtime does not,
+            # and it must not hide a real write to another file either: each file is checked
+            after = (w.get("pane_changed") or now) + idle_s
+            if any(after < m <= now for m in files.values()):
+                drop_notice(w, "idle")
+    elif any(seen.get(f) != m for f, m in files.items()):  # a change seen now is activity now
+        drop_notice(w, "idle")
+        w["activity_at"] = now
+    w["activity_files"], w["activity_session"] = files, sid
+    return before != (files, sid, w.get("activity_at"), "idle" in (w.get("notified") or {}))
 
 
 KEEP_ON_ACK = ("chain_done",)  # the end of the chain is never stale: it must get through
@@ -3824,6 +3878,8 @@ def _tick(cfg, st):
 
     # screen episodes end on screen before any branch below returns or sends the outbox
     screen = end_screen_episodes(w, pane_text(name), now)
+    if note_transcript_activity(w, now, cfg["idle_minutes"] * 60):
+        save_state(cfg, st)  # a policy-answered BLOCKED returns without saving: keep the ended episode
     txt = screen["txt"]
 
     if w.get("phase") in ("starting", "sending"):  # the first prompt is not through yet
@@ -3954,7 +4010,10 @@ def _tick(cfg, st):
             flush_notices(cfg, st, w)
 
     digest = screen["digest"]  # a new digest already restarted the clock (end_screen_episodes)
-    if now - w.get("pane_changed", now) > cfg["idle_minutes"] * 60:
+    if note_transcript_activity(w, now, cfg["idle_minutes"] * 60):  # a session bound in this tick
+        save_state(cfg, st)
+    active = max(w.get("pane_changed", now), w.get("activity_at") or 0)
+    if now - active > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
             put_notice(w, "idle", digest,
                        f"wave-autobot: волна {wave} молчит {cfg['idle_minutes']}+ мин "
