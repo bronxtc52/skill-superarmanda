@@ -1777,6 +1777,23 @@ class Episodes(Base):
         self.assertEqual(self.tg, [])
         self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["sessions"], ["s1", "s2"])
 
+    def test_upgrade_counts_a_real_write_next_to_a_future_dated_file(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        self.pane = "static screen\nline2\nline3\n"
+        st = self.get_state(self.cfg)
+        w = st["waves"]["W1"]
+        w["pane_digest"] = wab.pane_digest(self.pane)
+        w["pane_changed"] = t[0] - 1000
+        wab.once_per(w, "idle", w["pane_digest"])
+        self.put_state(self.cfg, st)
+        os.utime(main, (t[0] + 36000, t[0] + 36000))  # skewed
+        os.utime(agent, (t[0] - 10, t[0] - 10))  # a real write after the old notice
+        with mock.patch("time.time", side_effect=lambda: t[0]), \
+                mock.patch.object(wab, "flush_notices"):
+            self.tick()
+        self.assertNotIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
+
     def test_empty_status_read_changes_nothing(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
         self.tick()

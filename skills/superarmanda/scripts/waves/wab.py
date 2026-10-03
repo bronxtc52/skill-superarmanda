@@ -1342,8 +1342,10 @@ def note_transcript_activity(w, now, idle_s=0):
         if files:
             latest = max(files.values())
             w["activity_at"] = max(w.get("activity_at") or 0, min(latest, now))
-            # only a real past write proves activity after the old notice; a future mtime does not
-            if latest <= now and latest > (w.get("pane_changed") or now) + idle_s:
+            # only a real past write proves activity after the old notice; a future mtime does not,
+            # and it must not hide a real write to another file either: each file is checked
+            after = (w.get("pane_changed") or now) + idle_s
+            if any(after < m <= now for m in files.values()):
                 drop_notice(w, "idle")
     elif any(seen.get(f) != m for f, m in files.items()):  # a change seen now is activity now
         drop_notice(w, "idle")
