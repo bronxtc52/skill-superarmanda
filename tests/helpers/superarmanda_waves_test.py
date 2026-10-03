@@ -11507,6 +11507,46 @@ class W3PrNumber(GateBase):
         self.assertEqual(self.rec()["phase"], "gate")
         self.assertEqual(self.rec().get("pr"), 7)
 
+    def test_external_handoff_keeps_the_pr_when_collecting_the_facts_fails(self):
+        cfg = self.start(merge_gate="external", waves=["W1"])
+        for exc in (gate.CollectError("gh: boom"), RuntimeError("bad facts")):
+            with self.subTest(exc=type(exc).__name__):
+                st = self.get_state(cfg)
+                st["waves"]["W1"] = self.wave_rec(phase="running")
+                self.put_state(cfg, st)
+                self.set_status(cfg, "W1", "DONE")
+                v = None
+                with mock.patch.object(wab, "gate_facts", side_effect=exc):
+                    v = wab.gate_check(cfg, "W1", self.rec())
+                    self.assertEqual(v["verdict"], "wait")  # never a pass
+                    self.assertEqual(v["number"], 7)
+                    self.assertFalse(self.tick())
+                self.assertEqual(self.rec()["phase"], "awaiting_merge")
+                self.assertEqual(self.rec().get("pr"), 7)
+        self.alive = False
+        wab.main(["wab.py", "done", str(self.path)])
+        text = (cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8")
+        self.assertIn("PR: [#7](https://github.com/o/r/pull/7)", text)
+        self.assertNotIn("PR: нет", text)
+
+    def test_a_long_multiline_result_does_not_push_the_trusted_tail_out(self):
+        cfg = self.start(merge_gate="external")
+        (wab.wave_dir(cfg, "W1") / "result.md").write_text("\n".join(f"п{i}" for i in range(400)) + "\n",
+                                                          encoding="utf-8")
+        sha = "7" * 40
+        verdict = {"verdict": "pass", "reasons": [], "number": 7, "head": sha, "unresolved": [],
+                   "old_p01": [], "draft": False}
+        with mock.patch.object(wab, "gate_check", return_value=verdict):
+            self.assertFalse(self.tick())
+        [msg] = [t for t in self.tg if "сдала PR" in t]
+        script = "~/.cache/wab/" + wab.owner_script_name(cfg, "W1", sha)
+        self.assertIn(script, msg)
+        self.assertIn("Гейт мерджа пройден", msg)
+        self.assertIn("за координатором", msg)
+        self.assertLessEqual(len(msg), wab.TG_MESSAGE_LIMIT)
+        self.assertIn("…", msg)  # the quote was cut, not the dispatcher's own words
+        self.assertLessEqual(len(wab.render_notice(wab.quote("а\n" * 2000), 10 ** 9)), wab.TG_LIMIT + 40)
+
 
 def _frozen_events(cfg):
     p = cfg["run_dir"] / "events.log"
@@ -11645,6 +11685,27 @@ class W3FrozenContext(Base):
             self.tick()
         self.assertEqual(_frozen_events(self.cfg), [])
         self.assertFalse(self.rec().get("ctx_frozen"))
+
+    def test_an_earlier_attempt_of_this_wave_is_not_the_live_journal(self):
+        """Intended: a journal of an earlier try (attempts) of THIS wave is excluded like another wave's,
+        so its growth is no signal; the bound journal is never excluded."""
+        old = self.transcript("old1", [asst(inp=9)])
+        st = self.get_state(self.cfg)
+        st["waves"]["W1"]["attempts"] = [self.wave_rec("W1", sessions=["old1"])]
+        self.put_state(self.cfg, st)
+        self.neighbor.unlink()
+        self.tick()
+        for _ in range(min(wab.CTX_FROZEN_TICKS + 4, self.MAX_TICKS)):
+            with open(old, "a", encoding="utf-8") as f:
+                f.write(asst(inp=9) + "\n")
+            self.tick()
+        self.assertEqual(_frozen_events(self.cfg), [])
+        self.assertFalse(self.rec().get("ctx_frozen"))
+        # a journal that belongs to no one still counts at the same time
+        self.neighbor.write_text(asst(inp=5) + "\n", encoding="utf-8")
+        self.tick()
+        self.tick(wab.CTX_FROZEN_TICKS + 1, grow=self.neighbor)
+        self.assertEqual(len(_frozen_events(self.cfg)), 1)
 
     def test_a_stat_failure_never_stops_the_tick(self):
         self.tick()

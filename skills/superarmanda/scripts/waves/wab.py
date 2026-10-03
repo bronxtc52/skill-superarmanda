@@ -1139,8 +1139,19 @@ def _render_quote(inner, before):
     lines = inner.splitlines() or [""]
     if len(lines) == 1 and before and not before.endswith("\n"):
         return f"«цитата волны: {lines[0]}»"
-    return ("\n" if before and not before.endswith("\n") else "") + "Цитата волны:\n" \
-        + "\n".join(f"> {l}" for l in lines)
+    head = ("\n" if before and not before.endswith("\n") else "") + "Цитата волны:"
+    # the cap applies to the quote AS SHOWN (the head and the `> ` of every line count): hundreds of
+    # short lines must not swell it and push the dispatcher's own words after it out of the message
+    shown, used = [], len(head)
+    for i, l in enumerate(lines):
+        row = f"> {l}"
+        if used + 1 + len(row) > TG_LIMIT - 4:
+            room = TG_LIMIT - 4 - used - 1
+            shown.append(_clip(row, room) if room > 8 and not shown else "> …")
+            break
+        shown.append(row)
+        used += 1 + len(row)
+    return head + "\n" + "\n".join(shown)
 
 
 def render_notice(text, limit=TG_MESSAGE_LIMIT):
@@ -2882,6 +2893,7 @@ def gate_check(cfg, wave, w):
         pr = find_pr(cfg, w["cwd"])
         if pr is None:
             return dict(base, verdict="fail", reasons=["PR ветки волны не найден"])
+        base["number"] = pr.get("number")  # kept even if the facts below fail: the hand-off names the PR (#34)
         facts = gate_facts(cfg, pr)
         v = gate.evaluate(facts, pr["headRefOid"], read_manifest(cfg, wave), workdir_state(w["cwd"]),
                           base_branch_of(cfg, w["cwd"]))
