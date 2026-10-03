@@ -1701,6 +1701,44 @@ class Episodes(Base):
             self.tick()
         self.assertEqual(len(self.tg), 1)
 
+    def test_upgrade_from_a_record_without_bookkeeping_drops_a_stale_idle_notice(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        self.pane = "static screen\nline2\nline3\n"
+        st = self.get_state(self.cfg)
+        w = st["waves"]["W1"]
+        w["pane_digest"] = wab.pane_digest(self.pane)
+        w["pane_changed"] = t[0] - 1000  # 0.13.0 raised «молчит» at pane_changed + 60 s
+        wab.once_per(w, "idle", w["pane_digest"])
+        wab.put_notice(w, "idle", w["pane_digest"], "wave-autobot: волна W1 молчит 1+ мин")
+        self.put_state(self.cfg, st)
+        os.utime(main, (t[0] - 3600, t[0] - 3600))
+        os.utime(agent, (t[0] - 10, t[0] - 10))  # the subagent wrote after that notice
+        with mock.patch("time.time", side_effect=lambda: t[0]), \
+                mock.patch.object(wab, "flush_notices"):
+            self.tick()
+        w = self.get_state(self.cfg)["waves"]["W1"]
+        self.assertNotIn("idle", w.get("notified", {}))
+        self.assertNotIn("idle", w.get("outbox", {}))
+
+    def test_a_new_session_seeds_its_baseline_instead_of_counting_as_a_write(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for f in (main, agent):
+                os.utime(f, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            st = self.get_state(self.cfg)
+            st["waves"]["W1"]["sessions"] = ["s1", "s2"]  # bound after /clear
+            self.put_state(self.cfg, st)
+            p2 = self.transcript("s2", [asst(inp=2)])
+            os.utime(p2, (t[0] - 3600, t[0] - 3600))  # the new session is old and quiet
+            t[0] += 90
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+        self.assertIn("молчит", self.tg[0])
+
     def test_empty_status_read_changes_nothing(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
         self.tick()

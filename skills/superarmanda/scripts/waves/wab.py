@@ -1323,24 +1323,32 @@ def end_screen_episodes(w, txt, now):
     return screen
 
 
-def note_transcript_activity(w, now):
+def note_transcript_activity(w, now, idle_s=0):
     """A still screen over a working subagent is not silence: a NEW write to any transcript file of
-    the session counts as activity at the moment it is seen (mtimes are only used on the first look,
-    a future one clamped once, not every tick) and ends an idle episode already reported, so the next silence is reported again. Runs
-    next to end_screen_episodes, before any branch of the tick returns. In memory only; True when
-    the record changed (the caller saves at once: some branches return without saving)."""
+    the session counts as activity at the moment it is seen and ends an idle episode already
+    reported, so the next silence is reported again. The first look at a session (a new session
+    after /clear, or a record from a version without this bookkeeping) only seeds the baseline from
+    the files' own mtimes (a future one clamped); a write later than the moment an idle notice could
+    have been raised (`pane_changed` + `idle_s`) makes that notice stale. Runs next to
+    end_screen_episodes, before any branch of the tick returns. In memory only; True when the
+    record changed (the caller saves at once: some branches return without saving)."""
     files = transcript_activity(w)
+    sessions = w.get("sessions") or []
+    sid = sessions[-1] if sessions else None
     seen = w.get("activity_files")
-    changed = [m for f, m in files.items() if not isinstance(seen, dict) or seen.get(f) != m]
-    if changed:
-        if isinstance(seen, dict):  # a change seen now is activity now, whatever its mtime says
-            drop_notice(w, "idle")
-            w["activity_at"] = now
-        else:  # the first look: the files' own age, a future one clamped
-            w["activity_at"] = max(w.get("activity_at") or 0, min(max(changed), now))
-    moved = bool(changed) or seen != files
-    w["activity_files"] = files
-    return moved
+    first = not isinstance(seen, dict) or w.get("activity_session") != sid
+    before = (seen, w.get("activity_session"), w.get("activity_at"), "idle" in (w.get("notified") or {}))
+    if first:
+        if files:
+            seeded = min(max(files.values()), now)
+            w["activity_at"] = max(w.get("activity_at") or 0, seeded)
+            if seeded > (w.get("pane_changed") or now) + idle_s:
+                drop_notice(w, "idle")  # written after the old notice: it is stale
+    elif any(seen.get(f) != m for f, m in files.items()):  # a change seen now is activity now
+        drop_notice(w, "idle")
+        w["activity_at"] = now
+    w["activity_files"], w["activity_session"] = files, sid
+    return before != (files, sid, w.get("activity_at"), "idle" in (w.get("notified") or {}))
 
 
 KEEP_ON_ACK = ("chain_done",)  # the end of the chain is never stale: it must get through
@@ -3867,7 +3875,7 @@ def _tick(cfg, st):
 
     # screen episodes end on screen before any branch below returns or sends the outbox
     screen = end_screen_episodes(w, pane_text(name), now)
-    if note_transcript_activity(w, now):
+    if note_transcript_activity(w, now, cfg["idle_minutes"] * 60):
         save_state(cfg, st)  # a policy-answered BLOCKED returns without saving: keep the ended episode
     txt = screen["txt"]
 
