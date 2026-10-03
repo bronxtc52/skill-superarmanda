@@ -7393,6 +7393,42 @@ class GateVerdict(unittest.TestCase):
         self.assertEqual(v["verdict"], "fail")
         self.assertTrue(any("unknown record type 'waivers'" in r for r in v["reasons"]), v["reasons"])
 
+    def test_a_malformed_manifest_is_a_closed_refusal_not_an_exception(self):  # W1 fix1
+        def fails(m, needle):
+            v = self.ev(manifest=m)
+            self.assertEqual(v["verdict"], "fail", v["reasons"])
+            self.assertTrue(any(needle in r for r in v["reasons"]), v["reasons"])
+        for bad in (["T1"], "T1", 7):
+            with self.subTest(tasks=bad):
+                m = green_manifest()
+                m["tasks"] = bad
+                fails(m, "нет задач")
+        for field, bad in (("results", []), ("decisions", {"a": 1}), ("decisions", 5), ("deferrals", "x"),
+                           ("acceptances", 3), ("acceptances", {"source": "x"}), ("fix_sources", []),
+                           ("fix_cycles", "2"), ("session_roles", [])):
+            with self.subTest(field=field, bad=bad):
+                m = green_manifest()
+                m["tasks"]["T1"][field] = bad
+                fails(m, f"поле {field}")
+        m = green_manifest()
+        m["tasks"]["T1"] = "broken"
+        fails(m, "задача T1")
+        m = green_manifest()
+        m["run"] = "x"
+        fails(m, "поле run")
+        # non-dict elements inside a list do not crash the acceptance/deferral lookup
+        state = wab.gate.state
+        res = result("findings")
+        m = green_manifest()
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = res
+        m["tasks"]["T1"]["acceptances"] = ["x", 3, None]
+        m["tasks"]["T1"]["deferrals"] = [[], "y"]
+        self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
+        self.assertEqual(wab.gate.accepted_notes({"tasks": ["T1"]}, HEAD), [])
+        self.assertEqual(wab.gate.accepted_notes({"tasks": {"T1": {"results": {"coder": res},
+                                                                   "acceptances": 5}}}, HEAD), [])
+        self.assertIsNone(state.accepted_record({"acceptances": 5}, "coderabbit", res))
+
     def test_pr_head_other_than_the_gated_one_waits(self):
         facts = green_facts()
         facts["pr"]["head"] = OLD

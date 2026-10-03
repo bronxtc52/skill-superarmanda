@@ -680,7 +680,7 @@ def _bound_record(records, role, result):
     if not isinstance(result, dict) or result.get("status") != "findings":
         return None
     digest = result_digest(result)
-    for record in records or []:
+    for record in records if isinstance(records, list) else ():
         if (
             isinstance(record, dict)
             and record.get("source") == role
@@ -695,12 +695,12 @@ def is_deferred(entry, role, result):
     """A findings result counts as passed only through a deferral of the same
     role bound to exactly this result (its digest) and its head. The single
     rule for state.py and the wave gate."""
-    return _bound_record((entry or {}).get("deferrals"), role, result) is not None
+    return _bound_record(entry.get("deferrals") if isinstance(entry, dict) else None, role, result) is not None
 
 
 def accepted_record(entry, role, result):
     """The `fix-loop --accept` record bound to exactly this result, or None."""
-    return _bound_record((entry or {}).get("acceptances"), role, result)
+    return _bound_record(entry.get("acceptances") if isinstance(entry, dict) else None, role, result)
 
 
 def is_accepted(entry, role, result):
