@@ -10073,7 +10073,7 @@ class DecisionPolicy(Base):
         self.assertEqual(wab.parse_policy("Прогон: x\nтекст без раздела\n"), [])
 
     def test_unknown_key_class_red_or_merge_gate_is_refused(self):
-        for rule in ("- auto: class=bogus", "- auto: class=question color=red",
+        for rule in ("- auto: class=bogus", "- auto: class=plan_mismatch", "- auto: class=question color=red",
                      "- auto: class=question red=no", "- auto: class=merge_gate",
                      "- auto: rec=A", "- manual: class=question", "* auto: class=question",
                      "- auto: class=question rec=A rec=B"):
@@ -10168,6 +10168,85 @@ class DecisionPolicy(Base):
             self.tick(cfg, "BLOCKED: [class=merge_gate rec=A red=no] gate")
         self.assertEqual(self.answers(), [])
         self.assertEqual(len(self.owner_asked()), 1, self.tg)
+
+    def test_plan_mismatch_is_refused_with_its_reason_and_always_goes_to_the_owner(self):
+        with self.assertRaises(ValueError) as cm:
+            wab.parse_policy("Прогон: x\n## Политика решений\n- auto: class=plan_mismatch\n")
+        self.assertIn("plan_mismatch", str(cm.exception))
+        self.assertIn("владел", str(cm.exception))
+        self.assertEqual(wab.parse_blocked_label("BLOCKED: [class=plan_mismatch rec=fix red=no] p")["class"],
+                         "plan_mismatch")
+
+    def test_pinned_mandate_gone_or_foreign_refuses_the_policy_and_watch(self):
+        for name in ("missing", "foreign header", "empty"):
+            with self.subTest(name):
+                cfg, path = self.mandate()
+                m = cfg["run_dir"] / "mandate.md"
+                if name == "missing":
+                    m.unlink()
+                elif name == "empty":
+                    m.write_bytes(b"")
+                else:
+                    m.write_bytes("Прогон: other\n## Политика решений\n- auto: class=question\n".encode("utf-8"))
+                with self.assertRaises(SystemExit) as cm:
+                    wab.decision_policy(cfg)
+                self.assertIn("mandate_sha256", str(cm.exception))
+                with self.assertRaises(SystemExit):
+                    wab.watch(cfg, path, max_ticks=1)
+        cfg, _ = self.chain()  # no pin, no mandate: no policy, no refusal
+        self.assertEqual(wab.decision_policy(cfg), [])
+
+    def test_cap_counts_every_attempt_of_the_wave(self):
+        cfg, _ = self.mandate()
+        for i in range(3):
+            self.tick(cfg, f"BLOCKED: [class=question rec=A red=no] вопрос {i}")
+        self.assertEqual(len(self.answers()), 3)
+        st = wab.load_state(cfg)  # a restart archives the record into `attempts` (as _launch does)
+        old = st["waves"]["W1"]
+        st["waves"]["W1"] = self.wave_rec("W1", attempts=[{k: v for k, v in old.items() if k != "outbox"}])
+        self.put_state(cfg, st)
+        self.tick(cfg, "BLOCKED: [class=question rec=A red=no] вопрос после перезапуска")
+        self.assertEqual(len(self.answers()), 3, self.sent)
+        self.assertIn("policy cap reached", self.log(cfg))
+        self.assertEqual(len(self.owner_asked()), 1, self.tg)
+
+    def test_status_changed_before_delivery_is_not_answered(self):
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        real_read = wab.read
+
+        def moved(p, *a, **kw):  # the owner answered in the window: the wave wrote RUNNING meanwhile
+            if Path(p).name == "status" and moved.n > 0:
+                return "RUNNING"
+            moved.n += 1
+            return real_read(p, *a, **kw)
+        moved.n = 0
+        with mock.patch.object(wab, "read", side_effect=moved):
+            self.tick(cfg)
+        self.assertEqual(self.answers(), [], self.sent)
+        self.assertEqual(self.decisions(cfg), [])
+        self.assertEqual(self.owner_asked(), [], self.tg)  # a new episode, not a stale question
+
+    def test_successful_retry_closes_the_blocked_signal_and_attention(self):
+        cfg, _ = self.mandate(telegram=None)
+        calls = []
+
+        def flaky(n, t, **kw):
+            calls.append(t)
+            if len(calls) == 1:
+                raise wab.NotSubmitted("the text is still in the input line")
+            self.sent.append(("text", n, t))
+        wab.send_text.side_effect = flaky
+        with mock.patch.object(wab, "display_all"):
+            st = self.tick(cfg, self.ASK)
+            self.assertIn("blocked", st["waves"]["W1"].get("attention", {}))
+            self.assertTrue((cfg["run_dir"] / "ATTENTION").exists())
+            st = self.tick(cfg)
+        self.assertEqual(len(self.answers()), 1)
+        self.assertNotIn("blocked", st["waves"]["W1"].get("attention", {}))
+        self.assertNotIn("blocked", st["waves"]["W1"].get("outbox", {}))
+        att = cfg["run_dir"] / "ATTENTION"
+        self.assertFalse(att.exists() and "ждёт тебя" in att.read_text(encoding="utf-8"))
 
     def test_failed_delivery_is_retried_once(self):
         cfg, _ = self.mandate()

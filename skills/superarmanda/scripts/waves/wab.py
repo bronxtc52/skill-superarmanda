@@ -1420,7 +1420,14 @@ MANDATE_HEADER = "Прогон: "
 # A line without a (valid) label, red=yes, merge_gate and anything the policy does not name go to the
 # owner as before.
 LABEL_CLASSES = ("needs_decision", "blocked_cap", "plan_mismatch", "question", "merge_gate")
-POLICY_CLASSES = tuple(c for c in LABEL_CLASSES if c != "merge_gate")  # merge_gate: written by the dispatcher
+# Never in a policy: merge_gate is written by the dispatcher; plan_mismatch needs an amendment of the
+# approved waves.json, which takes the owner's «ок» and a new plan_sha256 — an answer cannot give that.
+OWNER_ONLY_CLASSES = {
+    "merge_gate": "merge_gate is never answered automatically",
+    "plan_mismatch": ("plan_mismatch always goes to the owner (владельцу): an amendment of the approved "
+                      "waves.json needs his «ок» and a new plan_sha256, an automatic answer cannot give it"),
+}
+POLICY_CLASSES = tuple(c for c in LABEL_CLASSES if c not in OWNER_ONLY_CLASSES)
 POLICY_HEADING = re.compile(r"##\s+Политика решений\s*")
 REC_TOKEN = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 _LABEL = re.compile(r"BLOCKED:[ \t]*\[([^\]\n]*)\][ \t]*(.*)", re.S)
@@ -1480,8 +1487,8 @@ def parse_policy(body):
                 raise ValueError(f"line {n}: unknown or repeated key in {s!r} (allowed: class, rec)")
             fields[key] = value
         cls = fields.get("class")
-        if cls == "merge_gate":
-            raise ValueError(f"line {n}: merge_gate is never answered automatically")
+        if cls in OWNER_ONLY_CLASSES:
+            raise ValueError(f"line {n}: {OWNER_ONLY_CLASSES[cls]}")
         if cls not in POLICY_CLASSES:
             raise ValueError(f"line {n}: class must be one of {', '.join(POLICY_CLASSES)}, got {cls!r}")
         if "rec" in fields and not REC_TOKEN.fullmatch(fields["rec"]):
@@ -1512,6 +1519,11 @@ def decision_policy(cfg):
         raise SystemExit(f"{mandate} is not valid UTF-8")
     first = body.splitlines()[:1]
     if not (first and first[0].strip() == MANDATE_HEADER + cfg["run_id"]):
+        if "mandate_sha256" in cfg:  # a pin promises the mandate: gone, empty or foreign is refused
+            why = ("is missing" if not mandate.exists() else "is empty" if not body.strip()
+                   else f"first line is not «{MANDATE_HEADER}{cfg['run_id']}»")
+            raise SystemExit(f"{mandate} {why}, but chain.json pins mandate_sha256 "
+                             f"{cfg['mandate_sha256']!r}: no policy answers")
         return []
     digest = hashlib.sha256(raw).hexdigest()
     if digest != cfg.get("mandate_sha256"):
@@ -3264,12 +3276,24 @@ def _complete_wave(cfg, st, wave, w, wdir, now):
     return started
 
 
+def _count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def auto_answers_used(w):
+    """Automatic answers of the whole wave: this try and every archived attempt (a restart moves the
+    record into `attempts`, the cap must survive it); a corrupt counter adds nothing."""
+    return sum(r["auto_answers"] for r in [w, *wave_attempts(w)] if _count(r.get("auto_answers")))
+
+
 def _policy_answer(cfg, st, wave, w, status, now, attach):
     """Answer a BLOCKED episode by the decision policy of mandate.md. True when it is answered (now
     or earlier in this episode): the owner is then informed (`policy_answer`), not asked. False sends
     the episode down the usual BLOCKED path: no or bad label, red=yes, merge_gate, a class/rec the
     policy does not allow, no or tampered policy, the cap reached, or a failed delivery (the next
-    tick tries again; `pending_enter` makes the retry Enter-only, so the answer is never typed twice)."""
+    tick tries again; `pending_enter` makes the retry Enter-only, so the answer is never typed twice).
+    None: the status file changed between the tick's read and the delivery: nothing is sent and the
+    tick ends; the next tick starts the new episode."""
     if _answered(w) == status:
         return True
     label = parse_blocked_label(status)
@@ -3284,8 +3308,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         return False
     if not any(r["class"] == label["class"] and r["rec"] in (None, label["rec"]) for r in rules):
         return False
-    used = w.get("auto_answers")
-    used = used if isinstance(used, int) and not isinstance(used, bool) and used > 0 else 0
+    used = auto_answers_used(w)
     cap = cfg.get("max_auto_answers", MAX_AUTO_ANSWERS)
     if used >= cap:
         if not w.get("policy_cap_reached"):
@@ -3294,13 +3317,19 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
             event(cfg, f"{wave}: policy cap reached ({used}/{cap}): class={label['class']} "
                        f"rec={label['rec']} goes to the owner")
         return False
+    current = read(wave_dir(cfg, wave) / "status", on_error=None)
+    if current != status:  # the wave (or the owner in its window) moved on since the tick read it
+        event(cfg, f"{wave}: policy answer not sent: the status changed before delivery")
+        return None
     w["policy_pending"] = status
     if not _deliver(cfg, st, wave, "policy answer", send_text, POLICY_ANSWER.format(rec=label["rec"])):
         save_state(cfg, st)
         return False
     w.pop("policy_pending", None)
     w.setdefault("notified", {})["policy_answer"] = status
-    w["auto_answers"] = used + 1
+    w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
+    drop_notice(w, "blocked")  # a usual BLOCKED signal of a failed first try asks nothing any more
+    w.setdefault("notified", {})["blocked"] = status  # ...and is not raised again in this episode
     question = redact((label["question"].splitlines() or [""])[0], 200)
     try:
         with open(wave_dir(cfg, wave) / "policy-decisions.log", "a", encoding="utf-8") as f:
@@ -3441,7 +3470,8 @@ def _tick(cfg, st):
             w.pop(key, None)  # the wave left that BLOCKED line: the half-sent answer is outdated
         save_state(cfg, st)
 
-    if status.startswith("BLOCKED") and _policy_answer(cfg, st, wave, w, status, now, attach):
+    answered = _policy_answer(cfg, st, wave, w, status, now, attach) if status.startswith("BLOCKED") else False
+    if answered is None or answered:
         flush_notices(cfg, st, w)
         return True
     if status.startswith("BLOCKED"):
