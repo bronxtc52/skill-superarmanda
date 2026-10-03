@@ -10096,6 +10096,25 @@ class DecisionPolicy(Base):
         self.tick(cfg)
         self.assertEqual(len(self.answers()), 2)  # answered again, not left waiting silently
 
+    def test_answer_is_bound_to_the_pre_delivery_stamp(self):  # Codex P2 on #49
+        cfg, _ = self.mandate()
+        path = cfg["run_dir"] / "W1" / "status"
+        self.set_status(cfg, "W1", self.ASK)
+        real = wab.send_text
+
+        def fast_wave(name, text, on_typed=None):  # the wave answers and re-blocks before send_text returns
+            real(name, text, on_typed=on_typed)
+            path.write_text("RUNNING", encoding="utf-8")
+            st0 = os.stat(path)
+            path.write_text(self.ASK, encoding="utf-8")
+            os.utime(path, ns=(st0.st_atime_ns, st0.st_mtime_ns + 5_000_000))
+        with mock.patch.object(wab, "send_text", fast_wave):
+            st = wab.load_state(cfg)
+            wab.tick(cfg, st)
+        self.assertEqual(len(self.answers()), 1)
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 2)  # the identical rewrite is a new episode
+
     def test_label_is_parsed(self):
         got = wab.parse_blocked_label(self.ASK)
         self.assertEqual((got["class"], got["rec"], got["red"]), ("needs_decision", "invariant", False))

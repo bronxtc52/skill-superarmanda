@@ -3310,7 +3310,11 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
             event(cfg, f"{wave}: policy cap reached ({used}/{cap}): class={label['class']} "
                        f"rec={label['rec']} goes to the owner")
         return False
-    still = lambda: read(wave_dir(cfg, wave) / "status", on_error=None) == status  # noqa: E731
+    seen = {}
+
+    def still():  # the status read AND its file stamp, taken under the input lock right before typing
+        seen["stamp"] = _status_stamp(cfg, wave)
+        return read(wave_dir(cfg, wave) / "status", on_error=None) == status
     if not still():  # the wave (or the owner in its window) moved on since the tick read it
         event(cfg, f"{wave}: policy answer not sent: the status changed before delivery")
         return None
@@ -3329,7 +3333,9 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         return False
     w.pop("policy_pending", None)
     w.setdefault("notified", {})["policy_answer"] = status
-    w["policy_answered_stamp"] = _status_stamp(cfg, wave)  # tells a rewritten identical line apart
+    # the stamp of the status the answer was for, taken BEFORE typing: a fast wave may already have
+    # rewritten the same line by now, and that rewrite must read as a new episode
+    w["policy_answered_stamp"] = seen.get("stamp", stamp)
     w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
     drop_notice(w, "blocked")  # a usual BLOCKED signal of a failed first try asks nothing any more
     w.setdefault("notified", {})["blocked"] = status  # ...and is not raised again in this episode
