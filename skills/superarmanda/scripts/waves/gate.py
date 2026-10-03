@@ -260,7 +260,8 @@ def manifest_problems(manifest, head, cwd_fingerprint):
             problems.append(f"задача {name}: статус {status} (цикл исправлений не завершён)")
         for role, other in sorted(results.items()):  # github_codex_review, coderabbit, ...
             if (role not in ("coder", "tester", "cross_provider_reviewer") and isinstance(other, dict)
-                    and other.get("head") == head and other.get("status") != "pass"):
+                    and other.get("head") == head and other.get("status") != "pass"
+                    and not _deferred(entry, role, other)):
                 problems.append(f"задача {name}: {role} {other.get('status')}")
         coder = results.get("coder")
         if not (isinstance(coder, dict) and coder.get("status") == "pass" and coder.get("head") == head):
@@ -278,7 +279,7 @@ def manifest_problems(manifest, head, cwd_fingerprint):
             problems.append(f"задача {name}: cross_provider_reviewer получен на другом дереве, чем рабочая копия")
         elif review.get("status") != "pass" and not _accepted(entry, review):
             problems.append(f"задача {name}: cross_provider_reviewer {review.get('status')} без решения "
-                            f"владельца accept_limitation по этому результату")
+                            f"владельца accept_limitation или --defer по этому результату")
     return problems
 
 
@@ -303,11 +304,20 @@ def _needs_fix_explained(entry, review, head, fingerprint_now):
             and (entry.get("fix_cycles") or 0) <= own)
 
 
+def _deferred(entry, role, result):
+    """`fix-loop --defer` on THIS result: low/P3-only findings of `role` moved to the next wave's
+    remainder. The rule is state.is_deferred (bound to the exact result and its head), not a copy."""
+    return state.is_deferred(entry, role, result)
+
+
 def _accepted(entry, review):
     """A decision made on THIS result: source cross_provider_reviewer, accept_limitation, recorded
-    no earlier than the result. Older decisions, other sources, invariant/cut_surface: no."""
+    no earlier than the result. Older decisions, other sources, invariant/cut_surface: no.
+    A deferral of the reviewer on this result (`fix-loop --defer`) counts the same way."""
     if review.get("status") != "findings":
         return False
+    if _deferred(entry, "cross_provider_reviewer", review):
+        return True
     made = _ts(review.get("recorded_at"))
     for decision in entry.get("decisions") or []:
         if not isinstance(decision, dict):
