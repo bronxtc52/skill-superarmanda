@@ -444,12 +444,16 @@ def unsent_reason(screen, text):
     preview hint is on the screen, or the input line (the LAST line with «❯», the box sits below
     the history) still holds a folded paste or the start of the text. A screen without an input
     line (a dialog, an empty capture) gives no evidence against the delivery: None."""
-    if PASTE_PREVIEW in screen:
+    all_lines = screen.splitlines()
+    marks = [i for i, l in enumerate(all_lines) if INPUT_MARK in l]
+    # only the active input region counts: the last «❯» line and the footer below it (or, without
+    # an input line, the last few lines). History above may quote the hint or the text itself.
+    region = all_lines[marks[-1]:] if marks else all_lines[-4:]
+    if any(PASTE_PREVIEW in l for l in region):
         return f"the paste preview is on the screen («{PASTE_PREVIEW}»)"
-    lines = [l for l in screen.splitlines() if INPUT_MARK in l]
-    if not lines:
+    if not marks:
         return None
-    rest = " ".join(lines[-1].split(INPUT_MARK, 1)[1].replace("\u2502", " ").split())
+    rest = " ".join(all_lines[marks[-1]].split(INPUT_MARK, 1)[1].replace("\u2502", " ").split())
     if "[Pasted text" in rest:
         return "the folded paste is still in the input line"
     head = _text_head(text)
@@ -906,8 +910,9 @@ def display_all(text):
     """Show `text` in the status line of every client of the waves' tmux server (the same socket
     as the windows: WAB_TMUX_SOCKET or the default). Raises on a tmux failure; the caller logs it."""
     clients = tmux("list-clients", "-F", "#{client_name}").stdout.split()
+    safe = text.replace("#", "##")  # display-message takes a FORMAT: «#(cmd)» would run a shell command
     for client in clients:
-        tmux("display-message", "-d", "0", "-c", client, text)
+        tmux("display-message", "-d", "0", "-c", client, safe)
 
 
 def notify(cfg, text, wave=None):
@@ -1802,16 +1807,21 @@ def _deliver(cfg, st, wave, what, send, text):
     name = w["tmux"]
     if w.get("pending_enter") == what:
         if send is send_text:
-            ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, text)
+            # after a restart the caller may not have the text any more: check against the head
+            # saved together with `pending_enter`, so recovery validates the same way
+            check = text or str(w.get("pending_text_head") or "")
+            ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, check)
         else:
             ok = _act(cfg, st, wave, f"{what} (Enter)", press_enter, name)
     else:
         def typed():
             w["pending_enter"] = what
+            w["pending_text_head"] = _text_head(text)  # what unsent_reason compares; short
             save_state(cfg, st)
         ok = _act(cfg, st, wave, what, send, name, text, on_typed=typed)
     if ok:
         w.pop("pending_enter", None)
+        w.pop("pending_text_head", None)
     return ok
 
 

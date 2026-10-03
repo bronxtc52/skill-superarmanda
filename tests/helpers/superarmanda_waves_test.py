@@ -9795,6 +9795,14 @@ class LocalAttention(Base):
         wab.save_state(cfg, st)
         self.assertIn("молчит", att.read_text(encoding="utf-8"))
 
+    def test_display_message_escapes_tmux_formats(self):  # CodeRabbit (security) on #47
+        cfg, _ = self.chain(telegram=None)
+        wab.display_all("волна W2: #(touch /tmp/pwned) #{session_name}")
+        [*_, msg] = self.displays()[-1]
+        self.assertNotIn("#(", msg.replace("##", ""))
+        self.assertIn("##(touch", msg)
+        self.assertIn("##{session_name}", msg)
+
     def test_attention_command_exit_codes(self):
         cfg, path = self.chain(telegram=None)
         with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()):
@@ -9900,6 +9908,31 @@ class Submit(Base):
         self.assertTrue(ok)
         self.assertNotIn("pending_enter", st["waves"]["W1"])
         self.assertEqual(sum("paste-buffer" in c for c in self.m_calls), 1)  # not pasted twice
+
+    def test_preview_phrase_in_history_does_not_count_as_unsent(self):  # Codex P2 on #47
+        history = "\n".join(["> обсуждали «paste again to expand» в прошлом ответе", "история",
+                              PROMPT_LINE.format(" ")])
+        self.assertIsNone(wab.unsent_reason(history, self.TEXT))
+        self.assertIsNotNone(wab.unsent_reason(self.PREVIEW, self.TEXT))  # the real footer still counts
+
+    def test_recovery_with_empty_text_checks_against_the_saved_head(self):  # Codex P2 on #47
+        cfg, path, f = self.say()
+        self.screens = [self.TYPED]  # pasted, Enter did not send
+        st = self.m.load_state(cfg)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, self.TEXT))
+        w = st["waves"]["W1"]
+        self.assertEqual(w.get("pending_enter"), "/update")
+        self.assertTrue(w.get("pending_text_head"))
+        # a restarted dispatcher no longer has the text (advance_pending / recover_update pass "")
+        self.m_enters.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, ""))
+        self.screens = [self.EMPTY]
+        self.m_enters.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, ""))
+        self.assertNotIn("pending_text_head", st["waves"]["W1"])
 
     def test_unsent_reason_on_screens(self):
         self.assertIsNotNone(wab.unsent_reason(self.PREVIEW, self.TEXT))
