@@ -3,6 +3,43 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 0.11.0 — 2026-10-03
+
+### Добавлено
+
+- Машинная метка строки `BLOCKED` от волны: `BLOCKED: [class=<класс> rec=<вариант> red=<yes|no>] …`
+  (классы `needs_decision`, `blocked_cap`, `plan_mismatch`, `question`; `merge_gate` — только
+  диспетчер). Строка без метки или с испорченной меткой обрабатывается как раньше.
+  ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
+- Поле `decision_policy` в `chain.json` (`[{"class": …, "rec": …}]`, `rec` необязателен): развилки,
+  на которые диспетчер отвечает сам. Строгая проверка в `load_chain` (лишний ключ, неизвестный
+  класс, `red`, `merge_gate`, `plan_mismatch`, неверный `rec` — отказ); поле входит в идентичность
+  прогона. ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
+- Автоответ диспетчера на разрешённую политикой развилку вне красной зоны: текст в окно волны путём
+  `say`, строка в `<волна>/policy-decisions.log`, событие и информирующее уведомление
+  `policy_answer`; один ответ на эпизод, повтор после неудачной доставки.
+  ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
+- `max_auto_answers` в `chain.json` (по умолчанию 3, настраивается на лету): после него — обычный
+  `BLOCKED` владельцу и событие `policy cap reached`.
+  ([#41](https://github.com/bronxtc52/skill-superarmanda/issues/41))
+
+### Исправлено по ревью
+
+- Политика решений перенесена из раздела `mandate.md` в `chain.json` (`decision_policy`): разбор
+  markdown со всеми его пограничными случаями убран целиком; заголовок «Политика решений» в мандате —
+  обычный текст. ([#49](https://github.com/bronxtc52/skill-superarmanda/pull/49))
+- Кап `max_auto_answers` считается по волне целиком (текущая попытка и все `attempts`) и засчитывает
+  ответ в полёте (`pending_enter`/`policy_pending`): перезапуск после смерти окна его не обходит.
+  ([#49](https://github.com/bronxtc52/skill-superarmanda/pull/49))
+- Статус волны перечитывается перед вводом автоответа и ещё раз под замком ввода: строка сменилась
+  (ответ владельца через `say`) — ответ не шлётся. ([#49](https://github.com/bronxtc52/skill-superarmanda/pull/49))
+- Успешный повтор автоответа снимает обычный сигнал `blocked` этого эпизода и ATTENTION.
+  ([#49](https://github.com/bronxtc52/skill-superarmanda/pull/49))
+- `plan_mismatch` исключён из классов политики (поправка плана требует «ок» владельца и нового
+  пина); метка допустима и всегда идёт владельцу. ([#49](https://github.com/bronxtc52/skill-superarmanda/pull/49))
+- Эпизод BLOCKED различается и по записи файла `status` (inode + mtime): та же строка, переписанная
+  после незамеченного `RUNNING`, — новый эпизод, а не «уже отвечено» (иначе волна ждала бы молча).
+
 ## 0.10.1 — 2026-10-03
 
 ### Исправлено

@@ -10015,6 +10015,364 @@ class Submit(Base):
         self.assertIsNone(wab.unsent_reason(self.EMPTY, self.TEXT))
 
 
+# ---------------------------------------------------------------- #41: decision policy in mandate.md
+class DecisionPolicy(Base):
+    """A labelled BLOCKED line whose class (and rec) chain.json `decision_policy` allows, outside the
+    red zone, is answered by the dispatcher itself — once per episode, capped."""
+    POLICY = [{"class": "needs_decision"}, {"class": "blocked_cap", "rec": "new_run"},
+              {"class": "question", "rec": "A"}]
+    ASK = "BLOCKED: [class=needs_decision rec=invariant red=no] needs_decision T3: гонка; варианты: invariant | cut_surface"
+
+    def mandate(self, policy=None, **over):
+        """chain.json with `decision_policy` (None = POLICY, "" = no field) and a pinned mandate.md whose
+        «Политика решений» heading is plain text: the policy lives only in chain.json."""
+        body = (f"Прогон: {RUN_ID}\nМердж при зелёном CI.\n\n## Политика решений\n"
+                f"- auto: class=plan_mismatch\n").encode("utf-8")
+        policy = self.POLICY if policy is None else policy
+        cfg, path = self.chain(mandate_sha256=hashlib.sha256(body).hexdigest(),
+                               decision_policy=policy if policy != "" else None, **over)
+        (cfg["run_dir"] / "mandate.md").write_bytes(body)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1")}})
+        return cfg, path
+
+    def tick(self, cfg, status=None):
+        if status is not None:
+            self.set_status(cfg, "W1", status)
+        st = wab.load_state(cfg)
+        wab.tick(cfg, st)
+        return wab.load_state(cfg)
+
+    def answers(self):
+        return [t for kind, n, t in self.sent if "РЕШЕНИЕ ПО ПОЛИТИКЕ" in t]
+
+    def log(self, cfg):
+        p = cfg["run_dir"] / "events.log"
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+
+    def decisions(self, cfg):
+        p = cfg["run_dir"] / "W1" / "policy-decisions.log"
+        return p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+
+    def owner_asked(self):
+        return [t for t in self.tg if "ждёт тебя" in t]
+
+    # ----- the label -----
+    def test_a_half_sent_answer_dropped_on_a_status_change_is_charged(self):  # Codex P2 on #49, round 2
+        cfg, _ = self.mandate()
+        st = wab.load_state(cfg)
+        w = st["waves"]["W1"]
+        w.update(pending_enter="policy answer", pending_text_head="[wab] РЕШЕНИЕ", policy_pending=self.ASK)
+        self.put_state(cfg, st)
+        st = self.tick(cfg, "RUNNING")  # the wave moved on: the answer may already have been submitted
+        w = st["waves"]["W1"]
+        self.assertNotIn("policy_pending", w)
+        self.assertEqual(wab.auto_answers_used(w), 1)
+
+    def test_status_rechecked_under_the_input_lock(self):  # Codex P2 on #49, round 4
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        real_lock = wab._InputLock.__enter__
+
+        def enter_and_owner_answers(lock):  # while waiting for the lock, `say` answered and the wave moved on
+            got = real_lock(lock)
+            self.set_status(cfg, "W1", "RUNNING")
+            return got
+        with mock.patch.object(wab._InputLock, "__enter__", enter_and_owner_answers):
+            st = wab.load_state(cfg)
+            wab.tick(cfg, st)
+        self.assertEqual(self.answers(), [])
+        self.assertIn("changed while waiting for the input", self.log(cfg))
+
+    def test_identical_blocked_rewritten_after_an_unseen_running_is_a_new_episode(self):  # Codex P2, #49
+        cfg, _ = self.policy_chain() if hasattr(self, "policy_chain") else self.mandate()
+        self.tick(cfg, self.ASK)
+        self.assertEqual(len(self.answers()), 1)
+        # the wave took the answer, wrote RUNNING and then the same BLOCKED line before the next poll
+        path = cfg["run_dir"] / "W1" / "status"
+        path.write_text("RUNNING", encoding="utf-8")
+        st0 = os.stat(path)
+        path.write_text(self.ASK, encoding="utf-8")
+        os.utime(path, ns=(st0.st_atime_ns, st0.st_mtime_ns + 5_000_000))
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 2)  # answered again, not left waiting silently
+
+    def test_answer_is_bound_to_the_pre_delivery_stamp(self):  # Codex P2 on #49
+        cfg, _ = self.mandate()
+        path = cfg["run_dir"] / "W1" / "status"
+        self.set_status(cfg, "W1", self.ASK)
+        real = wab.send_text
+
+        def fast_wave(name, text, on_typed=None):  # the wave answers and re-blocks before send_text returns
+            real(name, text, on_typed=on_typed)
+            path.write_text("RUNNING", encoding="utf-8")
+            st0 = os.stat(path)
+            path.write_text(self.ASK, encoding="utf-8")
+            os.utime(path, ns=(st0.st_atime_ns, st0.st_mtime_ns + 5_000_000))
+        with mock.patch.object(wab, "send_text", fast_wave):
+            st = wab.load_state(cfg)
+            wab.tick(cfg, st)
+        self.assertEqual(len(self.answers()), 1)
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 2)  # the identical rewrite is a new episode
+
+    def test_label_is_parsed(self):
+        got = wab.parse_blocked_label(self.ASK)
+        self.assertEqual((got["class"], got["rec"], got["red"]), ("needs_decision", "invariant", False))
+        self.assertTrue(got["question"].startswith("needs_decision T3"))
+        self.assertTrue(wab.parse_blocked_label("BLOCKED: [class=question rec=A red=yes] q")["red"])
+
+    def test_no_label_or_garbage_is_none(self):
+        for bad in ("BLOCKED: needs_decision T3: рекомендую invariant",
+                    "BLOCKED: merge gate: checks red",
+                    "BLOCKED: [class=needs_decision rec=invariant] нет red",
+                    "BLOCKED: [class=nonsense rec=A red=no] q",
+                    "BLOCKED: [class=question rec=A red=maybe] q",
+                    "BLOCKED: [class=question rec=A red=no extra=1] q",
+                    "BLOCKED: [class=question class=question rec=A red=no] q",
+                    "BLOCKED: [class=question rec=$(rm) red=no] q",
+                    "BLOCKED: [class=question rec=A red=no q",
+                    "RUNNING", ""):
+            with self.subTest(bad=bad):
+                self.assertIsNone(wab.parse_blocked_label(bad))
+
+    # ----- the policy (chain.json) -----
+    def test_decision_policy_is_loaded(self):
+        cfg, _ = self.mandate()
+        self.assertEqual(wab.decision_policy(cfg), [{"class": "needs_decision", "rec": None},
+                                                    {"class": "blocked_cap", "rec": "new_run"},
+                                                    {"class": "question", "rec": "A"}])
+        cfg, _ = self.chain()
+        self.assertEqual(wab.decision_policy(cfg), [])
+        self.assertNotIn("decision_policy", cfg)  # not defaulted: older runs keep their identity
+        cfg, _ = self.chain(decision_policy=[])
+        self.assertEqual(wab.decision_policy(cfg), [])
+
+    def test_decision_policy_refusals(self):
+        for bad in ([{"class": "bogus"}], [{"class": "plan_mismatch"}], [{"class": "merge_gate"}],
+                    [{"class": "question", "red": "no"}], [{"class": "question", "color": "x"}],
+                    [{"rec": "A"}], [{"class": "question", "rec": "$(rm)"}], [{"class": "question", "rec": ""}],
+                    [{"class": "question", "rec": None}], [{"class": "question", "rec": 1}], [{"class": 1}],
+                    ["question"], {"class": "question"}, "question", 0):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as cm:
+                    self.chain(decision_policy=bad)
+                self.assertIn("chain.json: decision_policy", str(cm.exception))
+        for cls, word in (("plan_mismatch", "владел"), ("merge_gate", "never")):
+            with self.assertRaises(SystemExit) as cm:
+                self.chain(decision_policy=[{"class": cls}])
+            self.assertIn(word, str(cm.exception))
+        with self.assertRaises(SystemExit) as cm:
+            self.chain(decision_policy=[{"class": "question", "red": "no"}])
+        self.assertIn("red zone", str(cm.exception))
+
+    def test_decision_policy_is_identity_not_tunable(self):
+        self.assertNotIn("decision_policy", wab.TUNABLE)
+        cfg, path = self.mandate()
+        st = wab.load_state(cfg)
+        self.assertTrue(wab.check_identity(cfg, st, "launch"))  # what the first launch pins
+        pinned = st["identity"]
+        cfg2, path2 = self.mandate(policy=[{"class": "question"}])  # edited between launch and watch
+        st2 = wab.load_state(cfg2)
+        st2["identity"] = pinned
+        self.put_state(cfg2, st2)
+        with self.assertRaises(SystemExit) as cm:
+            wab.watch(cfg2, path2, max_ticks=1)
+        self.assertIn("decision_policy", str(cm.exception))
+
+    def test_mandate_heading_is_plain_text(self):
+        cfg, _ = self.mandate(policy="")  # mandate.md carries «## Политика решений» with a rule in it
+        text = wab.system_prompt(cfg).read_text(encoding="utf-8")
+        self.assertIn("Политика решений", text)  # no refusal, just text of the mandate
+        self.tick(cfg, "BLOCKED: [class=plan_mismatch rec=fix red=no] план")
+        self.assertEqual(self.answers(), [])
+
+    def test_max_auto_answers_is_checked(self):
+        cfg, _ = self.chain()
+        self.assertEqual(cfg["max_auto_answers"], 3)
+        for bad in (-1, "3", True, 1.5, None, 10_001):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit):
+                    self.chain(max_auto_answers=bad) if bad is not None else wab.load_chain(
+                        self._chain_with_null())
+
+    def _chain_with_null(self):
+        _, path = self.chain()
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["max_auto_answers"] = None
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path
+
+    # ----- the auto-answer -----
+    def test_allowed_class_is_answered_once(self):
+        cfg, _ = self.mandate()
+        st = self.tick(cfg, self.ASK)
+        self.assertEqual(len(self.answers()), 1, self.sent)
+        self.assertIn("вариант invariant", self.answers()[0])
+        self.assertIn("W1: policy auto-answer: class=needs_decision rec=invariant", self.log(cfg))
+        [line] = self.decisions(cfg)
+        self.assertRegex(line, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ class=needs_decision rec=invariant needs_decision T3")
+        self.assertEqual(len([t for t in self.tg if "по политике" in t]), 1, self.tg)
+        self.assertEqual(self.owner_asked(), [])
+        self.assertEqual(st["waves"]["W1"]["auto_answers"], 1)
+        self.tick(cfg)  # the same episode
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 1, self.sent)
+        self.assertEqual(len(self.decisions(cfg)), 1)
+        self.assertEqual(self.owner_asked(), [])
+
+    def test_rec_named_by_the_rule_must_match(self):
+        cfg, _ = self.mandate()
+        self.tick(cfg, "BLOCKED: [class=blocked_cap rec=new_run red=no] кап 3/3 T2")
+        self.assertEqual(len(self.answers()), 1)
+
+    def test_no_answer_cases(self):
+        cases = {
+            "red zone": (None, "BLOCKED: [class=needs_decision rec=A red=yes] мердж без мандата?"),
+            "class outside the policy": (None, "BLOCKED: [class=plan_mismatch rec=fix red=no] план"),
+            "other rec": (None, "BLOCKED: [class=question rec=B red=no] вопрос"),
+            "merge_gate": ([{"class": "needs_decision"}],
+                           "BLOCKED: [class=merge_gate rec=A red=no] gate"),
+            "no label": (None, "BLOCKED: needs_decision T3: рекомендую invariant"),
+            "no policy": ("", self.ASK),
+        }
+        for name, (policy, status) in cases.items():
+            with self.subTest(name):
+                self.sent.clear()
+                self.tg.clear()
+                cfg, _ = self.mandate(policy=policy)
+                self.tick(cfg, status)
+                self.assertEqual(self.answers(), [], self.sent)
+                self.assertEqual(len(self.owner_asked()), 1, self.tg)
+                self.assertEqual(self.decisions(cfg), [])
+
+    def test_merge_gate_is_never_answered_even_if_a_rule_slipped_through(self):
+        cfg, _ = self.mandate()
+        with mock.patch.object(wab, "decision_policy", return_value=[{"class": "merge_gate", "rec": None}]):
+            self.tick(cfg, "BLOCKED: [class=merge_gate rec=A red=no] gate")
+        self.assertEqual(self.answers(), [])
+        self.assertEqual(len(self.owner_asked()), 1, self.tg)
+
+    def test_plan_mismatch_label_is_valid_and_goes_to_the_owner(self):
+        self.assertEqual(wab.parse_blocked_label("BLOCKED: [class=plan_mismatch rec=fix red=no] p")["class"],
+                         "plan_mismatch")
+
+    def test_answer_in_flight_when_the_window_died_is_charged_after_a_restart(self):  # Codex on a46c311
+        cfg, _ = self.mandate()
+        st = wab.load_state(cfg)
+        old = st["waves"]["W1"]
+        # _deliver typed the answer and saved pending_enter, then the window died before the count
+        old.update(auto_answers=2, pending_enter="policy answer", pending_text_head="[wab] РЕШЕНИЕ",
+                   policy_pending="BLOCKED: [class=question rec=A red=no] q", phase="dead")
+        st["waves"]["W1"] = self.wave_rec("W1", attempts=[{k: v for k, v in old.items() if k != "outbox"}])
+        self.put_state(cfg, st)
+        self.assertEqual(wab.auto_answers_used(wab.load_state(cfg)["waves"]["W1"]), 3)
+        self.tick(cfg, "BLOCKED: [class=question rec=A red=no] после перезапуска")
+        self.assertEqual(self.answers(), [], self.sent)
+        self.assertIn("policy cap reached", self.log(cfg))
+
+    def test_enter_only_retry_of_the_answer_in_flight_is_not_blocked_by_the_cap(self):
+        cfg, _ = self.mandate()
+        st = wab.load_state(cfg)
+        st["waves"]["W1"].update(auto_answers=2, pending_enter="policy answer",
+                                 pending_text_head="[wab] РЕШЕНИЕ", policy_pending=self.ASK)
+        self.put_state(cfg, st)
+        st = self.tick(cfg, self.ASK)
+        self.assertEqual(self.enters, ["wv-w1"])  # the Enter of the typed answer, nothing typed again
+        self.assertEqual(wab.auto_answers_used(st["waves"]["W1"]), 3)
+        self.assertNotIn("policy cap reached", self.log(cfg))
+
+    def test_cap_counts_every_attempt_of_the_wave(self):
+        cfg, _ = self.mandate()
+        for i in range(3):
+            self.tick(cfg, f"BLOCKED: [class=question rec=A red=no] вопрос {i}")
+        self.assertEqual(len(self.answers()), 3)
+        st = wab.load_state(cfg)  # a restart archives the record into `attempts` (as _launch does)
+        old = st["waves"]["W1"]
+        st["waves"]["W1"] = self.wave_rec("W1", attempts=[{k: v for k, v in old.items() if k != "outbox"}])
+        self.put_state(cfg, st)
+        self.tick(cfg, "BLOCKED: [class=question rec=A red=no] вопрос после перезапуска")
+        self.assertEqual(len(self.answers()), 3, self.sent)
+        self.assertIn("policy cap reached", self.log(cfg))
+        self.assertEqual(len(self.owner_asked()), 1, self.tg)
+
+    def test_status_changed_before_delivery_is_not_answered(self):
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        real_read = wab.read
+
+        def moved(p, *a, **kw):  # the owner answered in the window: the wave wrote RUNNING meanwhile
+            if Path(p).name == "status" and moved.n > 0:
+                return "RUNNING"
+            moved.n += 1
+            return real_read(p, *a, **kw)
+        moved.n = 0
+        with mock.patch.object(wab, "read", side_effect=moved):
+            self.tick(cfg)
+        self.assertEqual(self.answers(), [], self.sent)
+        self.assertEqual(self.decisions(cfg), [])
+        self.assertEqual(self.owner_asked(), [], self.tg)  # a new episode, not a stale question
+
+    def test_successful_retry_closes_the_blocked_signal_and_attention(self):
+        cfg, _ = self.mandate(telegram=None)
+        calls = []
+
+        def flaky(n, t, **kw):
+            calls.append(t)
+            if len(calls) == 1:
+                raise wab.NotSubmitted("the text is still in the input line")
+            self.sent.append(("text", n, t))
+        wab.send_text.side_effect = flaky
+        with mock.patch.object(wab, "display_all"):
+            st = self.tick(cfg, self.ASK)
+            self.assertIn("blocked", st["waves"]["W1"].get("attention", {}))
+            self.assertTrue((cfg["run_dir"] / "ATTENTION").exists())
+            st = self.tick(cfg)
+        self.assertEqual(len(self.answers()), 1)
+        self.assertNotIn("blocked", st["waves"]["W1"].get("attention", {}))
+        self.assertNotIn("blocked", st["waves"]["W1"].get("outbox", {}))
+        att = cfg["run_dir"] / "ATTENTION"
+        self.assertFalse(att.exists() and "ждёт тебя" in att.read_text(encoding="utf-8"))
+
+    def test_failed_delivery_is_retried_once(self):
+        cfg, _ = self.mandate()
+        calls = []
+
+        def flaky(n, t, **kw):
+            calls.append(t)
+            if len(calls) == 1:
+                raise wab.NotSubmitted("the text is still in the input line")
+            self.sent.append(("text", n, t))
+        wab.send_text.side_effect = flaky
+        self.tick(cfg, self.ASK)
+        self.assertEqual(self.answers(), [])
+        self.assertEqual(len(self.owner_asked()), 1, self.tg)
+        self.assertEqual(self.decisions(cfg), [])
+        self.tick(cfg)
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 1, self.sent)
+        self.assertEqual(len(self.decisions(cfg)), 1)
+
+    def test_cap_sends_the_fourth_episode_to_the_owner(self):
+        cfg, _ = self.mandate()
+        for i in range(5):
+            self.tick(cfg, f"BLOCKED: [class=question rec=A red=no] вопрос {i}")
+        self.assertEqual(len(self.answers()), 3, self.sent)
+        self.assertEqual(self.log(cfg).count("policy cap reached"), 1, self.log(cfg))
+        self.assertEqual(len(self.owner_asked()), 2, self.tg)
+
+    def test_cap_is_tuned_live(self):
+        # tunable, not identity: a state pinned without the field (or with another value) is the same run
+        self.assertIn("max_auto_answers", wab.TUNABLE)
+        cfg, _ = self.mandate()
+        ident = wab._pinned_identity(cfg)
+        cfg2, _ = self.chain(mandate_sha256=cfg["mandate_sha256"], decision_policy=self.POLICY, max_auto_answers=7)
+        self.assertEqual(wab._pinned_identity(cfg2), ident)
+        cfg, _ = self.mandate(max_auto_answers=0)
+        self.tick(cfg, self.ASK)
+        self.assertEqual(self.answers(), [])
+        self.assertIn("policy cap reached", self.log(cfg))
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")

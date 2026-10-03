@@ -147,6 +147,15 @@ def load_chain(path, create=True):
             raise SystemExit(f"chain.json: {key} must be a positive number, got {v!r}")
         if v > NUM_LIMITS[key]:  # time.sleep(1e10) raises OverflowError and kills `watch`
             raise SystemExit(f"chain.json: {key} must be at most {NUM_LIMITS[key]}, got {v!r}")
+    if "decision_policy" in cfg:  # not defaulted: a run without it keeps the identity it was started with
+        why = check_decision_policy(cfg["decision_policy"])
+        if why:
+            raise SystemExit(f"chain.json: decision_policy {why}")
+    cfg.setdefault("max_auto_answers", MAX_AUTO_ANSWERS)
+    v = cfg["max_auto_answers"]
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 10_000:
+        raise SystemExit(f"chain.json: max_auto_answers must be a whole number 0..10000 "
+                         f"(0 = no automatic answers), got {v!r}")
     tg = cfg.get("telegram")
     if tg and not isinstance(tg, dict):
         raise SystemExit("chain.json: telegram must be an object")
@@ -1003,6 +1012,21 @@ def _status(w):
     return str(w.get("last_status") or "")
 
 
+def _status_stamp(cfg, wave):
+    """Identity of the status file's current content write: [inode, mtime_ns], or None."""
+    try:
+        s = os.stat(wave_dir(cfg, wave) / "status")
+    except OSError:
+        return None
+    return [s.st_ino, s.st_mtime_ns]
+
+
+def _answered(w):
+    """The BLOCKED line the dispatcher answered by the decision policy (the episode's mark), or None."""
+    notified = w.get("notified")
+    return notified.get("policy_answer") if isinstance(notified, dict) else None
+
+
 # Every notice is about an episode, and it is stale once the episode is over. Key -> the end of
 # its episode as a predicate on the wave record (applied by drop_ended_episodes on EVERY save and
 # before every send), None = ended only by the coordinator's confirmation (ack_wave_notices).
@@ -1017,6 +1041,7 @@ def _status(w):
 #   tmux_failed         window gone   # + the next successful action (_act)
 #   dead                the phase left dead (the window is back); + ack on a relaunch
 #   blocked             the status is no longer BLOCKED, or window gone
+#   policy_answer       the status is no longer the answered BLOCKED line, or window gone
 #   permission, idle, auto_off   window gone   # + SCREEN_EPISODE_ENDS: the prompt left the screen /
 #                                              #   the pane moved / auto mode is back
 #   handoff             the phase left awaiting_merge (the coordinator confirmed it); + ack
@@ -1035,6 +1060,7 @@ NOTICE_EPISODE_ENDS = {
     "unverified_enter": _gone,  # a delivery of an older-version state pressed Enter unverified
     "dead": lambda w: w.get("phase") != "dead",
     "blocked": lambda w: _gone(w) or not _status(w).startswith("BLOCKED"),
+    "policy_answer": lambda w: _gone(w) or _status(w) != _answered(w),
     "permission": _gone,
     "idle": _gone,
     "auto_off": _gone,
@@ -1122,7 +1148,7 @@ def ack_wave_notices(w):
 
 # Notices that ask nothing of anybody: shown by display-message, but they open no ATTENTION signal
 # (`started` lasts as long as the window, `chain_done` forever: `attention` would never go quiet).
-INFO_NOTICES = ("started", "chain_done")
+INFO_NOTICES = ("started", "chain_done", "policy_answer")  # policy_answer: told, nothing to answer
 
 
 def note_attention(w, key, text, now):
@@ -1411,6 +1437,79 @@ def refresh_workdir(cfg, wave, cwd):
 
 
 MANDATE_HEADER = "Прогон: "
+
+# ---------- decision policy (#41) ----------
+# A wave that writes BLOCKED puts a machine label first: `BLOCKED: [class=<c> rec=<r> red=<yes|no>] ...`.
+# The optional `decision_policy` of chain.json (a list of {"class": c, "rec": r?}; part of the run's
+# identity, outside run_dir, so no wave can rewrite it) names the episodes the dispatcher answers itself.
+# Nothing in mandate.md is parsed for a policy: a «Политика решений» heading there is plain text.
+# A line without a (valid) label, red=yes, merge_gate and anything the policy does not name go to the
+# owner as before.
+LABEL_CLASSES = ("needs_decision", "blocked_cap", "plan_mismatch", "question", "merge_gate")
+# Never in a policy: merge_gate is written by the dispatcher; plan_mismatch needs an amendment of the
+# approved waves.json, which takes the owner's «ок» and a new plan_sha256 — an answer cannot give that.
+OWNER_ONLY_CLASSES = {
+    "merge_gate": "merge_gate is never answered automatically",
+    "plan_mismatch": ("plan_mismatch always goes to the owner (владельцу): an amendment of the approved "
+                      "waves.json needs his «ок» and a new plan_sha256, an automatic answer cannot give it"),
+}
+POLICY_CLASSES = tuple(c for c in LABEL_CLASSES if c not in OWNER_ONLY_CLASSES)
+REC_TOKEN = re.compile(r"[A-Za-z0-9_.-]{1,40}")
+_LABEL = re.compile(r"BLOCKED:[ \t]*\[([^\]\n]*)\][ \t]*(.*)", re.S)
+POLICY_ANSWER = ("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант {rec}. Действуй по своей рекомендации, "
+                 "затем запиши RUNNING в status. Находки low/P3 — fix-loop --defer в остаток.")
+MAX_AUTO_ANSWERS = 3  # chain.json `max_auto_answers` default: automatic answers per wave
+
+
+def parse_blocked_label(status):
+    """The machine label of a BLOCKED line as {class, rec, red, question}, or None: no label, or any
+    deviation from exactly `class=<known> rec=<token> red=<yes|no>` (unknown or repeated key, unknown
+    class, a rec that is not a short token). None means «no automatic answer», never a guess."""
+    m = _LABEL.match(status or "")
+    if not m:
+        return None
+    fields = {}
+    for tok in m.group(1).split():
+        key, sep, value = tok.partition("=")
+        if not sep or key not in ("class", "rec", "red") or key in fields:
+            return None
+        fields[key] = value
+    if (set(fields) != {"class", "rec", "red"} or fields["class"] not in LABEL_CLASSES
+            or not REC_TOKEN.fullmatch(fields["rec"]) or fields["red"] not in ("yes", "no")):
+        return None
+    return {"class": fields["class"], "rec": fields["rec"], "red": fields["red"] == "yes",
+            "question": m.group(2).strip()}
+
+
+def check_decision_policy(value):
+    """chain.json `decision_policy`: a list of {"class": <class>, "rec": <token>?}. The reason it is
+    refused, or None. Never in it: `red` (the red zone always goes to the owner), merge_gate,
+    plan_mismatch (OWNER_ONLY_CLASSES), any other key, an unknown class, a rec that is not a token."""
+    if not isinstance(value, list):
+        return f"must be a list of {{\"class\": ..., \"rec\": ...}} objects, got {value!r}"
+    for i, rule in enumerate(value):
+        if not isinstance(rule, dict):
+            return f"[{i}] must be an object, got {rule!r}"
+        if "red" in rule:
+            return f"[{i}]: `red` is not a policy key: the red zone always goes to the owner"
+        extra = sorted(set(rule) - {"class", "rec"})
+        if extra:
+            return f"[{i}]: unknown key(s) {', '.join(map(repr, extra))} (allowed: class, rec)"
+        cls = rule.get("class")
+        if isinstance(cls, str) and cls in OWNER_ONLY_CLASSES:
+            return f"[{i}]: {OWNER_ONLY_CLASSES[cls]}"
+        if cls not in POLICY_CLASSES:
+            return f"[{i}]: class must be one of {', '.join(POLICY_CLASSES)}, got {cls!r}"
+        rec = rule.get("rec")
+        if "rec" in rule and not (isinstance(rec, str) and REC_TOKEN.fullmatch(rec)):
+            return f"[{i}]: rec must match [A-Za-z0-9_.-]{{1,40}} (or be left out), got {rec!r}"
+    return None
+
+
+def decision_policy(cfg):
+    """The rules of chain.json `decision_policy` (checked by load_chain) as [{class, rec}], rec None =
+    any recommended variant of that class. No field: no automatic answers."""
+    return [{"class": r["class"], "rec": r.get("rec")} for r in cfg.get("decision_policy") or []]
 
 
 def system_prompt(cfg):
@@ -1846,7 +1945,7 @@ class _InputLock:
             self.fh.close()
 
 
-def _deliver(cfg, st, wave, what, send, text):
+def _deliver(cfg, st, wave, what, send, text, precheck=None):
     """Two-step send (text, then Enter) without duplicates: once the text is in the window
     that fact is saved (`pending_enter`), and a retry after a failed Enter presses only Enter.
     A pasted text counts as delivered only when the screen shows it left the input line (submit,
@@ -1858,6 +1957,9 @@ def _deliver(cfg, st, wave, what, send, text):
     except NotSubmitted as e:  # `say` is typing right now: nothing sent, the next tick retries
         event(cfg, f"{wave}: {what} postponed: {e}")
         return False
+    if precheck is not None and w.get("pending_enter") != what and not precheck():
+        lock.__exit__(None, None, None)  # checked under the lock, right before typing: stale, not sent
+        return None
     try:
         if w.get("pending_enter") == what:
             if send is send_text:
@@ -3156,6 +3258,102 @@ def _complete_wave(cfg, st, wave, w, wdir, now):
     return started
 
 
+def _count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def _answer_in_flight(r):
+    """A policy answer that may have reached the window without its count: typed and awaiting its
+    Enter (`pending_enter`), or begun (`policy_pending`) when the window or watch died."""
+    return r.get("pending_enter") == "policy answer" or bool(r.get("policy_pending"))
+
+
+def auto_answers_used(w):
+    """Automatic answers of the whole wave: this try and every archived attempt (a restart moves the
+    record into `attempts`, the cap must survive it), +1 for each record with an answer in flight
+    (charged, never free); a corrupt counter adds nothing."""
+    recs = [w, *wave_attempts(w)]
+    return (sum(r["auto_answers"] for r in recs if _count(r.get("auto_answers")))
+            + sum(1 for r in recs if _answer_in_flight(r)))
+
+
+def _policy_answer(cfg, st, wave, w, status, now, attach):
+    """Answer a BLOCKED episode by the decision_policy of chain.json. True when it is answered (now
+    or earlier in this episode): the owner is then informed (`policy_answer`), not asked. False sends
+    the episode down the usual BLOCKED path: no or bad label, red=yes, merge_gate, a class/rec the
+    policy does not allow, no policy, the cap reached, or a failed delivery (the next
+    tick tries again; `pending_enter` makes the retry Enter-only, so the answer is never typed twice).
+    None: the status file changed between the tick's read and the delivery: nothing is sent and the
+    tick ends; the next tick starts the new episode."""
+    stamp = _status_stamp(cfg, wave)
+    if _answered(w) == status:
+        if w.get("policy_answered_stamp") in (None, stamp):
+            return True
+        # the same text, but the file was rewritten since the answer (e.g. RUNNING in between, unseen by
+        # the poll): a NEW episode, not the answered one — otherwise the wave would wait silently
+        w.get("notified", {}).pop("policy_answer", None)
+        w.pop("policy_answered_stamp", None)
+    label = parse_blocked_label(status)
+    if label is None or label["red"] or label["class"] == "merge_gate":
+        return False
+    rules = decision_policy(cfg)
+    if not any(r["class"] == label["class"] and r["rec"] in (None, label["rec"]) for r in rules):
+        return False
+    used = auto_answers_used(w)
+    if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
+        used -= 1  # the Enter-only retry of THIS answer: it is the one in flight, already charged
+    cap = cfg.get("max_auto_answers", MAX_AUTO_ANSWERS)
+    if used >= cap:
+        if not w.get("policy_cap_reached"):
+            w["policy_cap_reached"] = True
+            save_state(cfg, st)
+            event(cfg, f"{wave}: policy cap reached ({used}/{cap}): class={label['class']} "
+                       f"rec={label['rec']} goes to the owner")
+        return False
+    seen = {}
+
+    def still():  # the status read AND its file stamp, taken under the input lock right before typing
+        seen["stamp"] = _status_stamp(cfg, wave)
+        return read(wave_dir(cfg, wave) / "status", on_error=None) == status
+    if not still():  # the wave (or the owner in its window) moved on since the tick read it
+        event(cfg, f"{wave}: policy answer not sent: the status changed before delivery")
+        return None
+    w["policy_pending"] = status
+    sent = _deliver(cfg, st, wave, "policy answer", send_text, POLICY_ANSWER.format(rec=label["rec"]),
+                    precheck=still)  # re-read again UNDER the input lock: `say` may have answered meanwhile
+    if sent is None:
+        w.pop("policy_pending", None)
+        save_state(cfg, st)
+        event(cfg, f"{wave}: policy answer not sent: the status changed while waiting for the input")
+        return None
+    if not sent:
+        if w.get("pending_enter") != "policy answer":
+            w.pop("policy_pending", None)  # nothing reached the window: the next tick starts afresh
+        save_state(cfg, st)
+        return False
+    w.pop("policy_pending", None)
+    w.setdefault("notified", {})["policy_answer"] = status
+    # the stamp of the status the answer was for, taken BEFORE typing: a fast wave may already have
+    # rewritten the same line by now, and that rewrite must read as a new episode
+    w["policy_answered_stamp"] = seen.get("stamp", stamp)
+    w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
+    drop_notice(w, "blocked")  # a usual BLOCKED signal of a failed first try asks nothing any more
+    w.setdefault("notified", {})["blocked"] = status  # ...and is not raised again in this episode
+    question = redact((label["question"].splitlines() or [""])[0], 200)
+    try:
+        with open(wave_dir(cfg, wave) / "policy-decisions.log", "a", encoding="utf-8") as f:
+            f.write(f"{_utc(now)} class={label['class']} rec={label['rec']} {question}\n")
+    except OSError as e:
+        event(cfg, f"{wave}: policy-decisions.log not written ({e.strerror or e})")
+    put_notice(w, "policy_answer", status,
+               f"wave-autobot: волна {wave}: развилка закрыта по политике chain.json "
+               f"(class={label['class']}, вариант {label['rec']}), ответ не нужен.\n\n"
+               f"{redact(status)}\n\nСмотреть: {attach}")
+    save_state(cfg, st)  # the mark, the counter and the notice together
+    event(cfg, f"{wave}: policy auto-answer: class={label['class']} rec={label['rec']}")
+    return True
+
+
 def tick(cfg, st):
     try:
         alive = _tick(cfg, st)
@@ -3276,6 +3474,18 @@ def _tick(cfg, st):
             w.pop("pending_enter")
         save_state(cfg, st)
 
+    if w.get("pending_enter") == "policy answer" and w.get("policy_pending") != status:
+        # the wave left that BLOCKED line: the half-sent answer is outdated. It may already have been
+        # submitted (watch died before its final save), so it is charged to the cap: never one free
+        w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
+        for key in ("pending_enter", "pending_text_head", "policy_pending"):
+            w.pop(key, None)
+        save_state(cfg, st)
+
+    answered = _policy_answer(cfg, st, wave, w, status, now, attach) if status.startswith("BLOCKED") else False
+    if answered is None or answered:
+        flush_notices(cfg, st, w)
+        return True
     if status.startswith("BLOCKED"):
         fresh = once_per(w, "blocked", status)
         if fresh:
@@ -3515,7 +3725,7 @@ def _state_or_event(cfg):
 
 
 TUNABLE = ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds", "telegram",
-           "titles", "model", "plan_sha256")
+           "titles", "model", "plan_sha256", "max_auto_answers")
 
 
 def _identity(cfg):
