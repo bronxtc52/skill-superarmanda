@@ -1020,6 +1020,7 @@ NOTICE_EPISODE_ENDS = {
     "updating": lambda w: _gone(w) or not w.get("await_session"),
     "checkpoint_timeout": lambda w: w.get("phase") != "checkpoint",
     "tmux_failed": _gone,
+    "unverified_enter": _gone,  # a delivery of an older-version state pressed Enter unverified
     "dead": lambda w: w.get("phase") != "dead",
     "blocked": lambda w: _gone(w) or not _status(w).startswith("BLOCKED"),
     "permission": _gone,
@@ -1798,6 +1799,41 @@ def _act(cfg, st, wave, what, fn, *args, **kw):
     return True
 
 
+INPUT_LOCK_SECONDS = 120  # longest paste + submit with retries; then the writer gives up
+
+
+class _InputLock:
+    """Short per-window input lock (`<run_dir>/<wave>/input.lock`): one writer types into a wave's
+    input at a time — the dispatcher's deliveries and `wab.py say` — so two texts never land in the
+    same input line before either Enter. Not the run lock: `watch` keeps running while `say` types."""
+
+    def __init__(self, cfg, wave):
+        self.path = cfg["run_dir"] / wave / "input.lock"
+        self.fh = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.path, "a+", encoding="utf-8")
+        deadline = time.time() + INPUT_LOCK_SECONDS
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    fh.close()
+                    raise NotSubmitted(f"input of the wave is busy (another writer holds {self.path})")
+                time.sleep(0.5)
+        self.fh = fh
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+
+
 def _deliver(cfg, st, wave, what, send, text):
     """Two-step send (text, then Enter) without duplicates: once the text is in the window
     that fact is saved (`pending_enter`), and a retry after a failed Enter presses only Enter.
@@ -1805,20 +1841,35 @@ def _deliver(cfg, st, wave, what, send, text):
     inside send_text); otherwise `pending_enter` stays and the retry is Enter-only, checked the same way."""
     w = st["waves"][wave]
     name = w["tmux"]
-    if w.get("pending_enter") == what:
-        if send is send_text:
-            # after a restart the caller may not have the text any more: check against the head
-            # saved together with `pending_enter`, so recovery validates the same way
-            check = text or str(w.get("pending_text_head") or "")
-            ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, check)
+    try:
+        lock = _InputLock(cfg, wave).__enter__()
+    except NotSubmitted as e:  # `say` is typing right now: nothing sent, the next tick retries
+        event(cfg, f"{wave}: {what} postponed: {e}")
+        return False
+    try:
+        if w.get("pending_enter") == what:
+            if send is send_text:
+                # after a restart the caller may not have the text any more: check against the head
+                # saved together with `pending_enter`, so recovery validates the same way
+                check = text or str(w.get("pending_text_head") or "")
+                if not check and once_per(w, "unverified_enter", what):
+                    # state of an older version: nothing to compare with — the Enter is pressed as
+                    # before, and the owner is told that this delivery is NOT verified
+                    put_notice(w, "unverified_enter", what,
+                               f"wave-autobot: {wave}: «{what}» дожат Enter без проверки отправки "
+                               f"(state старой версии без начала текста). Проверь окно: {attach_cmd(name)}")
+                    event(cfg, f"{wave}: {what} (Enter): delivery NOT verified (no saved text head)")
+                ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, check)
+            else:
+                ok = _act(cfg, st, wave, f"{what} (Enter)", press_enter, name)
         else:
-            ok = _act(cfg, st, wave, f"{what} (Enter)", press_enter, name)
-    else:
-        def typed():
-            w["pending_enter"] = what
-            w["pending_text_head"] = _text_head(text)  # what unsent_reason compares; short
-            save_state(cfg, st)
-        ok = _act(cfg, st, wave, what, send, name, text, on_typed=typed)
+            def typed():
+                w["pending_enter"] = what
+                w["pending_text_head"] = _text_head(text)  # what unsent_reason compares; short
+                save_state(cfg, st)
+            ok = _act(cfg, st, wave, what, send, name, text, on_typed=typed)
+    finally:
+        lock.__exit__(None, None, None)
     if ok:
         w.pop("pending_enter", None)
         w.pop("pending_text_head", None)
@@ -3645,7 +3696,8 @@ def say_cmd(cfg, wave, text_file):
     one bracketed paste, Enter, the submit check with Enter retries) and log the outcome. True when
     the text left the input line.
 
-    Safe next to a running `watch`: it takes no run lock and writes no state. It only puts input into
+    Safe next to a running `watch`: it takes no run lock and writes no state, only the short
+    per-window input lock shared with the dispatcher's deliveries (_InputLock). It puts input into
     the window and appends one line to events.log; the dispatcher's own deliveries are tracked in the
     state (`pending_enter`) and are not touched, and a wave reading its input does not depend on who
     typed it."""
@@ -3660,7 +3712,8 @@ def say_cmd(cfg, wave, text_file):
         event(cfg, f"{wave}: say FAILED (no window {name}): {first}")
         return False
     try:
-        send_text(name, text)
+        with _InputLock(cfg, wave):  # never interleaves with a dispatcher delivery into the same input
+            send_text(name, text)
     except (subprocess.CalledProcessError, OSError, NotSubmitted) as e:
         why = str(e) if isinstance(e, NotSubmitted) else type(e).__name__
         event(cfg, f"{wave}: say FAILED ({why}): {first}")

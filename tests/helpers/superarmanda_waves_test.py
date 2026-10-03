@@ -1779,7 +1779,7 @@ class TickAdvancesPendingTransitions(Base):
 
     def test_failed_enters_in_sending_are_retried_by_tick_without_a_restart(self):
         cfg, _ = self.chain()
-        w = self.wave_rec(phase="sending", pending_enter="first prompt")
+        w = self.wave_rec(phase="sending", pending_enter="first prompt", pending_text_head="задача волны")
         self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
         self.set_status(cfg, "W1", "STARTING")
         boom = subprocess.CalledProcessError(1, ["tmux"], stderr="boom")
@@ -9933,6 +9933,49 @@ class Submit(Base):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, ""))
         self.assertNotIn("pending_text_head", st["waves"]["W1"])
+
+    def hold_input_lock(self, cfg, wave="W1"):
+        import fcntl
+        path = cfg["run_dir"] / wave / "input.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(fh.close)
+        return fh
+
+    def test_dispatcher_postpones_while_another_writer_types(self):  # Codex P2 on #47
+        cfg, path, f = self.say()
+        self.hold_input_lock(cfg)
+        self.screens = [self.EMPTY]
+        st = self.m.load_state(cfg)
+        with mock.patch.object(self.m, "INPUT_LOCK_SECONDS", 0.2), contextlib.redirect_stdout(io.StringIO()):
+            ok = self.m._deliver(cfg, st, "W1", "alarm", self.m.send_text, self.TEXT)
+        self.assertFalse(ok)
+        self.assertFalse(any("paste-buffer" in c for c in self.m_calls), self.m_calls)  # nothing typed
+        self.assertNotIn("pending_enter", st["waves"]["W1"])
+        self.assertIn("alarm postponed", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_say_does_not_type_while_another_writer_holds_the_input(self):  # Codex P2 on #47
+        cfg, path, f = self.say()
+        self.hold_input_lock(cfg)
+        self.screens = [self.EMPTY]
+        with mock.patch.object(self.m, "INPUT_LOCK_SECONDS", 0.2), self.assertRaises(SystemExit) as e, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.m.main(["wab.py", "say", str(path), "W1", str(f)])
+        self.assertNotIn(e.exception.code, (0, None))
+        self.assertFalse(any("paste-buffer" in c for c in self.m_calls), self.m_calls)
+        self.assertIn("say FAILED", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_legacy_pending_enter_without_head_is_reported_unverified(self):  # CodeRabbit on #47
+        cfg, path, f = self.say()
+        st = self.m.load_state(cfg)
+        st["waves"]["W1"]["pending_enter"] = "/update"  # written by an older version: no text head
+        self.screens = [self.EMPTY]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, "")
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("delivery NOT verified", log)
+        self.assertIn("unverified_enter", st["waves"]["W1"].get("outbox", {}))
 
     def test_unsent_reason_on_screens(self):
         self.assertIsNotNone(wab.unsent_reason(self.PREVIEW, self.TEXT))
