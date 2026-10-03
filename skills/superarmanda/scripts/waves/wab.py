@@ -3705,7 +3705,10 @@ def say_cmd(cfg, wave, text_file):
     if wave not in cfg["waves"]:
         raise SystemExit(f"wab: unknown wave {wave}; chain.json waves: {cfg['waves']}")
     rec = load_state(cfg)["waves"].get(wave)
-    name = rec.get("tmux") if isinstance(rec, dict) and rec.get("tmux") else f"{cfg['tmux_prefix']}{wave.lower()}"
+    if not (isinstance(rec, dict) and rec.get("tmux")):
+        # never guess the session name: with a shared tmux_prefix it may belong to another chain
+        raise SystemExit(f"wab: say: wave {wave} has no launched session in state.json of this run; nothing sent")
+    name = rec["tmux"]
     lines = [l for l in text.splitlines() if l.strip()]
     first = redact(lines[0] if lines else "", 120)
     if not tmux_alive(name):

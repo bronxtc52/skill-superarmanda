@@ -9991,6 +9991,14 @@ class Submit(Base):
         self.assertFalse(any("paste-buffer" in c for c in self.m_calls), self.m_calls)
         self.assertIn("owes an Enter", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
+    def test_say_refuses_a_wave_without_a_launched_session(self):  # Codex P2 on #47, round 4
+        cfg, path, f = self.say()
+        self.screens = [self.EMPTY]
+        with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()):
+            self.m.main(["wab.py", "say", str(path), "W2", str(f)])  # W2 never launched in this run
+        self.assertIn("no launched session", str(e.exception.code))
+        self.assertFalse(any("paste-buffer" in c for c in self.m_calls), self.m_calls)
+
     def test_unsent_reason_on_screens(self):
         self.assertIsNotNone(wab.unsent_reason(self.PREVIEW, self.TEXT))
         self.assertIsNotNone(wab.unsent_reason(self.TYPED, self.TEXT))
