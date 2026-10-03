@@ -10068,6 +10068,27 @@ class DecisionPolicy(Base):
         self.assertNotIn("policy_pending", w)
         self.assertEqual(wab.auto_answers_used(w), 1)
 
+    def test_indented_policy_is_not_live(self):  # Codex P2 on #49, round 4: strict column-0 grammar
+        body = "Пример:\n\n    ## Политика решений\n    - auto: class=question\n"
+        self.assertEqual(wab.parse_policy(body), [])
+        mixed = "## Политика решений\n  - auto: class=question\n- auto: class=needs_decision\n"
+        self.assertEqual(wab.parse_policy(mixed), [{"class": "needs_decision", "rec": None}])
+
+    def test_status_rechecked_under_the_input_lock(self):  # Codex P2 on #49, round 4
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        real_lock = wab._InputLock.__enter__
+
+        def enter_and_owner_answers(lock):  # while waiting for the lock, `say` answered and the wave moved on
+            got = real_lock(lock)
+            self.set_status(cfg, "W1", "RUNNING")
+            return got
+        with mock.patch.object(wab._InputLock, "__enter__", enter_and_owner_answers):
+            st = wab.load_state(cfg)
+            wab.tick(cfg, st)
+        self.assertEqual(self.answers(), [])
+        self.assertIn("changed while waiting for the input", self.log(cfg))
+
     def test_label_is_parsed(self):
         got = wab.parse_blocked_label(self.ASK)
         self.assertEqual((got["class"], got["rec"], got["red"]), ("needs_decision", "invariant", False))

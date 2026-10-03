@@ -1469,6 +1469,7 @@ def parse_policy(body):
     for n, line in enumerate(body.splitlines(), 1):
         s = line.strip()
         m = _FENCE.match(s)
+        indented = line[:1] in (" ", "\t")  # strict grammar: a policy heading or rule starts at column 0
         if fence is None and m:
             fence = m.group(1)  # an illustrative code block: nothing inside it is a heading or a rule
             continue
@@ -1477,6 +1478,8 @@ def parse_policy(body):
             if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
                 fence = None
             continue
+        if indented:
+            continue  # indented code or nested markup: never live policy syntax
         if s.startswith("#"):
             if POLICY_HEADING.fullmatch(s):
                 if seen:
@@ -1978,7 +1981,7 @@ class _InputLock:
             self.fh.close()
 
 
-def _deliver(cfg, st, wave, what, send, text):
+def _deliver(cfg, st, wave, what, send, text, precheck=None):
     """Two-step send (text, then Enter) without duplicates: once the text is in the window
     that fact is saved (`pending_enter`), and a retry after a failed Enter presses only Enter.
     A pasted text counts as delivered only when the screen shows it left the input line (submit,
@@ -1990,6 +1993,9 @@ def _deliver(cfg, st, wave, what, send, text):
     except NotSubmitted as e:  # `say` is typing right now: nothing sent, the next tick retries
         event(cfg, f"{wave}: {what} postponed: {e}")
         return False
+    if precheck is not None and w.get("pending_enter") != what and not precheck():
+        lock.__exit__(None, None, None)  # checked under the lock, right before typing: stale, not sent
+        return None
     try:
         if w.get("pending_enter") == what:
             if send is send_text:
@@ -3329,12 +3335,19 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
             event(cfg, f"{wave}: policy cap reached ({used}/{cap}): class={label['class']} "
                        f"rec={label['rec']} goes to the owner")
         return False
-    current = read(wave_dir(cfg, wave) / "status", on_error=None)
-    if current != status:  # the wave (or the owner in its window) moved on since the tick read it
+    still = lambda: read(wave_dir(cfg, wave) / "status", on_error=None) == status  # noqa: E731
+    if not still():  # the wave (or the owner in its window) moved on since the tick read it
         event(cfg, f"{wave}: policy answer not sent: the status changed before delivery")
         return None
     w["policy_pending"] = status
-    if not _deliver(cfg, st, wave, "policy answer", send_text, POLICY_ANSWER.format(rec=label["rec"])):
+    sent = _deliver(cfg, st, wave, "policy answer", send_text, POLICY_ANSWER.format(rec=label["rec"]),
+                    precheck=still)  # re-read again UNDER the input lock: `say` may have answered meanwhile
+    if sent is None:
+        w.pop("policy_pending", None)
+        save_state(cfg, st)
+        event(cfg, f"{wave}: policy answer not sent: the status changed while waiting for the input")
+        return None
+    if not sent:
         save_state(cfg, st)
         return False
     w.pop("policy_pending", None)
