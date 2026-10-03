@@ -115,7 +115,8 @@ def load_orig(name):
 
 
 def sanitize(cwd):
-    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    # like Claude Code: the transcript directory is named after the REAL cwd (symlinks resolved)
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(str(cwd)))
 
 
 def asst(inp=0, create=0, read=0, out=0, tools=0, side=False):
@@ -305,6 +306,21 @@ class TranscriptParsing(Base):
     def test_no_session_or_file_means_zero(self):
         self.assertEqual(wab.context_tokens(self.wave_rec(sessions=[])), 0)
         self.assertEqual(wab.context_tokens(self.wave_rec(sessions=["absent"])), 0)
+
+    def test_symlinked_cwd_finds_transcript_under_the_real_path(self):
+        # macOS: /tmp -> /private/tmp. Claude Code names the transcript directory after the
+        # REAL cwd, while the admitted clone is recorded as /tmp/cc-admission-*/checkout.
+        # Live regression mh-creators run01 W0 (2026-10-03): the dashboard showed 0k/300k
+        # at 157k, and WAB-CHECKPOINT would never have fired.
+        real = self.tmp / "private" / "checkout"
+        real.mkdir(parents=True)
+        link = self.tmp / "alias"
+        link.symlink_to(real.parent, target_is_directory=True)
+        cwd = str(link / "checkout")
+        self.transcript("s1", [asst(inp=100, create=20, read=37)], cwd=os.path.realpath(cwd))
+        w = self.wave_rec(sessions=["s1"], cwd=cwd)
+        self.assertEqual(wab.context_tokens(w), 157)
+        self.assertEqual(wab.transcript_dir(cwd), wab.transcript_dir(os.path.realpath(cwd)))
 
 
 # ---------------------------------------------------------------- A2
