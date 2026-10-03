@@ -9374,6 +9374,19 @@ class ManifestDashboard(Base):
         cfg = self.running()
         self.assertIn("manifest ещё нет", self.frame(cfg))
 
+    def test_run_and_accepted_fields_are_shown_and_junk_does_not_crash(self):
+        cfg = self.running()
+        base = {"task": "T1", "task_status": "ok", "step": 6, "role": "coordinator", "verdicts": {}}
+        for extra, want in (({"run": "2/2", "last_run": True, "accepted": 2}, ("прогон 2/2!", "принято 2")),
+                            ({"run": "1/2", "last_run": False, "accepted": 0}, ("прогон 1/2",)),
+                            ({"run": ["x"], "accepted": "many", "last_run": None}, ())):
+            with self.subTest(extra=extra):
+                with mock.patch.object(self.dash, "manifest_where", return_value={**base, **extra}):
+                    text = self.frame(cfg)
+                self.assertNotIn("кадр не отрисован", text)
+                for part in want:
+                    self.assertIn(part, text)
+
     def test_broken_manifest_is_one_line_not_a_crash(self):
         cfg = self.running()
         manifest = cfg["run_dir"] / "W1" / "superarmanda" / "manifest.json"
@@ -10450,6 +10463,132 @@ class DecisionPolicy(Base):
         self.tick(cfg, self.ASK)
         self.assertEqual(self.answers(), [])
         self.assertIn("policy cap reached", self.log(cfg))
+
+
+class W1MaxRuns(Base):  # #39: the run cap of a wave travels with its session
+    def test_default_is_two(self):
+        cfg, _ = self.chain()
+        self.assertEqual(cfg["max_runs"], 2)
+
+    def test_bad_values_refused(self):
+        for bad in (0, -1, 1.5, "2", True, False, None, [2]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as ctx:
+                    if bad is None:
+                        _, path = self.chain()
+                        doc = json.loads(path.read_text(encoding="utf-8"))
+                        doc["max_runs"] = None
+                        path.write_text(json.dumps(doc), encoding="utf-8")
+                        wab.load_chain(path)
+                    else:
+                        self.chain(max_runs=bad)
+                self.assertIn("max_runs", str(ctx.exception))
+
+    def test_good_value_and_tunable(self):
+        cfg, _ = self.chain(max_runs=5)
+        self.assertEqual(cfg["max_runs"], 5)
+        self.assertIn("max_runs", wab.TUNABLE)
+
+    def test_env_goes_into_new_session(self):
+        for chain_over, want in (({}, "WAB_MAX_RUNS=2"), ({"max_runs": 4}, "WAB_MAX_RUNS=4")):
+            with self.subTest(want=want):
+                cfg, _ = self.chain(**chain_over)
+                self.tmux_calls.clear()
+                st = {"waves": {"W1": self.wave_rec(sessions=["s" * 8])}}
+                wab.start_session(cfg, st, "W1")
+                new = [c for c in self.tmux_calls if c[1] == "new-session"][0]
+                self.assertIn(want, new)
+                self.assertIn(f"WAB_DIR={wab.wave_dir(cfg, 'W1')}", new)
+
+
+class W1AfterDoneEdits(GateBase):  # #45: the wave pushes to the PR after DONE
+    A, B, C = "a" * 40, "b" * 40, "c" * 40
+
+    def feed(self, *verdicts):
+        """gate_check answers from a list: (verdict, head)."""
+        seq = list(verdicts)
+
+        def fake(cfg, wave, w):
+            kind, head = seq.pop(0) if len(seq) > 1 else seq[0]
+            return {"verdict": kind, "reasons": ["r"], "head": head, "number": 7, "unresolved": [],
+                    "draft": False, "old_p01": [], "pr": {}}
+        p = mock.patch.object(wab, "gate_check", side_effect=fake)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def count(self):
+        return self.log().count("волна правит после DONE")
+
+    def test_one_event_per_head_change(self):
+        self.start()
+        self.feed(("wait", self.A), ("wait", self.A), ("wait", self.B), ("wait", self.B), ("wait", self.C))
+        for _ in range(2):
+            self.tick()
+        self.assertFalse((self.cfg["run_dir"] / "events.log").exists() and self.count())  # first sight: remembered only
+        self.tick()
+        self.assertEqual(self.count(), 1)
+        self.assertIn(f"W1: волна правит после DONE: {self.A[:12]}→{self.B[:12]}", self.log())
+        self.tick()
+        self.assertEqual(self.count(), 1)  # the same new head: nothing more
+        self.tick()
+        self.assertEqual(self.count(), 2)
+        self.assertEqual(self.rec()["done_head"], self.C)
+
+    def test_gate_fail_resets_the_memory(self):
+        self.start()
+        self.feed(("wait", self.A), ("fail", self.A), ("wait", self.B))
+        self.tick()
+        self.tick()
+        self.assertNotIn("done_head", self.rec())
+        self.set_status(self.cfg, "W1", "DONE")  # the wave fixed and wrote DONE again
+        self.tick()
+        self.assertEqual(self.count(), 0)
+        self.assertEqual(self.rec()["done_head"], self.B)
+
+    def test_status_taken_back_resets_the_memory(self):
+        self.start()
+        self.feed(("wait", self.A))
+        self.tick()
+        self.assertEqual(self.rec()["done_head"], self.A)
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.tick()
+        self.assertNotIn("done_head", self.rec())
+
+
+class W1AfterDoneEditsMerging(Regate):
+    def test_head_moved_in_merging_gives_the_event_once(self):
+        self.start()
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.rec()["done_head"], HEAD)
+        self.moved()
+        self.tick()
+        self.assertEqual(self.log().count("волна правит после DONE"), 1)
+        self.assertIn(f"волна правит после DONE: {HEAD[:12]}→{self.NEW[:12]}", self.log())
+        self.tick()  # the gate on the new head passes and merges: no second event
+        self.assertEqual(self.log().count("волна правит после DONE"), 1)
+
+
+class W1AcceptedOnPass(GateBase):  # pass verdict carries accepted limitations
+    def test_event_with_accepted_limitations(self):
+        self.start()
+        real = wab.gate_check
+
+        def with_notes(cfg, wave, w):
+            v = real(cfg, wave, w)
+            if v["verdict"] == "pass":
+                v["reasons"] = ["accepted medium reviewer: шум в логах"]
+            return v
+        with mock.patch.object(wab, "gate_check", side_effect=with_notes):
+            self.tick()
+        self.assertIn("W1: merge gate passed with accepted limitations: accepted medium reviewer: шум в логах",
+                      self.log())
+        self.assertEqual(len(self.merges()), 1)  # the merge goes on
+
+    def test_no_event_without_notes(self):
+        self.start()
+        self.tick()
+        self.assertNotIn("accepted limitations", self.log())
 
 
 class Packaging(unittest.TestCase):

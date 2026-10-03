@@ -156,6 +156,11 @@ def load_chain(path, create=True):
     if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 10_000:
         raise SystemExit(f"chain.json: max_auto_answers must be a whole number 0..10000 "
                          f"(0 = no automatic answers), got {v!r}")
+    cfg.setdefault("max_runs", MAX_RUNS)
+    v = cfg["max_runs"]
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 1000:
+        raise SystemExit(f"chain.json: max_runs must be a whole number 1..1000 "
+                         f"(superarmanda runs per wave), got {v!r}")
     tg = cfg.get("telegram")
     if tg and not isinstance(tg, dict):
         raise SystemExit("chain.json: telegram must be an object")
@@ -1459,6 +1464,7 @@ _LABEL = re.compile(r"BLOCKED:[ \t]*\[([^\]\n]*)\][ \t]*(.*)", re.S)
 POLICY_ANSWER = ("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант {rec}. Действуй по своей рекомендации, "
                  "затем запиши RUNNING в status. Находки low/P3 — fix-loop --defer в остаток.")
 MAX_AUTO_ANSWERS = 3  # chain.json `max_auto_answers` default: automatic answers per wave
+MAX_RUNS = 2  # chain.json `max_runs` default: superarmanda runs (`init --from-plan`) per wave
 
 
 def parse_blocked_label(status):
@@ -1813,7 +1819,7 @@ def start_session(cfg, st, wave):
         cmd += ["--model", cfg["model"]]
     pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
     tmux("new-session", "-d", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
-       "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *pin, *cmd)
+       "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", "-e", f"WAB_MAX_RUNS={cfg['max_runs']}", *pin, *cmd)
     w["phase"] = "starting"
     save_state(cfg, st)
 
@@ -2525,6 +2531,7 @@ def _gate_tick(cfg, st, wave, w, wdir, now):
     w["gate_at"] = now
     v = gate_check(cfg, wave, w)
     reasons = "; ".join(v["reasons"])
+    _note_done_head(cfg, wave, w, v.get("head"))
     if v["verdict"] == "wait":
         if once_per(w, "gate_wait", reasons):
             event(cfg, f"{wave}: merge gate waits: {reasons}")
@@ -2543,6 +2550,17 @@ def _gate_tick(cfg, st, wave, w, wdir, now):
     return _gate_passed(cfg, st, wave, w, wdir, v)
 
 
+def _note_done_head(cfg, wave, w, head):
+    """The PR head seen while the wave is DONE. A different one later is the wave pushing after DONE:
+    one event per change, the new head is remembered (the same one again gives nothing)."""
+    if not (isinstance(head, str) and head):
+        return
+    old = w.get("done_head")
+    w["done_head"] = head
+    if isinstance(old, str) and old and old != head:
+        event(cfg, f"{wave}: волна правит после DONE: {old[:12]}→{head[:12]}")
+
+
 def _still_done(cfg, st, wave, w, wdir, what):
     """Is the status file still DONE after a slow step? Another line: the wave took DONE back, it goes
     on (phase `running`, its next DONE starts afresh); empty/unreadable: mid-rewrite, the next tick
@@ -2552,6 +2570,7 @@ def _still_done(cfg, st, wave, w, wdir, what):
         return True
     if again:
         w["last_status"], w["phase"] = again, "running"
+        w.pop("done_head", None)  # its next DONE starts afresh
     save_state(cfg, st)
     event(cfg, f"{wave}: {what}, but the status is «{_one_line(again or '', 80)}» now: nothing done")
     return False
@@ -2575,6 +2594,7 @@ def _gate_failed(cfg, st, wave, w, wdir, reasons):
                     f"{owner_handover_cmd(cfg, wave)}")
     w["last_status"] = _write_status(wdir, blocked)
     w["phase"] = "running"  # the wave goes on; its next DONE is gated again
+    w.pop("done_head", None)  # fixing after a failed gate is lawful: not an after-DONE edit
     if w.get("pending_enter") == "gate failure":
         w.pop("pending_enter")  # a new episode: its text is typed afresh, not just confirmed with Enter
     # the message to the window is saved WITH the status, like the checkpoint request: a tmux failure
@@ -2606,6 +2626,8 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
         return _gate_failed(cfg, st, wave, w, wdir, f"недопустимые repo/PR/sha: {e}")
     w["gate_sha"], w["gate_pr"] = sha, number
     unresolved = v["unresolved"]
+    if v["reasons"]:  # a pass carries only the accepted limitations (`accepted <sev> <source>: <note>`)
+        event(cfg, f"{wave}: merge gate passed with accepted limitations: {_one_line('; '.join(v['reasons']), 600)}")
     if v["draft"] and not unresolved:
         return _gate_ready(cfg, st, wave, w, wdir, number, sha)
     w["phase"] = "merging"
@@ -2718,6 +2740,7 @@ def _regate(cfg, st, wave, w, wdir, old, new):
         w.get("notified", {}).pop(key, None)
     w["phase"] = "gate"  # the save drops the merge_owner / merge_refused notices
     w["last_status"] = _write_status(wdir, "DONE")  # the gate runs on DONE; the BLOCKED line was ours
+    _note_done_head(cfg, wave, w, new if new != old else None)
     save_state(cfg, st)
     event(cfg, f"{wave}: HEAD сменился после гейта: {str(old)[:12]}→{str(new)[:12]}, гейт заново")
     return True
@@ -3401,6 +3424,7 @@ def _tick(cfg, st):
 
     if w.get("phase") == "gate" and status != "DONE":
         w["phase"] = "running"  # the wave took its DONE back while the gate waited
+        w.pop("done_head", None)
     if w.get("phase") == "merging":  # the gate passed: wait for MERGED (whatever the status file says now)
         return _merging_tick(cfg, st, wave, w, wdir, now)
 
@@ -3725,7 +3749,7 @@ def _state_or_event(cfg):
 
 
 TUNABLE = ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds", "telegram",
-           "titles", "model", "plan_sha256", "max_auto_answers")
+           "titles", "model", "plan_sha256", "max_auto_answers", "max_runs")
 
 
 def _identity(cfg):

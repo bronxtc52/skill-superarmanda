@@ -351,6 +351,12 @@ def manifest_lines(cfg, wave, w):
     fr = where.get("fix_round") if isinstance(where.get("fix_round"), dict) else {}
     srcs = "  ".join(f"{k} {v}" for k, v in fr.items() if k != "total")
     head.append(f"   круг {srcs or '—'}  total {fr.get('total', '—')}", style="yellow")
+    run = where.get("run")
+    if isinstance(run, str) and run:  # `index/max` of the wave's runs; the last one is marked
+        head.append(f"   прогон {run}{'!' if where.get('last_run') is True else ''}", style="cyan")
+    acc = where.get("accepted")
+    if isinstance(acc, int) and not isinstance(acc, bool) and acc > 0:
+        head.append(f"   принято {acc}", style="grey62")
     verdicts = where.get("verdicts") if isinstance(where.get("verdicts"), dict) else {}
     roles = [*VERDICT_ROLES, *(r for r in verdicts if r not in VERDICT_ROLES)]
     vt = Text("вердикты  ", style="bold")

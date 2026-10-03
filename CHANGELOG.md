@@ -3,6 +3,28 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 0.12.0 — 2026-10-03
+
+### Добавлено
+
+- `state.py fix-loop --accept --source <ревьюер> --severity <low|medium|high> --note …`: принятое
+  ограничение (запись `acceptances`, привязана к результату, кап не тратится). Принятые находки
+  засчитываются как отложенные; `where` отдаёт `accepted` и `accepted_limitations`. Pass-вердикт
+  гейта при принятых medium/high несёт строки `accepted <sev> <source>: <note>`, диспетчер пишет
+  событие `merge gate passed with accepted limitations`. Неизвестный ключ записи manifest —
+  закрытый отказ гейта. ([#54](https://github.com/bronxtc52/skill-superarmanda/issues/54))
+- Счётчик прогонов волны: `init --from-plan` ведёт `$WAB_DIR/runs.json`, лимит — `max_runs` в
+  `chain.json` (по умолчанию 2, настраивается на лету; диспетчер передаёт `WAB_MAX_RUNS`), сверх
+  лимита отказ без manifest; `where` отдаёт `run` и `last_run`, дашборд показывает прогон и число
+  принятых. ([#39](https://github.com/bronxtc52/skill-superarmanda/issues/39))
+- Событие «волна правит после DONE: <старый>→<новый>»: диспетчер замечает смену HEAD PR, пока волна
+  в `DONE`, одно событие на смену. ([#45](https://github.com/bronxtc52/skill-superarmanda/issues/45))
+
+### Изменено
+
+- PROTOCOL.md и документация: находки, не нарушающие приёмку, не полируются (`--defer`/`--accept`);
+  после `DONE` волна не пушит в PR; потолок прогонов и `blocked_cap`.
+
 ## 0.11.0 — 2026-10-03
 
 ### Добавлено
