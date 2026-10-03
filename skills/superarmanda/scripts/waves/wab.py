@@ -788,6 +788,29 @@ def context_tokens(w):
     return CACHE.read(transcript_path(w["cwd"], sessions[-1]))["ctx"]
 
 
+def transcript_activity(w):
+    """Last write (epoch seconds) to the transcript of the wave's CURRENT session or to any of its
+    subagent transcripts; None when there is none. A wave waiting for its background coder/tester
+    keeps a still screen while the subagent works: idleness counts this activity too."""
+    sessions = w.get("sessions") or []
+    if not sessions:
+        return None
+    main = transcript_path(w["cwd"], sessions[-1])
+    files = [main]
+    try:
+        files += list((main.parent / sessions[-1] / "subagents").glob("*.jsonl"))
+    except OSError:
+        pass
+    last = None
+    for f in files:
+        try:
+            m = f.stat().st_mtime
+        except OSError:
+            continue
+        last = m if last is None or m > last else last
+    return last
+
+
 def session_marker(cfg, wave):
     return f"[wab:{cfg['chain']}/{cfg['run_id']}/{wave}]"
 
@@ -3954,7 +3977,11 @@ def _tick(cfg, st):
             flush_notices(cfg, st, w)
 
     digest = screen["digest"]  # a new digest already restarted the clock (end_screen_episodes)
-    if now - w.get("pane_changed", now) > cfg["idle_minutes"] * 60:
+    active = w.get("pane_changed", now)
+    wrote = transcript_activity(w)  # a still screen over a working subagent is not silence
+    if wrote is not None:
+        active = max(active, min(wrote, now))
+    if now - active > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
             put_notice(w, "idle", digest,
                        f"wave-autobot: волна {wave} молчит {cfg['idle_minutes']}+ мин "

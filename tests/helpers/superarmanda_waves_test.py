@@ -1559,6 +1559,34 @@ class Episodes(Base):
         self.assertEqual(len(self.tg), 1)
         self.assertIn("молчит", self.tg[0])
 
+    def test_working_subagent_is_not_idleness(self):
+        # Live false alarms (mh-creators run01, 2026-10-03, three in one day): the wave waited for
+        # its background coder/tester subagent, the screen stood still for 12+ min, the owner got
+        # «волна молчит, возможно ждёт тебя». The subagent transcript was being written all along.
+        self.cfg, _ = self.chain(idle_minutes=1)
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(sessions=["s1"])}})
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.transcript("s1", [asst(inp=5)])
+        sub = self.home / ".claude" / "projects" / sanitize(self.cwd) / "s1" / "subagents"
+        sub.mkdir(parents=True)
+        agent = sub / "agent-a1.jsonl"
+        agent.write_text(asst(inp=1) + "\n", encoding="utf-8")
+        t = [5_000_000.0]
+        main = wab.transcript_path(self.cwd, "s1")
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            os.utime(main, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            for _ in range(3):  # 3 x 5 min of a still screen while the subagent writes
+                t[0] += 300
+                os.utime(agent, (t[0] - 20, t[0] - 20))
+                self.tick()
+            self.assertEqual(self.tg, [])
+            t[0] += 300  # the subagent stopped writing too: real silence is still reported
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+        self.assertIn("молчит", self.tg[0])
+
     def test_empty_status_read_changes_nothing(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
         self.tick()
