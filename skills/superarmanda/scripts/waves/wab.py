@@ -1457,6 +1457,9 @@ def parse_blocked_label(status):
             "question": m.group(2).strip()}
 
 
+_FENCE = re.compile(r"(`{3,}|~{3,})(.*)")
+
+
 def parse_policy(body):
     """The rules of the «## Политика решений» section of a mandate text: a list of {class, rec}
     (rec None = any). No section -> []. The section runs to the next heading; prose lines are
@@ -1465,11 +1468,13 @@ def parse_policy(body):
     rules, inside, seen, fence = [], False, False, None
     for n, line in enumerate(body.splitlines(), 1):
         s = line.strip()
-        if fence is None and (s.startswith("```") or s.startswith("~~~")):
-            fence = s[:3]  # an illustrative code block: nothing inside it is a heading or a rule
+        m = _FENCE.match(s)
+        if fence is None and m:
+            fence = m.group(1)  # an illustrative code block: nothing inside it is a heading or a rule
             continue
         if fence is not None:
-            if s.startswith(fence):
+            # CommonMark: closed by a run of the SAME character at least as long, with nothing after it
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
                 fence = None
             continue
         if s.startswith("#"):

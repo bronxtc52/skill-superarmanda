@@ -10050,6 +10050,12 @@ class DecisionPolicy(Base):
         self.assertEqual(wab.parse_policy(body), [])
         real = body + "\n## Политика решений\n- auto: class=question rec=A\n"
         self.assertEqual(wab.parse_policy(real), [{"class": "question", "rec": "A"}])
+        # a four-backtick fence showing a triple-backtick snippet: the inner ``` does not close it
+        nested = ("````markdown\n```\n## Политика решений\n- auto: class=question\n```\n"
+                  "## Политика решений\n- auto: class=needs_decision\n````\n")
+        self.assertEqual(wab.parse_policy(nested), [])
+        self.assertEqual(wab.parse_policy(nested + "## Политика решений\n- auto: class=question rec=B\n"),
+                         [{"class": "question", "rec": "B"}])
 
     def test_a_half_sent_answer_dropped_on_a_status_change_is_charged(self):  # Codex P2 on #49, round 2
         cfg, _ = self.mandate()
