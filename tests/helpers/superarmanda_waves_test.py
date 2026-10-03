@@ -1779,7 +1779,7 @@ class TickAdvancesPendingTransitions(Base):
 
     def test_failed_enters_in_sending_are_retried_by_tick_without_a_restart(self):
         cfg, _ = self.chain()
-        w = self.wave_rec(phase="sending", pending_enter="first prompt")
+        w = self.wave_rec(phase="sending", pending_enter="first prompt", pending_text_head="задача волны")
         self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
         self.set_status(cfg, "W1", "STARTING")
         boom = subprocess.CalledProcessError(1, ["tmux"], stderr="boom")
@@ -9703,6 +9703,306 @@ class OwnerHandover(GateBase):  # #36 п.2: the owner merged the wave's PR himse
         result = (self.cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8")
         self.assertIn(f"смержен владельцем ({self.merge[:12]})", result)
         self.assertNotIn("смержен координатором", result)
+
+
+# ---------------------------------------------------------------- #40: local signals without Telegram
+class LocalAttention(Base):
+    """Without a Telegram transport a notice leaves ATTENTION in the run directory and a
+    display-message on the waves' tmux server; the end of its episode removes the file."""
+    SECRET = "password=hunter2hunter2hunter2"
+
+    def setUp(self):
+        super().setUp()
+        self.clients = "client-a\nclient-b\n"
+        self.display_rc = 0
+        inner = wab.sh.side_effect
+
+        def fake(*args, **kw):
+            if args and args[0] == "tmux" and "list-clients" in args:
+                self.tmux_calls.append(args)
+                return subprocess.CompletedProcess(args, 0, self.clients, "")
+            if args and args[0] == "tmux" and "display-message" in args:
+                self.tmux_calls.append(args)
+                if self.display_rc:
+                    raise subprocess.CalledProcessError(self.display_rc, args, "", "no server")
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return inner(*args, **kw)
+        wab.sh.side_effect = fake
+
+    def blocked(self):
+        cfg, _ = self.chain(telegram=None)
+        rec = self.wave_rec("W2", phase="running", last_status=f"BLOCKED: вопрос {self.SECRET}")
+        st = {"current": "W2", "waves": {"W2": rec}}
+        self.put_state(cfg, st)
+        st = wab.load_state(cfg)
+        w = st["waves"]["W2"]
+        wab.put_notice(w, "blocked", "q1", f"wave-autobot: волна W2 BLOCKED: {self.SECRET}\nподробности")
+        wab.save_state(cfg, st)
+        wab.flush_notices(cfg, st, w)
+        return cfg, st, w
+
+    def displays(self):
+        return [c for c in self.tmux_calls if "display-message" in c]
+
+    def test_notice_without_telegram_writes_attention_and_display_message(self):
+        cfg, st, w = self.blocked()
+        att = cfg["run_dir"] / "ATTENTION"
+        self.assertTrue(att.is_file())
+        text = att.read_text(encoding="utf-8")
+        self.assertNotIn("hunter2hunter2", text)
+        self.assertIn("W2", text)
+        self.assertIn("attach -t wv-w2", text)
+        self.assertRegex(text, r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ")
+        self.assertNotIn("подробности", text)  # only the first line
+        shown = self.displays()
+        self.assertEqual(len(shown), 2, self.tmux_calls)  # every client of the waves' server
+        for call in shown:
+            msg = call[-1]
+            self.assertNotIn("hunter2hunter2", msg)
+            self.assertLessEqual(len(msg), 150)
+        self.assertIn("notify(skipped)", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_display_failure_does_not_stop_the_tick_and_leaves_one_event(self):
+        self.display_rc = 1
+        cfg, st, w = self.blocked()
+        self.assertTrue((cfg["run_dir"] / "ATTENTION").is_file())
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertEqual(log.count("display-message failed"), 1, log)
+
+    def test_running_after_blocked_removes_attention(self):
+        cfg, st, w = self.blocked()
+        att = cfg["run_dir"] / "ATTENTION"
+        self.assertTrue(att.is_file())
+        w["last_status"] = "RUNNING"
+        wab.save_state(cfg, st)
+        self.assertFalse(att.exists())
+
+    def test_ack_removes_attention(self):
+        cfg, st, w = self.blocked()
+        att = cfg["run_dir"] / "ATTENTION"
+        self.assertTrue(att.is_file())
+        wab.ack_wave_notices(w)
+        wab.save_state(cfg, st)
+        self.assertFalse(att.exists())
+
+    def test_attention_is_rewritten_with_the_remaining_signal(self):
+        cfg, st, w = self.blocked()
+        wab.put_notice(w, "idle", "d1", "wave-autobot: волна W2 молчит 30 мин")
+        wab.save_state(cfg, st)
+        wab.flush_notices(cfg, st, w)
+        att = cfg["run_dir"] / "ATTENTION"
+        w["last_status"] = "RUNNING"
+        wab.save_state(cfg, st)
+        self.assertIn("молчит", att.read_text(encoding="utf-8"))
+
+    def test_display_message_escapes_tmux_formats(self):  # CodeRabbit (security) on #47
+        cfg, _ = self.chain(telegram=None)
+        wab.display_all("волна W2: #(touch /tmp/pwned) #{session_name}")
+        [*_, msg] = self.displays()[-1]
+        self.assertNotIn("#(", msg.replace("##", ""))
+        self.assertIn("##(touch", msg)
+        self.assertIn("##{session_name}", msg)
+
+    def test_attention_command_exit_codes(self):
+        cfg, path = self.chain(telegram=None)
+        with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()):
+            wab.main(["wab.py", "attention", str(path)])
+        self.assertIn(e.exception.code, (0, None))
+        cfg, st, w = self.blocked()
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(out):
+            wab.main(["wab.py", "attention", str(path)])
+        self.assertEqual(e.exception.code, 1)
+        self.assertIn("W2", out.getvalue())
+
+
+# ---------------------------------------------------------------- #42: delivery with a submit check
+PROMPT_LINE = "│ ❯ {} │"
+
+
+class Submit(Base):
+    """`say` and the dispatcher's send_text share one «was it submitted» check on the screen."""
+
+    def setUp(self):
+        super().setUp()
+        self.m = load_orig("wab_submit")  # unpatched send_text / submit; tmux itself is faked below
+        self.screens = []  # the screen after each Enter; the last one repeats
+        self.m_enters = []
+        self.m_calls = []
+
+        def fake_sh(*args, **kw):
+            self.m_calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        for name, kw in (("sh", {"side_effect": fake_sh}),
+                         ("press_enter", {"side_effect": lambda n: self.m_enters.append(n)}),
+                         ("pane_text", {"side_effect": self.screen}),
+                         ("tmux_alive", {"side_effect": lambda n: True})):
+            p = mock.patch.object(self.m, name, **kw)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def screen(self, name):
+        i = min(len(self.m_enters), len(self.screens)) - 1
+        return self.screens[max(i, 0)] if self.screens else ""
+
+    TEXT = "Решение A: делай миграцию сначала, потом API"
+    PREVIEW = "\n".join(["история", PROMPT_LINE.format("[Pasted text #1 +3 lines]"),
+                         "  paste again to expand"])
+    TYPED = "\n".join(["история", PROMPT_LINE.format("Решение A: делай миграцию сначала, по")])
+    EMPTY = "\n".join(["история", "> Решение A: делай миграцию сначала, потом API", PROMPT_LINE.format(" ")])
+
+    def say(self, text=None):
+        cfg, path = self.chain(telegram=None)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1")}})
+        f = self.tmp / "answer.md"
+        f.write_text(text or self.TEXT, encoding="utf-8")
+        return cfg, path, f
+
+    def test_say_presses_enter_again_until_the_input_is_empty(self):
+        cfg, path, f = self.say()
+        self.screens = [self.PREVIEW, self.EMPTY]  # after the 1st Enter: preview; after the 2nd: sent
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.m.main(["wab.py", "say", str(path), "W1", str(f)])
+        self.assertEqual(len(self.m_enters), 2, self.m_enters)
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("say", log)
+        self.assertIn("Решение A", log)
+        self.assertTrue(any("paste-buffer" in c for c in self.m_calls), self.m_calls)
+
+    def test_say_fails_when_the_text_never_leaves_the_input(self):
+        cfg, path, f = self.say()
+        self.screens = [self.TYPED]
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            self.m.main(["wab.py", "say", str(path), "W1", str(f)])
+        self.assertNotIn(e.exception.code, (0, None))
+        self.assertEqual(len(self.m_enters), 1 + self.m.SUBMIT_RETRIES)
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("say FAILED", log)
+        self.assertIn("Решение A", log)
+
+    def test_say_redacts_the_logged_line_and_takes_no_lock(self):
+        cfg, path, f = self.say("секрет password=hunter2hunter2hunter2 тут")
+        self.screens = [self.EMPTY]
+        before = wab.state_path(cfg).read_text(encoding="utf-8")
+        with mock.patch.object(self.m, "_RunLock", side_effect=AssertionError("lock")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.m.main(["wab.py", "say", str(path), "W1", str(f)])
+        self.assertEqual(wab.state_path(cfg).read_text(encoding="utf-8"), before)
+        self.assertNotIn("hunter2hunter2", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_dispatcher_does_not_count_a_paste_preview_as_delivered(self):
+        cfg, path, f = self.say()
+        self.screens = [self.PREVIEW]
+        st = self.m.load_state(cfg)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok = self.m._deliver(cfg, st, "W1", "alarm", self.m.send_text, self.TEXT)
+        self.assertFalse(ok)
+        self.assertEqual(st["waves"]["W1"].get("pending_enter"), "alarm")  # the retry presses Enter only
+        self.screens = [self.EMPTY]
+        self.m_enters.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok = self.m._deliver(cfg, st, "W1", "alarm", self.m.send_text, self.TEXT)
+        self.assertTrue(ok)
+        self.assertNotIn("pending_enter", st["waves"]["W1"])
+        self.assertEqual(sum("paste-buffer" in c for c in self.m_calls), 1)  # not pasted twice
+
+    def test_preview_phrase_in_history_does_not_count_as_unsent(self):  # Codex P2 on #47
+        history = "\n".join(["> обсуждали «paste again to expand» в прошлом ответе", "история",
+                              PROMPT_LINE.format(" ")])
+        self.assertIsNone(wab.unsent_reason(history, self.TEXT))
+        self.assertIsNotNone(wab.unsent_reason(self.PREVIEW, self.TEXT))  # the real footer still counts
+
+    def test_recovery_with_empty_text_checks_against_the_saved_head(self):  # Codex P2 on #47
+        cfg, path, f = self.say()
+        self.screens = [self.TYPED]  # pasted, Enter did not send
+        st = self.m.load_state(cfg)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, self.TEXT))
+        w = st["waves"]["W1"]
+        self.assertEqual(w.get("pending_enter"), "/update")
+        self.assertTrue(w.get("pending_text_head"))
+        # a restarted dispatcher no longer has the text (advance_pending / recover_update pass "")
+        self.m_enters.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, ""))
+        self.screens = [self.EMPTY]
+        self.m_enters.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, ""))
+        self.assertNotIn("pending_text_head", st["waves"]["W1"])
+
+    def hold_input_lock(self, cfg, wave="W1"):
+        import fcntl
+        path = cfg["run_dir"] / wave / "input.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(fh.close)
+        return fh
+
+    def test_dispatcher_postpones_while_another_writer_types(self):  # Codex P2 on #47
+        cfg, path, f = self.say()
+        self.hold_input_lock(cfg)
+        self.screens = [self.EMPTY]
+        st = self.m.load_state(cfg)
+        with mock.patch.object(self.m, "INPUT_LOCK_SECONDS", 0.2), contextlib.redirect_stdout(io.StringIO()):
+            ok = self.m._deliver(cfg, st, "W1", "alarm", self.m.send_text, self.TEXT)
+        self.assertFalse(ok)
+        self.assertFalse(any("paste-buffer" in c for c in self.m_calls), self.m_calls)  # nothing typed
+        self.assertNotIn("pending_enter", st["waves"]["W1"])
+        self.assertIn("alarm postponed", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_say_does_not_type_while_another_writer_holds_the_input(self):  # Codex P2 on #47
+        cfg, path, f = self.say()
+        self.hold_input_lock(cfg)
+        self.screens = [self.EMPTY]
+        with mock.patch.object(self.m, "INPUT_LOCK_SECONDS", 0.2), self.assertRaises(SystemExit) as e, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.m.main(["wab.py", "say", str(path), "W1", str(f)])
+        self.assertNotIn(e.exception.code, (0, None))
+        self.assertFalse(any("paste-buffer" in c for c in self.m_calls), self.m_calls)
+        self.assertIn("say FAILED", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_legacy_pending_enter_without_head_is_reported_unverified(self):  # CodeRabbit on #47
+        cfg, path, f = self.say()
+        st = self.m.load_state(cfg)
+        st["waves"]["W1"]["pending_enter"] = "/update"  # written by an older version: no text head
+        self.screens = [self.EMPTY]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, "")
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("delivery NOT verified", log)
+        self.assertIn("unverified_enter", st["waves"]["W1"].get("outbox", {}))
+
+    def test_say_refuses_while_the_dispatcher_owes_an_enter(self):  # Codex P2 on #47, round 3
+        cfg, path, f = self.say()
+        st = self.m.load_state(cfg)
+        st["waves"]["W1"]["pending_enter"] = "alarm"
+        st["waves"]["W1"]["pending_text_head"] = "будильник"
+        self.m.save_state(cfg, st)
+        self.screens = [self.EMPTY]
+        with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.m.main(["wab.py", "say", str(path), "W1", str(f)])
+        self.assertNotIn(e.exception.code, (0, None))
+        self.assertFalse(any("paste-buffer" in c for c in self.m_calls), self.m_calls)
+        self.assertIn("owes an Enter", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_say_refuses_a_wave_without_a_launched_session(self):  # Codex P2 on #47, round 4
+        cfg, path, f = self.say()
+        self.screens = [self.EMPTY]
+        with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()):
+            self.m.main(["wab.py", "say", str(path), "W2", str(f)])  # W2 never launched in this run
+        self.assertIn("no launched session", str(e.exception.code))
+        self.assertFalse(any("paste-buffer" in c for c in self.m_calls), self.m_calls)
+
+    def test_unsent_reason_on_screens(self):
+        self.assertIsNotNone(wab.unsent_reason(self.PREVIEW, self.TEXT))
+        self.assertIsNotNone(wab.unsent_reason(self.TYPED, self.TEXT))
+        self.assertIsNone(wab.unsent_reason(self.EMPTY, self.TEXT))
 
 
 class Packaging(unittest.TestCase):
