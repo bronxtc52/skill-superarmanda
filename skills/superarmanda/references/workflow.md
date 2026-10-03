@@ -46,6 +46,11 @@ worktree с собственным origin пользователя. Устано
    Исключение — мелочь: если ВСЕ находки результата ревьюера low/P3 (nit, minor), coordinator
    вместо `--outcome failed` пишет `fix-loop --defer --source <ревьюер> --note "<что и куда>"` и
    переносит их в остаток следующей волны/задачи; кап и счётчики источника не тратятся.
+   Находки medium/high, не нарушающие приёмку, coordinator принимает как известное ограничение:
+   `fix-loop --accept --source <ревьюер> --severity <low|medium|high> --note "<что и почему>"`
+   (запись попадает в тело PR). В режиме `--waves` `init --from-plan` ещё и считает прогоны волны
+   (`max_runs`, по умолчанию 2): сверх лимита отказ. Лимит прогонов не ограничивает круги fix-loop
+   внутри текущего прогона: нарушения приёмки идут обычным `--outcome failed` и на последнем прогоне.
 6. После всех task reviews создаётся draft PR. GitHub Codex должен завершить review именно
    текущего HEAD. Повторные запросы на тот же head идемпотентны и не опрашиваются бесконечно.
    CodeRabbit необязателен, но существенные полученные findings разбираются.
@@ -119,7 +124,22 @@ head and tree, `--note` follows the `--decision` rules, and the task must not be
 A reviewer `findings` result counts as passed for readiness (and for the wave merge gate) only with
 a deferral of the same role recorded no earlier than the result; coder and tester still need `pass`.
 After `resume` new results are not covered by older deferrals. Severity is not parsed: deferring
-only low/P3 findings is coordinator discipline. `where` reports the count as `deferred`. Task IDs are coordinator-approved identifiers: renaming a
+only low/P3 findings is coordinator discipline. `where` reports the count as `deferred`.
+`fix-loop --accept --source <source> --severity <low|medium|high> --note <text>` (mutually exclusive
+with `--defer`/`--outcome`/`--decision`; `--severity` only with `--accept`) has the same preconditions
+as `--defer` (reviewer sources, a `findings` result on the current head and tree, task not `blocked`
+or `needs_decision`) and appends `{source, severity, note, head, result_sha256, result_recorded_at,
+recorded_at}` to `acceptances`; it spends no fix cycle. A result covered by a deferral or an
+acceptance (`state.is_covered`) counts as passed for readiness and for the wave merge gate; after
+`resume` new results are not covered by older records. `where` reports `accepted` (count) and
+`accepted_limitations` (medium/high ones: source, severity, note, head). Both cover only acceptances
+bound to a result of the current head and tree (`accepted_record`): after `resume` onto a new head
+the older records stay in the manifest as history but are neither counted in `accepted` nor listed.
+`init --from-plan` counts
+runs of a wave when `WAB_DIR` or `--runs-file` names a counter file (`runs.json`): the limit is
+`--max-runs`, else the file `$WAB_DIR/max-runs` (the live value kept by the dispatcher; damaged or
+not a whole number 1..1000 is a closed refusal), else `WAB_MAX_RUNS`, else 2; beyond it `init` refuses and creates no manifest; the
+manifest gets `run: {index, max}`, and `where` reports `run` and `last_run`. The counter is written before the manifest, so a process killed between the two writes leaves a counted run without a manifest (the cap is never exceeded; the budget only shrinks). Task IDs are coordinator-approved identifiers: renaming a
 blocked task is not a reset. v1 supplies no reset command; any human decision to resume work
 requires a new, explicitly documented run rather than editing the manifest.
 

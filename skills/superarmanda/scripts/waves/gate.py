@@ -239,20 +239,50 @@ def _bound(result, head, fingerprint_now):
             and result.get("tree_fingerprint") == fingerprint_now)
 
 
+# Field shapes the gate reads. A manifest that breaks one is refused with a reason:
+# the gate never guesses what a malformed record meant, and never raises on it.
+_TASK_FIELD_TYPES = {
+    "results": dict, "decisions": list, "deferrals": list, "acceptances": list,
+    "fix_sources": dict, "session_roles": dict,
+}
+
+
+def _shape_problems(manifest, tasks):
+    out = []
+    if "run" in manifest and not isinstance(manifest["run"], dict):
+        out.append("manifest: поле run не объект")
+    for name, entry in sorted(tasks.items()):
+        if not isinstance(entry, dict):
+            out.append(f"manifest: задача {name} не объект")
+            continue
+        for field, kind in _TASK_FIELD_TYPES.items():
+            if field in entry and not isinstance(entry[field], kind):
+                out.append(f"manifest: задача {name}: поле {field} не {'список' if kind is list else 'объект'}")
+        cycles = entry.get("fix_cycles")
+        if "fix_cycles" in entry and (isinstance(cycles, bool) or not isinstance(cycles, int)):
+            out.append(f"manifest: задача {name}: поле fix_cycles не число")
+    return out
+
+
 def manifest_problems(manifest, head, cwd_fingerprint):
     """Why the manifest does not vouch for `head` (empty list: it does)."""
     if not isinstance(manifest, dict):
         return ["manifest отсутствует или нечитаем"]
     problems = []
+    for key in sorted(k for k in manifest if k not in state.MANIFEST_KEYS):
+        problems.append(f"manifest: unknown record type {key!r}: this gate cannot judge it")
     if manifest.get("head") != head:
         problems.append(f"manifest.head {str(manifest.get('head'))[:12]} ≠ HEAD PR {head[:12]}")
     tasks = manifest.get("tasks")
     if not isinstance(tasks, dict) or not tasks:
         return problems + ["в manifest нет задач"]
+    problems += _shape_problems(manifest, tasks)
     if not cwd_fingerprint:
         problems.append("отпечаток дерева рабочей копии не получен")
     for name, entry in sorted(tasks.items()):
         entry = entry if isinstance(entry, dict) else {}
+        for key in sorted(k for k in entry if k not in state.TASK_KEYS):
+            problems.append(f"manifest: unknown record type {key!r} in task {name}: this gate cannot judge it")
         results = entry.get("results") if isinstance(entry.get("results"), dict) else {}
         status = entry.get("status")
         review = results.get("cross_provider_reviewer")
@@ -261,7 +291,7 @@ def manifest_problems(manifest, head, cwd_fingerprint):
         for role, other in sorted(results.items()):  # github_codex_review, coderabbit, ...
             if (role not in ("coder", "tester", "cross_provider_reviewer") and isinstance(other, dict)
                     and other.get("head") == head and other.get("status") != "pass"
-                    and not _deferred(entry, role, other)):
+                    and not _covered(entry, role, other)):
                 problems.append(f"задача {name}: {role} {other.get('status')}")
         coder = results.get("coder")
         if not (isinstance(coder, dict) and coder.get("status") == "pass" and coder.get("head") == head):
@@ -283,6 +313,10 @@ def manifest_problems(manifest, head, cwd_fingerprint):
     return problems
 
 
+def _as_list(value):
+    return value if isinstance(value, list) else []
+
+
 def _needs_fix_explained(entry, review, head, fingerprint_now):
     """`needs_fix` is allowed only as the accepted-limitation path: the reviewer's findings on HEAD are
     accepted and the LAST decision is accept_limitation of the reviewer. A later failed fix-loop leaves
@@ -292,7 +326,7 @@ def _needs_fix_explained(entry, review, head, fingerprint_now):
     with the same counters shape and is not distinguishable here."""
     if entry.get("status") != "needs_fix" or not (_bound(review, head, fingerprint_now) and _accepted(entry, review)):
         return False
-    decisions = [d for d in entry.get("decisions") or [] if isinstance(d, dict) and _ts(d.get("recorded_at"))]
+    decisions = [d for d in _as_list(entry.get("decisions")) if isinstance(d, dict) and _ts(d.get("recorded_at"))]
     if not decisions:
         return False
     last = max(decisions, key=lambda d: _ts(d.get("recorded_at")))
@@ -300,8 +334,11 @@ def _needs_fix_explained(entry, review, head, fingerprint_now):
         return False
     sources = entry.get("fix_sources") if isinstance(entry.get("fix_sources"), dict) else {}
     own = sources.get("cross_provider_reviewer") or 0
+    cycles = entry.get("fix_cycles") or 0
+    if not (isinstance(own, int) and isinstance(cycles, int)):
+        return False
     return (all(n in (0, None) for k, n in sources.items() if k != "cross_provider_reviewer")
-            and (entry.get("fix_cycles") or 0) <= own)
+            and cycles <= own)
 
 
 def _deferred(entry, role, result):
@@ -310,16 +347,39 @@ def _deferred(entry, role, result):
     return state.is_deferred(entry, role, result)
 
 
+def _covered(entry, role, result):
+    """Deferred or accepted (`fix-loop --accept`) on THIS result: state.is_covered, not a copy."""
+    return state.is_covered(entry, role, result)
+
+
+def accepted_notes(manifest, head):
+    """`accepted <severity> <source>: <note>` for each medium/high acceptance that covers a current
+    findings result of the manifest, so the verdict reports what the merge carries as a limitation."""
+    notes = []
+    tasks = manifest.get("tasks") if isinstance(manifest, dict) else None
+    for name, entry in sorted(tasks.items() if isinstance(tasks, dict) else ()):
+        if not isinstance(entry, dict) or not isinstance(entry.get("results"), dict):
+            continue
+        for role, res in sorted(entry["results"].items()):
+            if not (isinstance(res, dict) and res.get("head") == head):
+                continue
+            record = state.accepted_record(entry, role, res)
+            if record and record.get("severity") in ("medium", "high"):
+                notes.append(f"accepted {record['severity']} {role}: {record.get('note')}")
+    return notes
+
+
 def _accepted(entry, review):
     """A decision made on THIS result: source cross_provider_reviewer, accept_limitation, recorded
     no earlier than the result. Older decisions, other sources, invariant/cut_surface: no.
-    A deferral of the reviewer on this result (`fix-loop --defer`) counts the same way."""
+    A deferral (`fix-loop --defer`) or an acceptance (`fix-loop --accept`) of the reviewer on this
+    result counts the same way."""
     if review.get("status") != "findings":
         return False
-    if _deferred(entry, "cross_provider_reviewer", review):
+    if _covered(entry, "cross_provider_reviewer", review):
         return True
     made = _ts(review.get("recorded_at"))
-    for decision in entry.get("decisions") or []:
+    for decision in _as_list(entry.get("decisions")):
         if not isinstance(decision, dict):
             continue
         when = _ts(decision.get("recorded_at"))
@@ -378,9 +438,10 @@ def evaluate(facts, head, manifest, workdir_state, base):
     if work.get("head") != head:
         problems.append(f"HEAD рабочей копии {str(work.get('head'))[:12]} ≠ HEAD PR {head[:12]}")
     problems += manifest_problems(manifest, head, work.get("fingerprint"))
+    accepted = accepted_notes(manifest, head)
     if problems:
-        return _verdict("fail", problems, head, facts)
-    return _verdict("pass", [], head, facts)
+        return _verdict("fail", problems, head, facts, accepted=accepted)
+    return _verdict("pass", list(accepted), head, facts, accepted=accepted)
 
 
 # ---------- merge and owner script ----------

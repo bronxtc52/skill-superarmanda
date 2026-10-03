@@ -44,7 +44,8 @@ def _install_tmux_guard():
     tmpdir = tempfile.mkdtemp(prefix="wabtmux-")
     atexit.register(shutil.rmtree, tmpdir, True)
     os.environ["TMUX_TMPDIR"] = tmpdir
-    for var in ("TMUX", "TMUX_PANE", "WAB_TMUX_SOCKET"):
+    # a wave session exports WAB_DIR/WAB_MAX_RUNS/...: nothing of the live run may leak into tests
+    for var in ["TMUX", "TMUX_PANE", *(k for k in os.environ if k.startswith("WAB_"))]:
         os.environ.pop(var, None)
     real = shutil.which("tmux")
     if real:  # a shim that refuses a socketless tmux and then execs the real binary
@@ -7314,6 +7315,121 @@ class GateVerdict(unittest.TestCase):
         m["tasks"]["T1"]["results"]["cross_provider_reviewer"]["status"] = "error"
         self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
 
+    def test_accepted_findings_count_only_for_the_exact_result_and_are_printed(self):  # #54
+        state = wab.gate.state
+
+        def acceptance(res, source="cross_provider_reviewer", severity="medium", head=HEAD, digest=None):
+            return {"source": source, "severity": severity, "note": f"{severity} limitation",
+                    "head": head, "result_sha256": digest or state.result_digest(res),
+                    "result_recorded_at": res.get("recorded_at"), "recorded_at": res.get("recorded_at")}
+
+        def manifest(acceptances_of, role="cross_provider_reviewer"):
+            m = green_manifest()
+            res = result("findings")
+            m["tasks"]["T1"]["results"][role] = res
+            m["tasks"]["T1"]["acceptances"] = acceptances_of(res)
+            return m
+        for role in ("cross_provider_reviewer", "github_codex_review", "coderabbit"):
+            for severity in ("low", "medium", "high"):
+                with self.subTest(role=role, severity=severity):
+                    v = self.ev(manifest=manifest(lambda r: [acceptance(r, role, severity)], role))
+                    self.assertEqual(v["verdict"], "pass", v["reasons"])
+                    printed = [r for r in v["reasons"] if "accepted" in r]
+                    if severity == "low":
+                        self.assertEqual(printed, [])
+                    else:
+                        self.assertEqual(printed, [f"accepted {severity} {role}: {severity} limitation"])
+                        self.assertEqual(v["accepted"], printed)
+            cases = [
+                ("no acceptance", lambda r: []),
+                ("acceptance of another result, same head and second",
+                 lambda r: [acceptance(dict(r, session_id="rerun"), role)]),
+                ("acceptance on another head", lambda r: [acceptance(r, role, head=OLD)]),
+                ("acceptance of another role", lambda r: [acceptance(r, "tester")]),
+            ]
+            for name, acceptances_of in cases:
+                with self.subTest(role=role, case=name):
+                    v = self.ev(manifest=manifest(acceptances_of, role))
+                    self.assertEqual(v["verdict"], "fail", v["reasons"])
+        # an acceptance never turns coder/tester findings into pass, nor a non-findings status
+        for role in ("coder", "tester"):
+            with self.subTest(role=role):
+                m = manifest(lambda r, role=role: [acceptance(r, role)], role)
+                self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
+        m = manifest(lambda r: [acceptance(r)])
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"]["status"] = "error"
+        self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
+
+    def test_manifest_forms_of_0_11_0_keep_their_verdict(self):  # #54 compatibility
+        state = wab.gate.state
+        res = result("findings")
+        m = green_manifest(decisions=[{"source": "cross_provider_reviewer", "decision": "accept_limitation",
+                                       "note": "n", "recorded_at": "2026-10-01T10:06:00Z"}])
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = res
+        self.assertEqual(self.ev(manifest=m)["verdict"], "pass")
+        m = green_manifest(deferrals=[{"source": "cross_provider_reviewer", "note": "low", "head": HEAD,
+                                       "result_sha256": state.result_digest(res),
+                                       "result_recorded_at": res["recorded_at"],
+                                       "recorded_at": res["recorded_at"]}])
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = res
+        self.assertEqual(self.ev(manifest=m)["verdict"], "pass")
+        # everything state.py writes is known to the gate
+        full = green_manifest(fix_cycles=0, session_roles={}, fix_sources={}, decision_required_for=None,
+                              deferrals=[], acceptances=[], blocked_reason="x")
+        full.update({"version": 1, "run_id": "r", "repo": "/r", "base": OLD, "tree_fingerprint": FP,
+                     "created_at": "t", "updated_at": "t", "plan": {}, "wave": {}, "position": None,
+                     "run": {"index": 1, "max": 2}})
+        v = self.ev(manifest=full)
+        self.assertEqual((v["verdict"], v["reasons"]), ("pass", []))
+
+    def test_an_unknown_record_type_is_a_closed_refusal(self):  # #54
+        m = green_manifest(vetoes=[{"by": "owner"}])
+        v = self.ev(manifest=m)
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn("manifest: unknown record type 'vetoes' in task T1: this gate cannot judge it",
+                      v["reasons"])
+        m = green_manifest()
+        m["waivers"] = []
+        v = self.ev(manifest=m)
+        self.assertEqual(v["verdict"], "fail")
+        self.assertTrue(any("unknown record type 'waivers'" in r for r in v["reasons"]), v["reasons"])
+
+    def test_a_malformed_manifest_is_a_closed_refusal_not_an_exception(self):  # W1 fix1
+        def fails(m, needle):
+            v = self.ev(manifest=m)
+            self.assertEqual(v["verdict"], "fail", v["reasons"])
+            self.assertTrue(any(needle in r for r in v["reasons"]), v["reasons"])
+        for bad in (["T1"], "T1", 7):
+            with self.subTest(tasks=bad):
+                m = green_manifest()
+                m["tasks"] = bad
+                fails(m, "нет задач")
+        for field, bad in (("results", []), ("decisions", {"a": 1}), ("decisions", 5), ("deferrals", "x"),
+                           ("acceptances", 3), ("acceptances", {"source": "x"}), ("fix_sources", []),
+                           ("fix_cycles", "2"), ("session_roles", [])):
+            with self.subTest(field=field, bad=bad):
+                m = green_manifest()
+                m["tasks"]["T1"][field] = bad
+                fails(m, f"поле {field}")
+        m = green_manifest()
+        m["tasks"]["T1"] = "broken"
+        fails(m, "задача T1")
+        m = green_manifest()
+        m["run"] = "x"
+        fails(m, "поле run")
+        # non-dict elements inside a list do not crash the acceptance/deferral lookup
+        state = wab.gate.state
+        res = result("findings")
+        m = green_manifest()
+        m["tasks"]["T1"]["results"]["cross_provider_reviewer"] = res
+        m["tasks"]["T1"]["acceptances"] = ["x", 3, None]
+        m["tasks"]["T1"]["deferrals"] = [[], "y"]
+        self.assertEqual(self.ev(manifest=m)["verdict"], "fail")
+        self.assertEqual(wab.gate.accepted_notes({"tasks": ["T1"]}, HEAD), [])
+        self.assertEqual(wab.gate.accepted_notes({"tasks": {"T1": {"results": {"coder": res},
+                                                                   "acceptances": 5}}}, HEAD), [])
+        self.assertIsNone(state.accepted_record({"acceptances": 5}, "coderabbit", res))
+
     def test_pr_head_other_than_the_gated_one_waits(self):
         facts = green_facts()
         facts["pr"]["head"] = OLD
@@ -9295,6 +9411,19 @@ class ManifestDashboard(Base):
         cfg = self.running()
         self.assertIn("manifest ещё нет", self.frame(cfg))
 
+    def test_run_and_accepted_fields_are_shown_and_junk_does_not_crash(self):
+        cfg = self.running()
+        base = {"task": "T1", "task_status": "ok", "step": 6, "role": "coordinator", "verdicts": {}}
+        for extra, want in (({"run": "2/2", "last_run": True, "accepted": 2}, ("прогон 2/2!", "принято 2")),
+                            ({"run": "1/2", "last_run": False, "accepted": 0}, ("прогон 1/2",)),
+                            ({"run": ["x"], "accepted": "many", "last_run": None}, ())):
+            with self.subTest(extra=extra):
+                with mock.patch.object(self.dash, "manifest_where", return_value={**base, **extra}):
+                    text = self.frame(cfg)
+                self.assertNotIn("кадр не отрисован", text)
+                for part in want:
+                    self.assertIn(part, text)
+
     def test_broken_manifest_is_one_line_not_a_crash(self):
         cfg = self.running()
         manifest = cfg["run_dir"] / "W1" / "superarmanda" / "manifest.json"
@@ -10371,6 +10500,162 @@ class DecisionPolicy(Base):
         self.tick(cfg, self.ASK)
         self.assertEqual(self.answers(), [])
         self.assertIn("policy cap reached", self.log(cfg))
+
+
+class W1MaxRuns(Base):  # #39: the run cap of a wave travels with its session
+    def test_default_is_two(self):
+        cfg, _ = self.chain()
+        self.assertEqual(cfg["max_runs"], 2)
+
+    def test_bad_values_refused(self):
+        for bad in (0, -1, 1.5, "2", True, False, None, [2]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as ctx:
+                    if bad is None:
+                        _, path = self.chain()
+                        doc = json.loads(path.read_text(encoding="utf-8"))
+                        doc["max_runs"] = None
+                        path.write_text(json.dumps(doc), encoding="utf-8")
+                        wab.load_chain(path)
+                    else:
+                        self.chain(max_runs=bad)
+                self.assertIn("max_runs", str(ctx.exception))
+
+    def test_good_value_and_tunable(self):
+        cfg, _ = self.chain(max_runs=5)
+        self.assertEqual(cfg["max_runs"], 5)
+        self.assertIn("max_runs", wab.TUNABLE)
+
+    def test_env_goes_into_new_session(self):
+        for chain_over, want in (({}, "WAB_MAX_RUNS=2"), ({"max_runs": 4}, "WAB_MAX_RUNS=4")):
+            with self.subTest(want=want):
+                cfg, _ = self.chain(**chain_over)
+                self.tmux_calls.clear()
+                st = {"waves": {"W1": self.wave_rec(sessions=["s" * 8])}}
+                wab.start_session(cfg, st, "W1")
+                new = [c for c in self.tmux_calls if c[1] == "new-session"][0]
+                self.assertIn(want, new)
+                self.assertIn(f"WAB_DIR={wab.wave_dir(cfg, 'W1')}", new)
+
+
+class W1MaxRunsFile(Base):  # r2 P1: the live cap reaches an already running session
+    def cap_file(self, cfg, wave="W1"):
+        return wab.wave_dir(cfg, wave) / "max-runs"
+
+    def test_new_session_gets_the_file(self):
+        cfg, _ = self.chain(max_runs=4)
+        st = {"waves": {"W1": self.wave_rec(sessions=["s" * 8])}}
+        wab.start_session(cfg, st, "W1")
+        self.assertEqual(self.cap_file(cfg).read_text(encoding="utf-8"), "4\n")
+
+    def test_watch_updates_the_file_when_chain_json_max_runs_changes(self):
+        cfg, path = self.chain(max_runs=2)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "RUNNING")
+        seen = []
+
+        def fake_tick(c, st):
+            seen.append(self.cap_file(c).read_text(encoding="utf-8") if self.cap_file(c).exists() else None)
+            if len(seen) == 1:
+                doc = json.loads(path.read_text(encoding="utf-8"))
+                doc["max_runs"] = 3
+                path.write_text(json.dumps(doc), encoding="utf-8")
+            return True
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "tick", side_effect=fake_tick):
+            wab.watch(cfg, path, max_ticks=3)
+        self.assertEqual(seen, ["2\n", "3\n", "3\n"])
+        self.assertEqual([p.name for p in self.cap_file(cfg).parent.iterdir() if p.name.startswith("max-runs")],
+                         ["max-runs"])  # no temp leftovers
+
+
+class W1AfterDoneEdits(GateBase):  # #45: the wave pushes to the PR after DONE
+    A, B, C = "a" * 40, "b" * 40, "c" * 40
+
+    def feed(self, *verdicts):
+        """gate_check answers from a list: (verdict, head)."""
+        seq = list(verdicts)
+
+        def fake(cfg, wave, w):
+            kind, head = seq.pop(0) if len(seq) > 1 else seq[0]
+            return {"verdict": kind, "reasons": ["r"], "head": head, "number": 7, "unresolved": [],
+                    "draft": False, "old_p01": [], "pr": {}}
+        p = mock.patch.object(wab, "gate_check", side_effect=fake)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def count(self):
+        return self.log().count("волна правит после DONE")
+
+    def test_one_event_per_head_change(self):
+        self.start()
+        self.feed(("wait", self.A), ("wait", self.A), ("wait", self.B), ("wait", self.B), ("wait", self.C))
+        for _ in range(2):
+            self.tick()
+        self.assertFalse((self.cfg["run_dir"] / "events.log").exists() and self.count())  # first sight: remembered only
+        self.tick()
+        self.assertEqual(self.count(), 1)
+        self.assertIn(f"W1: волна правит после DONE: {self.A[:12]}→{self.B[:12]}", self.log())
+        self.tick()
+        self.assertEqual(self.count(), 1)  # the same new head: nothing more
+        self.tick()
+        self.assertEqual(self.count(), 2)
+        self.assertEqual(self.rec()["done_head"], self.C)
+
+    def test_gate_fail_resets_the_memory(self):
+        self.start()
+        self.feed(("wait", self.A), ("fail", self.A), ("wait", self.B))
+        self.tick()
+        self.tick()
+        self.assertNotIn("done_head", self.rec())
+        self.set_status(self.cfg, "W1", "DONE")  # the wave fixed and wrote DONE again
+        self.tick()
+        self.assertEqual(self.count(), 0)
+        self.assertEqual(self.rec()["done_head"], self.B)
+
+    def test_status_taken_back_resets_the_memory(self):
+        self.start()
+        self.feed(("wait", self.A))
+        self.tick()
+        self.assertEqual(self.rec()["done_head"], self.A)
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.tick()
+        self.assertNotIn("done_head", self.rec())
+
+
+class W1AfterDoneEditsMerging(Regate):
+    def test_head_moved_in_merging_gives_the_event_once(self):
+        self.start()
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.rec()["done_head"], HEAD)
+        self.moved()
+        self.tick()
+        self.assertEqual(self.log().count("волна правит после DONE"), 1)
+        self.assertIn(f"волна правит после DONE: {HEAD[:12]}→{self.NEW[:12]}", self.log())
+        self.tick()  # the gate on the new head passes and merges: no second event
+        self.assertEqual(self.log().count("волна правит после DONE"), 1)
+
+
+class W1AcceptedOnPass(GateBase):  # pass verdict carries accepted limitations
+    def test_event_with_accepted_limitations(self):
+        self.start()
+        real = wab.gate_check
+
+        def with_notes(cfg, wave, w):
+            v = real(cfg, wave, w)
+            if v["verdict"] == "pass":
+                v["reasons"] = ["accepted medium reviewer: шум в логах"]
+            return v
+        with mock.patch.object(wab, "gate_check", side_effect=with_notes):
+            self.tick()
+        self.assertIn("W1: merge gate passed with accepted limitations: accepted medium reviewer: шум в логах",
+                      self.log())
+        self.assertEqual(len(self.merges()), 1)  # the merge goes on
+
+    def test_no_event_without_notes(self):
+        self.start()
+        self.tick()
+        self.assertNotIn("accepted limitations", self.log())
 
 
 class Packaging(unittest.TestCase):

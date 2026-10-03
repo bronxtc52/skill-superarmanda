@@ -3,6 +3,43 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 0.12.0 — 2026-10-03
+
+### Добавлено
+
+- `state.py fix-loop --accept --source <ревьюер> --severity <low|medium|high> --note …`: принятое
+  ограничение (запись `acceptances`, привязана к результату, кап не тратится). Принятые находки
+  засчитываются как отложенные; `where` отдаёт `accepted` и `accepted_limitations`. Pass-вердикт
+  гейта при принятых medium/high несёт строки `accepted <sev> <source>: <note>`, диспетчер пишет
+  событие `merge gate passed with accepted limitations`. Неизвестный ключ записи manifest —
+  закрытый отказ гейта. ([#54](https://github.com/bronxtc52/skill-superarmanda/issues/54))
+- Счётчик прогонов волны: `init --from-plan` ведёт `$WAB_DIR/runs.json`, лимит — `max_runs` в
+  `chain.json` (по умолчанию 2, настраивается на лету; диспетчер передаёт `WAB_MAX_RUNS`), сверх
+  лимита отказ без manifest; `where` отдаёт `run` и `last_run`, дашборд показывает прогон и число
+  принятых. ([#39](https://github.com/bronxtc52/skill-superarmanda/issues/39))
+- Событие «волна правит после DONE: <старый>→<новый>»: диспетчер замечает смену HEAD PR, пока волна
+  в `DONE`, одно событие на смену. ([#45](https://github.com/bronxtc52/skill-superarmanda/issues/45))
+
+### Изменено
+
+- PROTOCOL.md и документация: находки, не нарушающие приёмку, не полируются (`--defer`/`--accept`);
+  после `DONE` волна не пушит в PR; потолок прогонов и `blocked_cap`.
+
+### Исправлено по ревью ([#58](https://github.com/bronxtc52/skill-superarmanda/pull/58))
+
+- Поднятый на лету `max_runs` доходит до идущей сессии волны: диспетчер атомарно пишет значение в
+  `<каталог волны>/max-runs` при запуске волны и при смене в `chain.json`; `init --from-plan` берёт
+  лимит в порядке `--max-runs` → `$WAB_DIR/max-runs` → `WAB_MAX_RUNS` → 2, испорченный файл —
+  закрытый отказ.
+- Подсказка `where` на последнем прогоне больше не уводит нарушения приёмки из fix-loop: они идут
+  обычным `fix-loop --outcome failed`, `--defer`/`--accept` — только для находок вне приёмки.
+- `where` (`accepted`, `accepted_limitations`) и дашборд считают только принятия, покрывающие
+  результат текущего HEAD и дерева; после `resume` старые принятия остаются историей в manifest.
+- Тесты не читают и не пишут каталог живого прогона: все переменные `WAB_*` сбрасываются при старте
+  наборов и не попадают в подпроцессы; добавлен набор `wab-env-isolation`.
+- `init` со счётчиком пишет `runs.json` раньше manifest (резерв прогона) и откатывает его при обычной
+  ошибке записи manifest: убитый между записями процесс больше не оставляет неучтённый manifest.
+
 ## 0.11.0 — 2026-10-03
 
 ### Добавлено
