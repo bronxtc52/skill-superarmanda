@@ -26,6 +26,10 @@ class PortableInstallTest(unittest.TestCase):
         self.installer = self.skill / "scripts" / "install-skill.py"
         self.home = self.root / "isolated home"
         subprocess.run(["git", "init", "-q", str(self.fork)], check=True)
+        # no detached background gc/maintenance after the commit below: it keeps writing into
+        # .git while TemporaryDirectory cleans up (macOS, git 2.54: "Directory not empty")
+        subprocess.run(["git", "-C", str(self.fork), "config", "gc.auto", "0"], check=True)
+        subprocess.run(["git", "-C", str(self.fork), "config", "maintenance.auto", "false"], check=True)
         subprocess.run(["git", "-C", str(self.fork), "config", "user.email", "fork@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(self.fork), "config", "user.name", "Fork Owner"], check=True)
         subprocess.run(["git", "-C", str(self.fork), "add", "."], check=True)
