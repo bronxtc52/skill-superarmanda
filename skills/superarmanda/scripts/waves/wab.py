@@ -1327,7 +1327,8 @@ def note_transcript_activity(w, now):
     """A still screen over a working subagent is not silence: a NEW write to any transcript file of
     the session counts as activity when it is seen (a future-dated mtime is clamped once, not every
     tick) and ends an idle episode already reported, so the next silence is reported again. Runs
-    next to end_screen_episodes, before any branch of the tick returns. In memory only."""
+    next to end_screen_episodes, before any branch of the tick returns. In memory only; True when
+    the record changed (the caller saves at once: some branches return without saving)."""
     files = transcript_activity(w)
     seen = w.get("activity_files")
     changed = [m for f, m in files.items() if not isinstance(seen, dict) or seen.get(f) != m]
@@ -1335,7 +1336,9 @@ def note_transcript_activity(w, now):
         if isinstance(seen, dict):
             drop_notice(w, "idle")
         w["activity_at"] = max(w.get("activity_at") or 0, min(max(changed), now))
+    moved = bool(changed) or seen != files
     w["activity_files"] = files
+    return moved
 
 
 KEEP_ON_ACK = ("chain_done",)  # the end of the chain is never stale: it must get through
@@ -3862,7 +3865,8 @@ def _tick(cfg, st):
 
     # screen episodes end on screen before any branch below returns or sends the outbox
     screen = end_screen_episodes(w, pane_text(name), now)
-    note_transcript_activity(w, now)
+    if note_transcript_activity(w, now):
+        save_state(cfg, st)  # a policy-answered BLOCKED returns without saving: keep the ended episode
     txt = screen["txt"]
 
     if w.get("phase") in ("starting", "sending"):  # the first prompt is not through yet

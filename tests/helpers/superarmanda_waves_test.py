@@ -1664,6 +1664,25 @@ class Episodes(Base):
             self.tick()
         self.assertNotIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
 
+    def test_ended_idle_episode_is_saved_even_when_the_tick_returns_without_saving(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for f in (main, agent):
+                os.utime(f, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            t[0] += 300
+            self.tick()
+            self.assertIn("idle", self.get_state(self.cfg)["waves"]["W1"]["notified"])
+            os.utime(agent, (t[0] - 5, t[0] - 5))
+            t[0] += 30
+            # a policy-answered BLOCKED: the branch returns True without save_state
+            self.set_status(self.cfg, "W1", "BLOCKED: [class=question rec=A red=no] q")
+            with mock.patch.object(wab, "_policy_answer", return_value=True):
+                self.tick()
+        self.assertNotIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
+
     def test_empty_status_read_changes_nothing(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
         self.tick()
