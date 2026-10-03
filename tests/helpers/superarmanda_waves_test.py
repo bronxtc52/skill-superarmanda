@@ -11465,6 +11465,59 @@ class W3PrNumber(GateBase):
         self.assertEqual(rec.get("pr"), 7)
         self.assertEqual(self.find_calls, 1)
 
+    def retake_done_during_lookup(self, new_status="RUNNING"):
+        """find_pr (a slow gh call) during which the wave takes its DONE back."""
+        real = self.pr
+
+        def slow(cfg, cwd):
+            self.find_calls += 1
+            self.set_status(self.cfg, "W1", new_status)
+            return real
+        p = mock.patch.object(wab, "find_pr", side_effect=slow)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_no_gate_handoff_is_not_made_when_done_is_taken_back_during_the_lookup(self):
+        for new in ("RUNNING", "BLOCKED: передумала"):
+            with self.subTest(status=new):
+                self.tg.clear()
+                self.start(merge_gate=None)
+                self.retake_done_during_lookup(new)
+                self.assertTrue(self.tick())
+                rec = self.rec()
+                self.assertNotEqual(rec["phase"], "awaiting_merge")
+                self.assertFalse(rec.get("pending_exit"))
+                self.assertNotIn("handoff", rec.get("notified", {}))
+                self.assertFalse(any("сдала PR" in t for t in self.tg), self.tg)
+
+    def test_last_wave_without_a_gate_is_not_completed_when_done_is_taken_back(self):
+        cfg = self.start(merge_gate=None, waves=["W1"])
+        self.retake_done_during_lookup()
+        self.assertTrue(self.tick())
+        rec = self.rec()
+        self.assertEqual(rec["phase"], "running")
+        self.assertIsNotNone(self.get_state(cfg)["current"])
+        self.assertNotIn("done", rec.get("notified", {}))
+        self.assertFalse(rec.get("pending_exit"))
+        self.assertFalse((cfg["run_dir"] / "chain-result.md").exists())
+        self.assertFalse(any("завершена" in t for t in self.tg), self.tg)
+        # its next, real DONE completes the chain as usual (fresh: the mark was not spent)
+        self.set_status(cfg, "W1", "DONE")
+        with mock.patch.object(wab, "find_pr", return_value=self.pr):
+            self.assertFalse(self.tick())
+        self.assertIsNone(self.get_state(cfg)["current"])
+        self.assertEqual(self.rec()["phase"], "done")
+        self.assertTrue(any("завершена" in t for t in self.tg), self.tg)
+        self.assertTrue((cfg["run_dir"] / "chain-result.md").exists())
+
+    def test_a_lookup_that_leaves_the_status_alone_hands_over_as_before(self):
+        self.start(merge_gate=None)
+        self.assertFalse(self.tick())
+        rec = self.rec()
+        self.assertEqual(rec["phase"], "awaiting_merge")
+        self.assertEqual(rec.get("pr"), 7)
+        self.assertTrue(any("сдала PR" in t for t in self.tg), self.tg)
+
     def test_a_failing_find_pr_never_stops_the_handoff(self):
         self.start(merge_gate=None)
         self.pr = gate.CollectError("gh: boom")

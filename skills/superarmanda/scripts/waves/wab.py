@@ -2978,15 +2978,17 @@ def _note_pr(w, number):
 
 def _remember_pr(cfg, w):
     """Best effort at a hand-off without a gate verdict: ask for the PR of the wave's branch once,
-    when no number is known yet. A failure is swallowed: the hand-off must not stop (#34)."""
+    when no number is known yet. A failure is swallowed: the hand-off must not stop (#34).
+    Returns True only if it really went to GitHub (a slow step: the caller re-reads DONE after it)."""
     if _wave_pr(w) is not None:
-        return
+        return False
     try:
         pr = find_pr(cfg, w["cwd"])
     except Exception:  # noqa: BLE001 - the hand-off goes on without a number
-        return
+        return True
     if isinstance(pr, dict):
         _note_pr(w, pr.get("number"))
+    return True
 
 
 def handoff_gate_line(cfg, wave, w):
@@ -3769,8 +3771,12 @@ def _complete_wave(cfg, st, wave, w, wdir, now):
     waves = cfg["waves"]
     idx = waves.index(wave)
     nxt = wdir / "next-prompt.md"
+    # a DONE before the alarm / without a gate has no number yet (#34); asked BEFORE the «done» mark:
+    # a wave that took DONE back during the slow lookup is not completed, and its next DONE is fresh
+    asked = _remember_pr(cfg, w)
+    if asked and w.get("phase") != "done" and not _still_done(cfg, st, wave, w, wdir, "PR lookup"):
+        return True
     fresh = once_per(w, "done", "1")  # a restart between this and the next launch must not repeat it
-    _remember_pr(cfg, w)  # a DONE before the alarm / without a gate has no number yet (#34)
     if fresh:
         w["finished"] = now
         w["pending_exit"] = True  # the intent to close the window, in the same save as the mark
@@ -4006,7 +4012,9 @@ def _tick(cfg, st):
         # the phase and its notice in ONE save: a crash after it still owes the notice (at least once),
         # and the phase stops a second hand-off, so a restart does not queue it twice
         if not external:
-            _remember_pr(cfg, w)  # no gate reading here: the number is asked once, best effort (#34)
+            # no gate reading here: the number is asked once, best effort (#34); DONE is re-read after it
+            if _remember_pr(cfg, w) and not _still_done(cfg, st, wave, w, wdir, "hand-off PR lookup"):
+                return True
         w["phase"] = "awaiting_merge"
         w["finished"] = now
         w["pending_exit"] = True  # the intent to close the window, in the same save as the phase
