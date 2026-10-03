@@ -846,6 +846,77 @@ def owned_sessions(st):
     return owned
 
 
+# Frozen-context watchdog (#44). After /clear the session may stay unbound: the dashboard then shows
+# an old context for hours while the real journal of the wave (another .jsonl in the same directory)
+# keeps growing. When the bound journal and its context stay unchanged for this many ticks AND another
+# journal of the directory (owned by no other wave) grew meanwhile, the episode is reported once.
+CTX_FROZEN_TICKS = 5  # ticks (tick_seconds each) of an unchanged bound journal before the check fires
+
+
+def _journal_sizes(cwd, skip):
+    """{stem: size} of the top-level journals of the working copy's transcript directory, without the
+    stems in `skip`. A file that cannot be read is left out; an unreadable directory gives {}."""
+    sizes = {}
+    try:
+        for f in transcript_dir(cwd).glob("*.jsonl"):
+            if f.stem in skip:
+                continue
+            try:
+                sizes[f.stem] = f.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return {}
+    return sizes
+
+
+def watch_context(cfg, st, wave, w, tokens):
+    """Keep w["ctx_watch"] (the bound journal's size and context, how many ticks they stood still, the
+    other journals' sizes) and raise w["ctx_frozen"] with ONE event per episode when the bound journal
+    is frozen while another journal of the same working copy grows. An episode ends the moment the
+    bound journal or the context changes: the mark and the dedup mark go. In memory; the tick's save
+    persists it. Never raises: the context measurement must not stop supervision."""
+    try:
+        if not w.get("sessions"):
+            return
+        stem = w["sessions"][-1]
+        try:
+            size = transcript_path(w["cwd"], stem).stat().st_size
+        except OSError:
+            size = -1
+        foreign = set()
+        for name, rec in st["waves"].items():
+            if name != wave and isinstance(rec, dict):
+                for r in [rec, *(rec.get("attempts") or [])]:
+                    foreign.update(r.get("sessions") or [])
+        for r in w.get("attempts") or []:
+            foreign.update(r.get("sessions") or [])  # earlier tries of this wave are not its live journal
+        others = _journal_sizes(w["cwd"], foreign | {stem})
+        prev = w.get("ctx_watch")
+        if not (isinstance(prev, dict) and prev.get("bound") == stem and prev.get("size") == size
+                and prev.get("ctx") == tokens):
+            # first measurement, or the bound journal / the context moved: a new episode
+            w["ctx_watch"] = {"bound": stem, "size": size, "ctx": tokens, "ticks": 0, "others": others,
+                              "grew": False}
+            w.pop("ctx_frozen", None)
+            w.get("notified", {}).pop("ctx_frozen", None)
+            return
+        old = prev.get("others") if isinstance(prev.get("others"), dict) else {}
+        grown = next((k for k, v in others.items() if k not in old or v > (old[k] if isinstance(old[k], int) else 0)),
+                     None)
+        prev["others"] = others
+        prev["ticks"] = (prev["ticks"] if isinstance(prev.get("ticks"), int) else 0) + 1
+        if grown is not None and not prev.get("grew"):
+            prev["grew"], prev["grown"] = True, grown
+        if prev["ticks"] >= CTX_FROZEN_TICKS and prev.get("grew"):
+            w["ctx_frozen"] = True
+            if once_per(w, "ctx_frozen", f"{stem}:{size}:{tokens}"):
+                event(cfg, f"{wave}: контекст не меряется (сессия не привязана?): журнал {stem} неизменен "
+                           f"{prev['ticks']} тактов, растёт {prev.get('grown')}")
+    except Exception as e:  # noqa: BLE001 - a diagnostic, never a reason to stop the tick
+        event(cfg, f"{wave}: проверка замёрзшего контекста не удалась ({type(e).__name__})")
+
+
 def find_new_session(cfg, st, wave):
     """After /clear the wave continues in a new session file. Find it by the marker in its
     first message, among transcripts of this clone that no wave owns yet."""
@@ -990,14 +1061,16 @@ def _mask_structured(m):
     return "[скрыто]"
 
 
-def redact(text, limit=TG_LIMIT):
+def redact(text, limit=TG_LIMIT, owner_paths=True):
     """Mask secrets and personal data in text that leaves for Telegram. Rules: see the comment
-    above _OPAQUE. A heuristic, not a guarantee; its limits are listed in references/waves.md."""
+    above _OPAQUE. A heuristic, not a guarantee; its limits are listed in references/waves.md.
+    `owner_paths=False` drops the owner-script exemption (rule 3): text of the wave and other
+    outside text is never trusted to name the dispatcher's own file (see quote)."""
     for rx in _STRUCTURED:
         text = rx.sub(_mask_structured, text)
     for rx in _HEURISTIC:
         spans = [m.span() for m in _GITHUB_PATH.finditer(text) if _github_host(m.group(0))]
-        own = _owner_script_spans(text)
+        own = _owner_script_spans(text) if owner_paths else []
 
         def keep(m, rx=rx, spans=spans, own=own):
             if _labelled_sha(m) or any(a <= m.start() and m.end() <= b for a, b in own):
@@ -1010,6 +1083,61 @@ def redact(text, limit=TG_LIMIT):
 
         text = rx.sub(lambda m: m.group(0) if keep(m) else "[скрыто]", text)
     return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
+
+
+# The wave's own text (result.md, a status line, a reason from outside) is a QUOTE, never part of the
+# dispatcher's trusted wording. quote() cleans control characters (so the wave cannot carry the
+# markers below), masks with redact(owner_paths=False) and wraps the text in the two markers; the
+# notice keeps them in the outbox. render_notice() is the one place that turns a notice into the text
+# that leaves (Telegram, display-message, ATTENTION): it masks the quotes AGAIN without the
+# owner-script exemption and shows them marked (a «Цитата волны:» block with `> ` lines, or an inline
+# «цитата волны: ...»), and masks the rest, the dispatcher's own wording, as before. The exemption
+# exists for the one path the dispatcher itself puts into a message (write_owner_script), and a wave
+# could name a secret as the <wave> segment of such a path and quote it.
+QUOTE_OPEN, QUOTE_CLOSE = "\x02", "\x03"
+_QUOTE_SPAN = re.compile("\x02(.*?)(?:\x03|$)", re.S)
+_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")  # all but \n and \t
+
+
+def quote(text, limit=TG_LIMIT):
+    """The wave's (or any outside) text for a notice: control characters (and so the quote markers) are
+    removed, secrets masked WITHOUT the owner-script exemption, the length capped at `limit`, the whole
+    wrapped in the quote markers. See render_notice."""
+    clean = _CONTROL.sub("", str(text))
+    return QUOTE_OPEN + redact(clean.strip(), limit, owner_paths=False) + QUOTE_CLOSE
+
+
+def _clip(text, limit):
+    return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
+
+
+def _render_quote(inner, before):
+    """One quote as it is shown: a block when it holds lines or starts a line, else inline."""
+    inner = redact(_CONTROL.sub("", inner), 10 ** 9, owner_paths=False)  # again, idempotent
+    lines = inner.splitlines() or [""]
+    if len(lines) == 1 and before and not before.endswith("\n"):
+        return f"«цитата волны: {lines[0]}»"
+    return ("\n" if before and not before.endswith("\n") else "") + "Цитата волны:\n" \
+        + "\n".join(f"> {l}" for l in lines)
+
+
+def render_notice(text, limit=TG_MESSAGE_LIMIT):
+    """The text of a notice as it leaves: the dispatcher's wording is redacted as before (owner-script
+    exemption included), every quote is cleaned, redacted without the exemption and marked. A notice
+    without markers (an older entry of the outbox) is redacted as a whole, as before."""
+    out, pos = [], 0
+    for m in _QUOTE_SPAN.finditer(text):
+        out.append(redact(text[pos:m.start()].replace(QUOTE_CLOSE, ""), 10 ** 9))
+        out.append(_render_quote(m.group(1).replace(QUOTE_OPEN, ""), "".join(out)))
+        pos = m.end()
+    out.append(redact(text[pos:].replace(QUOTE_CLOSE, ""), 10 ** 9))
+    return _clip("".join(out).replace(QUOTE_OPEN, ""), limit)
+
+
+def _first_line(text, limit):
+    """The first non-empty line of a rendered notice, capped (display-message, ATTENTION, events)."""
+    lines = [l for l in render_notice(text, 10 ** 9).splitlines() if l.strip()]
+    return _clip(lines[0], limit) if lines else ""
 
 
 AZ_TIMEOUT = 30  # seconds: a hung `az` must not block the watch loop
@@ -1058,21 +1186,20 @@ def display_all(text):
 
 
 def notify(cfg, text, wave=None):
-    lines = [l for l in text.splitlines() if l.strip()]
-    first = redact(lines[0], 120) if lines else ""
+    first = _first_line(text, 120)
     if not telegram_configured(cfg):
         event(cfg, f"notify(skipped): {first}")
         # no transport: a local signal on the waves' tmux server instead (ATTENTION is written by
         # flush_notices, which knows the episode). One call per notice, so a failure is one event
         # per episode; it never stops the tick.
-        short = redact(f"wave-autobot{' ' + wave if wave else ''}: {lines[0] if lines else ''}", DISPLAY_LIMIT)
+        short = _clip(f"wave-autobot{' ' + wave if wave else ''}: {_first_line(text, DISPLAY_LIMIT)}", DISPLAY_LIMIT)
         try:
             display_all(short)
         except (subprocess.CalledProcessError, OSError) as e:
             event(cfg, f"display-message failed ({type(e).__name__}): {first[:80]}")
         return True  # Telegram is not configured: there is nothing to repeat
     try:
-        _send_telegram(cfg, redact(text, TG_MESSAGE_LIMIT))
+        _send_telegram(cfg, render_notice(text, TG_MESSAGE_LIMIT))
         event(cfg, f"telegram: {first}")
         return True
     except Exception as e:  # notification must never stop supervision
@@ -1091,7 +1218,8 @@ def put_notice(w, key, value, text):
     end (SCREEN_EPISODE_ENDS); not_ready, no_prompt,
     checkpoint_timeout, dead, handoff -> their phase is left; sending -> the wave wrote a status;
     updating -> the new session is bound; blocked -> status not BLOCKED; done/no_next/
-    launch_refused -> ack only;
+    launch_refused -> ack only (`done` is information: it opens no ATTENTION, INFO_NOTICES);
+    the wave's own text in the notice is wrapped by quote() (see render_notice);
     chain_done -> never).
     The caller saves it with the SAME save_state as the change it reports (the phase, the
     once_per mark), then calls flush_notices: a process killed right after that save still owes
@@ -1120,6 +1248,16 @@ def drop_notice(w, key):
         box.pop(key, None)
         if not box:
             w.pop("outbox", None)
+
+
+def drop_attention(w, key):
+    """Close one open local signal (ATTENTION) of the wave and nothing else: the outbox and the
+    «already notified» mark stay (unlike drop_notice), so the notice is neither lost nor repeated."""
+    att = w.get("attention")
+    if isinstance(att, dict):
+        att.pop(key, None)
+        if not att:
+            w.pop("attention", None)
 
 
 WINDOW_GONE = ("dead", "done", "awaiting_merge")  # no live window of this wave to look at
@@ -1222,7 +1360,8 @@ def _answered(w):
 #   handoff             the phase left awaiting_merge (the coordinator confirmed it); + ack
 #   merge_owner, merge_refused, merge_unknown   the phase left merging (the PR is merged, or the wave goes on)
 #   merge_stopped       the phase left awaiting_merge (the coordinator took over); + ack
-#   done, no_next, launch_refused   None: only the coordinator's confirmation (ack)
+#   done, no_next, launch_refused   None: only the coordinator's confirmation (ack); `done` is told only
+#                       (INFO_NOTICES: it opens no ATTENTION), no_next / launch_refused ask for a decision
 #   chain_done          None and kept even on ack: the end of the chain must get through
 NOTICE_EPISODE_ENDS = {
     "started": _gone,
@@ -1323,14 +1462,16 @@ def ack_wave_notices(w):
 
 # Notices that ask nothing of anybody: shown by display-message, but they open no ATTENTION signal
 # (`started` lasts as long as the window, `chain_done` forever: `attention` would never go quiet).
-INFO_NOTICES = ("started", "chain_done", "policy_answer")  # policy_answer: told, nothing to answer
+# `done` is the same: the dispatcher launches the next wave itself (no ack then), so its episode would
+# end only with the coordinator's confirmation and ATTENTION would stay open after a normal DONE (#55).
+# The undelivered `done` still waits in the outbox until the coordinator's ack, as before.
+INFO_NOTICES = ("started", "chain_done", "policy_answer", "done")  # policy_answer: told, nothing to answer
 
 
 def note_attention(w, key, text, now):
     """A notice went out only locally (no Telegram): an open signal of its episode, IN MEMORY; the
     caller's save writes ATTENTION (sync_attention). drop_notice and ack_wave_notices close it."""
-    lines = [l for l in text.splitlines() if l.strip()]
-    w.setdefault("attention", {})[key] = {"at": now, "line": redact(lines[0] if lines else "", 300)}
+    w.setdefault("attention", {})[key] = {"at": now, "line": _first_line(text, 300)}
 
 
 def attention_path(cfg):
@@ -1873,6 +2014,10 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     before = cfg["waves"][idx - 1] if idx > 0 and not restart else None
     if not by_dispatcher and before and isinstance(st["waves"].get(before), dict):
         ack_wave_notices(st["waves"][before])  # the coordinator launched the next wave: confirmed
+    elif by_dispatcher and before and isinstance(st["waves"].get(before), dict):
+        # the dispatcher's own launch is no confirmation (its other notices stay), but the end of the
+        # previous wave is told and asks nothing: its «done» signal (e.g. of an older version) closes (#55)
+        drop_attention(st["waves"][before], "done")
     sid = str(uuid.uuid4())  # known up front: the transcript is bound to the wave by session id
     (wdir / "status").write_text("STARTING\n", encoding="utf-8")  # the wave has not started yet
     system_prompt(cfg)
@@ -2041,7 +2186,7 @@ def _plan_pin_refused(cfg, st, wave, drop_pending=False):
         extra = f" ({closed or left})" if closed or left else ""
         if once_per(w, "not_ready", "plan_pin"):
             put_notice(w, "not_ready", "plan_pin",
-                       f"wave-autobot: волна {wave} не запущена: {redact(why)}{extra}. Цепочка стоит.")
+                       f"wave-autobot: волна {wave} не запущена: {quote(why)}{extra}. Цепочка стоит.")
         save_state(cfg, st)
         event(cfg, f"{wave}: {why}; session/prompt NOT started"
                    + (f"; session closed" if closed else f"; {left}" if left else ""))
@@ -2077,7 +2222,7 @@ def _mark_dead(cfg, st, wave, status=""):
     fresh = once_per(w, "dead", "1")
     w["phase"] = "dead"
     if fresh:
-        put_notice(w, "dead", "1", f"wave-autobot: окно волны {wave} закрылось, статус «{status}». Цепочка стоит.")
+        put_notice(w, "dead", "1", f"wave-autobot: окно волны {wave} закрылось, статус {quote(status)}. Цепочка стоит.")
     save_state(cfg, st)  # the phase, the mark and the notice together
     if fresh:
         event(cfg, f"{wave}: tmux session {w['tmux']} is gone (status={status})")
@@ -2546,7 +2691,7 @@ def _stop_without_next(cfg, st, w, wave, now, why=None):
     fresh_stop = once_per(w, "no_next", "1")
     if fresh_stop:
         put_notice(w, "no_next", "1",
-                   f"wave-autobot: {wave} готова, но next-prompt.md непригоден ({redact(why)}) — "
+                   f"wave-autobot: {wave} готова, но next-prompt.md непригоден ({quote(why)}) — "
                    f"следующую волну не запускаю." if why else
                    f"wave-autobot: {wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
     save_state(cfg, st)
@@ -2571,7 +2716,7 @@ def _launch_refused(cfg, st, wave, nxt, why):
     first = once_per(w, "launch_refused", why)
     if first:
         put_notice(w, "launch_refused", why,
-                   f"wave-autobot: {wave} готова, но следующую волну {nxt} не запустил: {redact(why)}. "
+                   f"wave-autobot: {wave} готова, но следующую волну {nxt} не запустил: {quote(why)}. "
                    f"Цепочка стоит; устрани причину и запусти {nxt} (wab.py launch).")
     save_state(cfg, st)
     event(cfg, f"{wave}: launch of {nxt} refused: {why}")
@@ -2785,16 +2930,37 @@ def write_owner_script(cfg, wave, sha):
     return path
 
 
+def _note_pr(w, number):
+    """Keep the PR number of the wave record (chain-result.md and the dashboard read it): in memory,
+    saved with the caller's next save. Anything but an int is ignored."""
+    if isinstance(number, int) and not isinstance(number, bool):
+        w["pr"] = number
+
+
+def _remember_pr(cfg, w):
+    """Best effort at a hand-off without a gate verdict: ask for the PR of the wave's branch once,
+    when no number is known yet. A failure is swallowed: the hand-off must not stop (#34)."""
+    if _wave_pr(w) is not None:
+        return
+    try:
+        pr = find_pr(cfg, w["cwd"])
+    except Exception:  # noqa: BLE001 - the hand-off goes on without a number
+        return
+    if isinstance(pr, dict):
+        _note_pr(w, pr.get("number"))
+
+
 def handoff_gate_line(cfg, wave, w):
     """One line for the hand-off notice of `merge_gate: external`: the verdict and, when the gate
     passed, the command (or the owner's script). Best effort: nothing here may stop the hand-off."""
     try:
         v = gate_check(cfg, wave, w)
+        _note_pr(w, v.get("number"))  # whatever the verdict: the hand-off carries the PR number (#34)
         reasons = _one_line("; ".join(v["reasons"]), 300)
         if v["verdict"] == "wait" and reasons.startswith("сбор фактов"):
-            return f"Гейт мерджа не проверен: {reasons}"
+            return f"Гейт мерджа не проверен: {quote(reasons)}"
         if v["verdict"] != "pass":
-            return f"Гейт мерджа {'ждёт' if v['verdict'] == 'wait' else 'не пройден'}: {reasons}"
+            return f"Гейт мерджа {'ждёт' if v['verdict'] == 'wait' else 'не пройден'}: {quote(reasons)}"
         number, sha = v["number"], v["head"]
         w["pr"] = number
         w["gate_sha"], w["gate_pr"] = sha, number  # saved with the hand-off: `owner-merge` gates against them
@@ -2806,7 +2972,7 @@ def handoff_gate_line(cfg, wave, w):
         path = write_owner_script(cfg, wave, sha)  # never the raw `gh pr merge`: the script gates again
         return f"Гейт мерджа пройден. Выполни: {home_form(path)} (заново проверит гейт на этом HEAD; draft PR сперва переведёт в ready и остановится, потом запусти ещё раз, чтобы смержить)"
     except Exception as e:  # noqa: BLE001
-        return f"Гейт мерджа не проверен: {type(e).__name__}: {_one_line(e, 200)}"
+        return f"Гейт мерджа не проверен: {type(e).__name__}: {quote(_one_line(e, 200))}"
 
 
 def _gate_tick(cfg, st, wave, w, wdir, now):
@@ -2817,6 +2983,7 @@ def _gate_tick(cfg, st, wave, w, wdir, now):
         return True
     w["gate_at"] = now
     v = gate_check(cfg, wave, w)
+    _note_pr(w, v.get("number"))  # kept on wait and fail too (saved below), not only on pass (#34)
     reasons = "; ".join(v["reasons"])
     _note_done_head(cfg, wave, w, v.get("head"))
     if v["verdict"] == "wait":
@@ -2947,7 +3114,7 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
         save_state(cfg, st)
         event(cfg, f"{wave}: merge gate passed, merge of PR #{number} requested at {sha[:12]}")
         return True
-    return _hand_to_owner(cfg, st, wave, w, wdir, number, sha, f"гейт пройден, мердж отклонён: {refused}",
+    return _hand_to_owner(cfg, st, wave, w, wdir, number, sha, f"гейт пройден, мердж отклонён: {quote(refused)}",
                           f"merge refused: {refused}")
 
 
@@ -2978,7 +3145,7 @@ def _gate_ready(cfg, st, wave, w, wdir, number, sha):
         w["phase"] = "merging"
         w["merge_poll_at"] = time.time()
         return _hand_to_owner(cfg, st, wave, w, wdir, number, sha,
-                              f"гейт пройден, перевод в ready отклонён: {refused}", f"ready refused: {refused}")
+                              f"гейт пройден, перевод в ready отклонён: {quote(refused)}", f"ready refused: {refused}")
     w["phase"] = "gate"  # the new checks must register before the next collection
     w["gate_at"] = time.time()
     save_state(cfg, st)
@@ -3010,7 +3177,7 @@ def _merge_stopped(cfg, st, wave, w, wdir, why, now):
     w["pending_exit"] = True
     if once_per(w, "merge_stopped", why):
         put_notice(w, "merge_stopped", why,
-                   f"wave-autobot: волна {wave}: {why}. Следующую волну не запускаю: проверь PR и реши сам.")
+                   f"wave-autobot: волна {wave}: {quote(why)}. Следующую волну не запускаю: проверь PR и реши сам.")
     save_state(cfg, st)
     event(cfg, f"{wave}: {why}; next wave NOT launched")
     flush_notices(cfg, st, w)
@@ -3564,11 +3731,12 @@ def _complete_wave(cfg, st, wave, w, wdir, now):
     idx = waves.index(wave)
     nxt = wdir / "next-prompt.md"
     fresh = once_per(w, "done", "1")  # a restart between this and the next launch must not repeat it
+    _remember_pr(cfg, w)  # a DONE before the alarm / without a gate has no number yet (#34)
     if fresh:
         w["finished"] = now
         w["pending_exit"] = True  # the intent to close the window, in the same save as the mark
         put_notice(w, "done", "1",
-                   f"wave-autobot: волна {wave} завершена.\n\n{redact(read(wdir / 'result.md'))}\n\n"
+                   f"wave-autobot: волна {wave} завершена.\n\n{quote(read(wdir / 'result.md'))}\n\n"
                    f"Целиком: {wdir}/result.md")
     w["phase"] = "done"
     last = idx + 1 >= len(waves)
@@ -3718,7 +3886,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     put_notice(w, "policy_answer", status,
                f"wave-autobot: волна {wave}: развилка закрыта по политике chain.json "
                f"(class={label['class']}, вариант {label['rec']}), ответ не нужен.\n\n"
-               f"{redact(status)}\n\nСмотреть: {attach}")
+               f"{quote(status)}\n\nСмотреть: {attach}")
     save_state(cfg, st)  # the mark, the counter and the notice together
     event(cfg, f"{wave}: policy auto-answer: class={label['class']} rec={label['rec']}")
     return True
@@ -3798,11 +3966,13 @@ def _tick(cfg, st):
             return True  # the gate reading is slow: a DONE taken back meanwhile is not handed over
         # the phase and its notice in ONE save: a crash after it still owes the notice (at least once),
         # and the phase stops a second hand-off, so a restart does not queue it twice
+        if not external:
+            _remember_pr(cfg, w)  # no gate reading here: the number is asked once, best effort (#34)
         w["phase"] = "awaiting_merge"
         w["finished"] = now
         w["pending_exit"] = True  # the intent to close the window, in the same save as the phase
         put_notice(w, "handoff", "1",
-                   f"wave-autobot: волна {wave} сдала PR.\n\n{redact(read(wdir / 'result.md'))}\n\n{gate_line}"
+                   f"wave-autobot: волна {wave} сдала PR.\n\n{quote(read(wdir / 'result.md'))}\n\n{gate_line}"
                    + ("Мердж и запуск следующей волны — за координатором." if not is_last else
                       f"Мердж последнего PR и завершение цепочки (wab.py done) — за координатором."))
         save_state(cfg, st)
@@ -3866,7 +4036,7 @@ def _tick(cfg, st):
             if not status.startswith("BLOCKED: merge gate:"):  # the wave fixes a gate failure itself
                 note_question(w, status, now)
             put_notice(w, "blocked", status,
-                       f"wave-autobot: волна {wave} ждёт тебя.\n\n{redact(status)}\n\nОтветить: {attach}")
+                       f"wave-autobot: волна {wave} ждёт тебя.\n\n{quote(status)}\n\nОтветить: {attach}")
         save_state(cfg, st)
         if fresh:
             event(cfg, f"{wave}: {status[:200]}")
@@ -3909,6 +4079,7 @@ def _tick(cfg, st):
         w["tokens"] = tokens
         w["peak"] = max(w.get("peak", 0), tokens)
         w["ctx_hist"] = (w.get("ctx_hist", []) + [tokens])[-120:]
+        watch_context(cfg, st, wave, w, tokens)
 
     if w.get("phase") == "running" and not awaiting and tokens >= cfg["ctx_limit"]:
         event(cfg, f"{wave}: context {tokens} >= {cfg['ctx_limit']}, checkpoint requested")
@@ -3958,7 +4129,7 @@ def _tick(cfg, st):
         if once_per(w, "idle", digest):
             put_notice(w, "idle", digest,
                        f"wave-autobot: волна {wave} молчит {cfg['idle_minutes']}+ мин "
-                       f"(статус «{status}»). Возможно, ждёт тебя: {attach}")
+                       f"(статус {quote(status)}). Возможно, ждёт тебя: {attach}")
             save_state(cfg, st)
             event(cfg, f"{wave}: pane idle {cfg['idle_minutes']}+ min, status={status}")
             flush_notices(cfg, st, w)

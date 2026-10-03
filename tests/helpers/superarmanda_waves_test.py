@@ -8315,10 +8315,13 @@ class MergeGate(GateBase):
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
-        self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
-        self.assertEqual(self.find_calls, 0)
+        with mock.patch.object(wab, "gate_facts") as facts:
+            self.assertFalse(wab.tick(cfg, wab.load_state(cfg)))
+        facts.assert_not_called()  # nothing is gated: no facts, no verdict
+        self.assertEqual(self.find_calls, 1)  # only the PR number is asked, once (#34)
         self.assertEqual(self.gh_calls, [])
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"].get("pr"), 7)
 
     def test_auto_needs_a_repo(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -8917,7 +8920,7 @@ class ExternalHandoffVerdict(GateBase):
 
     def test_fail_and_wait_and_error_are_said_plainly(self):
         self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
-        self.assertIn("Гейт мерджа не пройден: проверки неуспешны: ci (failure)", self.handoff())
+        self.assertIn("Гейт мерджа не пройден: «цитата волны: проверки неуспешны: ci (failure)»", self.handoff())
 
     def test_unreadable_facts_never_stop_the_handoff(self):
         self.pr = gate.CollectError("gh: boom")
@@ -11371,6 +11374,469 @@ class InputClearPolicy(Base):
         doc = json.loads(self.marker(cfg).read_text(encoding="utf-8"))
         self.assertEqual(doc["status"], f"BLOCKED: {N - 1}")
         self.assertEqual([p.name for p in (cfg["run_dir"] / "W1").glob(".owner-answered.*")], [])
+
+
+# ---------------------------------------------------------------- 0.14.0 (W3): #55, #34, #44, #32
+def _attention_exit(cfg):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return wab.attention_cmd(cfg)
+
+
+class W3DoneAttention(GateBase):
+    """#55: «волна X завершена» is information: it opens no ATTENTION."""
+
+    def test_auto_merge_and_autolaunch_leave_no_attention(self):
+        cfg = self.start(telegram=None)
+        self.assertTrue(self.tick())  # the gate passes, the merge is requested
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
+        self.assertTrue(self.tick())  # merged: «волна W1 завершена», W2 is launched by the dispatcher
+        self.launch.assert_called_once()
+        self.assertTrue(self.launch.call_args[1]["by_dispatcher"])
+        self.assertIn("notify(skipped): wave-autobot: волна W1 завершена", self.log())
+        self.assertEqual(_attention_exit(cfg), 0)
+        self.assertFalse((cfg["run_dir"] / "ATTENTION").exists())
+        self.assertNotIn("done", self.rec().get("attention") or {})
+
+    def test_done_is_an_info_notice(self):
+        self.assertIn("done", wab.INFO_NOTICES)
+
+
+class W3NextLaunchClosesDone(Base):
+    """#55 (b): the dispatcher's launch of the next wave closes the «done» signal of the previous one
+    (left, for example, by the state of an older version)."""
+
+    def test_a_done_signal_left_by_an_older_version_is_closed_by_the_next_launch(self):
+        cfg, _ = self.chain(telegram=None, merge_gate="auto")
+        att = {"done": {"at": time.time(), "line": "wave-autobot: волна W1 завершена."}}
+        self.put_state(cfg, {"current": "W1", "waves": {
+            "W1": self.wave_rec("W1", phase="done", attention=att, notified={"done": "1"})}})
+        self.set_status(cfg, "W1", "DONE")
+        wab.save_state(cfg, wab.load_state(cfg))
+        self.assertEqual(_attention_exit(cfg), 1)  # the premise: the old state holds the signal
+        prompt = self.tmp / "p.md"
+        prompt.write_text("go\n", encoding="utf-8")
+        self.alive = False
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            wab.launch(cfg, "W2", prompt, by_dispatcher=True)
+        st = self.get_state(cfg)
+        self.assertEqual(st["current"], "W2")
+        self.assertNotIn("done", st["waves"]["W1"].get("attention") or {})
+        self.assertEqual(_attention_exit(cfg), 0)
+        self.assertEqual(st["waves"]["W1"].get("notified", {}).get("done"), "1")  # the dedup mark stays
+
+    def test_a_coordinator_launch_still_acknowledges(self):
+        cfg, _ = self.chain(telegram=None, merge_gate="auto")
+        self.put_state(cfg, {"current": "W1", "waves": {
+            "W1": self.wave_rec("W1", phase="done", attention={"idle": {"at": time.time(), "line": "x"}})}})
+        wab.save_state(cfg, wab.load_state(cfg))
+        prompt = self.tmp / "p.md"
+        prompt.write_text("go\n", encoding="utf-8")
+        self.alive = False
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            wab.launch(cfg, "W2", prompt)
+        self.assertEqual(_attention_exit(cfg), 0)
+
+
+class W3PrNumber(GateBase):
+    """#34: the PR number is kept from the hand-off on, whatever the gate mode or verdict."""
+
+    def test_no_gate_done_before_the_alarm_keeps_the_pr_in_chain_result_and_dashboard(self):
+        cfg = self.start(merge_gate=None, waves=["W1"])
+        self.assertNotIn("pr", self.rec())
+        self.assertFalse(self.tick())  # the last wave without a gate: completed at once, the chain ends
+        self.assertEqual(self.find_calls, 1)
+        self.assertEqual(self.rec().get("pr"), 7)
+        text = (cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8")
+        self.assertIn("PR: [#7](https://github.com/o/r/pull/7)", text)
+        self.assertNotIn("PR: нет", text)
+        w = self.rec()
+        self.assertEqual(wab._wave_pr(w), 7)
+        try:
+            import dash
+        except ImportError:
+            return
+        self.assertEqual(dash.wave_pr(w), 7)
+
+    def test_no_gate_handoff_keeps_the_pr(self):
+        self.start(merge_gate=None)
+        self.assertFalse(self.tick())  # W1 of two: handed to the coordinator
+        rec = self.rec()
+        self.assertEqual(rec["phase"], "awaiting_merge")
+        self.assertEqual(rec.get("pr"), 7)
+        self.assertEqual(self.find_calls, 1)
+
+    def test_a_failing_find_pr_never_stops_the_handoff(self):
+        self.start(merge_gate=None)
+        self.pr = gate.CollectError("gh: boom")
+        self.assertFalse(self.tick())
+        rec = self.rec()
+        self.assertEqual(rec["phase"], "awaiting_merge")
+        self.assertNotIn("pr", rec)
+
+    def test_an_already_known_pr_is_not_looked_up_again(self):
+        self.start(merge_gate=None, waves=["W1"])
+        st = self.get_state(self.cfg)
+        st["waves"]["W1"]["pr"] = 31
+        self.put_state(self.cfg, st)
+        self.assertFalse(self.tick())
+        self.assertEqual(self.find_calls, 0)
+        self.assertEqual(self.rec()["pr"], 31)
+
+    def test_external_wait_verdict_still_saves_the_number(self):
+        cfg = self.start(merge_gate="external", waves=["W1"])
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+        self.assertFalse(self.tick())
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+        self.assertEqual(self.rec().get("pr"), 7)
+        self.assertTrue(any("Гейт мерджа ждёт" in t for t in self.tg), self.tg)
+        self.alive = False  # the window of the handed-over wave is closed
+        wab.main(["wab.py", "done", str(self.path)])
+        text = (cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8")
+        self.assertIn("PR: [#7](https://github.com/o/r/pull/7)", text)
+
+    def test_external_fail_verdict_saves_the_number(self):
+        self.start(merge_gate="external")
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
+        self.assertFalse(self.tick())
+        self.assertEqual(self.rec().get("pr"), 7)
+
+    def test_auto_gate_wait_saves_the_number(self):
+        self.start()
+        self.facts = green_facts(check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+        self.assertTrue(self.tick())
+        self.assertEqual(self.rec()["phase"], "gate")
+        self.assertEqual(self.rec().get("pr"), 7)
+
+
+def _frozen_events(cfg):
+    p = cfg["run_dir"] / "events.log"
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    return [l for l in text.splitlines() if "контекст не меряется" in l]
+
+
+class W3FrozenContext(Base):
+    """#44: the bound journal does not move, another journal of the same working copy (owned by no
+    other wave) grows: the session was not rebound after /clear. One event per episode."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg, self.path = self.chain()
+        self.bound = self.transcript("s1", [asst(inp=1000, out=10)])
+        self.neighbor = self.bound.parent / "zz.jsonl"
+        self.neighbor.write_text(asst(inp=5) + "\n", encoding="utf-8")
+        self.pane = "a\nb\nc\n"
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+            sessions=["s1"], pane_digest=wab.pane_digest(self.pane), pane_changed=time.time())}})
+        self.set_status(self.cfg, "W1", "RUNNING")
+
+    def tick(self, n=1, grow=None):
+        for _ in range(n):
+            if grow is not None:
+                with open(grow, "a", encoding="utf-8") as f:
+                    f.write(asst(inp=7) + "\n")
+            wab.tick(self.cfg, wab.load_state(self.cfg))
+
+    def rec(self):
+        return self.get_state(self.cfg)["waves"]["W1"]
+
+    def test_one_event_per_episode_and_the_mark_follows_it(self):
+        self.tick()  # the first measurement only seeds the watch
+        self.tick(wab.CTX_FROZEN_TICKS - 1, grow=self.neighbor)
+        self.assertEqual(_frozen_events(self.cfg), [])  # not long enough yet
+        self.tick(1, grow=self.neighbor)
+        events = _frozen_events(self.cfg)
+        self.assertEqual(len(events), 1, events)
+        self.assertIn("zz", events[0])
+        self.assertIn("s1", events[0])
+        self.assertTrue(self.rec().get("ctx_frozen"))
+        self.tick(4, grow=self.neighbor)  # the same episode goes on: nothing new
+        self.assertEqual(len(_frozen_events(self.cfg)), 1)
+        self.assertTrue(self.rec().get("ctx_frozen"))
+        self.assertEqual(self.tg, [])  # an event and the dashboard only: no notice
+        # the bound journal grows: the episode is over, the mark is gone
+        self.tick(1, grow=self.bound)
+        self.assertFalse(self.rec().get("ctx_frozen"))
+        self.tick(1)
+        self.assertEqual(len(_frozen_events(self.cfg)), 1)
+        # a new episode: one more event
+        self.tick(wab.CTX_FROZEN_TICKS + 1, grow=self.neighbor)
+        self.assertEqual(len(_frozen_events(self.cfg)), 2)
+        self.assertTrue(self.rec().get("ctx_frozen"))
+
+    def test_a_quiet_neighbor_is_no_event(self):
+        self.tick(wab.CTX_FROZEN_TICKS + 5)
+        self.assertEqual(_frozen_events(self.cfg), [])
+        self.assertFalse(self.rec().get("ctx_frozen"))
+
+    def test_a_new_journal_appearing_counts_as_growth(self):
+        self.tick()
+        self.tick(wab.CTX_FROZEN_TICKS)
+        (self.bound.parent / "fresh.jsonl").write_text(asst(inp=3) + "\n", encoding="utf-8")
+        self.tick(1)
+        self.assertEqual(len(_frozen_events(self.cfg)), 1)
+
+    def test_growth_of_a_journal_owned_by_another_wave_is_no_event(self):
+        theirs = self.transcript("w2s", [asst(inp=9)])
+        old = self.transcript("w2old", [asst(inp=9)])
+        st = self.get_state(self.cfg)
+        st["waves"]["W2"] = self.wave_rec("W2", phase="done", sessions=["w2s"],
+                                          attempts=[self.wave_rec("W2", sessions=["w2old"])])
+        self.put_state(self.cfg, st)
+        self.neighbor.unlink()
+        self.tick()
+        for _ in range(wab.CTX_FROZEN_TICKS + 4):
+            for p in (theirs, old):
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(asst(inp=9) + "\n")
+            self.tick()
+        self.assertEqual(_frozen_events(self.cfg), [])
+        self.assertFalse(self.rec().get("ctx_frozen"))
+
+    def test_a_stat_failure_never_stops_the_tick(self):
+        self.tick()
+        real = Path.stat
+
+        def broken(p, *a, **kw):
+            if p.suffix == ".jsonl":
+                raise OSError("gone")
+            return real(p, *a, **kw)
+        with mock.patch.object(Path, "stat", broken):
+            self.tick(3)
+        self.assertEqual(_frozen_events(self.cfg), [])
+
+    def test_dashboard_shows_the_mark(self):
+        try:
+            import dash
+            from rich.console import Console
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        st = self.get_state(self.cfg)
+        st["waves"]["W1"]["ctx_frozen"] = True
+        self.put_state(self.cfg, st)
+
+        def render():
+            buf = io.StringIO()
+            Console(file=buf, width=220, force_terminal=False).print(dash.safe_render(self.cfg))
+            return buf.getvalue()
+        self.assertEqual(render().count("не меряется"), 2)  # the current panel and the table
+        st["waves"]["W1"]["ctx_frozen"] = False
+        self.put_state(self.cfg, st)
+        self.assertNotIn("не меряется", render())
+
+
+class W3Quote(Base):
+    """#32: the wave's own text is a quote: it passes redact WITHOUT the owner-script exemption and
+    is marked as a quote, whichever way the message goes out."""
+    SECRET = "Zx9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk0Lm9Nb7Vc5Xz3Wq"
+    POLICY = [{"class": "needs_decision"}]
+    ASK = "BLOCKED: [class=needs_decision rec=invariant red=no] needs_decision T3: {}; варианты: invariant | cut_surface"
+
+    def setUp(self):
+        super().setUp()
+        self.shown = []
+        for name, target in (("display_all", lambda text: self.shown.append(text)),
+                             ("drop_stale_btab", None)):
+            p = mock.patch.object(wab, name, side_effect=target) if target else mock.patch.object(wab, name)
+            p.start()
+            self.addCleanup(p.stop)
+        folder = self.home / ".cache" / "wab"
+        folder.mkdir(parents=True)
+        self.script = f"{self.SECRET}.{'a' * 12}.{'b' * 16}.merge"
+        (folder / self.script).write_text("#!/bin/sh\n", encoding="utf-8")
+        self.hostile = f"см. ~/.cache/wab/{self.script} и ключ {self.SECRET}"
+        self.n = 0
+
+    def chain_for(self, telegram, **over):
+        self.n += 1
+        over.setdefault("chain", f"c{self.n}")
+        if not telegram:
+            over["telegram"] = None
+        return self.chain(**over)
+
+    def put(self, cfg, **rec):
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", **rec)}})
+
+    def outputs(self, cfg):
+        att = cfg["run_dir"] / "ATTENTION"
+        return list(self.tg) + list(self.shown) + [att.read_text(encoding="utf-8") if att.exists() else ""]
+
+    # ----- the scenarios: each puts the hostile text into one notice -----
+    def blocked(self, cfg):
+        self.put(cfg)
+        self.set_status(cfg, "W1", f"BLOCKED: вопрос {self.hostile}")
+        wab.tick(cfg, wab.load_state(cfg))
+
+    def idle(self, cfg):
+        self.pane = "a\nb\nc\n"
+        self.put(cfg, pane_digest=wab.pane_digest(self.pane), pane_changed=time.time() - 99999)
+        self.set_status(cfg, "W1", f"RUNNING {self.hostile}")
+        wab.tick(cfg, wab.load_state(cfg))
+
+    def dead(self, cfg):
+        self.put(cfg)
+        self.set_status(cfg, "W1", f"RUNNING {self.hostile}")
+        self.alive = False
+        wab.tick(cfg, wab.load_state(cfg))
+
+    def done(self, cfg):
+        self.put(cfg)
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "result.md").write_text(f"Итог: {self.hostile}\n", encoding="utf-8")
+        wab.tick(cfg, wab.load_state(cfg))
+
+    def handoff(self, cfg):
+        self.done(cfg)
+
+    def policy(self, cfg):
+        self.put(cfg)
+        self.set_status(cfg, "W1", self.ASK.format(self.hostile))
+        wab.tick(cfg, wab.load_state(cfg))
+
+    SCENARIOS = {  # name -> (chain overrides, a fragment that proves the notice went out)
+        "blocked": ({}, "ждёт тебя"),
+        "idle": ({}, "молчит"),
+        "dead": ({}, "закрылось"),
+        "done": ({"waves": ["W1"]}, "завершена"),
+        "handoff": ({"merge_gate": "external"}, "сдала PR"),
+        "policy": ({"decision_policy": POLICY}, "развилка закрыта"),
+    }
+
+    def run_scenario(self, name, telegram):
+        over, _ = self.SCENARIOS[name]
+        self.alive = True
+        body = b"Run\n\n## Policy\n- auto: class=plan_mismatch\n"
+        if name == "policy":
+            over = dict(over, mandate_sha256=hashlib.sha256(body).hexdigest())
+        cfg, _ = self.chain_for(telegram, **over)
+        if name == "policy":
+            (cfg["run_dir"] / "mandate.md").write_bytes(body)
+        if name == "handoff":
+            (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        getattr(self, name)(cfg)
+        return cfg
+
+    def test_the_secret_in_a_wave_text_reaches_no_channel(self):
+        for name, (_, proof) in self.SCENARIOS.items():
+            for telegram in (True, False):
+                with self.subTest(scenario=name, telegram=telegram):
+                    self.tg.clear()
+                    self.shown.clear()
+                    cfg = self.run_scenario(name, telegram)
+                    if telegram:
+                        self.assertTrue(any(proof in t for t in self.tg), (proof, self.tg))
+                    else:
+                        self.assertTrue(any(proof in t for t in self.shown), (proof, self.shown))
+                    for out in self.outputs(cfg):
+                        self.assertNotIn(self.SECRET, out)
+                        self.assertNotIn("\x02", out)
+                        self.assertNotIn("\x03", out)
+                    if telegram:
+                        self.assertTrue(any("цитата" in t.lower() for t in self.tg), self.tg)
+
+    def test_the_quote_is_capped_and_the_message_fits(self):
+        cfg, _ = self.chain_for(True, waves=["W1"])
+        self.put(cfg)
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "result.md").write_text("слово " * 3000, encoding="utf-8")
+        wab.tick(cfg, wab.load_state(cfg))
+        [msg] = [t for t in self.tg if "волна W1 завершена" in t]
+        self.assertLessEqual(len(msg), wab.TG_MESSAGE_LIMIT)
+        self.assertIn("Целиком:", msg)  # the framing after the quote survives
+        self.assertIn("Цитата волны", msg)
+        self.assertIn("> ", msg)
+
+    def test_a_secret_is_masked_in_the_outbox_text_too(self):
+        cfg, _ = self.chain_for(True)
+        text = wab.quote(self.hostile)
+        self.assertNotIn(self.SECRET, text)
+        self.assertLessEqual(len(wab.quote("x " * 5000)), wab.TG_LIMIT + 8)
+
+    def test_a_wave_cannot_smuggle_the_markers(self):
+        evil = f"x\x03 вне цитаты \x02Q {self.hostile}\x07\x1b[31m"
+        q = wab.quote(evil)
+        inner = q[1:-1]
+        for ch in ("\x02", "\x03", "\x07", "\x1b"):
+            self.assertNotIn(ch, inner)
+        self.assertEqual((q[0], q[-1]), ("\x02", "\x03"))
+        self.assertNotIn(self.SECRET, q)
+
+    def test_the_second_redaction_inside_notify_ignores_the_owner_exemption(self):
+        cfg, _ = self.chain_for(True)
+        raw = f"wave-autobot: цитата\n\x02{self.hostile}\x03\nконец"  # an entry that skipped quote()
+        wab.notify(cfg, raw)
+        self.assertNotIn(self.SECRET, self.tg[-1])
+
+    def test_old_entries_without_markers_are_handled_as_before(self):
+        cfg, _ = self.chain_for(True)
+        wab.notify(cfg, "wave-autobot: password=hunter2hunter2 тест")
+        self.assertNotIn("hunter2hunter2", self.tg[-1])
+        self.assertIn("wave-autobot: ", self.tg[-1])
+        self.assertNotIn("Цитата", self.tg[-1])
+
+    def test_the_dispatchers_own_script_path_stays_whole(self):
+        cfg, _ = self.chain_for(True)
+        sha = "7" * 40
+        path = wab.write_owner_script(cfg, "W1", sha)
+        wab.notify(cfg, f"wave-autobot: Гейт мерджа пройден. Выполни: {wab.home_form(path)}\n"
+                        f"{wab.quote('результат волны')}")
+        self.assertIn(wab.home_form(path), self.tg[-1])
+        self.assertIn("результат волны", self.tg[-1])
+
+    def test_the_dispatchers_path_survives_in_the_external_handoff(self):
+        cfg, _ = self.chain_for(True, merge_gate="external")
+        with mock.patch.object(wab, "gate_check", return_value={
+                "verdict": "pass", "reasons": [], "number": 7, "head": HEAD, "unresolved": [],
+                "old_p01": [], "draft": False}):
+            self.put(cfg)
+            self.set_status(cfg, "W1", "DONE")
+            (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+            (wab.wave_dir(cfg, "W1") / "result.md").write_text(f"Итог: {self.hostile}\n", encoding="utf-8")
+            wab.tick(cfg, wab.load_state(cfg))
+        [msg] = [t for t in self.tg if "сдала PR" in t]
+        self.assertIn("~/.cache/wab/" + wab.owner_script_name(cfg, "W1", HEAD), msg)
+        self.assertNotIn(self.SECRET, msg)
+
+
+def _unquoted_wave_text(src):
+    """put_notice calls whose text holds a wave/external text (a file read, a status, a reason) that
+    is not inside quote(): such text would go out unmarked and with the owner-script exemption."""
+    import ast
+    untrusted = {"status", "why", "refused", "reasons"}
+    tree = ast.parse(src)
+    bad = []
+
+    def walk(node, quoted):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+            if name == "quote":
+                quoted = True
+            elif name in ("redact", "read") and not quoted:
+                bad.append(f"{name}() in a notice text, line {node.lineno}")
+        if isinstance(node, ast.Name) and node.id in untrusted and not quoted:
+            bad.append(f"{node.id} in a notice text, line {node.lineno}")
+        for child in ast.iter_child_nodes(node):
+            # the test of `a if why else b` only decides which wording is used: it prints nothing
+            walk(child, quoted or (isinstance(node, ast.IfExp) and child is node.test))
+
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "put_notice"
+                and len(node.args) >= 4):
+            walk(node.args[3], False)
+    return bad
+
+
+class W3NoticeQuoteGuard(Base):
+    def test_every_wave_text_in_a_notice_goes_through_quote(self):
+        self.assertEqual(_unquoted_wave_text((WAVES / "wab.py").read_text(encoding="utf-8")), [])
+
+    def test_the_guard_sees_an_unquoted_text(self):
+        src = ("def f(w, status, wdir):\n"
+               "    put_notice(w, 'blocked', status, f'x {redact(status)}')\n"
+               "    put_notice(w, 'done', '1', f'x {read(wdir)}')\n"
+               "    put_notice(w, 'idle', '1', f'x {status}')\n"
+               "    put_notice(w, 'idle', '1', f'x {quote(status)}')\n")
+        self.assertEqual(len(_unquoted_wave_text(src)), 4, _unquoted_wave_text(src))
 
 
 class Packaging(unittest.TestCase):
