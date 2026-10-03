@@ -10044,6 +10044,24 @@ class DecisionPolicy(Base):
         return [t for t in self.tg if "ждёт тебя" in t]
 
     # ----- the label -----
+    def test_policy_inside_a_fenced_example_is_ignored(self):  # Codex P2 on #49, round 2
+        body = ("Прогон: x\n\nПример:\n```markdown\n## Политика решений\n- auto: class=question\n```\n"
+                "~~~\n## Политика решений\n- auto: class=needs_decision\n~~~\n")
+        self.assertEqual(wab.parse_policy(body), [])
+        real = body + "\n## Политика решений\n- auto: class=question rec=A\n"
+        self.assertEqual(wab.parse_policy(real), [{"class": "question", "rec": "A"}])
+
+    def test_a_half_sent_answer_dropped_on_a_status_change_is_charged(self):  # Codex P2 on #49, round 2
+        cfg, _ = self.mandate()
+        st = wab.load_state(cfg)
+        w = st["waves"]["W1"]
+        w.update(pending_enter="policy answer", pending_text_head="[wab] РЕШЕНИЕ", policy_pending=self.ASK)
+        self.put_state(cfg, st)
+        st = self.tick(cfg, "RUNNING")  # the wave moved on: the answer may already have been submitted
+        w = st["waves"]["W1"]
+        self.assertNotIn("policy_pending", w)
+        self.assertEqual(wab.auto_answers_used(w), 1)
+
     def test_label_is_parsed(self):
         got = wab.parse_blocked_label(self.ASK)
         self.assertEqual((got["class"], got["rec"], got["red"]), ("needs_decision", "invariant", False))

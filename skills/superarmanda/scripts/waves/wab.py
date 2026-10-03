@@ -1462,9 +1462,16 @@ def parse_policy(body):
     (rec None = any). No section -> []. The section runs to the next heading; prose lines are
     allowed, every bullet must be a rule. ValueError on anything else: an unknown key or class,
     `red` (the red zone always goes to the owner), merge_gate, a second section."""
-    rules, inside, seen = [], False, False
+    rules, inside, seen, fence = [], False, False, None
     for n, line in enumerate(body.splitlines(), 1):
         s = line.strip()
+        if fence is None and (s.startswith("```") or s.startswith("~~~")):
+            fence = s[:3]  # an illustrative code block: nothing inside it is a heading or a rule
+            continue
+        if fence is not None:
+            if s.startswith(fence):
+                fence = None
+            continue
         if s.startswith("#"):
             if POLICY_HEADING.fullmatch(s):
                 if seen:
@@ -3466,8 +3473,11 @@ def _tick(cfg, st):
         save_state(cfg, st)
 
     if w.get("pending_enter") == "policy answer" and w.get("policy_pending") != status:
+        # the wave left that BLOCKED line: the half-sent answer is outdated. It may already have been
+        # submitted (watch died before its final save), so it is charged to the cap: never one free
+        w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
         for key in ("pending_enter", "pending_text_head", "policy_pending"):
-            w.pop(key, None)  # the wave left that BLOCKED line: the half-sent answer is outdated
+            w.pop(key, None)
         save_state(cfg, st)
 
     answered = _policy_answer(cfg, st, wave, w, status, now, attach) if status.startswith("BLOCKED") else False
