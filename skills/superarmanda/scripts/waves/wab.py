@@ -2152,7 +2152,14 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None):
                 event(cfg, f"{wave}: {what} postponed: the input line is not cleared yet")
             return False
         w.get("notified", {}).pop("input_postponed", None)
-        if precheck is not None and not precheck():
+        try:
+            fresh = precheck() if precheck is not None else True
+        except gate.CollectError as e:  # the facts could not be read: neither typed, nor Enter, nor clearing
+            if once_per(w, "precheck_error", f"{what}: {e}"[:150]):
+                event(cfg, f"{wave}: {what} postponed: facts not collected under the input lock: {e}")
+            return False
+        w.get("notified", {}).pop("precheck_error", None)
+        if not fresh:
             # checked under the lock, right before typing or pressing Enter: stale, not sent. A typed
             # text waiting for its Enter (the retry) must not stay in the input line
             if w.get("pending_enter") == what:
@@ -2347,9 +2354,10 @@ def close_window(cfg, st, w):
                 w.get("notified", {}).pop("exit_blocked", None)
                 tmux("send-keys", "-t", pane_target(name), "-l", "/exit", check=False)
                 tmux("send-keys", "-t", pane_target(name), "Enter", check=False)
-        except NotSubmitted as e:
-            if once_per(w, "exit_blocked", str(e)):
-                event(cfg, f"{wave}: /exit not sent: {e}; retried next tick")
+        except (NotSubmitted, subprocess.SubprocessError, OSError) as e:  # a vanished pane, a busy input
+            why = str(e) if isinstance(e, NotSubmitted) else type(e).__name__
+            if once_per(w, "exit_blocked", why):
+                event(cfg, f"{wave}: /exit not sent: {why}; retried next tick")
             return False
         return True
     w.pop("pending_exit", None)
@@ -3361,8 +3369,16 @@ def _send_alarm(cfg, st, wave, w):
     msg = w.get("alarm_msg")
     if not isinstance(msg, dict) or msg.get("sent"):
         return
-    if _deliver(cfg, st, wave, "alarm", send_text, str(msg.get("text") or "")):
+    def current():  # under the input lock, right before typing or the Enter: is the alarm still about this PR
+        if w.get("pending_enter") != "alarm":
+            return True  # a fresh text: the facts were collected by this very tick, before the lock
+        pr = find_pr(cfg, w["cwd"])  # CollectError: _deliver holds everything and retries
+        return bool(pr) and pr.get("state") == "OPEN" and pr.get("headRefOid") == msg.get("head")
+    sent = _deliver(cfg, st, wave, "alarm", send_text, str(msg.get("text") or ""), precheck=current)
+    if sent:
         msg["sent"] = True
+    elif sent is None:
+        w.pop("alarm_msg", None)  # outdated: the PR closed or the head moved (a typed text was cleared)
     save_state(cfg, st)
 
 

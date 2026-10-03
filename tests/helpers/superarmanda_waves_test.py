@@ -10974,6 +10974,74 @@ class InputClear(GateBase):
         wab.close_window(self.cfg, w, w["waves"]["W1"])
         self.assertEqual(self.exits(), [])
 
+    # ----- #31 under the lock: the PR is looked at again right before the Enter -----
+    def flip_pr_when_the_lock_is_taken(self, pr):
+        real = wab._InputLock.__enter__
+        done = []
+
+        def enter(lock):
+            got = real(lock)
+            if not done:
+                done.append(1)
+                self.pr = pr  # the PR changed while this writer waited for the input lock
+            return got
+        return mock.patch.object(wab._InputLock, "__enter__", enter)
+
+    def test_head_moved_while_waiting_for_the_lock_gets_no_enter(self):
+        self.typed_alarm()
+        with self.flip_pr_when_the_lock_is_taken(
+                {"number": 7, "headRefOid": "e" * 40, "isDraft": False, "state": "OPEN"}):
+            self.tick()
+        self.assertEqual(self.enters, [])
+        self.assertEqual(len(self.clear_keys), 1)
+        self.assertNotIn("pending_enter", self.rec())
+        self.assertFalse(self.rec().get("alarm_msg", {}).get("head") == HEAD and self.rec()["alarm_msg"].get("sent"))
+
+    def test_pr_closed_while_waiting_for_the_lock_gets_no_enter(self):
+        self.typed_alarm()
+        with self.flip_pr_when_the_lock_is_taken(
+                {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "CLOSED"}):
+            self.tick()
+        self.assertEqual(self.enters, [])
+        self.assertEqual(len(self.clear_keys), 1)
+        self.assertNotIn("pending_enter", self.rec())
+
+    def test_unreadable_pr_under_the_lock_gets_neither_enter_nor_clear(self):
+        self.typed_alarm()
+        with self.flip_pr_when_the_lock_is_taken(gate.CollectError("gh: down")):
+            self.tick()
+        self.assertEqual((self.enters, self.clear_keys), ([], []))
+        self.assertEqual(self.rec()["pending_enter"], "alarm")  # held; the next tick tries again
+        self.tick()  # gh is back, the head is the same: only the Enter
+        self.assertEqual(self.enters, [])  # self.pr is still the error: nothing yet
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.ansi = EMPTY_ANSI
+        self.tick()
+        self.assertEqual(self.enters, ["wv-w1"])
+
+    def test_close_window_survives_a_clearing_that_raises(self):
+        self.done_with_typed_alarm()
+        self.clear_works = False
+
+        def boom(name):
+            raise subprocess.CalledProcessError(1, ["tmux", "send-keys"])
+        with mock.patch.object(wab, "send_clear_keys", side_effect=boom):
+            self.tick()
+            self.assertEqual(self.exits(), [])
+        self.assertTrue(self.rec().get("pending_exit"))
+        self.assertIn("/exit not sent", self.log())
+
+    def test_close_window_survives_the_direct_clear_raising(self):
+        self.running()
+        self.ansi = live("19-folded.ansi")
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["pending_exit"] = True
+        with mock.patch.object(wab, "clear_input", side_effect=subprocess.CalledProcessError(1, ["tmux"])):
+            self.assertFalse(wab.close_window(self.cfg, st, st["waves"]["W1"]))
+        self.assertEqual(self.exits(), [])
+        self.assertTrue(st["waves"]["W1"].get("pending_exit"))
+        self.assertIn("/exit not sent", self.log())
+
     # ----- #31 -----
     def test_pending_alarm_on_a_moved_head_is_cleared_not_entered(self):
         self.typed_alarm()
