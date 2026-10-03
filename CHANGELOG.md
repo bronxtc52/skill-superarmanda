@@ -3,6 +3,29 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 0.13.0 — 2026-10-03
+
+### Добавлено
+
+- Очистка поля ввода окна волны: недоставленный текст диспетчера (`pending_enter`) больше не снимается
+  молча. Пустота ввода проверяется по экрану `capture-pane -p -e` (серая подсказка `Try "…"` — dim),
+  круг `C-e C-u C-k BSpace`, без рамки ввода клавиш нет, успех только по экрану; провал держит резерв
+  `pending_clear`, событие `input NOT cleared`, повтор каждый такт, `say` и новые доставки ждут.
+  ([#48](https://github.com/bronxtc52/skill-superarmanda/issues/48))
+- Маркер `<run_dir>/<волна>/owner-answered`: `wab.py say` атомарно помечает эпизод `BLOCKED`,
+  на который ответил владелец (строка + штамп файла `status`); автоответ политики поверх не печатается,
+  кап не тратится. `say` по-прежнему не пишет state.
+  ([#51](https://github.com/bronxtc52/skill-superarmanda/issues/51))
+
+### Исправлено
+
+- Повтор Enter устаревшего будильника: сначала сверка PR/HEAD, при смене или закрытом PR — очистка
+  вместо Enter. ([#31](https://github.com/bronxtc52/skill-superarmanda/issues/31))
+- Снижение `max_auto_answers` на ходу при висящем автоответе: ввод очищается, ответ засчитывается в кап.
+  ([#50](https://github.com/bronxtc52/skill-superarmanda/issues/50))
+- Enter-only повтор доставки выполняет `precheck` под замком ввода; не прошёл — очистка, ответ
+  политики засчитывается. ([#53](https://github.com/bronxtc52/skill-superarmanda/issues/53))
+
 ## 0.12.0 — 2026-10-03
 
 ### Добавлено

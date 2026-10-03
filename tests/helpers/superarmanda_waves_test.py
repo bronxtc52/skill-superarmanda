@@ -10948,6 +10948,7 @@ class InputClearPolicy(Base):
     tick = DecisionPolicy.tick
     answers = DecisionPolicy.answers
     log = DecisionPolicy.log
+    owner_asked = DecisionPolicy.owner_asked
 
     def pend(self, cfg, **over):
         st = wab.load_state(cfg)
@@ -10994,6 +10995,157 @@ class InputClearPolicy(Base):
         self.assertEqual(len(self.clear_keys), 1)
         self.assertEqual(wab.auto_answers_used(st["waves"]["W1"]), 1)
         self.assertNotIn("pending_enter", st["waves"]["W1"])
+
+    # ----- #51: `say` marks the episode it answered -----
+    def say_file(self, text="ответ владельца"):
+        f = self.tmp / "owner.md"
+        f.write_text(text, encoding="utf-8")
+        return f
+
+    def marker(self, cfg):
+        return cfg["run_dir"] / "W1" / "owner-answered"
+
+    def test_say_holding_the_lock_makes_the_policy_stay_silent(self):
+        import threading
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        typed, release = threading.Event(), threading.Event()
+
+        def send(name, text, on_typed=None, **kw):
+            if text.startswith("[wab] РЕШЕНИЕ"):
+                self.sent.append(("text", name, text))
+                return
+            if on_typed:
+                on_typed()  # the owner's text is in the window
+            typed.set()
+            release.wait(10)
+            self.sent.append(("text", name, "owner"))
+        wab.send_text.side_effect = send
+        res = {}
+        t_say = threading.Thread(target=lambda: res.update(say=wab.say_cmd(cfg, "W1", self.say_file())))
+        t_say.start()
+        self.assertTrue(typed.wait(10))
+        t_pol = threading.Thread(target=lambda: self.tick(cfg))
+        t_pol.start()
+        threading.Event().wait(0.3)  # the policy tick now waits for the input lock
+        release.set()
+        t_say.join(10)
+        t_pol.join(10)
+        self.assertTrue(res["say"])
+        self.assertEqual(self.answers(), [], self.sent)  # no second answer on top of the owner's
+        st = wab.load_state(cfg)
+        self.assertEqual(wab.auto_answers_used(st["waves"]["W1"]), 0)  # the cap is not spent
+        self.assertIn("the owner answered this episode (say)", self.log(cfg))
+        for _ in range(3):
+            self.tick(cfg)
+        self.assertEqual(self.log(cfg).count("the owner answered this episode"), 1)  # once per episode
+        self.assertEqual(self.owner_asked(), [])  # the owner has answered: no BLOCKED notice
+
+    def test_marker_of_another_stamp_is_a_new_episode(self):
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        wab.write_owner_answered(cfg, "W1")
+        path = cfg["run_dir"] / "W1" / "status"
+        st0 = os.stat(path)
+        path.write_text(self.ASK, encoding="utf-8")  # the same line, but the file was rewritten
+        os.utime(path, ns=(st0.st_atime_ns, st0.st_mtime_ns + 5_000_000))
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 1)
+
+    def test_marker_of_the_same_episode_blocks_the_answer(self):
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        wab.write_owner_answered(cfg, "W1")
+        self.tick(cfg)
+        self.assertEqual(self.answers(), [])
+
+    def test_a_broken_marker_is_no_marker(self):
+        cfg, _ = self.mandate(max_auto_answers=20)
+        self.set_status(cfg, "W1", self.ASK)
+        for junk in ("{not json", "[]", "", '{"status": 1}', '{"status": "x", "stamp": "y"}'):
+            self.marker(cfg).write_text(junk, encoding="utf-8")
+            self.sent.clear()
+            self.tick(cfg, "RUNNING")
+            self.tick(cfg, self.ASK)
+            self.assertEqual(len(self.answers()), 1, junk)
+        self.marker(cfg).unlink()
+        self.marker(cfg).mkdir()  # unreadable as a file
+        self.sent.clear()
+        self.tick(cfg, "RUNNING")
+        self.tick(cfg, self.ASK)
+        self.assertEqual(len(self.answers()), 1)
+
+    def test_pending_answer_is_cleared_when_the_owner_answered(self):
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        self.pend(cfg)
+        wab.write_owner_answered(cfg, "W1")
+        st = self.tick(cfg)
+        w = st["waves"]["W1"]
+        self.assertEqual(self.enters, [])
+        self.assertEqual(len(self.clear_keys), 1)
+        self.assertNotIn("pending_enter", w)
+        self.assertNotIn("policy_pending", w)
+        self.assertEqual(wab.auto_answers_used(w), 1)  # it may have gone: charged
+
+    def test_say_does_not_write_the_state_and_writes_the_marker(self):
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        sp = wab.state_path(cfg)
+        before = (sp.read_bytes(), os.stat(sp).st_mtime_ns)
+        wab.send_text.side_effect = lambda n, t, on_typed=None, **kw: on_typed and on_typed()
+        self.assertTrue(wab.say_cmd(cfg, "W1", self.say_file()))
+        self.assertEqual((sp.read_bytes(), os.stat(sp).st_mtime_ns), before)
+        doc = json.loads(self.marker(cfg).read_text(encoding="utf-8"))
+        self.assertEqual(doc["status"], self.ASK)
+        self.assertEqual(doc["stamp"], wab._status_stamp(cfg, "W1"))
+        self.assertTrue(doc["at"].endswith("Z"))
+
+    def test_marker_is_written_even_if_enter_fails(self):
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+
+        def typed_then_fail(name, text, on_typed=None, **kw):
+            on_typed()
+            raise wab.NotSubmitted("the text stays in the input")
+        wab.send_text.side_effect = typed_then_fail
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(wab.say_cmd(cfg, "W1", self.say_file()))
+        self.assertTrue(wab.owner_answered(cfg, "W1", self.ASK))
+
+    def test_state_saves_and_marker_writes_do_not_lose_each_other(self):
+        import threading
+        cfg, _ = self.mandate()
+        self.set_status(cfg, "W1", self.ASK)
+        N = 150
+        errors = []
+
+        def watch():
+            try:
+                st = wab.load_state(cfg)
+                for i in range(N):
+                    st["waves"]["W1"]["counter"] = i
+                    wab.save_state(cfg, st)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        def say():
+            try:
+                for i in range(N):
+                    (cfg["run_dir"] / "W1" / "status").write_text(f"BLOCKED: {i}", encoding="utf-8")
+                    wab.write_owner_answered(cfg, "W1")
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+        ts = [threading.Thread(target=watch), threading.Thread(target=say)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(wab.load_state(cfg)["waves"]["W1"]["counter"], N - 1)
+        doc = json.loads(self.marker(cfg).read_text(encoding="utf-8"))
+        self.assertEqual(doc["status"], f"BLOCKED: {N - 1}")
+        self.assertEqual([p.name for p in (cfg["run_dir"] / "W1").glob(".owner-answered.*")], [])
 
 
 class Packaging(unittest.TestCase):

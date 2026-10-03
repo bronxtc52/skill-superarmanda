@@ -1115,6 +1115,53 @@ def _status_stamp(cfg, wave):
     return [s.st_ino, s.st_mtime_ns]
 
 
+OWNER_ANSWERED = "owner-answered"
+
+
+def write_owner_answered(cfg, wave):
+    """`wab.py say` marks the episode it answered: `<run_dir>/<wave>/owner-answered` = {status, stamp,
+    at}, written atomically (tmp in the same directory, fsync, os.replace, fsync of the directory).
+    The marker is not state.json: `say` takes no run lock and never writes the state. Called under the
+    window's input lock, when the owner's text is already in the window."""
+    wdir = wave_dir(cfg, wave)
+    doc = {"status": read(wdir / "status", on_error=None), "stamp": _status_stamp(cfg, wave), "at": _utc(time.time())}
+    fd, tmp = tempfile.mkstemp(dir=wdir, prefix=".owner-answered.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(doc, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, wdir / OWNER_ANSWERED)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        dfd = os.open(wdir, os.O_RDONLY)  # binary fd, "rb"
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def owner_answered(cfg, wave, status):
+    """True when the owner answered THIS episode through `say`: the marker holds the same status line AND
+    the same stamp of the status file as now (a rewrite of the file, even with the same line, is a new
+    episode). A missing, unreadable or corrupt marker is no marker."""
+    try:
+        doc = json.loads((wave_dir(cfg, wave) / OWNER_ANSWERED).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(doc, dict) or doc.get("status") != status:
+        return False
+    stamp = doc.get("stamp")
+    return isinstance(stamp, list) and stamp == _status_stamp(cfg, wave)
+
+
 def _answered(w):
     """The BLOCKED line the dispatcher answered by the decision policy (the episode's mark), or None."""
     notified = w.get("notified")
@@ -3518,6 +3565,18 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     rules = decision_policy(cfg)
     if not any(r["class"] == label["class"] and r["rec"] in (None, label["rec"]) for r in rules):
         return False
+    if owner_answered(cfg, wave, status):  # the owner answered this very episode with `say`
+        if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
+            # our answer is typed and waits for its Enter, the owner's came after: clear it (it may
+            # have gone out already: charged to the cap)
+            w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
+            w.pop("policy_pending", None)
+            _abandon_input(cfg, st, wave, w, "policy answer: the owner answered this episode (say)")
+            save_state(cfg, st)
+        if once_per(w, "owner_answered", f"{status}|{_status_stamp(cfg, wave)}"):
+            event(cfg, f"{wave}: policy answer not sent: the owner answered this episode (say)")
+            save_state(cfg, st)
+        return None
     used = auto_answers_used(w)
     if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
         used -= 1  # the Enter-only retry of THIS answer: it is the one in flight, already charged
@@ -3540,6 +3599,9 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
 
     def still():  # the status read AND its file stamp, taken under the input lock right before typing
         seen["stamp"] = _status_stamp(cfg, wave)
+        if owner_answered(cfg, wave, status):  # `say` held the lock and answered this episode meanwhile
+            seen["owner"] = True
+            return False
         return read(wave_dir(cfg, wave) / "status", on_error=None) == status
     if not still():  # the wave (or the owner in its window) moved on since the tick read it
         event(cfg, f"{wave}: policy answer not sent: the status changed before delivery")
@@ -3553,7 +3615,10 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         if retry:  # the typed answer was given up, possibly already submitted: charged to the cap
             w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
         save_state(cfg, st)
-        event(cfg, f"{wave}: policy answer not sent: the status changed while waiting for the input")
+        if seen.get("owner"):
+            event(cfg, f"{wave}: policy answer not sent: the owner answered this episode (say)")
+        else:
+            event(cfg, f"{wave}: policy answer not sent: the status changed while waiting for the input")
         return None
     if not sent:
         if w.get("pending_enter") != "policy answer":
@@ -4182,7 +4247,12 @@ def say_cmd(cfg, wave, text_file):
             if isinstance(pending, dict) and pending.get("pending_clear"):
                 raise NotSubmitted(f"the dispatcher has not yet cleared the input of «{pending['pending_clear'].get('what')}» "
                                    f"(its text may still be there); retry after it is cleared")
-            send_text(name, text)
+            def typed():  # the owner's text is in the input: the dispatcher must not type over it, even if
+                try:      # the Enter fails later
+                    write_owner_answered(cfg, wave)
+                except OSError as e:
+                    event(cfg, f"{wave}: say: owner-answered marker not written ({e.strerror or e})")
+            send_text(name, text, on_typed=typed)
     except (subprocess.CalledProcessError, OSError, NotSubmitted) as e:
         why = str(e) if isinstance(e, NotSubmitted) else type(e).__name__
         event(cfg, f"{wave}: say FAILED ({why}): {first}")
