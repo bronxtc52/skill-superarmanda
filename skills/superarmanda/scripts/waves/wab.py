@@ -9,6 +9,8 @@ Commands:
   wab.py owner-merge <chain.json> <wave> <run_id> <sha>  gated merge by the owner (run by the generated script)
   wab.py owner-handover <chain.json> <wave> <run_id>  the owner merged the wave's PR himself: hand the chain on
   wab.py notify <chain.json> <text>                 Telegram message to the owner
+  wab.py attention <chain.json>                     print $RUN_DIR/ATTENTION; exit 1 while a signal is open
+  wab.py say <chain.json> <wave> <text-file>        type a reply into the wave's window and check it was sent
   wab.py current-tmux <chain.json>                  tmux session name of the current wave
 
 Per wave the session writes $WAB_DIR/status (RUNNING | HANDOFF_READY | BLOCKED: ... | DONE),
@@ -317,6 +319,7 @@ def save_state(cfg, st):
         except OSError:
             pass
         raise
+    sync_attention(cfg, st)
 
 
 def event(cfg, text):
@@ -418,17 +421,75 @@ def press_enter(name):
     tmux("send-keys", "-t", pane_target(name), "Enter")
 
 
+PASTE_PREVIEW = "paste again to expand"  # Claude Code folded a long paste: Enter only expanded it
+INPUT_MARK = "\u276f"  # «❯ », the start of Claude Code's input line
+SUBMIT_RETRIES = 3     # extra Enters after the first one before the delivery counts as failed
+SUBMIT_PAUSE = 1.5     # seconds between an Enter and the look at the screen
+
+
+class NotSubmitted(Exception):
+    """The text is in the window, but the input line still holds it after every Enter."""
+
+
+def _text_head(text, n=20):
+    for line in (text or "").splitlines():
+        s = " ".join(line.split())
+        if s:
+            return s[:n]
+    return ""
+
+
+def unsent_reason(screen, text):
+    """Why `text` evidently was NOT submitted on this screen, or None. Not submitted: the paste
+    preview hint is on the screen, or the input line (the LAST line with «❯», the box sits below
+    the history) still holds a folded paste or the start of the text. A screen without an input
+    line (a dialog, an empty capture) gives no evidence against the delivery: None."""
+    all_lines = screen.splitlines()
+    marks = [i for i, l in enumerate(all_lines) if INPUT_MARK in l]
+    # only the active input region counts: the last «❯» line and the footer below it (or, without
+    # an input line, the last few lines). History above may quote the hint or the text itself.
+    region = all_lines[marks[-1]:] if marks else all_lines[-4:]
+    if any(PASTE_PREVIEW in l for l in region):
+        return f"the paste preview is on the screen («{PASTE_PREVIEW}»)"
+    if not marks:
+        return None
+    rest = " ".join(all_lines[marks[-1]].split(INPUT_MARK, 1)[1].replace("\u2502", " ").split())
+    if "[Pasted text" in rest:
+        return "the folded paste is still in the input line"
+    head = _text_head(text)
+    k = min(len(head), len(rest))
+    if head and k >= min(5, len(head)) and rest[:k] == head[:k]:
+        return "the text is still in the input line"
+    return None
+
+
+def submit(name, text):
+    """Press Enter and check on the screen that `text` left the input line; up to SUBMIT_RETRIES
+    more Enters with a pause, then NotSubmitted with the reason. The one «was it sent» check of the
+    dispatcher (send_text, the Enter-only retry of _deliver) and of `say`."""
+    press_enter(name)
+    for attempt in range(SUBMIT_RETRIES + 1):
+        time.sleep(SUBMIT_PAUSE)
+        why = unsent_reason(pane_text(name), text)
+        if why is None:
+            return
+        if attempt == SUBMIT_RETRIES:
+            raise NotSubmitted(f"{why} after {SUBMIT_RETRIES + 1} Enter presses")
+        press_enter(name)
+
+
 def send_text(name, text, on_typed=None):
-    """Paste text as one bracketed paste, then submit it. The buffer is private to this
-    dispatcher and session: tmux buffers are global to the server. `on_typed` runs once the
-    text is in the window and Enter is still to come (the caller records that step)."""
+    """Paste text as one bracketed paste, then submit it and check that it left the input line
+    (submit). The buffer is private to this dispatcher and session: tmux buffers are global to the
+    server. `on_typed` runs once the text is in the window and Enter is still to come (the caller
+    records that step)."""
     buf = f"wab-{os.getpid()}-{name}"
     tmux("load-buffer", "-b", buf, "-", input=text)
     tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pane_target(name))
     if on_typed:
         on_typed()
     time.sleep(1.5)
-    press_enter(name)
+    submit(name, text)
 
 
 def send_command(name, cmd, on_typed=None):
@@ -837,12 +898,36 @@ def _send_telegram(cfg, text):
         raise
 
 
-def notify(cfg, text):
+def telegram_configured(cfg):
     tg = cfg.get("telegram")
+    return isinstance(tg, dict) and all(tg.get(k) for k in ("keyvault", "token_secret", "chat_secret"))
+
+
+DISPLAY_LIMIT = 150  # characters of a display-message line
+
+
+def display_all(text):
+    """Show `text` in the status line of every client of the waves' tmux server (the same socket
+    as the windows: WAB_TMUX_SOCKET or the default). Raises on a tmux failure; the caller logs it."""
+    clients = tmux("list-clients", "-F", "#{client_name}").stdout.split()
+    safe = text.replace("#", "##")  # display-message takes a FORMAT: «#(cmd)» would run a shell command
+    for client in clients:
+        tmux("display-message", "-d", "0", "-c", client, safe)
+
+
+def notify(cfg, text, wave=None):
     lines = [l for l in text.splitlines() if l.strip()]
     first = redact(lines[0], 120) if lines else ""
-    if not (isinstance(tg, dict) and all(tg.get(k) for k in ("keyvault", "token_secret", "chat_secret"))):
+    if not telegram_configured(cfg):
         event(cfg, f"notify(skipped): {first}")
+        # no transport: a local signal on the waves' tmux server instead (ATTENTION is written by
+        # flush_notices, which knows the episode). One call per notice, so a failure is one event
+        # per episode; it never stops the tick.
+        short = redact(f"wave-autobot{' ' + wave if wave else ''}: {lines[0] if lines else ''}", DISPLAY_LIMIT)
+        try:
+            display_all(short)
+        except (subprocess.CalledProcessError, OSError) as e:
+            event(cfg, f"display-message failed ({type(e).__name__}): {first[:80]}")
         return True  # Telegram is not configured: there is nothing to repeat
     try:
         _send_telegram(cfg, redact(text, TG_MESSAGE_LIMIT))
@@ -882,9 +967,13 @@ def put_notice(w, key, value, text):
 
 def drop_notice(w, key):
     """The episode is over: forget it, and a notice not yet delivered is stale."""
-    notified, box = w.get("notified"), w.get("outbox")
+    notified, box, att = w.get("notified"), w.get("outbox"), w.get("attention")
     if isinstance(notified, dict):
         notified.pop(key, None)
+    if isinstance(att, dict):
+        att.pop(key, None)
+        if not att:
+            w.pop("attention", None)
     if isinstance(box, dict):
         box.pop(key, None)
         if not box:
@@ -931,6 +1020,7 @@ NOTICE_EPISODE_ENDS = {
     "updating": lambda w: _gone(w) or not w.get("await_session"),
     "checkpoint_timeout": lambda w: w.get("phase") != "checkpoint",
     "tmux_failed": _gone,
+    "unverified_enter": _gone,  # a delivery of an older-version state pressed Enter unverified
     "dead": lambda w: w.get("phase") != "dead",
     "blocked": lambda w: _gone(w) or not _status(w).startswith("BLOCKED"),
     "permission": _gone,
@@ -1004,7 +1094,9 @@ def ack_wave_notices(w):
     """The coordinator confirmed this wave (launched the next one, restarted this one, ran `done`):
     every undelivered notice about its past state (handoff, no_next, dead, not_ready, blocked,
     idle, permission, ...) is stale now and leaves the outbox; only «цепочка завершена» stays.
-    The one rule for every confirmation point; notices of other waves are not touched."""
+    The one rule for every confirmation point; notices of other waves are not touched.
+    Every open local signal of the wave (ATTENTION) is closed as well."""
+    w.pop("attention", None)
     box = w.get("outbox")
     if not isinstance(box, dict):
         w.pop("outbox", None)
@@ -1014,6 +1106,77 @@ def ack_wave_notices(w):
             box.pop(key, None)
     if not box:
         w.pop("outbox", None)
+
+
+# Notices that ask nothing of anybody: shown by display-message, but they open no ATTENTION signal
+# (`started` lasts as long as the window, `chain_done` forever: `attention` would never go quiet).
+INFO_NOTICES = ("started", "chain_done")
+
+
+def note_attention(w, key, text, now):
+    """A notice went out only locally (no Telegram): an open signal of its episode, IN MEMORY; the
+    caller's save writes ATTENTION (sync_attention). drop_notice and ack_wave_notices close it."""
+    lines = [l for l in text.splitlines() if l.strip()]
+    w.setdefault("attention", {})[key] = {"at": now, "line": redact(lines[0] if lines else "", 300)}
+
+
+def attention_path(cfg):
+    return cfg["run_dir"] / "ATTENTION"
+
+
+def attention_text(st):
+    """ATTENTION for the open signals of the state: the latest one, or None when none is open."""
+    latest, total = None, 0
+    for wave, w in (st.get("waves") or {}).items():
+        att = w.get("attention") if isinstance(w, dict) else None
+        if not isinstance(att, dict):
+            continue
+        for item in att.values():
+            if isinstance(item, dict):
+                total += 1
+                if latest is None or (num(item.get("at")) or 0) > (num(latest[2].get("at")) or 0):
+                    latest = (wave, w, item)
+    if latest is None:
+        return None
+    wave, w, item = latest
+    text = (f"time: {_utc(item.get('at'))}\nwave: {wave}\nsignal: {item.get('line', '')}\n"
+            f"attach: {attach_cmd(str(w.get('tmux') or ''))}\n")
+    if total > 1:
+        text += f"open signals: {total} (wab.py status, events.log)\n"
+    return text
+
+
+def sync_attention(cfg, st):
+    """Make $RUN_DIR/ATTENTION match the open signals of the state: atomically rewritten with the
+    latest one, removed when none is left. Called by save_state, so an episode that ends with a save
+    (RUNNING after BLOCKED, an ack, the next launch) takes the file with it."""
+    path = attention_path(cfg)
+    text = attention_text(st)
+    if text is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    if read(path, None) == text.strip():
+        return
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".attention.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def attention_cmd(cfg):
+    """Print ATTENTION; 1 when it holds an open signal, 0 when there is none (no file)."""
+    text = read(attention_path(cfg))
+    if text:
+        print(text)
+        return 1
+    return 0
 
 
 def flush_notices(cfg, st, w, force=False):
@@ -1026,12 +1189,16 @@ def flush_notices(cfg, st, w, force=False):
         return
     now = time.time()
     tried = False
+    local = not telegram_configured(cfg)
+    wave = next((k for k, v in st.get("waves", {}).items() if v is w), None)
     for key, item in list(box.items()):
         if item.get("next_at", 0) > now and not force:
             continue
         tried = True
-        if notify(cfg, item["text"]):
+        if notify(cfg, item["text"], wave):
             box.pop(key, None)
+            if local and key not in INFO_NOTICES:
+                note_attention(w, key, item["text"], now)
         else:
             item["next_at"] = now + NOTIFY_RETRY_SECONDS
     if not box:
@@ -1615,7 +1782,7 @@ def _act(cfg, st, wave, what, fn, *args, **kw):
     w = st["waves"][wave]
     try:
         fn(*args, **kw)
-    except (subprocess.CalledProcessError, OSError) as e:
+    except (subprocess.CalledProcessError, OSError, NotSubmitted) as e:
         if not tmux_alive(w["tmux"]):
             _mark_dead(cfg, st, wave, read(cfg["run_dir"] / wave / "status"))
             raise _WindowGone() from e
@@ -1632,20 +1799,80 @@ def _act(cfg, st, wave, what, fn, *args, **kw):
     return True
 
 
+INPUT_LOCK_SECONDS = 120  # longest paste + submit with retries; then the writer gives up
+
+
+class _InputLock:
+    """Short per-window input lock (`<run_dir>/<wave>/input.lock`): one writer types into a wave's
+    input at a time — the dispatcher's deliveries and `wab.py say` — so two texts never land in the
+    same input line before either Enter. Not the run lock: `watch` keeps running while `say` types."""
+
+    def __init__(self, cfg, wave):
+        self.path = cfg["run_dir"] / wave / "input.lock"
+        self.fh = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.path, "a+", encoding="utf-8")
+        deadline = time.time() + INPUT_LOCK_SECONDS
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    fh.close()
+                    raise NotSubmitted(f"input of the wave is busy (another writer holds {self.path})")
+                time.sleep(0.5)
+        self.fh = fh
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+
+
 def _deliver(cfg, st, wave, what, send, text):
     """Two-step send (text, then Enter) without duplicates: once the text is in the window
-    that fact is saved (`pending_enter`), and a retry after a failed Enter presses only Enter."""
+    that fact is saved (`pending_enter`), and a retry after a failed Enter presses only Enter.
+    A pasted text counts as delivered only when the screen shows it left the input line (submit,
+    inside send_text); otherwise `pending_enter` stays and the retry is Enter-only, checked the same way."""
     w = st["waves"][wave]
     name = w["tmux"]
-    if w.get("pending_enter") == what:
-        ok = _act(cfg, st, wave, f"{what} (Enter)", press_enter, name)
-    else:
-        def typed():
-            w["pending_enter"] = what
-            save_state(cfg, st)
-        ok = _act(cfg, st, wave, what, send, name, text, on_typed=typed)
+    try:
+        lock = _InputLock(cfg, wave).__enter__()
+    except NotSubmitted as e:  # `say` is typing right now: nothing sent, the next tick retries
+        event(cfg, f"{wave}: {what} postponed: {e}")
+        return False
+    try:
+        if w.get("pending_enter") == what:
+            if send is send_text:
+                # after a restart the caller may not have the text any more: check against the head
+                # saved together with `pending_enter`, so recovery validates the same way
+                check = text or str(w.get("pending_text_head") or "")
+                if not check and once_per(w, "unverified_enter", what):
+                    # state of an older version: nothing to compare with — the Enter is pressed as
+                    # before, and the owner is told that this delivery is NOT verified
+                    put_notice(w, "unverified_enter", what,
+                               f"wave-autobot: {wave}: «{what}» дожат Enter без проверки отправки "
+                               f"(state старой версии без начала текста). Проверь окно: {attach_cmd(name)}")
+                    event(cfg, f"{wave}: {what} (Enter): delivery NOT verified (no saved text head)")
+                ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, check)
+            else:
+                ok = _act(cfg, st, wave, f"{what} (Enter)", press_enter, name)
+        else:
+            def typed():
+                w["pending_enter"] = what
+                w["pending_text_head"] = _text_head(text)  # what unsent_reason compares; short
+                save_state(cfg, st)
+            ok = _act(cfg, st, wave, what, send, name, text, on_typed=typed)
+    finally:
+        lock.__exit__(None, None, None)
     if ok:
         w.pop("pending_enter", None)
+        w.pop("pending_text_head", None)
     return ok
 
 
@@ -3464,6 +3691,48 @@ def done_cmd(cfg, wave=None):
         return True
 
 
+def say_cmd(cfg, wave, text_file):
+    """Type the coordinator's reply into the wave's window the way the dispatcher does (send_text:
+    one bracketed paste, Enter, the submit check with Enter retries) and log the outcome. True when
+    the text left the input line.
+
+    Safe next to a running `watch`: it takes no run lock and writes no state, only the short
+    per-window input lock shared with the dispatcher's deliveries (_InputLock). It puts input into
+    the window and appends one line to events.log; the dispatcher's own deliveries are tracked in the
+    state (`pending_enter`) and are not touched, and a wave reading its input does not depend on who
+    typed it."""
+    text = read_prompt(text_file)
+    if wave not in cfg["waves"]:
+        raise SystemExit(f"wab: unknown wave {wave}; chain.json waves: {cfg['waves']}")
+    rec = load_state(cfg)["waves"].get(wave)
+    if not (isinstance(rec, dict) and rec.get("tmux")):
+        # never guess the session name: with a shared tmux_prefix it may belong to another chain
+        raise SystemExit(f"wab: say: wave {wave} has no launched session in state.json of this run; nothing sent")
+    name = rec["tmux"]
+    lines = [l for l in text.splitlines() if l.strip()]
+    first = redact(lines[0] if lines else "", 120)
+    if not tmux_alive(name):
+        event(cfg, f"{wave}: say FAILED (no window {name}): {first}")
+        return False
+    try:
+        with _InputLock(cfg, wave):  # never interleaves with a dispatcher delivery into the same input
+            # the input stays reserved while the dispatcher still owes an Enter: its text is in the
+            # input line, and a paste now would merge with it (read under the lock, after any delivery)
+            pending = load_state(cfg)["waves"].get(wave, {})
+            if isinstance(pending, dict) and pending.get("pending_enter"):
+                raise NotSubmitted(f"the dispatcher still owes an Enter for «{pending['pending_enter']}» "
+                                   f"in this input; retry after it is delivered")
+            send_text(name, text)
+    except (subprocess.CalledProcessError, OSError, NotSubmitted) as e:
+        why = str(e) if isinstance(e, NotSubmitted) else type(e).__name__
+        event(cfg, f"{wave}: say FAILED ({why}): {first}")
+        print(f"wab: say: the text did not leave the input line of {name}: {why}; "
+              f"look: {attach_cmd(name)}", file=sys.stderr)
+        return False
+    event(cfg, f"{wave}: say: {first}")
+    return True
+
+
 def status_cmd(cfg):
     st = load_state(cfg)
     print("current:", st.get("current"))
@@ -3507,6 +3776,11 @@ def main(argv):
         owner_handover(load_chain(path, create=False), argv[3], argv[4])
     elif cmd == "notify":
         notify(load_chain(path), " ".join(argv[3:]))
+    elif cmd == "attention":
+        sys.exit(attention_cmd(load_chain(path, create=False)))
+    elif cmd == "say" and len(argv) == 5:
+        if not say_cmd(load_chain(path, create=False), argv[3], argv[4]):
+            sys.exit(3)
     else:
         sys.exit(__doc__)
 
