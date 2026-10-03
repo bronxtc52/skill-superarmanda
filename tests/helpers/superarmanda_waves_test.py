@@ -1647,6 +1647,23 @@ class Episodes(Base):
             self.tick()
         self.assertEqual(len(self.tg), 1)
 
+    def test_subagent_write_ends_the_idle_episode_on_an_early_return_path(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for f in (main, agent):
+                os.utime(f, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            t[0] += 300
+            self.tick()
+            self.assertIn("idle", self.get_state(self.cfg)["waves"]["W1"]["notified"])
+            self.set_status(self.cfg, "W1", "BLOCKED: a question")  # the tick returns early now
+            os.utime(agent, (t[0] - 5, t[0] - 5))
+            t[0] += 30
+            self.tick()
+        self.assertNotIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
+
     def test_empty_status_read_changes_nothing(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
         self.tick()

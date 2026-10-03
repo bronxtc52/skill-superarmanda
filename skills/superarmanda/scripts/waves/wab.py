@@ -1323,6 +1323,21 @@ def end_screen_episodes(w, txt, now):
     return screen
 
 
+def note_transcript_activity(w, now):
+    """A still screen over a working subagent is not silence: a NEW write to any transcript file of
+    the session counts as activity when it is seen (a future-dated mtime is clamped once, not every
+    tick) and ends an idle episode already reported, so the next silence is reported again. Runs
+    next to end_screen_episodes, before any branch of the tick returns. In memory only."""
+    files = transcript_activity(w)
+    seen = w.get("activity_files")
+    changed = [m for f, m in files.items() if not isinstance(seen, dict) or seen.get(f) != m]
+    if changed:
+        if isinstance(seen, dict):
+            drop_notice(w, "idle")
+        w["activity_at"] = max(w.get("activity_at") or 0, min(max(changed), now))
+    w["activity_files"] = files
+
+
 KEEP_ON_ACK = ("chain_done",)  # the end of the chain is never stale: it must get through
 
 
@@ -3847,6 +3862,7 @@ def _tick(cfg, st):
 
     # screen episodes end on screen before any branch below returns or sends the outbox
     screen = end_screen_episodes(w, pane_text(name), now)
+    note_transcript_activity(w, now)
     txt = screen["txt"]
 
     if w.get("phase") in ("starting", "sending"):  # the first prompt is not through yet
@@ -3977,17 +3993,6 @@ def _tick(cfg, st):
             flush_notices(cfg, st, w)
 
     digest = screen["digest"]  # a new digest already restarted the clock (end_screen_episodes)
-    # a still screen over a working subagent is not silence: a NEW write to any transcript file of
-    # the session counts as activity when it is seen (a future-dated mtime is clamped once, not every
-    # tick) and ends an idle episode already reported, so the next silence is reported again
-    files = transcript_activity(w)
-    seen = w.get("activity_files")
-    changed = [m for f, m in files.items() if not isinstance(seen, dict) or seen.get(f) != m]
-    if changed:
-        if isinstance(seen, dict):
-            drop_notice(w, "idle")
-        w["activity_at"] = max(w.get("activity_at") or 0, min(max(changed), now))
-    w["activity_files"] = files
     active = max(w.get("pane_changed", now), w.get("activity_at") or 0)
     if now - active > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
