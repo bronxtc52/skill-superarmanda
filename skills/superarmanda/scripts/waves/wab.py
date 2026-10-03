@@ -1340,10 +1340,11 @@ def note_transcript_activity(w, now, idle_s=0):
     before = (seen, w.get("activity_session"), w.get("activity_at"), "idle" in (w.get("notified") or {}))
     if first:
         if files:
-            seeded = min(max(files.values()), now)
-            w["activity_at"] = max(w.get("activity_at") or 0, seeded)
-            if seeded > (w.get("pane_changed") or now) + idle_s:
-                drop_notice(w, "idle")  # written after the old notice: it is stale
+            latest = max(files.values())
+            w["activity_at"] = max(w.get("activity_at") or 0, min(latest, now))
+            # only a real past write proves activity after the old notice; a future mtime does not
+            if latest <= now and latest > (w.get("pane_changed") or now) + idle_s:
+                drop_notice(w, "idle")
     elif any(seen.get(f) != m for f, m in files.items()):  # a change seen now is activity now
         drop_notice(w, "idle")
         w["activity_at"] = now
@@ -4007,6 +4008,8 @@ def _tick(cfg, st):
             flush_notices(cfg, st, w)
 
     digest = screen["digest"]  # a new digest already restarted the clock (end_screen_episodes)
+    if note_transcript_activity(w, now, cfg["idle_minutes"] * 60):  # a session bound in this tick
+        save_state(cfg, st)
     active = max(w.get("pane_changed", now), w.get("activity_at") or 0)
     if now - active > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):

@@ -1739,6 +1739,44 @@ class Episodes(Base):
         self.assertEqual(len(self.tg), 1)
         self.assertIn("молчит", self.tg[0])
 
+    def test_upgrade_with_a_future_dated_file_keeps_a_valid_idle_notice(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        self.pane = "static screen\nline2\nline3\n"
+        st = self.get_state(self.cfg)
+        w = st["waves"]["W1"]
+        w["pane_digest"] = wab.pane_digest(self.pane)
+        w["pane_changed"] = t[0] - 1000
+        wab.once_per(w, "idle", w["pane_digest"])
+        self.put_state(self.cfg, st)
+        os.utime(main, (t[0] - 3600, t[0] - 3600))
+        os.utime(agent, (t[0] + 36000, t[0] + 36000))  # skewed, no write happened
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            self.tick()
+        self.assertIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
+
+    def test_a_session_bound_in_the_same_tick_is_counted_before_the_idle_check(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for f in (main, agent):
+                os.utime(f, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            st = self.get_state(self.cfg)
+            st["waves"]["W1"]["await_session"] = True  # after /clear: the new transcript is not bound yet
+            self.put_state(self.cfg, st)
+            p2 = self.transcript("s2", [asst(inp=2)])
+            t[0] += 90
+            os.utime(p2, (t[0] - 2, t[0] - 2))  # the new session has just written
+
+            def bind(cfg, st_, wave):
+                return "s2"
+            with mock.patch.object(wab, "find_new_session", side_effect=bind):
+                self.tick()
+        self.assertEqual(self.tg, [])
+        self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["sessions"], ["s1", "s2"])
+
     def test_empty_status_read_changes_nothing(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
         self.tick()
