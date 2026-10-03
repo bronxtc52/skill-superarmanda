@@ -3,6 +3,29 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 0.10.0 — 2026-10-03
+
+### Добавлено
+
+- Без Telegram уведомление больше не пропадает в `notify(skipped)`: `tmux display-message` всем
+  клиентам сервера окон волн и файл `<run_dir>/ATTENTION` (время UTC, волна, первая строка после
+  `redact()`, команда attach); файл удаляется с концом эпизода (не-`BLOCKED` после `BLOCKED`,
+  подтверждение координатора, `launch` следующей волны).
+  ([#40](https://github.com/bronxtc52/skill-superarmanda/issues/40))
+- `wab.py attention <chain>`: печатает ATTENTION, код 1 при открытом сигнале, 0 без файла.
+  ([#40](https://github.com/bronxtc52/skill-superarmanda/issues/40))
+- `wab.py say <chain> <волна> <файл-текста>`: ответ в окно волны путём диспетчера с проверкой
+  отправки по `capture-pane` (строка ввода `❯` пуста, нет `paste again to expand`), до 3 повторных
+  Enter, иначе код 3; событие в `events.log`; без замка прогона и записи state.
+  ([#42](https://github.com/bronxtc52/skill-superarmanda/issues/42))
+
+### Исправлено
+
+- Доставка диспетчера (`send_text`) не считает текст, оставшийся в превью вставки или в строке
+  ввода, отправленным: общая проверка `submit`, повтор Enter; при отказе `pending_enter` остаётся,
+  и следующий тик жмёт только Enter с той же проверкой.
+  ([#42](https://github.com/bronxtc52/skill-superarmanda/issues/42))
+
 ## 0.9.0 — 2026-10-02
 
 ### Добавлено
