@@ -1325,17 +1325,19 @@ def end_screen_episodes(w, txt, now):
 
 def note_transcript_activity(w, now):
     """A still screen over a working subagent is not silence: a NEW write to any transcript file of
-    the session counts as activity when it is seen (a future-dated mtime is clamped once, not every
-    tick) and ends an idle episode already reported, so the next silence is reported again. Runs
+    the session counts as activity at the moment it is seen (mtimes are only used on the first look,
+    a future one clamped once, not every tick) and ends an idle episode already reported, so the next silence is reported again. Runs
     next to end_screen_episodes, before any branch of the tick returns. In memory only; True when
     the record changed (the caller saves at once: some branches return without saving)."""
     files = transcript_activity(w)
     seen = w.get("activity_files")
     changed = [m for f, m in files.items() if not isinstance(seen, dict) or seen.get(f) != m]
     if changed:
-        if isinstance(seen, dict):
+        if isinstance(seen, dict):  # a change seen now is activity now, whatever its mtime says
             drop_notice(w, "idle")
-        w["activity_at"] = max(w.get("activity_at") or 0, min(max(changed), now))
+            w["activity_at"] = now
+        else:  # the first look: the files' own age, a future one clamped
+            w["activity_at"] = max(w.get("activity_at") or 0, min(max(changed), now))
     moved = bool(changed) or seen != files
     w["activity_files"] = files
     return moved

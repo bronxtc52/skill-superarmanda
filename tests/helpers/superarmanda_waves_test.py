@@ -1683,6 +1683,24 @@ class Episodes(Base):
                 self.tick()
         self.assertNotIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
 
+    def test_a_write_with_a_corrected_older_mtime_still_counts_as_activity(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            os.utime(main, (t[0] - 3600, t[0] - 3600))
+            os.utime(agent, (t[0] + 36000, t[0] + 36000))  # skewed: clamped to now on the first look
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            t[0] += 50
+            self.tick()
+            t[0] += 50
+            os.utime(agent, (t[0] - 200, t[0] - 200))  # the clock is fixed: a write with an older mtime
+            self.tick()
+            self.assertEqual(self.tg, [])  # a change seen now is activity now
+            t[0] += 300
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+
     def test_empty_status_read_changes_nothing(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
         self.tick()
