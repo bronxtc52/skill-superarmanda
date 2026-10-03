@@ -1559,6 +1559,241 @@ class Episodes(Base):
         self.assertEqual(len(self.tg), 1)
         self.assertIn("молчит", self.tg[0])
 
+    def test_working_subagent_is_not_idleness(self):
+        # Live false alarms (mh-creators run01, 2026-10-03, three in one day): the wave waited for
+        # its background coder/tester subagent, the screen stood still for 12+ min, the owner got
+        # «волна молчит, возможно ждёт тебя». The subagent transcript was being written all along.
+        self.cfg, _ = self.chain(idle_minutes=1)
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(sessions=["s1"])}})
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.transcript("s1", [asst(inp=5)])
+        sub = self.home / ".claude" / "projects" / sanitize(self.cwd) / "s1" / "subagents"
+        sub.mkdir(parents=True)
+        agent = sub / "agent-a1.jsonl"
+        agent.write_text(asst(inp=1) + "\n", encoding="utf-8")
+        t = [5_000_000.0]
+        main = wab.transcript_path(self.cwd, "s1")
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            os.utime(main, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            for _ in range(3):  # 3 x 5 min of a still screen while the subagent writes
+                t[0] += 300
+                os.utime(agent, (t[0] - 20, t[0] - 20))
+                self.tick()
+            self.assertEqual(self.tg, [])
+            t[0] += 300  # the subagent stopped writing too: real silence is still reported
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+        self.assertIn("молчит", self.tg[0])
+
+    def _subagent_wave(self):
+        self.cfg, _ = self.chain(idle_minutes=1)
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(sessions=["s1"])}})
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.transcript("s1", [asst(inp=5)])
+        sub = self.home / ".claude" / "projects" / sanitize(self.cwd) / "s1" / "subagents"
+        sub.mkdir(parents=True)
+        agent = sub / "agent-a1.jsonl"
+        agent.write_text(asst(inp=1) + "\n", encoding="utf-8")
+        return wab.transcript_path(self.cwd, "s1"), agent
+
+    def test_subagent_write_after_an_idle_notice_ends_the_episode(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for f in (main, agent):
+                os.utime(f, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            t[0] += 300
+            self.tick()
+            self.assertEqual(len(self.tg), 1)  # real silence: reported
+            os.utime(agent, (t[0] - 5, t[0] - 5))  # the subagent works again, the screen is still
+            t[0] += 30
+            self.tick()
+            self.assertNotIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
+            t[0] += 300  # and stops: the new silence is reported again, the old mark does not mute it
+            self.tick()
+        self.assertEqual(len(self.tg), 2)
+
+    def test_future_dated_transcript_does_not_mute_silence(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            os.utime(main, (t[0] - 3600, t[0] - 3600))
+            os.utime(agent, (t[0] + 36000, t[0] + 36000))  # a skewed clock: 10 h ahead, never rewritten
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            t[0] += 300
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+        self.assertIn("молчит", self.tg[0])
+
+    def test_a_future_dated_file_does_not_hide_writes_to_another(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            os.utime(main, (t[0] + 36000, t[0] + 36000))  # skewed and never rewritten
+            os.utime(agent, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            for _ in range(3):  # the subagent writes; the max over files stays the future one
+                t[0] += 50
+                os.utime(agent, (t[0] - 5, t[0] - 5))
+                self.tick()
+            self.assertEqual(self.tg, [])
+            t[0] += 300
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+
+    def test_subagent_write_ends_the_idle_episode_on_an_early_return_path(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for f in (main, agent):
+                os.utime(f, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            t[0] += 300
+            self.tick()
+            self.assertIn("idle", self.get_state(self.cfg)["waves"]["W1"]["notified"])
+            self.set_status(self.cfg, "W1", "BLOCKED: a question")  # the tick returns early now
+            os.utime(agent, (t[0] - 5, t[0] - 5))
+            t[0] += 30
+            self.tick()
+        self.assertNotIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
+
+    def test_ended_idle_episode_is_saved_even_when_the_tick_returns_without_saving(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for f in (main, agent):
+                os.utime(f, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            t[0] += 300
+            self.tick()
+            self.assertIn("idle", self.get_state(self.cfg)["waves"]["W1"]["notified"])
+            os.utime(agent, (t[0] - 5, t[0] - 5))
+            t[0] += 30
+            # a policy-answered BLOCKED: the branch returns True without save_state
+            self.set_status(self.cfg, "W1", "BLOCKED: [class=question rec=A red=no] q")
+            with mock.patch.object(wab, "_policy_answer", return_value=True):
+                self.tick()
+        self.assertNotIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
+
+    def test_a_write_with_a_corrected_older_mtime_still_counts_as_activity(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            os.utime(main, (t[0] - 3600, t[0] - 3600))
+            os.utime(agent, (t[0] + 36000, t[0] + 36000))  # skewed: clamped to now on the first look
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            t[0] += 50
+            self.tick()
+            t[0] += 50
+            os.utime(agent, (t[0] - 200, t[0] - 200))  # the clock is fixed: a write with an older mtime
+            self.tick()
+            self.assertEqual(self.tg, [])  # a change seen now is activity now
+            t[0] += 300
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+
+    def test_upgrade_from_a_record_without_bookkeeping_drops_a_stale_idle_notice(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        self.pane = "static screen\nline2\nline3\n"
+        st = self.get_state(self.cfg)
+        w = st["waves"]["W1"]
+        w["pane_digest"] = wab.pane_digest(self.pane)
+        w["pane_changed"] = t[0] - 1000  # 0.13.0 raised «молчит» at pane_changed + 60 s
+        wab.once_per(w, "idle", w["pane_digest"])
+        wab.put_notice(w, "idle", w["pane_digest"], "wave-autobot: волна W1 молчит 1+ мин")
+        self.put_state(self.cfg, st)
+        os.utime(main, (t[0] - 3600, t[0] - 3600))
+        os.utime(agent, (t[0] - 10, t[0] - 10))  # the subagent wrote after that notice
+        with mock.patch("time.time", side_effect=lambda: t[0]), \
+                mock.patch.object(wab, "flush_notices"):
+            self.tick()
+        w = self.get_state(self.cfg)["waves"]["W1"]
+        self.assertNotIn("idle", w.get("notified", {}))
+        self.assertNotIn("idle", w.get("outbox", {}))
+
+    def test_a_new_session_seeds_its_baseline_instead_of_counting_as_a_write(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for f in (main, agent):
+                os.utime(f, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            st = self.get_state(self.cfg)
+            st["waves"]["W1"]["sessions"] = ["s1", "s2"]  # bound after /clear
+            self.put_state(self.cfg, st)
+            p2 = self.transcript("s2", [asst(inp=2)])
+            os.utime(p2, (t[0] - 3600, t[0] - 3600))  # the new session is old and quiet
+            t[0] += 90
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+        self.assertIn("молчит", self.tg[0])
+
+    def test_upgrade_with_a_future_dated_file_keeps_a_valid_idle_notice(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        self.pane = "static screen\nline2\nline3\n"
+        st = self.get_state(self.cfg)
+        w = st["waves"]["W1"]
+        w["pane_digest"] = wab.pane_digest(self.pane)
+        w["pane_changed"] = t[0] - 1000
+        wab.once_per(w, "idle", w["pane_digest"])
+        self.put_state(self.cfg, st)
+        os.utime(main, (t[0] - 3600, t[0] - 3600))
+        os.utime(agent, (t[0] + 36000, t[0] + 36000))  # skewed, no write happened
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            self.tick()
+        self.assertIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
+
+    def test_a_session_bound_in_the_same_tick_is_counted_before_the_idle_check(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for f in (main, agent):
+                os.utime(f, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            st = self.get_state(self.cfg)
+            st["waves"]["W1"]["await_session"] = True  # after /clear: the new transcript is not bound yet
+            self.put_state(self.cfg, st)
+            p2 = self.transcript("s2", [asst(inp=2)])
+            t[0] += 90
+            os.utime(p2, (t[0] - 2, t[0] - 2))  # the new session has just written
+
+            def bind(cfg, st_, wave):
+                return "s2"
+            with mock.patch.object(wab, "find_new_session", side_effect=bind):
+                self.tick()
+        self.assertEqual(self.tg, [])
+        self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["sessions"], ["s1", "s2"])
+
+    def test_upgrade_counts_a_real_write_next_to_a_future_dated_file(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        self.pane = "static screen\nline2\nline3\n"
+        st = self.get_state(self.cfg)
+        w = st["waves"]["W1"]
+        w["pane_digest"] = wab.pane_digest(self.pane)
+        w["pane_changed"] = t[0] - 1000
+        wab.once_per(w, "idle", w["pane_digest"])
+        self.put_state(self.cfg, st)
+        os.utime(main, (t[0] + 36000, t[0] + 36000))  # skewed
+        os.utime(agent, (t[0] - 10, t[0] - 10))  # a real write after the old notice
+        with mock.patch("time.time", side_effect=lambda: t[0]), \
+                mock.patch.object(wab, "flush_notices"):
+            self.tick()
+        self.assertNotIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
+
     def test_empty_status_read_changes_nothing(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
         self.tick()
