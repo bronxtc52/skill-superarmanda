@@ -1587,6 +1587,66 @@ class Episodes(Base):
         self.assertEqual(len(self.tg), 1)
         self.assertIn("молчит", self.tg[0])
 
+    def _subagent_wave(self):
+        self.cfg, _ = self.chain(idle_minutes=1)
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(sessions=["s1"])}})
+        self.set_status(self.cfg, "W1", "RUNNING")
+        self.transcript("s1", [asst(inp=5)])
+        sub = self.home / ".claude" / "projects" / sanitize(self.cwd) / "s1" / "subagents"
+        sub.mkdir(parents=True)
+        agent = sub / "agent-a1.jsonl"
+        agent.write_text(asst(inp=1) + "\n", encoding="utf-8")
+        return wab.transcript_path(self.cwd, "s1"), agent
+
+    def test_subagent_write_after_an_idle_notice_ends_the_episode(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            for f in (main, agent):
+                os.utime(f, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            t[0] += 300
+            self.tick()
+            self.assertEqual(len(self.tg), 1)  # real silence: reported
+            os.utime(agent, (t[0] - 5, t[0] - 5))  # the subagent works again, the screen is still
+            t[0] += 30
+            self.tick()
+            self.assertNotIn("idle", self.get_state(self.cfg)["waves"]["W1"].get("notified", {}))
+            t[0] += 300  # and stops: the new silence is reported again, the old mark does not mute it
+            self.tick()
+        self.assertEqual(len(self.tg), 2)
+
+    def test_future_dated_transcript_does_not_mute_silence(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            os.utime(main, (t[0] - 3600, t[0] - 3600))
+            os.utime(agent, (t[0] + 36000, t[0] + 36000))  # a skewed clock: 10 h ahead, never rewritten
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            t[0] += 300
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+        self.assertIn("молчит", self.tg[0])
+
+    def test_a_future_dated_file_does_not_hide_writes_to_another(self):
+        main, agent = self._subagent_wave()
+        t = [5_000_000.0]
+        with mock.patch("time.time", side_effect=lambda: t[0]):
+            os.utime(main, (t[0] + 36000, t[0] + 36000))  # skewed and never rewritten
+            os.utime(agent, (t[0] - 3600, t[0] - 3600))
+            self.pane = "static screen\nline2\nline3\n"
+            self.tick()
+            for _ in range(3):  # the subagent writes; the max over files stays the future one
+                t[0] += 50
+                os.utime(agent, (t[0] - 5, t[0] - 5))
+                self.tick()
+            self.assertEqual(self.tg, [])
+            t[0] += 300
+            self.tick()
+        self.assertEqual(len(self.tg), 1)
+
     def test_empty_status_read_changes_nothing(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
         self.tick()

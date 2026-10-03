@@ -789,26 +789,26 @@ def context_tokens(w):
 
 
 def transcript_activity(w):
-    """Last write (epoch seconds) to the transcript of the wave's CURRENT session or to any of its
-    subagent transcripts; None when there is none. A wave waiting for its background coder/tester
-    keeps a still screen while the subagent works: idleness counts this activity too."""
+    """mtime of every transcript of the wave's CURRENT session: the main one and its subagents'
+    (`<session>/subagents/*.jsonl`), as {path: mtime}; {} when there is none. A wave waiting for
+    its background coder/tester keeps a still screen while the subagent works: idleness counts
+    a changed file as activity (per file, so one future-dated file cannot hide the others)."""
     sessions = w.get("sessions") or []
     if not sessions:
-        return None
+        return {}
     main = transcript_path(w["cwd"], sessions[-1])
     files = [main]
     try:
         files += list((main.parent / sessions[-1] / "subagents").glob("*.jsonl"))
     except OSError:
         pass
-    last = None
+    out = {}
     for f in files:
         try:
-            m = f.stat().st_mtime
+            out[str(f)] = f.stat().st_mtime
         except OSError:
             continue
-        last = m if last is None or m > last else last
-    return last
+    return out
 
 
 def session_marker(cfg, wave):
@@ -3977,10 +3977,18 @@ def _tick(cfg, st):
             flush_notices(cfg, st, w)
 
     digest = screen["digest"]  # a new digest already restarted the clock (end_screen_episodes)
-    active = w.get("pane_changed", now)
-    wrote = transcript_activity(w)  # a still screen over a working subagent is not silence
-    if wrote is not None:
-        active = max(active, min(wrote, now))
+    # a still screen over a working subagent is not silence: a NEW write to any transcript file of
+    # the session counts as activity when it is seen (a future-dated mtime is clamped once, not every
+    # tick) and ends an idle episode already reported, so the next silence is reported again
+    files = transcript_activity(w)
+    seen = w.get("activity_files")
+    changed = [m for f, m in files.items() if not isinstance(seen, dict) or seen.get(f) != m]
+    if changed:
+        if isinstance(seen, dict):
+            drop_notice(w, "idle")
+        w["activity_at"] = max(w.get("activity_at") or 0, min(max(changed), now))
+    w["activity_files"] = files
+    active = max(w.get("pane_changed", now), w.get("activity_at") or 0)
     if now - active > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
             put_notice(w, "idle", digest,
