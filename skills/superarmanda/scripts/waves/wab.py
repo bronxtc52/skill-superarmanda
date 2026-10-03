@@ -1809,10 +1809,28 @@ def archive_attempt_files(wdir, n):
     return target
 
 
+def sync_max_runs(cfg, wave):
+    """Keep <wave dir>/max-runs equal to chain.json `max_runs` (one integer line, temp+rename).
+    The wave's session reads it in `state.py init --from-plan`, so a cap raised while the wave
+    runs reaches the session whose env still holds the old value. Written only when the
+    value differs or the file is missing; a failure is an event, never a stop."""
+    want = f"{cfg['max_runs']}\n"
+    try:
+        target = wave_dir(cfg, wave) / "max-runs"
+        if read(target) == want.strip():
+            return
+        tmp = target.with_name(f".max-runs.{os.getpid()}.tmp")
+        tmp.write_text(want, encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as e:
+        event(cfg, f"{wave}: max-runs file not written: {e}")
+
+
 def start_session(cfg, st, wave):
     """launching -> starting: create the tmux window (same session id on a repeat)."""
     w = st["waves"][wave]
     wdir = wave_dir(cfg, wave)
+    sync_max_runs(cfg, wave)
     cmd = ["claude", "--permission-mode", "auto", "--append-system-prompt-file", str(system_prompt(cfg)),
            "--name", f"wab-{cfg['chain']}-{wave}", "--session-id", w["sessions"][0]]
     if cfg["model"]:
@@ -3874,6 +3892,8 @@ def _watch(cfg, path, max_ticks=None):
                                  f"stopping; restart watch for the new run")
             cfg = fresh
         st = _state_or_event(cfg)
+        if st.get("current") in cfg["waves"]:
+            sync_max_runs(cfg, st["current"])
         if not tick(cfg, st):
             drain_notices(cfg)  # handoff / chain-finished notices must not be lost with the exit
             return _stop_event(cfg, load_state(cfg), path)

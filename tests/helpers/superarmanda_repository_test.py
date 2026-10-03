@@ -145,7 +145,7 @@ class RepositoryContract(unittest.TestCase):
         )
 
     def mock_env(self, mode="success"):
-        env = os.environ.copy()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("WAB_")}
         env.update(
             {
                 "PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
@@ -169,7 +169,7 @@ class RepositoryContract(unittest.TestCase):
             with self.subTest(variable=name):
                 if self.packet_path.exists():
                     self.packet_path.unlink()
-                env = os.environ.copy()
+                env = {k: v for k, v in os.environ.items() if not k.startswith("WAB_")}
                 env[name] = value
                 proc = self.packet(env=env)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -195,7 +195,7 @@ class RepositoryContract(unittest.TestCase):
         self.git("commit", "-qm", "unsafe filter fixture")
         self.git("config", "filter.unsafe.clean", str(driver))
         self.git("config", "core.fsmonitor", str(driver))
-        env = os.environ.copy()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("WAB_")}
         env["SA_DRIVER_MARKER"] = str(marker)
         proc = self.packet(env=env)
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)

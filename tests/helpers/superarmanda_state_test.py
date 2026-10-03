@@ -27,7 +27,7 @@ STATE = ROOT / "skills" / "superarmanda" / "scripts" / "state.py"
 
 # A wave dispatcher exports WAB_DIR/WAB_MAX_RUNS; the run counter of `init --from-plan`
 # must not leak into fixtures that did not ask for it.
-for _key in ("WAB_DIR", "WAB_MAX_RUNS"):
+for _key in [k for k in os.environ if k.startswith("WAB_")]:
     os.environ.pop(_key, None)
 
 
@@ -2241,6 +2241,18 @@ class StateContract(unittest.TestCase):
         self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
         self.assertEqual(self.manifest_data()["tasks"]["implement"]["status"], "in_progress")
 
+    def test_where_lists_only_acceptances_covering_the_current_result(self):  # r2 P2
+        self.reviewed()
+        self.accept()
+        info = json.loads(self.cli("where").stdout)
+        self.assertEqual(len(info["accepted_limitations"]), 1)
+        self.assertEqual(info["accepted"], 1)
+        self.commit_change("another head\n")
+        info = json.loads(self.cli("where").stdout)
+        self.assertEqual(info["accepted_limitations"], [])
+        self.assertEqual(info["accepted"], 0)
+        self.assertEqual(self.manifest_data()["tasks"]["implement"]["acceptances"][0]["severity"], "medium")  # history stays
+
     def test_accept_rejections(self):
         self.record("coder", session="coder-1")
         self.record("tester", status="findings", session="tester-1")
@@ -3447,7 +3459,7 @@ class RunCounter(unittest.TestCase):
         patcher = mock.patch.dict(os.environ)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in ("WAB_DIR", "WAB_MAX_RUNS"):
+        for key in [k for k in os.environ if k.startswith("WAB_")]:
             os.environ.pop(key, None)
         self.runs = Path(self.tmp.name) / "wabdir" / "runs.json"
         self.write_plan()
@@ -3573,6 +3585,55 @@ class RunCounter(unittest.TestCase):
                 self.assertFalse(manifest.exists())
                 self.assertEqual(self.runs.read_text(encoding="utf-8"), raw)
 
+    def test_max_runs_file_beats_env_and_a_raise_reaches_the_old_environment(self):  # r2 P1
+        wab = self.runs.parent
+        wab.mkdir(parents=True, exist_ok=True)
+        env = {"WAB_DIR": str(wab), "WAB_MAX_RUNS": "2"}  # the session's env stays at the old cap
+        for name in ("a", "b"):
+            self.assertEqual(self.init_run(name, env=env)[1].returncode, 0)
+        _m, proc = self.init_run("c", env=env)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("run cap reached", proc.stderr)
+        (wab / "max-runs").write_text("3\n", encoding="utf-8")  # the dispatcher saw the owner's raise
+        manifest, proc = self.init_run("c2", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(manifest.read_text())["run"], {"index": 3, "max": 3})
+
+    def test_explicit_flag_beats_the_max_runs_file(self):
+        wab = self.runs.parent
+        wab.mkdir(parents=True, exist_ok=True)
+        (wab / "max-runs").write_text("1\n", encoding="utf-8")
+        env = {"WAB_DIR": str(wab)}
+        self.assertEqual(self.init_run("a", extra=["--max-runs", 3], env=env)[1].returncode, 0)
+        self.assertEqual(self.init_run("b", extra=["--max-runs", 3], env=env)[1].returncode, 0)
+
+    def test_damaged_max_runs_file_is_a_closed_refusal(self):
+        wab = self.runs.parent
+        wab.mkdir(parents=True, exist_ok=True)
+        for raw in ("", "\n", "x", "0", "-1", "1.5", "2 3", "1001"):
+            with self.subTest(raw=raw):
+                (wab / "max-runs").write_text(raw, encoding="utf-8")
+                manifest, proc = self.init_run("d", env={"WAB_DIR": str(wab)})
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertIn("max-runs", proc.stderr)
+                self.assertFalse(manifest.exists())
+                self.assertFalse(self.runs.exists())
+
+    def test_last_run_does_not_lead_acceptance_findings_out_of_fix_loop(self):  # r2 P1
+        flags = ["--max-runs", 1, "--runs-file", self.runs]
+        self.manifest, _ = self.init_run("a", extra=flags)
+        self.record("coder")
+        self.record("tester")
+        self.record("cross_provider_reviewer", status="findings")
+        info = self.where()
+        self.assertTrue(info["last_run"])
+        action = info["next_action"]
+        self.assertIn("--outcome failed --source cross_provider_reviewer", action)
+        self.assertIn("acceptance", action)
+        self.assertIn("--defer", action)
+        self.assertIn("--accept", action)
+        self.assertNotIn("instead of a new fix round", action)
+
     def test_where_reports_the_run_and_the_last_run_hint(self):
         flags = ["--max-runs", 2, "--runs-file", self.runs]
         first, _ = self.init_run("a", extra=flags)
@@ -3592,7 +3653,7 @@ class RunCounter(unittest.TestCase):
         self.assertEqual((info["run"], info["last_run"]), ("2/2", True))
         self.assertIn("--defer", info["next_action"])
         self.assertIn("--accept", info["next_action"])
-        self.assertNotIn("--outcome failed", info["next_action"])
+        self.assertIn("--outcome failed", info["next_action"])  # acceptance findings keep the fix-loop
 
 
 class WhereDerivationExhaustive(unittest.TestCase):

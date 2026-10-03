@@ -966,7 +966,8 @@ def parse_max_runs(value, origin):
 
 
 def run_counter_settings(args):
-    """(runs_file, max_runs) when the wave run counter applies, else None. It applies
+    """(runs_file, max_runs) when the wave run counter applies, else None. The cap comes from
+    --max-runs, else $WAB_DIR/max-runs (the live value), else $WAB_MAX_RUNS, else 2. It applies
     only to `init --from-plan` and only when --runs-file or $WAB_DIR names where the
     counter lives; an ordinary /superarmanda run is never counted."""
     explicit = args.max_runs is not None or args.runs_file is not None
@@ -983,8 +984,17 @@ def run_counter_settings(args):
         if args.max_runs is not None:
             fail("--max-runs requires --runs-file or WAB_DIR")
         return None
+    limit_file = Path(directory) / "max-runs" if directory else None
     if args.max_runs is not None:
         limit = parse_max_runs(args.max_runs, "--max-runs")
+    elif limit_file is not None and limit_file.exists():
+        # The dispatcher keeps the live cap here (chain.json max_runs can be raised while the
+        # wave runs; the env of an already started session cannot follow it).
+        try:
+            raw = limit_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            fail(f"{limit_file} is unreadable ({exc}); fix or remove it")
+        limit = parse_max_runs(raw.rstrip("\n"), str(limit_file))
     elif "WAB_MAX_RUNS" in os.environ:
         limit = parse_max_runs(os.environ["WAB_MAX_RUNS"], "WAB_MAX_RUNS")
     else:
@@ -1426,8 +1436,9 @@ REVIEW_ORDER = (
 
 def derive_step(entry, verdicts, last_run=False):
     """Return (step, role, note); note overrides the default next_action.
-    On the last permitted run of a wave a reviewer's open findings are disposed with
-    --defer/--accept rather than a new fix round."""
+    On the last permitted run of a wave there is no new `init --from-plan`, but fix rounds
+    of the current run go on: findings that break the acceptance are a normal fix-loop
+    --outcome failed; only findings outside the acceptance are deferred/accepted."""
     status = entry.get("status") if entry else None
     if status == "blocked":
         return None, None, None
@@ -1448,9 +1459,10 @@ def derive_step(entry, verdicts, last_run=False):
         return (
             6,
             "coordinator",
-            f"last run of the wave: record fix-loop --defer or --accept --source "
-            f"{disposition[0]} --note <text> (--accept needs --severity) "
-            "instead of a new fix round",
+            "last run of the wave (no new init --from-plan): findings that break the "
+            f"wave acceptance go through fix-loop --outcome failed --source {disposition[0]}; "
+            "findings outside the acceptance: fix-loop --defer (low/P3) or --accept "
+            f"--source {disposition[0]} --severity <low|medium|high> --note <text>",
         )
     if disposition:
         return (
@@ -1588,7 +1600,13 @@ def where(args):
     else:
         action = f"step {step} {role}: continue task {name}"
     action = one_line(action)
-    acceptances = (entry or {}).get("acceptances") or []
+    # Only acceptances that cover a result of the current head/tree are active: after a
+    # resume onto a new head the old ones are history, not limitations of this result.
+    acceptances = [
+        record
+        for record in (accepted_record(entry, role, item) for role, item in sorted(current.items()))
+        if record is not None
+    ]
     print(
         json.dumps(
             {

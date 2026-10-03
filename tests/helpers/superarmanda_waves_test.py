@@ -44,7 +44,8 @@ def _install_tmux_guard():
     tmpdir = tempfile.mkdtemp(prefix="wabtmux-")
     atexit.register(shutil.rmtree, tmpdir, True)
     os.environ["TMUX_TMPDIR"] = tmpdir
-    for var in ("TMUX", "TMUX_PANE", "WAB_TMUX_SOCKET"):
+    # a wave session exports WAB_DIR/WAB_MAX_RUNS/...: nothing of the live run may leak into tests
+    for var in ["TMUX", "TMUX_PANE", *(k for k in os.environ if k.startswith("WAB_"))]:
         os.environ.pop(var, None)
     real = shutil.which("tmux")
     if real:  # a shim that refuses a socketless tmux and then execs the real binary
@@ -10535,6 +10536,36 @@ class W1MaxRuns(Base):  # #39: the run cap of a wave travels with its session
                 new = [c for c in self.tmux_calls if c[1] == "new-session"][0]
                 self.assertIn(want, new)
                 self.assertIn(f"WAB_DIR={wab.wave_dir(cfg, 'W1')}", new)
+
+
+class W1MaxRunsFile(Base):  # r2 P1: the live cap reaches an already running session
+    def cap_file(self, cfg, wave="W1"):
+        return wab.wave_dir(cfg, wave) / "max-runs"
+
+    def test_new_session_gets_the_file(self):
+        cfg, _ = self.chain(max_runs=4)
+        st = {"waves": {"W1": self.wave_rec(sessions=["s" * 8])}}
+        wab.start_session(cfg, st, "W1")
+        self.assertEqual(self.cap_file(cfg).read_text(encoding="utf-8"), "4\n")
+
+    def test_watch_updates_the_file_when_chain_json_max_runs_changes(self):
+        cfg, path = self.chain(max_runs=2)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", "RUNNING")
+        seen = []
+
+        def fake_tick(c, st):
+            seen.append(self.cap_file(c).read_text(encoding="utf-8") if self.cap_file(c).exists() else None)
+            if len(seen) == 1:
+                doc = json.loads(path.read_text(encoding="utf-8"))
+                doc["max_runs"] = 3
+                path.write_text(json.dumps(doc), encoding="utf-8")
+            return True
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "tick", side_effect=fake_tick):
+            wab.watch(cfg, path, max_ticks=3)
+        self.assertEqual(seen, ["2\n", "3\n", "3\n"])
+        self.assertEqual([p.name for p in self.cap_file(cfg).parent.iterdir() if p.name.startswith("max-runs")],
+                         ["max-runs"])  # no temp leftovers
 
 
 class W1AfterDoneEdits(GateBase):  # #45: the wave pushes to the PR after DONE
