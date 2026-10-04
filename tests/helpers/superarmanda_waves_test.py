@@ -13645,6 +13645,103 @@ class ChainCleanup(Base):
         self.assertIn("kill-pane failed", events)
         self.assertNotIn("chain sessions closed", events)
 
+    # --- round 3: /exit goes to OUR pane by id, never to the active pane of a shared session
+    def shared_session(self, cfg):
+        """wv-w2: our pane (%a) plus a foreign pane (the active one) that echoes what is typed."""
+        tag = f"{CHAIN}/{RUN_ID}"
+        self.session("wv-w2", tag, cfg["run_dir"], cmd="cat")
+        ours = self.tm("display-message", "-p", "-t", "=wv-w2:", "#{pane_id}").stdout.strip()
+        self.assertEqual(self.tm("new-window", "-t", "=wv-w2:", "cat").returncode, 0)
+        foreign = self.tm("display-message", "-p", "-t", "=wv-w2:", "#{pane_id}").stdout.strip()
+        self.tm("set-option", "-p", "-t", foreign, "@wab_run", "other/1")
+        self.tm("set-option", "-p", "-t", foreign, "@wab_run_dir", "/elsewhere")
+        self.assertNotEqual(ours, foreign)
+        return ours, foreign
+
+    def screen(self, pane):
+        return self.tm("capture-pane", "-p", "-t", pane).stdout
+
+    def test_done_with_a_foreign_pane_in_the_session_closes_ours_and_types_nothing_there(self):
+        cfg, path = self.cfg()
+        self.state_two_waves(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W2"]["pending_exit"] = True
+        self.put_state(cfg, st)
+        ours, foreign = self.shared_session(cfg)
+        typed = []
+        self.w.clear_input = lambda name: typed.append(name)  # an empty input box: /exit may be typed
+        self.w.EXIT_WAIT = 1
+        self.assertTrue(self.w.done_cmd(cfg))
+        self.assertNotIn(ours, self.pane_ids())
+        self.assertIn(foreign, self.pane_ids())
+        self.assertNotIn("/exit", self.screen(foreign))
+        self.assertFalse(self.get_state(cfg)["waves"]["W2"].get("pending_exit"))
+        self.assertTrue(self.w.done_cmd(cfg))  # again: still 0, still nothing typed there
+        self.assertNotIn("/exit", self.screen(foreign))
+        self.assertNotIn(foreign, typed)
+
+    def test_close_window_types_exit_only_into_our_pane(self):
+        cfg, path = self.cfg()
+        self.state_two_waves(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W2"]["pending_exit"] = True
+        self.put_state(cfg, st)
+        ours, foreign = self.shared_session(cfg)
+        seen = []
+        self.w.clear_input = lambda name: seen.append(name)
+        st = self.get_state(cfg)
+        self.assertTrue(self.w.close_window(cfg, st, st["waves"]["W2"]))
+        time.sleep(0.3)
+        self.assertEqual(seen, [ours])
+        self.assertIn("/exit", self.screen(ours))
+        self.assertNotIn("/exit", self.screen(foreign))
+
+    def test_a_session_marked_by_another_run_gets_no_exit_and_the_intent_is_dropped(self):
+        cfg, path = self.cfg()
+        self.state_two_waves(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W2"]["pending_exit"] = True
+        self.put_state(cfg, st)
+        self.session("wv-w2", "demo/2026-12-31", "/elsewhere", cmd="cat")
+        self.w.clear_input = lambda name: None
+        st = self.get_state(cfg)
+        self.assertFalse(self.w.close_window(cfg, st, st["waves"]["W2"]))
+        self.assertFalse(self.get_state(cfg)["waves"]["W2"].get("pending_exit"))
+        pane = next(iter(self.pane_ids()))
+        self.assertNotIn("/exit", self.screen(pane))
+
+    # --- round 3: a session found alive by recovery gets its marks
+    def test_recover_launch_marks_a_live_unmarked_session(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="launching")}})
+        st = self.get_state(cfg)
+        wab.recover_launch(cfg, st, "W1")
+        sets = [c for c in self.tmux_calls if c[1] == "set-option"]
+        self.assertTrue(any("@wab_run" in c for c in sets), sets)
+
+    def test_recover_launch_does_not_mark_a_session_of_another_run(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="launching")}})
+        st = self.get_state(cfg)
+        with mock.patch.object(wab, "_ours", return_value="foreign"):
+            wab.recover_launch(cfg, st, "W1")
+        self.assertFalse([c for c in self.tmux_calls if c[1] == "set-option"])
+
+    # --- round 3: stale chains are keyed by (tag, run_dir)
+    def test_stale_chains_tells_runs_with_the_same_tag_apart_by_directory(self):
+        cfg, path = self.cfg()
+        d1, d2 = self.tmp / "old-1", self.tmp / "old-2"
+        for d in (d1, d2):
+            d.mkdir()
+            (d / "chain-result.md").write_text("x", encoding="utf-8")
+        tag = f"{CHAIN}/{RUN_ID}"  # the SAME tag as ours
+        self.session("old1-w1", tag, d1)
+        self.session("old2-w1", tag, d2)
+        self.session("mine-w1", tag, cfg["run_dir"])
+        found = self.w.stale_chains(cfg)
+        self.assertEqual(sorted((f["run_dir"], tuple(f["targets"])) for f in found),
+                         sorted([(str(d1.resolve()), ("old1-w1",)), (str(d2.resolve()), ("old2-w1",))]))
+
     # --- 6. launch of the first wave warns about a FINISHED foreign chain only
     def test_stale_chains_lists_finished_chains_without_a_dispatcher_only(self):
         cfg, path = self.cfg()
