@@ -35,6 +35,36 @@ and all substantive trusted-bot review/comment threads, are emitted as findings 
 disposition. They are never silently erased. CodeRabbit unavailability does not block, but any
 actual CodeRabbit finding remains a finding.
 
+### CodeRabbit: результат по факту ревью HEAD (1.0.2, #72)
+
+`check` кладёт в результат поле `coderabbit` = `{"status", "reason", "evidence_url"}`; оно есть всегда
+(при HEAD ≠ ожидаемому — `pending`). Основной `status` и список `findings` оно не меняет. Учитываются
+только элементы с login `coderabbitai[bot]` и типом `Bot`.
+
+- `findings` — inline-комментарий CodeRabbit на HEAD (не шаблон-заглушка), либо его review на HEAD с
+  непустым телом, с прикреплёнными комментариями или в состоянии `CHANGES_REQUESTED`/`DISMISSED`.
+  Находки перекрывают любое доказательство.
+- `pass` — нет находок на HEAD и есть доказательство ревью HEAD по любому из двух каналов:
+  1. review CodeRabbit с `commit_id` = HEAD в состоянии `COMMENTED`/`APPROVED`/`CHANGES_REQUESTED`
+     (в том числе с пустым телом);
+  2. issue comment или тело review CodeRabbit, где среди строк вне блок-цитат (первая непробельная
+     литера `>` — цитата) есть `No actionable comments were generated` или `Actionable comments posted: N`
+     И диапазон `between <полный SHA> and <полный SHA>` (40 или 64 hex), конец которого равен HEAD
+     без учёта регистра. Маркер и диапазон — в одном и том же комментарии. Сокращённые SHA не принимаются.
+- `unavailable` — доказательства и находок нет, но в теле доверенного комментария/review есть явный отказ
+  (`review limit reached`, `rate limited`, `no credits available`, `reviews are disabled`, без учёта
+  регистра) и в том же теле нет диапазона `between X and Y` либо его конец равен HEAD (отказ по старому
+  HEAD не считается). `reason` называет фразу, `evidence_url` — комментарий.
+- `pending` — всё остальное (`no CodeRabbit review bound to current HEAD yet`; для известного шаблона
+  пропуска черновика — `CodeRabbit skipped the draft PR`). Скрипт не ждёт.
+
+Правило координатора. Пока `coderabbit.status == pending`, повторять `check`. Если CodeRabbit не дал
+доказательства за 30 минут после завершения Codex на HEAD — записать
+`task-result --role coderabbit --status unavailable` с причиной timeout. Запись роли `coderabbit` по полю:
+`pass` → `pass`, `findings` → `findings`, `unavailable` → `unavailable`. `unavailable` гейт мерджа не
+блокирует; `findings` разбираются (исправление, `fix-loop --defer` или `--accept`).
+Фикстуры — `tests/fixtures/pr-review/coderabbit/` (PR #70, #71, #592).
+
 Two clean-comment formats are accepted, each a structure, not a wording list. The legacy format
 (unchanged by #442) is:
 

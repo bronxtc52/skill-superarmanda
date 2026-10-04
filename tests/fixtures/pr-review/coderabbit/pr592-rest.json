@@ -1,0 +1,37 @@
+{
+  "draft": false,
+  "head": {
+    "sha": "c1fe47b26b91f046c58b02213b9aa20b85b49b70"
+  },
+  "issue_comments": [
+    {
+      "body": "<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-10-04T11:26:02.612716Z\">2026-10-04T11:26:02.612716Z</relative-time> | `c1fe47b` | Manual request |\n\n\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings.\n\n</details>",
+      "html_url": "https://github.com/bronxtc52/agent-config/pull/592#issuecomment-5979289367",
+      "id": 5979289367,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      }
+    },
+    {
+      "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n> [!WARNING]\n> ## Review limit reached\n> \n> Your organization has reached its usage spending cap. Adjust your spending cap in the [billing tab](https://app.coderabbit.ai/settings/billing?tab=usage&orgId=02d6df35-9975-480a-af13-111016eb280e).\n> \n> **Next included review available in 21 minutes.**\n> \n> [Check out review usage here](https://app.coderabbit.ai/dashboard/review-capacity?orgId=02d6df35-9975-480a-af13-111016eb280e).\n> \n> <details>\n> <summary>View limit details</summary>\n> \n> **Limit details:** You’ve used the included review currently available. Your 61 included PR review attempts over the past 7 days set your current allowance at 1 review per hour.\n> \n> [Learn how review limits work](https://docs.coderabbit.ai/management/plans#rate-limits).\n> \n> **Review configuration:**\n> \n> <details>\n> <summary>⚙️ Run configuration</summary>\n> \n> - **Configuration used**: Organization UI\n> - **Review profile**: CHILL\n> - **Plan**: Essentials\n> - **Run ID**: `c660c7b4-3b2e-499e-a85b-44ae6499d3ca`\n> \n> </details>\n> \n> <details>\n> <summary>📥 Commits</summary>\n> \n> Reviewing files that changed from the base of the PR and between 637d81769f6442e0c07ea7c35f6ed9e33b287f33 and c1fe47b26b91f046c58b02213b9aa20b85b49b70.\n> \n> </details>\n> \n> <details>\n> <summary>📒 Files selected for processing (1)</summary>\n> \n> * `docs/specs/2026-09-30-superarmanda-waves.md`\n> \n> </details>\n> \n> </details>\n\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->\n\n<!-- autopilot:start -->\n- [ ] <!-- {\"checkboxId\":\"2708ad07-9f24-4260-9c11-7dc76a49f2e3\"} --> <strong title=\"Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts\">Autopilot</strong> · Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts\n<!-- autopilot:end -->\n<!-- tips_start -->\n\n---\n\n\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->",
+      "html_url": "https://github.com/bronxtc52/agent-config/pull/592#issuecomment-5979289602",
+      "id": 5979289602,
+      "user": {
+        "login": "coderabbitai[bot]",
+        "type": "Bot"
+      }
+    },
+    {
+      "body": "Codex Review: Didn't find any major issues. Swish!\n\n**Reviewed commit:** `c1fe47b26b`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "html_url": "https://github.com/bronxtc52/agent-config/pull/592#issuecomment-5979439415",
+      "id": 5979439415,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      }
+    }
+  ],
+  "review_comments": [],
+  "reviews": []
+}
