@@ -2193,9 +2193,11 @@ class StateContract(unittest.TestCase):
     def test_where_after_head_change_drops_old_results_until_resume(self):
         self.record("coder", session="coder-1")
         self.record("tester", session="tester-1")
-        self.cli("fix-loop", "--task", "implement", "--source", "cross_provider_reviewer",
-                 "--note", "n", check=False)
-        fixes = self.manifest_data()["tasks"]["implement"].get("fix_cycles", 0)
+        self.cli("fix-loop", "--task", "implement", "--outcome", "failed",
+                 "--source", "cross_provider_reviewer")
+        task = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(task["fix_cycles"], 1)
+        self.assertEqual(task["fix_sources"]["cross_provider_reviewer"], 1)
         self.new_commit("changed\n")
         info = json.loads(self.cli("where").stdout)
         self.assertFalse(info["tree_matches"])
@@ -2207,7 +2209,8 @@ class StateContract(unittest.TestCase):
         self.resume()
         task = self.manifest_data()["tasks"]["implement"]
         self.assertEqual(task["results"], {})
-        self.assertEqual(task.get("fix_cycles", 0), fixes)
+        self.assertEqual(task["fix_cycles"], 1)
+        self.assertEqual(task["fix_sources"]["cross_provider_reviewer"], 1)
         after = json.loads(self.cli("where").stdout)
         self.assertTrue(after["tree_matches"])
         self.assertEqual(after["artifacts"], [])
