@@ -118,9 +118,10 @@ def range_ends(body):
 def coderabbit_verdict(expected_head, reviews, review_comments, issue_comments):
     """Результат CodeRabbit на HEAD по факту ревью; чистая функция без I/O.
 
-    Два канала доказательства: review на HEAD или сводка с маркером завершения
-    и диапазоном, кончающимся ровно на HEAD. Явный отказ засчитывается, только
-    если не относится к другому HEAD. Остальное — pending: ждёт координатор.
+    Два канала доказательства: (а) review на HEAD; (б) сводный issue comment с
+    маркером завершения и диапазоном, кончающимся ровно на HEAD (тела review не
+    считаются). Явный отказ засчитывается, только если в его теле есть диапазон
+    с концом на HEAD. Остальное — pending: ждёт координатор.
     """
     head = (expected_head or "").lower()
     verdict = lambda status, reason, evidence=None: {  # noqa: E731
@@ -158,7 +159,12 @@ def coderabbit_verdict(expected_head, reviews, review_comments, issue_comments):
         for item in (*reviews, *issue_comments)
         if trusted(item, RABBIT) and text(item)
     ]
-    for where, body in bodies:
+    summaries = [
+        (url(item), text(item))
+        for item in issue_comments
+        if trusted(item, RABBIT) and text(item)
+    ]
+    for where, body in summaries:
         quoted_free = outside_quotes(body)
         if RABBIT_DONE.search(quoted_free) and head in range_ends(quoted_free):
             proof = proof or where
@@ -168,8 +174,7 @@ def coderabbit_verdict(expected_head, reviews, review_comments, issue_comments):
         return verdict("pass", "CodeRabbit review of current HEAD is proven", proof)
     for where, body in bodies:
         match = RABBIT_REFUSAL.search(body)
-        ends = range_ends(body)
-        if match and (not ends or head in ends):
+        if match and head in range_ends(body):
             return verdict(
                 "unavailable", f"CodeRabbit refused: {match.group(0).lower()}", where
             )

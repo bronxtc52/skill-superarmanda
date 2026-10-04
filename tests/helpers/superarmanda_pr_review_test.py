@@ -1822,7 +1822,8 @@ class CodeRabbitFact(unittest.TestCase):
             item["body"] = item["body"].replace(self.H592, self.OTHER)
         self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "pending")
 
-    def test_refusal_without_range_counts(self):
+    def test_refusal_without_range_is_pending_not_unavailable(self):
+        # Изменено в 1.0.2 (круг 2): отказ без диапазона не привязан к HEAD.
         data = self.load(592)
         data["issue_comments"] = [
             {
@@ -1832,11 +1833,37 @@ class CodeRabbitFact(unittest.TestCase):
                 "html_url": "https://github.com/x/y/pull/1#issuecomment-5",
             }
         ]
-        verdict = self.run_eval(data)["coderabbit"]
-        self.assertEqual(verdict["status"], "unavailable", verdict)
-        self.assertEqual(
-            verdict["evidence_url"], "https://github.com/x/y/pull/1#issuecomment-5"
+        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "pending")
+
+    def test_historical_rate_limited_does_not_bypass_new_head(self):
+        data = self.load(71)
+        data["head"]["sha"] = self.OTHER
+        for key in ("reviews", "review_comments"):
+            data[key] = [x for x in data[key] if x.get("commit_id") != self.H71]
+        self.assertTrue(
+            any("rate limited" in x["body"].lower() for x in self.rabbit(data)),
+            "в фикстуре #71 есть исторический отказ без диапазона",
         )
+        verdict = self.run_eval(data)["coderabbit"]
+        self.assertNotEqual(verdict["status"], "unavailable", verdict)
+        self.assertEqual(verdict["status"], "pending", verdict)
+
+    def test_done_marker_and_range_in_review_body_is_not_proof(self):
+        data = self.only_rabbit_evidence(self.load(70))
+        data["issue_comments"] = []
+        data["reviews"] = [
+            {
+                "id": 90,
+                "user": {"login": self.RABBIT, "type": "Bot"},
+                "state": "COMMENTED",
+                "body": "No actionable comments were generated in the review of "
+                f"changes between {self.OTHER} and {self.H70}.",
+                "commit_id": self.OTHER,
+                "html_url": "https://github.com/x/y/pull/1#pullrequestreview-90",
+            }
+        ]
+        data["review_comments"] = []
+        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "pending")
 
     def test_no_evidence_is_pending(self):
         data = self.load(592)

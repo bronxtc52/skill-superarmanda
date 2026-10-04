@@ -37,7 +37,7 @@ actual CodeRabbit finding remains a finding.
 
 ### CodeRabbit: результат по факту ревью HEAD (1.0.2, #72)
 
-`check` кладёт в результат поле `coderabbit` = `{"status", "reason", "evidence_url"}`; оно есть всегда Если HEAD PR или evidence изменились между снимками, `coderabbit` тоже `pending` (как и `status` = `incomplete`).
+`check` кладёт в результат поле `coderabbit` = `{"status", "reason", "evidence_url"}`; оно есть всегда. Если HEAD PR или evidence изменились между снимками, `coderabbit` тоже `pending` (как и `status` = `incomplete`).
 (при HEAD ≠ ожидаемому — `pending`). Основной `status` и список `findings` оно не меняет. Учитываются
 только элементы с login `coderabbitai[bot]` и типом `Bot`.
 
@@ -47,14 +47,15 @@ actual CodeRabbit finding remains a finding.
 - `pass` — нет находок на HEAD и есть доказательство ревью HEAD по любому из двух каналов:
   1. review CodeRabbit с `commit_id` = HEAD в состоянии `COMMENTED`/`APPROVED`/`CHANGES_REQUESTED`
      (в том числе с пустым телом);
-  2. issue comment или тело review CodeRabbit, где среди строк вне блок-цитат (первая непробельная
+  2. сводный issue comment CodeRabbit (тела review этот канал не дают), где среди строк вне блок-цитат (первая непробельная
      литера `>` — цитата) есть `No actionable comments were generated` или `Actionable comments posted: N`
      И диапазон `between <полный SHA> and <полный SHA>` (40 или 64 hex), конец которого равен HEAD
      без учёта регистра. Маркер и диапазон — в одном и том же комментарии. Сокращённые SHA не принимаются.
 - `unavailable` — доказательства и находок нет, но в теле доверенного комментария/review есть явный отказ
   (`review limit reached`, `rate limited`, `no credits available`, `reviews are disabled`, без учёта
-  регистра) и в том же теле нет диапазона `between X and Y` либо его конец равен HEAD (отказ по старому
-  HEAD не считается). `reason` называет фразу, `evidence_url` — комментарий.
+  регистра) и в том же теле есть диапазон `between X and Y`, конец которого равен HEAD (диапазон может
+  быть в цитате). Отказ без диапазона или с диапазоном на другой HEAD не считается: это `pending`, а
+  `unavailable` по таймауту даёт правило координатора ниже. `reason` называет фразу, `evidence_url` — комментарий.
 - `pending` — всё остальное (`no CodeRabbit review bound to current HEAD yet`; для известного шаблона
   пропуска черновика — `CodeRabbit skipped the draft PR`). Скрипт не ждёт.
 
