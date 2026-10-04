@@ -15,6 +15,23 @@
 | required PR review | GitHub Codex | GitHub Codex |
 | optional PR review | CodeRabbit | CodeRabbit |
 
+## Effort ролей
+
+Effort субагента — параметр брифа координатора, а не свойство роли. Координатор указывает его в
+брифе явно; без указания действуют значения по умолчанию:
+
+| Роль | Effort по умолчанию | Когда выше |
+|---|---|---|
+| tester | `medium` | `high` для задачи с риском `high` (план или `waves.json`: `risk: high`) |
+| reader | `low` | — (извлекает факты и ссылки `file:line`, не рассуждает) |
+| coder | по выбору координатора | — |
+
+Модели ролей это не меняет (`tester@sonnet`, `reader@haiku`). Повод (#15): субагенты coder/tester
+съедали больше половины суточного лимита, перечитывая репозиторий целиком. Поэтому бриф tester по
+умолчанию — дифф и команды проверки, а чтение репозитория идёт через `reader`: выжимка и ссылки
+`file:line`, а не файлы целиком. Если host не умеет задавать effort субагента, координатор
+записывает это в отчёт и запускает роль с effort по умолчанию host'а.
+
 Defaults above document tested host choices, not aliases required on every
 installation. Coordinator, coder and tester select an available explicit
 native model and record observed metadata. The subscription review adapters
