@@ -959,6 +959,9 @@ def plan_check(data):
 def parse_max_runs(value, origin):
     if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value) is None:
         fail(f"{origin} must be a positive integer, got {value!r}")
+    # length first: int() of a string past sys.int_info.str_digits_check_threshold raises ValueError
+    if len(value) > len(str(MAX_RUNS_LIMIT)):
+        fail(f"{origin} must be at most {MAX_RUNS_LIMIT}")
     number = int(value)
     if number > MAX_RUNS_LIMIT:
         fail(f"{origin} must be at most {MAX_RUNS_LIMIT}")
@@ -1016,7 +1019,8 @@ def live_run_cap(manifest_cap):
     except (OSError, UnicodeDecodeError):
         return manifest_cap
     raw = raw.rstrip("\n")
-    if re.fullmatch(r"[1-9][0-9]*", raw) is None or int(raw) > MAX_RUNS_LIMIT:
+    if (re.fullmatch(r"[1-9][0-9]*", raw) is None or len(raw) > len(str(MAX_RUNS_LIMIT))
+            or int(raw) > MAX_RUNS_LIMIT):
         return manifest_cap
     return int(raw)
 

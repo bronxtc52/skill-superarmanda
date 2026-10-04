@@ -3781,7 +3781,7 @@ module.init(module.parser().parse_args(sys.argv[4:]))
     def test_damaged_max_runs_file_is_a_closed_refusal(self):
         wab = self.runs.parent
         wab.mkdir(parents=True, exist_ok=True)
-        for raw in ("", "\n", "x", "0", "-1", "1.5", "2 3", "1001"):
+        for raw in ("", "\n", "x", "0", "-1", "1.5", "2 3", "1001", "9" * 5000):
             with self.subTest(raw=raw):
                 (wab / "max-runs").write_text(raw, encoding="utf-8")
                 manifest, proc = self.init_run("d", env={"WAB_DIR": str(wab)})
@@ -3841,7 +3841,7 @@ module.init(module.parser().parse_args(sys.argv[4:]))
     def test_where_with_a_broken_live_cap_file_falls_back_to_the_manifest(self):  # #60 p.1
         self.manifest, _ = self.init_run(
             "a", extra=["--max-runs", 2, "--runs-file", self.runs])
-        for junk in ("abc", "0", "", "-1", "99999999"):
+        for junk in ("abc", "0", "", "-1", "99999999", "9" * 5000):  # 5000 digits: past int() str limit
             self.set_live_cap(junk)
             info = self.where_live()
             self.assertEqual((info["run"], info["last_run"]), ("1/2", False), junk)
