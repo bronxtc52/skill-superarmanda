@@ -120,8 +120,10 @@ Record a role with `task-result --task <id> --role <role> --status <status> --se
 The only valid roles are `coder`, `tester`, `cross_provider_reviewer`,
 `github_codex_review`, and `coderabbit`; valid statuses are `pass`, `findings`,
 `incomplete`, `error`, and `unavailable`.
-Cross-provider `pass` must contain matching `--reviewed-head <sha>` and
-`--packet-hash sha256:<64 lowercase hex>`; a mismatched reviewed head is rejected. GitHub Codex
+Cross-provider `pass` must contain matching `--reviewed-head <sha>` and `--packet-hash`: either
+`sha256:<64 lowercase hex>` (the report field `state_packet_hash` of `review.py run`) or the bare
+64 lowercase hex that `review.py` writes in the envelope; state always stores `sha256:<hex>`, and
+any other form is rejected. A mismatched reviewed head is rejected. GitHub Codex
 `pass` instead requires matching `--reviewed-head` and an HTTPS evidence artifact URL, with no
 packet hash. Every SHA here is the full hexadecimal commit ID emitted by Git, never an abbreviated
 or normalized caller value. State stores artifact metadata but does not dereference its URL or

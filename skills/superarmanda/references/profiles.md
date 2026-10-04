@@ -42,6 +42,12 @@ artifact. Runner не выбирает Opus сам, не принимает мо
 затем проверяется effective config и ChatGPT subscription. Сервер должен вернуть
 точные model/provider, read-only sandbox; thread и turn получают `environments: []`.
 Любой tool/approval event, model reroute или неверные IDs отклоняют ревью.
+`systemError` статуса thread не обрывает чтение до терминального события; notification `error` с
+`codexErrorInfo: "usageLimitExceeded"` (или такой же `turn.error` у `failed` turn) — это
+`error_category: "quota"`, как и для Fable; прочие коды — `completion`, чужие ID — `protocol`.
+Поддерживаются репозитории `--object-format=sha256` (полные 64-hex ID), бинарные изменения
+определяются разбором `numstat -z`, а в отчёте `run` есть `state_packet_hash` (`sha256:<hex>`) для
+`state.py task-result --packet-hash`.
 `thread/settings/updated` допускается только как эхо того же контракта: read-only
 sandbox без сети, `on-request`, точные model/provider, без permission profile,
 тот же thread.
