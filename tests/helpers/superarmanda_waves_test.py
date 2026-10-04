@@ -13429,8 +13429,9 @@ class ChainCleanup(Base):
         return subprocess.run([self.exe, "-L", self.sock, "-f", "/dev/null", *args], capture_output=True,
                               text=True, encoding="utf-8", env=self.env)
 
-    def session(self, name, tag=None, run_dir=None, cmd="sleep 600"):
-        r = self.tm("new-session", "-d", "-s", name, "-x", "80", "-y", "24", cmd)
+    def session(self, name, tag=None, run_dir=None, cmd="sleep 600", env=None):
+        envs = [a for k, v in (env or {}).items() for a in ("-e", f"{k}={v}")]
+        r = self.tm("new-session", "-d", "-s", name, "-x", "80", "-y", "24", *envs, cmd)
         self.assertEqual(r.returncode, 0, r.stderr)
         if tag:
             self.tm("set-option", "-t", f"={name}:", "@wab_run", tag)
@@ -13785,13 +13786,30 @@ class ChainCleanup(Base):
 
     def test_recover_launch_marks_a_lone_unmarked_pane_by_id(self):
         cfg, path = self.cfg()
-        self.session("wv-w1", None, cmd="cat")
+        self.session("wv-w1", None, cmd="cat", env={"WAB_DIR": str(self.w.wave_dir(cfg, "W1")), "WAB_WAVE": "W1"})
         pane = next(iter(self.pane_ids()))
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="launching")}})
         st = self.get_state(cfg)
         self.w.recover_launch(cfg, st, "W1")
         self.assertEqual(self.tm("show-options", "-p", "-v", "-t", pane, "@wab_run").stdout.strip(), f"{CHAIN}/{RUN_ID}")
         self.assertEqual(self.tm("show-options", "-v", "-t", "=wv-w1:", "@wab_run_dir").stdout.strip(), str(cfg["run_dir"]))
+
+    def test_recover_launch_does_not_mark_a_lone_pane_whose_environment_is_not_this_waves(self):
+        for env in (None, {"WAB_DIR": "/elsewhere/W1", "WAB_WAVE": "W1"}, "wrong-wave"):
+            with self.subTest(env=env):
+                self.tm("kill-server")
+                cfg, path = self.cfg()
+                if env == "wrong-wave":
+                    env = {"WAB_DIR": str(self.w.wave_dir(cfg, "W1")), "WAB_WAVE": "W9"}
+                self.session("wv-w1", None, cmd="cat", env=env)
+                pane = next(iter(self.pane_ids()))
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="launching")}})
+                st = self.get_state(cfg)
+                self.w.recover_launch(cfg, st, "W1")
+                self.assertEqual(self.tm("show-options", "-p", "-t", pane).stdout.strip(), "")
+                self.assertEqual(self.tm("show-options", "-t", "=wv-w1:").stdout.count("@wab_run"), 0)
+                self.assertIn("session environment is not this wave's",
+                              (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
     # --- 6. launch of the first wave warns about a FINISHED foreign chain only
     def test_stale_chains_lists_finished_chains_without_a_dispatcher_only(self):

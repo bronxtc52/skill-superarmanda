@@ -2535,11 +2535,28 @@ def _plan_pin_refused(cfg, st, wave, drop_pending=False):
     return False
 
 
-def _mark_recovered(cfg, name):
+def _session_env(name, var):
+    """The value of `var` in the environment of the tmux session (what `new-session -e` gave it);
+    None when unset or unreadable."""
+    try:
+        r = tmux("show-environment", "-t", session_target(name), var, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = r.stdout.strip()
+    return out.partition("=")[2] if r.returncode == 0 and out.startswith(var + "=") else None
+
+
+def _mark_recovered(cfg, name, wave):
     """Marks for a live session found by recovery: only when it is CONFIRMED unmarked (not unknown, not
-    foreign, not already ours) and has exactly one pane, confirmed unmarked too; that pane is marked by id."""
+    foreign, not already ours), its environment is this wave's (WAB_DIR and WAB_WAVE, as start_session
+    passed them: a stranger's session of the same name has neither) and it has exactly one pane,
+    confirmed unmarked too; that pane is marked by id."""
     who = _ours(cfg, session=name)
     if who == "ours":
+        return
+    if who == "unmarked" and not (_norm_dir(_session_env(name, "WAB_DIR")) == _norm_dir(wave_dir(cfg, wave))
+                                  and _session_env(name, "WAB_WAVE") == wave):
+        event(cfg, f"{name}: not marked: session environment is not this wave's; cleanup will only warn")
         return
     panes = _list_panes(name) if who == "unmarked" else None
     if who == "unmarked" and panes is not None and len(panes) == 1 and _ours(cfg, pane=panes[0][0]) == "unmarked":
@@ -2557,7 +2574,7 @@ def recover_launch(cfg, st, wave):
         return
     if tmux_alive(w["tmux"]):
         event(cfg, f"{wave}: resumed in phase 'launching': window exists, not starting another")
-        _mark_recovered(cfg, w["tmux"])  # the dispatcher may have died between new-session and the marks
+        _mark_recovered(cfg, w["tmux"], wave)  # the dispatcher may have died between new-session and the marks
         w["phase"] = "starting"
         save_state(cfg, st)
     else:
