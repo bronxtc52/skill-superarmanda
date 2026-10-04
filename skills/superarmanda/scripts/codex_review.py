@@ -471,6 +471,30 @@ def _reject_event(message, thread_id=None, turn_id=None):
             _fail("execution")
 
 
+def _error_category(error):
+    """Только исчерпанная подписка выделена в quota; всё прочее — completion."""
+    if isinstance(error, dict) and error.get("codexErrorInfo") == "usageLimitExceeded":
+        return "quota"
+    return "completion"
+
+
+def _terminal_error(event, thread_id, turn_id):
+    """Notification `error` — только сигнал терминального отказа текущего turn.
+
+    Никогда не успех: функция всегда завершается исключением. Чужой или
+    отсутствующий threadId/turnId — protocol. Текст причины и account/plan
+    payload в отчёт не попадают, остаётся только категория.
+    """
+    params = event.get("params")
+    if (
+        not isinstance(params, dict)
+        or params.get("threadId") != thread_id
+        or params.get("turnId") != turn_id
+    ):
+        _fail("protocol")
+    _fail(_error_category(params.get("error")))
+
+
 def _thread_settings(params):
     """Accept a settings echo only when it repeats the verified thread contract."""
     settings = params.get("threadSettings")
@@ -632,6 +656,8 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
             if "id" in event and "method" in event:
                 _fail("execution")
             method = event.get("method")
+            if method == "error":
+                _terminal_error(event, thread_id, turn_id)
             if method == "turn/completed":
                 _reject_event(event, thread_id, turn_id)
                 params = event.get("params")
@@ -643,6 +669,8 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
                     or final_turn.get("id") != turn_id
                     or final_turn.get("status") != "completed"
                 ):
+                    if isinstance(final_turn, dict) and final_turn.get("id") == turn_id:
+                        _fail(_error_category(final_turn.get("error")))
                     _fail("completion")
                 _optional_identity(final_turn)
                 completed = final_turn

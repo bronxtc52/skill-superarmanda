@@ -141,6 +141,18 @@ for line in sys.stdin:
   elif mode=="approval": out({"method":"commandExecution/requestApproval","params":{}})
   elif mode=="wrongid": out({"method":"turn/completed","params":{"threadId":"other","turn":{"id":"u","status":"completed"}}})
   elif mode=="missing": pass
+  elif mode.startswith("limit"):
+   # Последовательность снята с живого прогона при исчерпанной подписке (issue #17).
+   info="otherError" if mode=="limit_other" else "usageLimitExceeded"
+   tid="other" if mode=="limit_wrong_thread" else "t"
+   message="You've hit your usage limit. Upgrade to Pro, or try again at Oct 5th, 2026 3:35 AM."
+   out({"method":"turn/started","params":{"threadId":"t","turn":{"id":"u"}}})
+   out({"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":100}}}})
+   out({"method":"thread/status/changed","params":{"threadId":"t","status":{"type":"systemError"}}})
+   if mode not in ("limit_turn_only","limit_silent"):
+    out({"method":"error","params":{"error":{"codexErrorInfo":info,"message":message,"additionalDetails":None},"willRetry":False,"threadId":tid,"turnId":"u"}})
+   if mode not in ("limit_no_terminal","limit_silent"):
+    out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"failed","error":{"codexErrorInfo":info,"message":message}}}})
   elif mode=="missing_ids":
    out({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"{}"}}})
    out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
@@ -395,6 +407,37 @@ class Contract(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "review CLI failed: " + category),
             ):
                 self.invoke(mode, timeout)
+
+    def failure(self, mode, timeout=5):
+        with self.assertRaises(ValueError) as caught:
+            self.invoke(mode, timeout=timeout)
+        return str(caught.exception)
+
+    def test_usage_limit_after_system_error_is_quota(self):
+        # issue #17/#10: systemError не обрывает чтение, error/usageLimitExceeded -> quota
+        self.assertEqual(
+            self.failure("limit"), "review CLI failed: quota"
+        )
+
+    def test_usage_limit_only_in_failed_turn_is_quota(self):
+        self.assertEqual(
+            self.failure("limit_turn_only"), "review CLI failed: quota"
+        )
+
+    def test_other_error_info_is_not_quota(self):
+        self.assertEqual(
+            self.failure("limit_other"), "review CLI failed: completion"
+        )
+
+    def test_error_notification_with_foreign_thread_is_protocol(self):
+        self.assertEqual(
+            self.failure("limit_wrong_thread"), "review CLI failed: protocol"
+        )
+
+    def test_system_error_without_terminal_event_keeps_timeout(self):
+        self.assertEqual(
+            self.failure("limit_silent", timeout=2), "review CLI failed: timeout"
+        )
 
     def test_usage_boolean_counts_are_not_reported(self):
         _, metadata = self.invoke("usage_bool")
