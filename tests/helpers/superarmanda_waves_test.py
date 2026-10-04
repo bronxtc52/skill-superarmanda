@@ -13500,6 +13500,49 @@ class ChainCleanup(Base):
         self.assertEqual(self.pane_ids(), {pane_b})
         self.assertEqual(self.alive_names(), {"dashes"})
 
+    # --- 2b. has-session fails after the kill for a reason other than «no such session»: not «closed»
+    def test_a_failing_has_session_after_the_kill_is_not_a_closed_session(self):
+        cfg, path = self.cfg()
+        tag = f"{CHAIN}/{RUN_ID}"
+        self.state_two_waves(cfg)
+        self.session("wv-w1", tag, cfg["run_dir"])
+        # a pane of someone else shares the session: it stays alive after our pane is killed
+        self.assertEqual(self.tm("split-window", "-d", "-t", "=wv-w1:", "sleep 600").returncode, 0)
+        foreign = [p for p in self.tm("list-panes", "-s", "-t", "=wv-w1:", "-F", "#{pane_id}").stdout.split()
+                   if self.tm("show-options", "-p", "-t", p).stdout.strip() == ""]
+        self.assertEqual(len(foreign), 1)
+        self.finish(cfg)
+        real, killed = self.w.tmux, []
+
+        def flaky(*args, **kw):
+            if args[:1] == ("kill-pane",):
+                killed.append(args)
+            if args[:1] == ("has-session",) and killed:  # the server is alive, the answer is lost
+                return subprocess.CompletedProcess(args, 1, "", "error connecting to /tmp/x (Connection refused)\n")
+            return real(*args, **kw)
+        with mock.patch.object(self.w, "tmux", flaky):
+            res = self.w.close_chain_sessions(cfg, json.loads((cfg["run_dir"] / "state.json").read_text(encoding="utf-8")))
+        self.assertTrue(killed)
+        self.assertEqual(res["sessions"], [])  # not confirmed: not claimed
+        events = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("could not confirm what was closed (has-session failed)", events)
+        self.assertNotIn("chain sessions closed", events)
+        self.assertIn(foreign[0], self.pane_ids())  # the foreign pane lives
+
+    def test_session_gone_tells_a_confirmed_absence_from_a_failure(self):
+        def answer(rc, err):
+            return mock.patch.object(self.w, "tmux", lambda *a, **kw: subprocess.CompletedProcess(a, rc, "", err))
+        for rc, err, want in ((0, "", False),
+                              (1, "can't find session: wv-w1\n", True),
+                              (1, "no server running on /tmp/x\n", True),
+                              (1, "error connecting to /tmp/x (No such file or directory)\n", True),
+                              (1, "error connecting to /tmp/x (Connection refused)\n", None),
+                              (1, "", None), (124, "timeout", None)):
+            with answer(rc, err):
+                self.assertIs(self.w._session_gone("wv-w1"), want, (rc, err))
+        with mock.patch.object(self.w, "tmux", mock.Mock(side_effect=OSError("boom"))):
+            self.assertIsNone(self.w._session_gone("wv-w1"))
+
     # --- 3. refusals and idempotence
     def test_cleanup_refused_with_a_live_dispatcher_or_without_chain_result(self):
         cfg, path = self.cfg()
