@@ -5964,6 +5964,31 @@ class W4Round34(Base):
         self.assertNotIn("stopped", st)
         self.assertNotIn("launch_refused", st["waves"]["W1"].get("outbox") or {})
 
+    def test_dispatcher_force_closes_a_done_wave_window_that_ignores_exit(self):
+        # Live stop (mh-creators run01, 2026-10-03 18:56Z): W1 was merged, its window answered /exit
+        # with the «Exit and stop tasks» menu, the launch of W2 was refused and the chain stood 9 h.
+        wd = self.repo()
+        cfg, path = self.auto_chain(workdir=str(wd), base_branch="main")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec(cwd=str(wd))}})
+        self.set_status(cfg, "W1", "DONE")
+        (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
+        self.exit_closes = False  # the window ignores /exit
+        inner = wab.tmux.side_effect
+
+        def tmux_with_kill(*args, **kw):
+            if "kill-session" in args:
+                self.windows.discard("wv-w1")
+            return inner(*args, **kw)
+        wab.tmux.side_effect = tmux_with_kill
+        with mock.patch.object(wab, "drop_stale_btab"), mock.patch.object(wab, "refresh_workdir"):
+            wab.watch(cfg, path, max_ticks=3)
+        st = self.get_state(cfg)
+        self.assertEqual(st["current"], "W2")
+        self.assertNotIn("stopped", st)
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("closed with kill-session (the wave is done)", log)
+        self.assertNotIn("launch of W2 refused", log)
+
     # ----- 3: dash.py without rich -----
     def test_dash_without_rich_is_one_clear_line_and_rc_2(self):
         shim = self.tmp / "norich"
@@ -11365,6 +11390,48 @@ class InputClear(GateBase):
         self.ansi = EMPTY_ANSI
         self.assertTrue(wab.close_window(self.cfg, st, st["waves"]["W1"]))
         self.assertEqual(len(self.exits()), 1)
+
+    EXIT_MENU = ("Background tasks are still running:\n  shell · until [ -s /tmp/x ]\n"
+                 "  ❯ 1. Exit and stop tasks\n    2. Move to background and exit\n    3. Stay\n"
+                 "  Enter to confirm · Esc to cancel\n")
+
+    def test_exit_menu_with_option_1_is_confirmed_by_enter(self):
+        self.running()
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["pending_exit"] = True
+        self.pane = self.EXIT_MENU
+        self.ansi = self.EXIT_MENU  # no input box: the old path held /exit forever
+        self.assertTrue(wab.close_window(self.cfg, st, st["waves"]["W1"]))
+        self.assertEqual(self.enters, [st["waves"]["W1"]["tmux"]])
+        self.assertEqual(self.exits(), [])  # no second /exit typed into the menu
+        self.assertIn("/exit menu confirmed", self.log())
+
+    def test_exit_menu_with_another_option_highlighted_is_not_confirmed(self):
+        self.running()
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["pending_exit"] = True
+        menu = self.EXIT_MENU.replace("❯ 1. Exit", "  1. Exit").replace("    3. Stay", "  ❯ 3. Stay")
+        self.pane = self.ansi = menu
+        self.assertFalse(wab.close_window(self.cfg, st, st["waves"]["W1"]))
+        self.assertEqual(self.enters, [])
+        self.assertIn("option 1 not highlighted", self.log())
+
+    def test_exit_menu_quoted_in_the_output_is_not_taken_for_the_dialog(self):
+        quoted = ("⏺ The wave noted: «❯ 1. Exit and stop tasks / 2. Move to background and exit / 3. Stay»\n"
+                  "  Enter to confirm · Esc to cancel was on screen earlier\n")
+        box = "─" * 40 + "\n❯ \n" + "─" * 40 + "\n  ⏵⏵ auto mode on\n"
+        for screen in ("⏺ grep found «Exit and stop tasks» in the docs\n", quoted):
+            with self.subTest(screen=screen[:30]):
+                self.assertIsNone(wab.exit_dialog(screen + box))
+                self.assertIsNone(wab.exit_dialog(screen))
+        self.assertTrue(wab.exit_dialog(self.EXIT_MENU))
+
+    def test_a_quoted_exit_menu_above_another_dialog_is_not_the_live_menu(self):
+        other = ("Do you want to proceed?\n❯ 1. Yes\n  2. No\n"
+                 "  Enter to confirm · Esc to cancel\n")
+        self.assertIsNone(wab.exit_dialog(self.EXIT_MENU + other))
+        self.assertIsNone(wab.exit_dialog(self.EXIT_MENU + "trailing output line\n"))
+        self.assertTrue(wab.exit_dialog("history line\n" + self.EXIT_MENU + "\n\n"))
 
     def test_close_window_survives_a_clearing_that_raises(self):
         self.done_with_typed_alarm()
