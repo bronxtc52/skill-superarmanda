@@ -153,10 +153,14 @@ def main(argv):
     if cmd == "new-session":
         s = {"name": None, "cwd": None, "env": {}, "command": [], "input": "", "folded": False}
         i = 0
+        print_pane = False
         while i < len(args):
             a = args[i]
-            if a == "-d":
+            if a in ("-d", "-P"):
+                print_pane = print_pane or a == "-P"
                 i += 1
+            elif a == "-F":  # (#57) `-P -F #{pane_id}`: the new pane's id
+                i += 2
             elif a in ("-s", "-c", "-x", "-y", "-e"):
                 if a == "-s":
                     s["name"] = args[i + 1]
@@ -173,6 +177,8 @@ def main(argv):
             fail(f"duplicate session: {s['name']}")
         save(s)
         jlog("new_sessions.jsonl", {k: s[k] for k in ("name", "cwd", "env", "command")})
+        if print_pane:
+            print("%0")
         return
     if cmd == "kill-session":
         name = target(args[args.index("-t") + 1])
@@ -221,8 +227,10 @@ def main(argv):
         return
     if cmd in ("list-sessions", "list-panes"):  # (#57) no dashboards or foreign sessions in this world
         return
-    if cmd == "show-options":  # (#57) a user option nobody set: like real tmux, rc 1 and a message
-        fail("invalid option: " + (args[-1] if args else ""), 1)
+    if cmd == "show-options":  # (#57) nobody set any option here: an empty listing, or rc 1 for a named one
+        if "-v" in args:
+            fail("invalid option: " + (args[-1] if args else ""), 1)
+        return
     jlog("calls.jsonl", {"unsupported": cmd, "argv": argv})
     fail(f"unsupported tmux command in the test stand-in: {cmd}", 2)
 

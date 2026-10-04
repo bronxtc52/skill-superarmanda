@@ -2490,9 +2490,9 @@ def start_session(cfg, st, wave):
     if cfg["model"]:
         cmd += ["--model", cfg["model"]]
     pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
-    tmux("new-session", "-d", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
-       "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", "-e", f"WAB_MAX_RUNS={cfg['max_runs']}", *pin, *cmd)
-    mark_owner(cfg, w["tmux"])
+    made = tmux("new-session", "-d", "-P", "-F", "#{pane_id}", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
+                "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", "-e", f"WAB_MAX_RUNS={cfg['max_runs']}", *pin, *cmd)
+    mark_owner(cfg, w["tmux"], (made.stdout or "").strip())
     w["phase"] = "starting"
     save_state(cfg, st)
 
@@ -2535,6 +2535,20 @@ def _plan_pin_refused(cfg, st, wave, drop_pending=False):
     return False
 
 
+def _mark_recovered(cfg, name):
+    """Marks for a live session found by recovery: only when it is CONFIRMED unmarked (not unknown, not
+    foreign, not already ours) and has exactly one pane, confirmed unmarked too; that pane is marked by id."""
+    who = _ours(cfg, session=name)
+    if who == "ours":
+        return
+    panes = _list_panes(name) if who == "unmarked" else None
+    if who == "unmarked" and panes is not None and len(panes) == 1 and _ours(cfg, pane=panes[0][0]) == "unmarked":
+        mark_owner(cfg, name, panes[0][0])
+    else:
+        event(cfg, f"{name}: not marked as this run's (state: {who}, "
+                   f"panes: {'unknown' if panes is None else len(panes)}); cleanup will only warn")
+
+
 def recover_launch(cfg, st, wave):
     """Dispatcher died around `tmux new-session`: a live window means it was started,
     otherwise start it again with the same session id. Then carry on as `starting`."""
@@ -2543,8 +2557,7 @@ def recover_launch(cfg, st, wave):
         return
     if tmux_alive(w["tmux"]):
         event(cfg, f"{wave}: resumed in phase 'launching': window exists, not starting another")
-        if _ours(cfg, session=w["tmux"]) != "foreign":  # died between new-session and the marks
-            mark_owner(cfg, w["tmux"])
+        _mark_recovered(cfg, w["tmux"])  # the dispatcher may have died between new-session and the marks
         w["phase"] = "starting"
         save_state(cfg, st)
     else:
@@ -2866,11 +2879,16 @@ def _window_state(cfg, name):
         return "legacy", name
     if who == "foreign":
         return "foreign", None
+    if who == "unknown":
+        return "unknown", None
     panes = _list_panes(name)
     if panes is None:
         return "unknown", None
-    mine = [pane for pane, _ in panes if _ours(cfg, pane=pane) == "ours"]
-    return ("ours", mine[0]) if mine else ("closed", None)
+    states = [(pane, _ours(cfg, pane=pane)) for pane, _ in panes]
+    mine = [pane for pane, st_ in states if st_ == "ours"]
+    if mine:
+        return "ours", mine[0]
+    return ("unknown", None) if any(st_ == "unknown" for _, st_ in states) else ("closed", None)
 
 
 def close_window(cfg, st, w):
@@ -4896,16 +4914,22 @@ def run_tag(cfg):
     return f"{cfg['chain']}/{cfg['run_id']}"
 
 
-def mark_owner(cfg, name):
-    """Right after new-session: @wab_run and @wab_run_dir on the wave's session and on its first
-    pane, so that the end of the chain (and `cleanup`) closes only what this run started. A failure
-    is an event, the launch goes on."""
+def mark_owner(cfg, name, pane=None):
+    """@wab_run and @wab_run_dir on the wave's session and on its pane, so that the end of the chain (and
+    `cleanup`) closes only what this run started. The pane is given by its id (`new-session -P`, or the
+    one confirmed lone pane of a recovered session), never as «the active pane of =name:». A failure is
+    an event, the launch goes on."""
     try:
         for opt, val in (("@wab_run", run_tag(cfg)), ("@wab_run_dir", str(cfg["run_dir"]))):
-            for flag in ((), ("-p",)):
-                r = tmux("set-option", *flag, "-t", pane_target(name), opt, val, check=False)
+            targets = [((), name)]
+            if isinstance(pane, str) and re.fullmatch(r"%\d+", pane):
+                targets.append((("-p",), pane))
+            for flag, where in targets:
+                r = tmux("set-option", *flag, "-t", pane_target(where), opt, val, check=False)
                 if r.returncode != 0:
                     event(cfg, f"{name}: {opt} not set: {r.stderr.strip() or r.stdout.strip()}")
+        if not (isinstance(pane, str) and re.fullmatch(r"%\d+", pane)):
+            event(cfg, f"{name}: pane id unknown, only the session is marked")
     except (OSError, subprocess.SubprocessError) as e:
         event(cfg, f"{name}: owner marks not set: {type(e).__name__}")
 
@@ -4959,16 +4983,43 @@ def _norm_dir(path):
         return None
 
 
+def _marks(session=None, pane=None):
+    """{"run": value or None, "dir": value or None} of the marks set exactly on that pane (else session),
+    None when they could not be read: «no such option» (confirmed by a successful listing) differs
+    of course from a tmux failure."""
+    try:
+        if pane:
+            r = tmux("show-options", "-p", "-t", pane, check=False)
+        else:
+            r = tmux("show-options", "-t", pane_target(session), check=False)
+        if r.returncode != 0:
+            return None
+        names = {l.split(None, 1)[0] for l in r.stdout.splitlines() if l.strip()}
+        out = {}
+        for key, opt in (("run", "@wab_run"), ("dir", "@wab_run_dir")):
+            out[key] = None
+            if opt in names:
+                v = tmux_opt(opt, session=session, pane=pane)
+                if v is None:
+                    return None
+                out[key] = v
+        return out
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _ours(cfg, session=None, pane=None):
     """Whose is this session / pane (options at ITS OWN level, read now, never inherited)?
     "ours": @wab_run == run_tag AND @wab_run_dir names this run's directory (two chain.json may repeat
-    chain/run_id and a session name; the directory tells them apart). "unmarked": no @wab_run at all.
-    "foreign": anything else (another run, or the tag without a matching directory)."""
-    mark = tmux_opt("@wab_run", session=session, pane=pane)
-    if mark is None:
+    chain/run_id and a session name; the directory tells them apart). "unmarked": no @wab_run, CONFIRMED
+    by a successful listing. "foreign": anything else (another run, or the tag without a matching
+    directory). "unknown": the marks could not be read: callers do nothing (no kill, no input)."""
+    marks = _marks(session=session, pane=pane)
+    if marks is None:
+        return "unknown"
+    if marks["run"] is None:
         return "unmarked"
-    rdir = tmux_opt("@wab_run_dir", session=session, pane=pane)
-    if mark == run_tag(cfg) and rdir and _norm_dir(rdir) == _norm_dir(cfg["run_dir"]):
+    if marks["run"] == run_tag(cfg) and marks["dir"] and _norm_dir(marks["dir"]) == _norm_dir(cfg["run_dir"]):
         return "ours"
     return "foreign"
 
@@ -5041,6 +5092,9 @@ def close_chain_sessions(cfg, st):
             if who == "unmarked":
                 warn(f"{name}: no @wab_run mark, not closed (started by an older wab?); "
                      f"close it yourself: tmux kill-session -t {name}")
+                continue
+            if who == "unknown":
+                event(cfg, f"{name}: marks could not be read; nothing closed, retried next time")
                 continue
             if who != "ours":
                 event(cfg, f"{name}: not ours (@wab_run={tmux_opt('@wab_run', session=name)}, "

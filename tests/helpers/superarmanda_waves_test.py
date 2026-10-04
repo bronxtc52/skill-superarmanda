@@ -13711,14 +13711,6 @@ class ChainCleanup(Base):
         self.assertNotIn("/exit", self.screen(pane))
 
     # --- round 3: a session found alive by recovery gets its marks
-    def test_recover_launch_marks_a_live_unmarked_session(self):
-        cfg, path = self.chain()
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="launching")}})
-        st = self.get_state(cfg)
-        wab.recover_launch(cfg, st, "W1")
-        sets = [c for c in self.tmux_calls if c[1] == "set-option"]
-        self.assertTrue(any("@wab_run" in c for c in sets), sets)
-
     def test_recover_launch_does_not_mark_a_session_of_another_run(self):
         cfg, path = self.chain()
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="launching")}})
@@ -13741,6 +13733,65 @@ class ChainCleanup(Base):
         found = self.w.stale_chains(cfg)
         self.assertEqual(sorted((f["run_dir"], tuple(f["targets"])) for f in found),
                          sorted([(str(d1.resolve()), ("old1-w1",)), (str(d2.resolve()), ("old2-w1",))]))
+
+    # --- round 4: "could not read the marks" is not "no marks"
+    def test_unreadable_marks_mean_no_input_no_kill_and_the_intent_stays(self):
+        cfg, path = self.cfg()
+        self.state_two_waves(cfg)
+        st = self.get_state(cfg)
+        st["waves"]["W2"]["pending_exit"] = True
+        self.put_state(cfg, st)
+        self.session("wv-w2", f"{CHAIN}/{RUN_ID}", cfg["run_dir"], cmd="cat")
+        self.finish(cfg)
+        real, calls = self.w.tmux, []
+
+        def flaky(*args, **kw):
+            calls.append(args)
+            if args and args[0] == "show-options":
+                return subprocess.CompletedProcess(args, 1, "", "server busy")
+            return real(*args, **kw)
+        self.w.tmux = flaky
+        self.w.clear_input = lambda name: None
+        st = self.get_state(cfg)
+        self.assertFalse(self.w.close_window(cfg, st, st["waves"]["W2"]))
+        self.assertTrue(self.get_state(cfg)["waves"]["W2"].get("pending_exit"))
+        res = self.w.cleanup_cmd(cfg)
+        self.assertEqual((res["sessions"], res["panes"]), ([], []))
+        self.assertFalse([c for c in calls if c[0] in ("send-keys", "kill-pane", "kill-session")], calls)
+        self.assertEqual(self.alive_names(), {"wv-w2"})
+
+    # --- round 4: marks go on a pane by id, and only on a confirmed unmarked lone pane
+    def test_recover_launch_never_marks_the_active_pane_of_an_already_marked_session(self):
+        cfg, path = self.cfg()
+        self.session("wv-w1", f"{CHAIN}/{RUN_ID}", cfg["run_dir"], cmd="cat")
+        self.assertEqual(self.tm("new-window", "-t", "=wv-w1:", "cat").returncode, 0)
+        foreign = self.tm("display-message", "-p", "-t", "=wv-w1:", "#{pane_id}").stdout.strip()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="launching")}})
+        st = self.get_state(cfg)
+        self.w.recover_launch(cfg, st, "W1")
+        self.assertEqual(self.tm("show-options", "-p", "-t", foreign).stdout.strip(), "")
+
+    def test_recover_launch_marks_nothing_in_an_unmarked_session_with_two_panes(self):
+        cfg, path = self.cfg()
+        self.session("wv-w1", None, cmd="cat")
+        self.assertEqual(self.tm("new-window", "-t", "=wv-w1:", "cat").returncode, 0)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="launching")}})
+        st = self.get_state(cfg)
+        self.w.recover_launch(cfg, st, "W1")
+        self.assertEqual(self.tm("show-options", "-t", "=wv-w1:").stdout.count("@wab_run"), 0)
+        for pane in self.pane_ids():
+            self.assertEqual(self.tm("show-options", "-p", "-t", pane).stdout.strip(), "")
+        self.assertIn("not marked", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_recover_launch_marks_a_lone_unmarked_pane_by_id(self):
+        cfg, path = self.cfg()
+        self.session("wv-w1", None, cmd="cat")
+        pane = next(iter(self.pane_ids()))
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="launching")}})
+        st = self.get_state(cfg)
+        self.w.recover_launch(cfg, st, "W1")
+        self.assertEqual(self.tm("show-options", "-p", "-v", "-t", pane, "@wab_run").stdout.strip(), f"{CHAIN}/{RUN_ID}")
+        self.assertEqual(self.tm("show-options", "-v", "-t", "=wv-w1:", "@wab_run_dir").stdout.strip(), str(cfg["run_dir"]))
 
     # --- 6. launch of the first wave warns about a FINISHED foreign chain only
     def test_stale_chains_lists_finished_chains_without_a_dispatcher_only(self):
@@ -13808,8 +13859,18 @@ class ChainCleanup(Base):
         cfg, path = self.chain()
         self.alive = False
         st = {"current": "W1", "waves": {"W1": self.wave_rec("W1", sessions=["sid-1"], phase="launching")}}
+        orig = wab.sh.side_effect
+
+        def with_pane_id(*args, **kw):  # `new-session -P -F #{pane_id}` answers with the new pane's id
+            r = orig(*args, **kw)
+            if args[:2] == ("tmux", "new-session") or (len(args) > 3 and args[3] == "new-session"):
+                return subprocess.CompletedProcess(args, 0, "%7\n", "")
+            return r
+        wab.sh.side_effect = with_pane_id
         wab.start_session(cfg, st, "W1")
+        wab.sh.side_effect = orig
         sets = [c for c in self.tmux_calls if c[1] == "set-option"]
+        self.assertTrue(any("%7" in c for c in sets), sets)  # the pane is marked by its id
         tag = f"{CHAIN}/{RUN_ID}"
         self.assertTrue(any("@wab_run" in c and tag in c and "-p" not in c for c in sets), sets)
         self.assertTrue(any("@wab_run" in c and tag in c and "-p" in c for c in sets), sets)
