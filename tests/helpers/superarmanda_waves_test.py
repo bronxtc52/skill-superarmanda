@@ -11372,6 +11372,16 @@ class InputClear(GateBase):
         self.assertEqual(self.enters, [])
         self.assertIn("option 1 not highlighted", self.log())
 
+    def test_exit_menu_quoted_in_the_output_is_not_taken_for_the_dialog(self):
+        quoted = ("⏺ The wave noted: «❯ 1. Exit and stop tasks / 2. Move to background and exit / 3. Stay»\n"
+                  "  Enter to confirm · Esc to cancel was on screen earlier\n")
+        box = "─" * 40 + "\n❯ \n" + "─" * 40 + "\n  ⏵⏵ auto mode on\n"
+        for screen in ("⏺ grep found «Exit and stop tasks» in the docs\n", quoted):
+            with self.subTest(screen=screen[:30]):
+                self.assertIsNone(wab.exit_dialog(screen + box))
+                self.assertIsNone(wab.exit_dialog(screen))
+        self.assertTrue(wab.exit_dialog(self.EXIT_MENU))
+
     def test_close_window_survives_a_clearing_that_raises(self):
         self.done_with_typed_alarm()
         self.clear_works = False

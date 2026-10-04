@@ -2391,11 +2391,22 @@ EXIT_DIALOG = "Exit and stop tasks"
 
 def exit_dialog(text):
     """None: no /exit menu on the screen; True: it is there with option 1 highlighted (Enter takes
-    it); False: it is there, but another option is highlighted (Enter would not exit)."""
-    tail = text.splitlines()[-15:]
-    if not any(EXIT_DIALOG in l for l in tail):
+    it); False: it is there, but another option is highlighted (Enter would not exit). The menu is
+    recognised only whole and live: its three options and the «Enter to confirm» hint, in this order
+    at the bottom, and no input box under them (a menu quoted in the history keeps the input box
+    below it, so ordinary output mentioning the option is not taken for the menu)."""
+    lines = text.splitlines()[-15:]
+    idx = [i for i, l in enumerate(lines) if EXIT_DIALOG in l]
+    if not idx:
         return None
-    return any(INPUT_MARK in l and EXIT_DIALOG in l for l in tail)
+    i = idx[-1]
+    rest = lines[i + 1:]
+    tail = "\n".join(rest)
+    if not ("Move to background and exit" in tail and "Stay" in tail and "Enter to confirm" in tail):
+        return None
+    if any(INPUT_MARK in l and k > 0 and _is_rule(rest[k - 1]) for k, l in enumerate(rest)):
+        return None  # an input box below: the «menu» is history, not the live dialog
+    return INPUT_MARK in lines[i]
 
 
 def close_window(cfg, st, w):
@@ -2476,8 +2487,8 @@ def wait_window_closed(cfg, st, w, push=True):
             return False
         if attempt == 0 and push:
             close_window(cfg, st, w)
-        elif attempt and exit_dialog(pane_text(name)):
-            close_window(cfg, st, w)  # the /exit menu came up after our /exit: confirm it
+        elif attempt and exit_dialog(pane_text(name)) is not None:
+            close_window(cfg, st, w)  # the /exit menu came up after our /exit: confirm it (or log why not)
         time.sleep(1)
     return False
 
