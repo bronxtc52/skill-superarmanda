@@ -249,7 +249,9 @@ class Journal:
 
     def after_clear(self):  # what Claude Code writes at /clear, before any message of the wave
         lines = fixture_lines("clear-session-head.jsonl")
-        cut = next(i for i, l in enumerate(lines) if json.loads(l)["type"] == "last-prompt") + 1
+        cut = next(i for i, l in enumerate(lines) if "<command-name>/superarmanda" in l)  # the typed command
+        while json.loads(lines[cut - 1])["type"] == "file-history-snapshot":  # its snapshot goes with it
+            cut -= 1
         self.write("clear-session-head.jsonl", lines=lines[:cut])
         self.rest = lines[cut:]
 
