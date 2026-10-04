@@ -164,6 +164,7 @@ A reviewer `findings` result counts as passed for readiness (and for the wave me
 a deferral of the same role recorded no earlier than the result; coder and tester still need `pass`.
 After `resume` new results are not covered by older deferrals. Severity is not parsed: deferring
 only low/P3 findings is coordinator discipline. `where` reports the count as `deferred`.
+Both `--defer` and `--accept` also work from `needs_fix` (the same findings were first sent through `--outcome failed`, then judged acceptable): once every required role is pass or covered the task becomes `ready_for_pr_review`; while another role is still open it stays `needs_fix`.
 `fix-loop --accept --source <source> --severity <low|medium|high> --note <text>` (mutually exclusive
 with `--defer`/`--outcome`/`--decision`; `--severity` only with `--accept`) has the same preconditions
 as `--defer` (reviewer sources, a `findings` result on the current head and tree, task not `blocked`
@@ -178,7 +179,7 @@ the older records stay in the manifest as history but are neither counted in `ac
 runs of a wave when `WAB_DIR` or `--runs-file` names a counter file (`runs.json`): the limit is
 `--max-runs`, else the file `$WAB_DIR/max-runs` (the live value kept by the dispatcher; damaged or
 not a whole number 1..1000 is a closed refusal), else `WAB_MAX_RUNS`, else 2; beyond it `init` refuses and creates no manifest; the
-manifest gets `run: {index, max}`, and `where` reports `run` and `last_run`. The counter is written before the manifest, so a process killed between the two writes leaves a counted run without a manifest (the cap is never exceeded; the budget only shrinks). Task IDs are coordinator-approved identifiers: renaming a
+manifest gets `run: {index, max}`, and `where` reports `run` and `last_run` judged by the LIVE cap (`$WAB_DIR/max-runs`; a missing or invalid file falls back to the manifest `max`, `where` never fails on it). The counter is written before the manifest, so a process killed between the two writes leaves a counted run without a manifest (the cap is never exceeded; the budget only shrinks). Task IDs are coordinator-approved identifiers: renaming a
 blocked task is not a reset. v1 supplies no reset command; any human decision to resume work
 requires a new, explicitly documented run rather than editing the manifest.
 
