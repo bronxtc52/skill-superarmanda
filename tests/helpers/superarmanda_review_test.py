@@ -1178,6 +1178,15 @@ raise SystemExit(1)
         self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "fable")
         self.assertEqual(len(self.logs()), 2)
 
+    def test_astra_usage_limit_is_reported_as_quota_in_run_result(self):
+        # issue #17/#10: исчерпанная подписка Codex — это quota, а не protocol
+        self.assert_packet_ok()
+        proc = self.review_run("claude-host", "limit")
+        self.assertNotEqual(proc.returncode, 0)
+        result = self.result()
+        self.assertEqual(result["error_category"], "quota")
+        self.assertFalse(result["gate_ready"])
+
     def test_codex_adapter_verifies_app_server_model_subscription_and_capabilities(
         self,
     ):
