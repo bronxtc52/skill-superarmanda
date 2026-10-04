@@ -13500,6 +13500,49 @@ class ChainCleanup(Base):
         self.assertEqual(self.pane_ids(), {pane_b})
         self.assertEqual(self.alive_names(), {"dashes"})
 
+    # --- 2b. has-session fails after the kill for a reason other than «no such session»: not «closed»
+    def test_a_failing_has_session_after_the_kill_is_not_a_closed_session(self):
+        cfg, path = self.cfg()
+        tag = f"{CHAIN}/{RUN_ID}"
+        self.state_two_waves(cfg)
+        self.session("wv-w1", tag, cfg["run_dir"])
+        # a pane of someone else shares the session: it stays alive after our pane is killed
+        self.assertEqual(self.tm("split-window", "-d", "-t", "=wv-w1:", "sleep 600").returncode, 0)
+        foreign = [p for p in self.tm("list-panes", "-s", "-t", "=wv-w1:", "-F", "#{pane_id}").stdout.split()
+                   if self.tm("show-options", "-p", "-t", p).stdout.strip() == ""]
+        self.assertEqual(len(foreign), 1)
+        self.finish(cfg)
+        real, killed = self.w.tmux, []
+
+        def flaky(*args, **kw):
+            if args[:1] == ("kill-pane",):
+                killed.append(args)
+            if args[:1] == ("has-session",) and killed:  # the server is alive, the answer is lost
+                return subprocess.CompletedProcess(args, 1, "", "error connecting to /tmp/x (Connection refused)\n")
+            return real(*args, **kw)
+        with mock.patch.object(self.w, "tmux", flaky):
+            res = self.w.close_chain_sessions(cfg, json.loads((cfg["run_dir"] / "state.json").read_text(encoding="utf-8")))
+        self.assertTrue(killed)
+        self.assertEqual(res["sessions"], [])  # not confirmed: not claimed
+        events = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("could not confirm what was closed (has-session failed)", events)
+        self.assertNotIn("chain sessions closed", events)
+        self.assertIn(foreign[0], self.pane_ids())  # the foreign pane lives
+
+    def test_session_gone_tells_a_confirmed_absence_from_a_failure(self):
+        def answer(rc, err):
+            return mock.patch.object(self.w, "tmux", lambda *a, **kw: subprocess.CompletedProcess(a, rc, "", err))
+        for rc, err, want in ((0, "", False),
+                              (1, "can't find session: wv-w1\n", True),
+                              (1, "no server running on /tmp/x\n", True),
+                              (1, "error connecting to /tmp/x (No such file or directory)\n", True),
+                              (1, "error connecting to /tmp/x (Connection refused)\n", None),
+                              (1, "", None), (124, "timeout", None)):
+            with answer(rc, err):
+                self.assertIs(self.w._session_gone("wv-w1"), want, (rc, err))
+        with mock.patch.object(self.w, "tmux", mock.Mock(side_effect=OSError("boom"))):
+            self.assertIsNone(self.w._session_gone("wv-w1"))
+
     # --- 3. refusals and idempotence
     def test_cleanup_refused_with_a_live_dispatcher_or_without_chain_result(self):
         cfg, path = self.cfg()
@@ -13893,6 +13936,308 @@ class ChainCleanup(Base):
         self.assertTrue(any("@wab_run" in c and tag in c and "-p" not in c for c in sets), sets)
         self.assertTrue(any("@wab_run" in c and tag in c and "-p" in c for c in sets), sets)
         self.assertTrue(any("@wab_run_dir" in c and str(cfg["run_dir"]) in c for c in sets), sets)
+
+
+EVENTS = Path(__file__).resolve().parent.parent / "fixtures" / "events"
+
+
+class DashEvents(unittest.TestCase):
+    """«📜 События» for a human (#69): the type of an event -> a short Russian phrase, a folded pulse.
+    The fixtures are LIVE logs (tests/fixtures/events/README.md); the lines marked EMITTER FORMAT below
+    have no live sample and follow the event(...) calls of wab.py."""
+
+    # live types the fixture is allowed to leave raw (none today; list a type here on purpose)
+    RAW_ALLOWED = ()
+
+    def setUp(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        self.dash = dash
+
+    @staticmethod
+    def _msgs(name):
+        out = []
+        for line in (EVENTS / name).read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                out.append(line.partition(" ")[2].partition(" ")[2] if line[:2] == "20" else line)
+        return out
+
+    def test_every_live_line_has_a_human_phrase(self):
+        raw = []
+        total = 0
+        for name in ("waves-finish-events.log", "waves-tails-events.log"):
+            for msg in self._msgs(name):
+                total += 1
+                phrase, details, colour, known = self.dash.humanize_event(msg)
+                if not known and not msg.startswith(self.RAW_ALLOWED):
+                    raw.append(msg[:90])
+        self.assertGreater(total, 200)
+        self.assertEqual(raw, [], f"unrecognised event types in the live fixture: {raw[:5]}")
+
+    def test_blocked_says_who_is_needed(self):
+        h = self.dash.humanize_event
+        phrase, details, colour, known = h(
+            "W3: BLOCKED: [class=blocked_cap rec=owner red=no] blocked w3: кап 3/3 в прогоне r1")
+        self.assertTrue(known)
+        self.assertIn("W3", phrase)
+        self.assertIn("твоего решения", phrase)
+        self.assertIn("попыт", phrase)  # the cap: out of attempts to fix a review finding
+        self.assertIn("red", colour)
+        self.assertIsNotNone(details)
+        self.assertIn("class=blocked_cap", details)
+        phrase, _, _, _ = h("W3: BLOCKED: [class=needs_decision rec=invariant red=yes] x")
+        self.assertIn("твоего решения", phrase)  # red=yes: the owner
+        phrase, _, _, _ = h("W3: BLOCKED: [class=question rec=fix red=no] x")
+        self.assertNotIn("твоего", phrase)  # a policy episode: not the owner
+        self.assertIn("W3", phrase)
+        phrase, _, _, _ = h("W3: BLOCKED: no label at all")
+        self.assertIn("твоего", phrase)  # no label: it goes to the owner
+        pulse, _, _, known = h("W3: phase=running ctx=199k restarts=0 status=BLOCKED: [class=blocked_cap rec=owner red=no] x")
+        self.assertTrue(known)
+        self.assertIn("твоего решения", pulse)
+
+    def test_merge_and_checkpoint_phrases(self):
+        h = self.dash.humanize_event
+        cases = {
+            "W1: merge gate passed, merge of PR #12 requested at abcdef123456": ("PR #12", "мердж"),
+            "W1: PR #12 MERGED, base not known (PR: 'x', chain: 'y')": ("PR #12", "смерж"),
+            "W1: merge gate waits: Codex не завершил ревью": ("гейт", "ждёт"),
+            "W1: merge gate failed: Codex: 2 замечания P1": ("гейт", "не пройден"),
+            "W2: context 250000 >= 240000, checkpoint requested": ("W2", "контрольн"),
+            "W2: handoff ready, /clear + /update (restart #1)": ("W2", "перезапуск"),
+            "W2: handoff ready, /clear + /superarmanda --resume (restart #2)": ("W2", "перезапуск"),  # EMITTER FORMAT
+            "W2: new session 3ad76723-1140-4b67-9abd-b9b72531cf22 bound by marker": ("W2", "сесси"),
+            "W2: policy auto-answer: class=needs_decision rec=invariant": ("W2", "автоответ"),
+            "W2: policy cap reached (3/3): class=question rec=fix goes to the owner": ("W2", "лимит"),  # EMITTER FORMAT
+            "W2: launched in tmux wf-w2, cwd /tmp/x": ("W2", "запущен"),
+            "W2: DONE": ("W2", "готова"),
+            "W2: DONE, awaiting merge by the coordinator": ("W2", "мердж"),  # EMITTER FORMAT
+            "watch started, ctx_limit=240000": ("слежение", "начато"),
+            "watch stopped: no current wave": ("слежение", "остановлено"),
+            "chain finished": ("цепочка", "завершена"),
+            "chain sessions closed: sessions ['a'], panes ['%1']": ("tmux", "закрыт"),  # EMITTER FORMAT
+            "telegram: wave-autobot: стартовала волна W1.": ("уведомление", "отправлено"),
+            "telegram FAILED (TimeoutExpired): wave-autobot: x": ("не доставлено", "telegram"),  # EMITTER FORMAT
+            "display-message failed (OSError): x": ("не доставлено", "tmux"),  # EMITTER FORMAT
+            "notify(skipped): wave-autobot: x": ("не настроен", "уведомл"),  # EMITTER FORMAT
+            "W4: pane idle 15+ min, status=RUNNING": ("W4", "молчит"),
+            "W4: idle nudge sent (15 min, no live background work)": ("W4", "толчок"),  # EMITTER FORMAT
+            "W4: idle nudge dropped: the input holds another text (left untouched)": ("W4", "толчок"),  # EMITTER FORMAT
+            "W2: фоновые хвосты в окне волны: pid 3217426 (30 мин без работы)": ("W2", "фонов"),
+            "W2: дерево процессов недоступно: ps failed": ("W2", "дерево"),  # EMITTER FORMAT
+            "W2: alarm: PR #7 checks completed and Codex finished at abcdef123456": ("PR #7", "проверки"),
+            "W2: say: РЕШЕНИЕ КООРДИНАТОРА: вариант new_run": ("W2", "окно"),
+            "admission: host policy, cc-autonomy prepare -> /tmp/x": ("клон", "допуск"),
+            "W2: workdir /tmp/x detached on origin/main (abc)": ("W2", "рабоч"),
+            "W2: window is not in auto mode": ("W2", "авто"),
+            "W2: permission prompt on screen": ("W2", "разреш"),  # EMITTER FORMAT
+            "W2: tmux session wf-w2 is gone (status=RUNNING)": ("W2", "закрылось"),  # EMITTER FORMAT
+            "W2: owner-handover: PR #5 смержен владельцем (head abc, merge def)": ("PR #5", "смерж"),
+        }
+        for msg, needles in cases.items():
+            phrase, details, colour, known = h(msg)
+            self.assertTrue(known, msg)
+            for n in needles:
+                self.assertIn(n.lower(), phrase.lower(), (msg, phrase))
+            self.assertLess(len(phrase), 200, msg)
+
+    def test_unknown_line_is_raw_and_shortened(self):
+        msg = "W9: something nobody has seen yet " + "x" * 400
+        phrase, details, colour, known = self.dash.humanize_event(msg)
+        self.assertFalse(known)
+        self.assertTrue(phrase.startswith("W9: something nobody"))
+        self.assertLessEqual(len(phrase), 140)
+        self.assertIsNone(details)
+
+    def test_secrets_are_masked_in_phrase_and_details(self):
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        for msg in (f"W9: unknown thing with {token} inside",
+                    f"W1: say: РЕШЕНИЕ: используй {token} для входа",
+                    f"W1: BLOCKED: [class=question rec=fix red=no] {token} в цитате",
+                    f"W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=question rec=fix red=no] {token}"):
+            phrase, details, colour, known = self.dash.humanize_event(msg)
+            self.assertNotIn(token, phrase + (details or ""), msg)
+        phrase, details, _, _ = self.dash.humanize_event("W1: BLOCKED: [class=question rec=fix red=no] password=hunter2hunter2 тут")
+        self.assertNotIn("hunter2", phrase + (details or ""))
+
+    @staticmethod
+    def _pulse(hh, ctx, status="RUNNING", phase="running", restarts=0, wave="W1"):
+        return f"2026-10-04 {hh} {wave}: phase={phase} ctx={ctx}k restarts={restarts} status={status}"
+
+    def test_identical_pulses_fold_into_one_line(self):
+        lines = [self._pulse(f"10:0{i}:00Z", 100 + i) for i in range(6)]  # ctx grows: not a change
+        items = self.dash.fold_events(lines)
+        self.assertEqual(len(items), 1, items)
+        self.assertIn("без изменений с 10:00 (×6)", items[0][1])
+
+    def test_pulse_change_breaks_the_fold(self):
+        lines = ([self._pulse(f"10:0{i}:00Z", 100) for i in range(3)]
+                 + [self._pulse(f"10:1{i}:00Z", 100, status="BLOCKED: [class=question rec=fix red=no] q") for i in range(3)])
+        items = self.dash.fold_events(lines)
+        self.assertEqual(len(items), 2, items)
+        self.assertIn("(×3)", items[0][1])
+        self.assertIn("(×3)", items[1][1])
+        # another event between pulses breaks the fold too; restarts is a change; another wave is one
+        mixed = [self._pulse("10:00:00Z", 1), self._pulse("10:01:00Z", 1),
+                 "2026-10-04 10:02:00Z W1: DONE", self._pulse("10:03:00Z", 1), self._pulse("10:04:00Z", 1)]
+        self.assertEqual(len(self.dash.fold_events(mixed)), 3)
+        self.assertEqual(len(self.dash.fold_events([self._pulse("10:00:00Z", 1), self._pulse("10:01:00Z", 1, restarts=1)])), 2)
+        self.assertEqual(len(self.dash.fold_events([self._pulse("10:00:00Z", 1), self._pulse("10:01:00Z", 1, wave="W2")])), 2)
+
+    def test_control_characters_never_reach_the_terminal(self):
+        from rich.console import Console
+        bad = "\x1b[31m red \x1b]0;title\x07 c1\x9b31m \x00 \x7f \x85"
+        bad_chars = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+        lines = [f"2026-10-04 10:00:00Z W9: unknown thing {bad}",
+                 f"2026-10-04 10:00:01Z W1: say: РЕШЕНИЕ {bad}",
+                 f"2026-10-04 10:00:02Z W1: BLOCKED: [class=question rec=fix red=no] {bad}",
+                 f"2026-10-04 10:00:03Z W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=question rec=fix red=no] {bad}",
+                 f"no time at all {bad}"]
+        for msg in (l[20:] for l in lines[:4]):
+            phrase, details, _, _ = self.dash.humanize_event(msg)
+            self.assertIsNone(bad_chars.search(phrase + (details or "")), (phrase, details))
+        run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        (run_dir / "events.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        buf = io.StringIO()
+        Console(file=buf, width=140, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}))
+        self.assertIsNone(re.search("[\x00-\x09\x0b-\x1f\x7f-\x9f]", buf.getvalue()), repr(buf.getvalue()))
+        self.assertIn("unknown thing", buf.getvalue())  # the text itself stays
+
+    def test_a_folded_series_shows_the_first_time_and_the_last_state(self):
+        lines = [self._pulse(f"10:0{i}:00Z", i) for i in range(6)]  # ctx 0k..5k
+        items = self.dash.fold_events(lines)
+        self.assertEqual(len(items), 1)
+        ts, phrase, details, _ = items[0]
+        self.assertIn("без изменений с 10:00 (×6)", phrase)
+        self.assertIn("ctx=5k", details)
+        self.assertNotIn("ctx=0k", details)
+
+    def test_a_secret_cut_by_the_length_limit_does_not_leak_a_prefix(self):
+        secrets = ["ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+                   "sk-ant-api03-" + "Zy9Xw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe9Dc8Ba7",
+                   "password=hunter2hunter2hunter2xyz"]
+
+        def leaks(secret, *texts):
+            out = " ".join(t or "" for t in texts)
+            value = secret.split("=", 1)[-1] if secret.startswith("password=") else secret
+            return [value[i:i + 9] for i in range(len(value) - 8) if value[i:i + 9] in out]
+
+        for secret in secrets:
+            for start in range(100, 140, 5):  # the secret crosses the 140 border of a raw line
+                msg = "W9: " + "x" * (start - 4) + " " + secret + " tail"
+                phrase, details, _, known = self.dash.humanize_event(msg)
+                self.assertEqual(leaks(secret, phrase, details), [], (secret, start, phrase))
+            for start in range(100, 200, 7):  # ... and the 160 border of the details / the BLOCKED question
+                for msg in (f"W1: BLOCKED: [class=question rec=fix red=no] {'q' * start} {secret} tail",
+                            f"W1: say: {'q' * start} {secret} tail",
+                            f"W1: merge gate failed: {'q' * start} {secret} tail"):
+                    phrase, details, _, _ = self.dash.humanize_event(msg)
+                    self.assertEqual(leaks(secret, phrase, details), [], (secret, start, msg[:30], details))
+
+    def test_a_long_run_of_pulses_does_not_push_the_event_before_it_out(self):
+        from rich.console import Console
+        run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        lines = ["2026-10-04 09:59:00Z W1: launched in tmux wf-w1, cwd /tmp/x"]
+        for i in range(1000):
+            sec = i % 60
+            lines.append(self._pulse(f"10:{i // 60 % 60:02d}:{sec:02d}Z", 100 + i))
+        (run_dir / "events.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        buf = io.StringIO()
+        Console(file=buf, width=140, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}, n=12))
+        out = buf.getvalue()
+        self.assertIn("запущен", out)
+        self.assertIn("без изменений с 10:00 (×1000)", out)
+
+    def test_an_invisible_character_inside_a_secret_does_not_hide_it(self):
+        # one representative of every class of wab._INVISIBLE: Cf (zero width, joiner, word joiner, BOM, soft
+        # hyphen, tag), Zl, Hangul fillers, variation selector, CGJ, an unassigned default-ignorable one, bidi
+        chars = ["\u200b", "\u200d", "\u2060", "\ufeff", "\u00ad", "\u2028", "\u3164", "\u115f", "\U000e0001",
+                 "\ufe0f", "\u034f", "\u2065", "\u202e", "\u2029", "\x00", "\x9b"]
+        token = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        for c in chars:
+            cases = [("password" + c + "=hunter2hunter2", "hunter2"),
+                     ("ghp_" + token[:18] + c + token[18:], token[:9]),
+                     ("sk-ant-api03-" + token[:12] + c + token[12:], token[14:23])]
+            for secret, fragment in cases:
+                for msg in (f"W1: say: {secret}", f"W9: unknown thing {secret} tail",
+                            f"W1: BLOCKED: [class=question rec=fix red=no] вопрос {secret}",
+                            f"W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=question rec=fix red=no] {secret}",
+                            f"W1: merge gate failed: {secret}"):
+                    phrase, details, _, _ = self.dash.humanize_event(msg)
+                    out = phrase + " " + (details or "")
+                    self.assertNotIn(fragment, out, (hex(ord(c[0])), msg[:40], out))
+                    self.assertNotIn("hunter2", out, (hex(ord(c[0])), msg[:40], out))
+
+    def test_wave_names_are_the_dispatchers_names(self):
+        h = self.dash.humanize_event
+        for wave in ("fix-input", "1", "w2-resume", "9a"):
+            phrase, details, _, known = h(f"{wave}: BLOCKED: [class=blocked_cap rec=owner red=no] x")
+            self.assertTrue(known, wave)
+            self.assertIn(wave, phrase)
+            self.assertIn("твоего решения", phrase)
+            items = self.dash.fold_events([self._pulse(f"10:0{i}:00Z", i, wave=wave) for i in range(6)])
+            self.assertEqual(len(items), 1, (wave, items))
+            self.assertIn("(×6)", items[0][1])
+            self.assertIn(wave, items[0][1])
+        mixed = [self._pulse("10:00:00Z", 1, wave="fix-a"), self._pulse("10:01:00Z", 1, wave="fix-b"),
+                 self._pulse("10:02:00Z", 1, wave="fix-a")]
+        self.assertEqual(len(self.dash.fold_events(mixed)), 3)  # waves with a hyphen are not glued together
+
+    def test_a_record_is_split_only_at_a_newline(self):
+        # str.splitlines also cuts at U+2028/2029, NEL, VT, FF, FS/GS/RS: «password<sep>=hunter2…» fell in two and
+        # the second half was shown unmasked. A record of events.log ends at \n (and a CRLF's \r), nowhere else.
+        from rich.console import Console
+        seps = ["\u2028", "\u2029", "\x85", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\r"]
+        lines = []
+        for i, sep in enumerate(seps):
+            lines.append(f"2026-10-04 10:00:{i:02d}Z W1: say: password{sep}=hunter2hunter2 хвост «Привет»")
+        run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        path = run_dir / "events.log"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
+        buf = io.StringIO()
+        Console(file=buf, width=200, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}, n=20))
+        self.assertNotIn("hunter2", buf.getvalue())
+        self.assertEqual(buf.getvalue().count("в окно волны написали"), len(seps))  # one record each, none split
+        for block in (7, 50, 64 * 1024):  # a block border may fall anywhere, in the middle of a UTF-8 character too
+            items = self.dash.tail_items(path, 20, block=block)
+            self.assertEqual(len(items), len(seps), block)
+            self.assertNotIn("hunter2", " ".join(f"{i[1]} {i[2]}" for i in items), block)
+        crlf = run_dir / "crlf.log"
+        crlf.write_bytes(b"2026-10-04 10:00:00Z W1: DONE\r\n2026-10-04 10:00:01Z chain finished\r\n")
+        self.assertEqual([i[1] for i in self.dash.tail_items(crlf, 5)], ["✔ W1 готова", "🏁 цепочка завершена"])
+
+    def test_events_panel_folds_before_it_cuts_the_tail(self):
+        from rich.console import Console
+        run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        lines = ["2026-10-04 09:00:00Z W1: launched in tmux wf-w1, cwd /tmp/x"]
+        lines += [self._pulse(f"10:{i // 60:02d}:{i % 60:02d}Z", 100 + i) for i in range(50)]
+        (run_dir / "events.log").write_text("\n".join(lines) + "\nbroken line without a time\n", encoding="utf-8")
+        buf = io.StringIO()
+        Console(file=buf, width=120, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}, n=12))
+        out = buf.getvalue()
+        self.assertIn("запущен", out)  # 50 pulses did not push the launch out of the last 12
+        self.assertIn("×50", out)
+        self.assertIn("broken line", out)
+
+    def test_events_panel_renders_on_the_live_fixture(self):
+        from rich.console import Console
+        run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        shutil.copy(EVENTS / "waves-finish-events.log", run_dir / "events.log")
+        buf = io.StringIO()
+        Console(file=buf, width=120, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}, n=30))
+        self.assertIn("События", buf.getvalue())
+        empty = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, empty, True)
+        buf = io.StringIO()
+        Console(file=buf, width=120, color_system=None).print(self.dash.events_panel({"run_dir": empty}))
+        self.assertIn("событий пока нет", buf.getvalue())
 
 
 class Packaging(unittest.TestCase):

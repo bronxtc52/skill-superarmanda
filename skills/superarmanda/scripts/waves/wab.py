@@ -5086,6 +5086,24 @@ def _kill_pane_sent(cfg, pane):
     return True
 
 
+def _session_gone(name):
+    """After a kill: True when tmux CONFIRMS the session is not there («can't find session», «no server
+    running», or no socket at all: «error connecting … (No such file or directory)», the forms of tmux 3.4),
+    False when it is, None when has-session failed any other way (a timeout, a refused connection, OSError):
+    then nothing is known, and «gone» must not be claimed (tmux_alive reads any failure as «not alive»)."""
+    try:
+        r = tmux("has-session", "-t", session_target(name), check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode == 0:
+        return False
+    err = (r.stderr or "").lower()
+    if "can't find session" in err or "no server running" in err or (
+            "error connecting" in err and "no such file or directory" in err):
+        return True
+    return None
+
+
 def close_chain_sessions(cfg, st):
     """The chain is finished (the caller checked chain-result.md): close the tmux sessions of its waves
     and the dashboard panes, only the ones THIS run marked (`_ours`: @wab_run and @wab_run_dir, read at
@@ -5128,7 +5146,11 @@ def close_chain_sessions(cfg, st):
                      f"close it yourself: tmux kill-session -t {name}")
                 continue
             attempted = [pane for pane in ours if _kill_pane_sent(cfg, pane)]
-            if not tmux_alive(name):
+            gone_now = _session_gone(name)
+            if gone_now is None:
+                event(cfg, f"{name}: could not confirm what was closed (has-session failed)")
+                continue
+            if gone_now:
                 res["sessions"].append(name)
                 gone.update(pane for pane, _ in panes)
                 continue

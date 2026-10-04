@@ -28,8 +28,19 @@ WAB-CHECKPOINT -> handoff.md + HANDOFF_READY -> /clear -> new journal -> `/super
 --resume [wab:...]` -> the new session is bound by the marker -> DONE -> gate -> merge ->
 chain-result.md.
 
+Since 1.0.1-1.0.3 the same run also covers (W4, #68/#72/#57):
+  * the idle nudge: W1 is RUNNING and silent past `idle_nudge_minutes` while a background shell of its
+    Claude lives (the `ps` stand-in shows it): NO nudge; when the shell is gone the wave gets exactly ONE;
+  * an unavailable CodeRabbit: W2 records `coderabbit` = `unavailable` (the verdict of the real
+    pr_review.coderabbit_verdict on the live refusal comment, tests/fixtures/pr-review/coderabbit) and the
+    gate still passes;
+  * the cleanup of a finished chain with panes that are not the run's: an unmarked pane and a pane of
+    another run share the wave sessions, the owner's own dashboard of this chain sits next to the owner's
+    shell and a dashboard of an older run: only the run's own dashboard pane is closed.
+
 Mutations (same scenario, broken dispatcher, the oracle must notice): no merge gate, no session
-binding after /clear, no decision policy.
+binding after /clear, no decision policy, an idle nudge with the process tree ignored (or no nudge at all),
+an unavailable CodeRabbit that blocks the gate, a cleanup that does not check whose a pane is.
 """
 
 import atexit
@@ -57,12 +68,14 @@ STATE_PY = ROOT / "skills" / "superarmanda" / "scripts" / "state.py"
 FIXTURES = ROOT / "tests" / "fixtures"
 FAKES = Path(__file__).resolve().parent / "wab_e2e_fakes"
 sys.path.insert(0, str(WAVES))
+sys.path.insert(0, str(ROOT / "skills" / "superarmanda" / "scripts"))
 
 # the host's session may export these (a wave of the live chain does): none of them may leak
 for _var in [k for k in os.environ if k.startswith(("WAB_", "TMUX"))]:
     os.environ.pop(_var, None)
 
 import wab  # noqa: E402
+import pr_review  # noqa: E402
 
 REPO = "acme/waves-demo"
 CHAIN = "e2e"
@@ -71,7 +84,10 @@ CTX_LIMIT = 50_000
 TICK = 60
 DELAY = 20  # virtual seconds between what the dispatcher typed and the session's reaction
 BOT_STATUS = "[class=needs_decision rec=A red=no]"
-EXPECTED_TOOLS = ("tmux", "gh", "claude")
+NUDGE_MINUTES = 5  # chain.json idle_nudge_minutes of the scenario
+BG_SECONDS = 9 * 60  # how long W1's background shell lives: longer than the nudge threshold
+OLD_RUN = ("e2e/2026-01-01-old", "/elsewhere/runs/e2e/2026-01-01-old")  # (@wab_run, @wab_run_dir) of another run
+EXPECTED_TOOLS = ("tmux", "gh", "claude", "ps")
 TOOLS_THAT_MUST_NOT_RESOLVE = ("curl", "az", "wget", "ssh")
 
 
@@ -136,7 +152,7 @@ class World:
             "GIT_COMMITTER_NAME": "e2e", "GIT_COMMITTER_EMAIL": "e2e@example.invalid",
             "WAB_TMUX_SOCKET": str(self.sock), "FAKE_TMUX_STATE": str(self.tmux_state),
             "FAKE_TMUX_FIXTURES": str(FIXTURES / "screens"), "FAKE_GH_STATE": str(self.gh_state),
-            "FAKE_GH_FIXTURES": str(FIXTURES / "github"),
+            "FAKE_GH_FIXTURES": str(FIXTURES / "github"), "FAKE_TMUX_SOCKET": str(self.sock),
         }
 
     # -- commands run in the test's own environment (never the host's)
@@ -161,7 +177,7 @@ class World:
             must(path, f"{name} is needed by the test")
             (self.sysbin / name).symlink_to(path)
         shebang = f"#!{sys.executable} -S\n"
-        for name, src in (("tmux", "tmux.py"), ("gh", "gh.py"), ("claude", "claude.py")):
+        for name, src in (("tmux", "tmux.py"), ("gh", "gh.py"), ("claude", "claude.py"), ("ps", "ps.py")):
             target = self.bindir / name
             target.write_text(shebang + (FAKES / src).read_text(encoding="utf-8"), encoding="utf-8")
             target.chmod(0o755)
@@ -181,13 +197,29 @@ class World:
         chain = {"chain": CHAIN, "run_id": RUN_ID, "waves": ["W1", "W2"], "repo": REPO, "base_branch": "main",
                  "workdir": str(self.workdir), "merge_gate": "auto", "tick_seconds": TICK,
                  "ctx_limit": CTX_LIMIT, "idle_minutes": 1440, "handoff_timeout_minutes": 1440,
-                 "telegram": False}
+                 "idle_nudge_minutes": NUDGE_MINUTES, "telegram": False}
         if self.policy:
             chain["decision_policy"] = [{"class": "needs_decision", "rec": "A"}]
         self.chain_file.write_text(json.dumps(chain, indent=1), encoding="utf-8")
         (self.root / "w1-prompt.md").write_text(
             "Волна W1: добавь файл w1.txt в репозиторий.\n" + "\n".join(f"Пункт {i} задачи." for i in range(1, 7)) + "\n",
             encoding="utf-8")
+
+    # -- the tmux / ps stand-ins' world
+    def tmux(self, *argv):
+        """A command the OWNER would type on the private socket (split a pane off, set an option on it)."""
+        return self.run("tmux", "-S", str(self.sock), *argv)
+
+    def ps_set(self, rows):
+        (self.tmux_state / "ps-extra.json").write_text(json.dumps(rows), encoding="utf-8")
+
+    def sessions(self):
+        return {f.stem: json.loads(f.read_text(encoding="utf-8"))
+                for f in sorted((self.tmux_state / "sessions").glob("*.json"))}
+
+    def panes(self):
+        """{pane id: (session name, pane record)} of every pane alive now."""
+        return {p["id"]: (n, p) for n, s in self.sessions().items() for p in s["panes"]}
 
     # -- the gh stand-in's world
     def gh(self):
@@ -295,6 +327,10 @@ class Actor:
         self.events = []     # (virtual time, wave, what) the session did
         self.w2_start = None  # the state of the working copy when W2's task arrived
         self.gate_fail_seen = False
+        self.foreign = {}    # name -> pane id of a pane that is NOT the run's (see decorate)
+        self.bg_until = None  # virtual time at which W1's background shell ended
+        self.bg_since = None
+        self.worked = False
 
     # -- scheduling
     def after(self, delay, label, fn):
@@ -305,6 +341,7 @@ class Actor:
         for rec in self.w.jsonl(self.w.tmux_state / "new_sessions.jsonl")[self.new_seen:]:
             self.sessions[rec["name"]] = Session(rec)
             self.new_seen += 1
+            self.decorate(rec["name"])
         for rec in self.w.jsonl(self.w.tmux_state / "inbox.jsonl")[self.inbox_seen:]:
             self.inbox_seen += 1
             self.on_message(self.sessions[rec["session"]], rec["text"])
@@ -314,6 +351,39 @@ class Actor:
                 return
             self.queue.remove(due[0])
             due[0][3]()
+
+    def decorate(self, name):
+        """The owner's panes next to the run's (a real owner splits panes off and opens dashboards)."""
+        w, tmux = self.w, self.w.tmux
+        old = {"@wab_run": OLD_RUN[0], "@wab_run_dir": OLD_RUN[1]}
+        mine = {"@wab_run": f"{CHAIN}/{RUN_ID}", "@wab_run_dir": str(w.run_dir)}
+
+        def split(session, **opts):
+            pane = tmux("split-window", "-d", "-t", f"={session}:", "-P", "-F", "#{pane_id}", "sh").stdout.strip()
+            for k, v in opts.items():
+                tmux("set-option", "-p", "-t", pane, k, v)
+            return pane
+
+        def mark(pane, marks):
+            for k, v in marks.items():
+                tmux("set-option", "-p", "-t", pane, k, v)
+
+        if name == "wab-w1":
+            self.foreign["unmarked"] = split("wab-w1")  # no @wab_run at all
+            dash = tmux("new-session", "-d", "-s", "owner-work", "-P", "-F", "#{pane_id}", "sh").stdout.strip()
+            open_cmd = f"python3 wab-open {w.chain_file}"
+            tmux("set-option", "-p", "-t", dash, "@wab_open", open_cmd)
+            mark(dash, mine)
+            self.foreign["own dashboard"] = dash  # the run's: it IS closed at the end
+            self.foreign["owner shell"] = split("owner-work")
+            old_dash = split("owner-work")
+            tmux("set-option", "-p", "-t", old_dash, "@wab_open", open_cmd)
+            mark(old_dash, old)
+            self.foreign["old dashboard"] = old_dash
+        if name == "wab-w2":
+            pane = split("wab-w2")
+            mark(pane, old)
+            self.foreign["other run"] = pane
 
     def did(self, s, what):
         self.events.append((self.clock.offset, s.wave, what))
@@ -350,7 +420,9 @@ class Actor:
             return self.after(DELAY, "first prompt", lambda: getattr(self, f"start_{s.wave.lower()}")(s))
         if "РЕШЕНИЕ ПО ПОЛИТИКЕ" in text:
             return self.after(DELAY, "policy answer", lambda: self.w1_answered(s))
-        if "Гейт мерджа не пройден" in text:
+        if text.startswith("[wab] Толчок"):  # the idle nudge: the wave remembers its work and goes on
+            return self.after(DELAY, "nudge answered", lambda: self.w1_work(s))
+        if "Гейт мерджа не пройден" in text and s.wave == "W1":
             return self.after(DELAY, "gate failure", lambda: self.w1_fixed(s))
         if text.startswith("WAB-CHECKPOINT"):
             return self.after(DELAY, "checkpoint", lambda: self.w2_checkpoint(s))
@@ -404,10 +476,27 @@ class Actor:
         self.write_status(s, f"BLOCKED: {BOT_STATUS} Какую схему выбрать? Варианты: A) тонкая правка, B) переделка.")
 
     def w1_answered(self, s):
+        # RUNNING again, then silence: the wave waits for a background shell (a long `sleep` of its Bash tool)
+        # for longer than idle_nudge_minutes. The `ps` stand-in shows the shell under the wave's Claude; it ends
+        # at BG_SECONDS, and only then may the dispatcher push the wave (it does not know what the wave waits for).
         self.write_status(s, "RUNNING")
-        self.after(60, "w1 work", lambda: self.w1_work(s))
+        self.w.ps_set([
+            {"pid": 7001, "under": s.name, "etime": "02:00",
+             "args": "/bin/bash -c -l source /home/e2e/.claude/shell-snapshots/snapshot-bash.sh && "
+                     "eval 'sleep 600' < /dev/null && pwd -P >| /tmp/claude-cwd"},
+            {"pid": 7002, "ppid": 7001, "etime": "02:00", "args": "sleep 600"}])
+        self.bg_since = self.clock.offset
+        self.after(BG_SECONDS, "background shell ends", lambda: self.bg_ended(s))
+
+    def bg_ended(self, s):
+        self.w.ps_set([])
+        self.bg_until = self.clock.offset
+        self.did(s, "background shell ended")
 
     def w1_work(self, s):
+        if self.worked:  # one nudge answers once, whatever else arrives
+            return
+        self.worked = True
         # the gate mutants: the PR is red (gate_off) or only Codex wrote on an older commit (gate_off_codex), for good
         bad = self.mode in ("gate_off", "gate_off_codex")
         number = self.commit_and_pr(s, ci={"gate_off": "failure", "gate_off_codex": "success"}.get(self.mode, "in_progress"),
@@ -466,8 +555,22 @@ class Actor:
         self.write_status(s, "RUNNING")
         self.after(80, "w2 done", lambda: self.w2_done(s))
 
+    def record_coderabbit_refusal(self, s):
+        """CodeRabbit refused the review of this head: its live refusal comment (pr592 of the fixtures; the range
+        end is the head of THIS PR), classified by the real pr_review.coderabbit_verdict, recorded as the role."""
+        head = self.w.git("rev-parse", "HEAD")
+        d = json.loads((FIXTURES / "pr-review" / "coderabbit" / "pr592-rest.json").read_text(encoding="utf-8"))
+        old = d["head"]["sha"]
+        comments = json.loads(json.dumps(d["issue_comments"]).replace(old, head))
+        verdict = pr_review.coderabbit_verdict(head, d["reviews"], d["review_comments"], comments)
+        must(verdict["status"] == "unavailable", f"the live refusal is not classified as unavailable: {verdict}")
+        self.state_py("task-result", "--manifest", str(self.manifest_path(s)), "--task", "T1", "--role", "coderabbit",
+                      "--status", verdict["status"], "--session-id", f"e2e-{s.wave}-coderabbit", "--head", head)
+        self.did(s, f"coderabbit {verdict['status']}")
+
     def w2_done(self, s):
         self.record_results(s)
+        self.record_coderabbit_refusal(s)
         s.journal.turn(11_000)
         self.finish(s)
 
@@ -482,7 +585,9 @@ def run_scenario(mode="normal", limit=90 * 60):
     """mode: normal | gate_off (merge gate always passes, CI red) | gate_off_codex (the same, CI green but
     Codex reviewed an older commit) | no_rebind (find_new_session finds nothing) | no_policy (chain.json
     without decision_policy) | stale_base (the next wave starts on the old working copy) | no_checkpoint
-    (the context is never measured)."""
+    (the context is never measured) | no_children_check (the nudge ignores the process tree) | no_nudge (no idle
+    nudge at all) | rabbit_blocks (a CodeRabbit that is `unavailable` blocks the gate) | kill_any (the cleanup
+    does not check whose a pane is)."""
     base = Path(tempfile.mkdtemp(prefix="wabe2e-"))
     atexit.register(shutil.rmtree, base, True)
     world = World(base, policy=mode != "no_policy")
@@ -523,6 +628,23 @@ def run_scenario(mode="normal", limit=90 * 60):
             stack.enter_context(mock.patch.object(wab, "refresh_workdir", lambda cfg, wave, cwd: None))
         if mode == "no_checkpoint":
             stack.enter_context(mock.patch.object(wab, "context_tokens", lambda w: 0))
+        if mode == "no_children_check":
+            stack.enter_context(mock.patch.object(wab, "wave_children", lambda cfg, w: []))
+        if mode == "no_nudge":
+            stack.enter_context(mock.patch.object(wab, "_idle_nudge_tick", lambda *a, **kw: None))
+        if mode == "rabbit_blocks":
+            real = wab.gate.manifest_problems
+
+            def strict(manifest, head, fingerprint):
+                out = real(manifest, head, fingerprint)
+                for name, entry in ((manifest or {}).get("tasks") or {}).items():
+                    r = (entry.get("results") or {}).get("coderabbit") or {}
+                    if r.get("head") == head and r.get("status") == "unavailable":
+                        out.append(f"задача {name}: coderabbit unavailable")
+                return out
+            stack.enter_context(mock.patch.object(wab.gate, "manifest_problems", strict))
+        if mode == "kill_any":
+            stack.enter_context(mock.patch.object(wab, "_ours", lambda cfg, session=None, pane=None: "ours"))
         run.env_seen = {"wab_tmux": sorted(k for k in os.environ if k.startswith(("WAB_", "TMUX"))),
                         "home": str(Path.home()), "path": os.environ["PATH"]}
         run.resolved = {t: shutil.which(t) for t in EXPECTED_TOOLS + TOOLS_THAT_MUST_NOT_RESOLVE}
@@ -550,6 +672,10 @@ def oracle_hygiene(run):
     for c in calls:
         must(c.get("sock") == ["-S", str(w.sock)], f"tmux call without the private socket: {c}")
         must("unsupported" not in c, f"tmux command the stand-in does not know: {c}")
+    ps = w.jsonl(w.tmux_state / "ps_calls.jsonl")
+    must(ps, "the process tree was never read (the idle nudge and the tails watch need it)")
+    for c in ps:
+        must(c["argv"] == list(wab.PS_ARGV[1:]), f"ps called as {c['argv']}")
     news = w.jsonl(w.tmux_state / "new_sessions.jsonl")
     must([n["name"] for n in news] == ["wab-w1", "wab-w2"], f"sessions started: {[n['name'] for n in news]}")
     for n in news:
@@ -606,6 +732,54 @@ def oracle_policy(run):
          f"policy answers: {answers}")
 
 
+def oracle_nudge(run):
+    """The idle nudge (#68): W1 was silent for longer than the threshold while its background shell lived
+    (no nudge then), and got exactly one push after the shell was gone."""
+    a = run.actor
+    must(a.bg_since is not None and a.bg_until is not None, "the scenario never ran W1's background shell")
+    must(a.bg_until - a.bg_since > NUDGE_MINUTES * 60, "the background shell must outlive the nudge threshold")
+    text = wab.idle_nudge_text(NUDGE_MINUTES)
+    nudges = [(t, wave) for t, wave, msg in a.received if msg == text]
+    must(nudges, "no idle nudge reached the silent wave once its background work was gone")
+    must(len(nudges) == 1, f"{len(nudges)} idle nudges in one idle episode")
+    t, wave = nudges[0]
+    must(wave == "W1", f"the nudge went to {wave}")
+    must(t >= a.bg_until, f"a false idle nudge: sent at +{t - a.bg_since:.0f} s while the wave's background shell "
+                          f"lived until +{a.bg_until - a.bg_since:.0f} s")
+    must(run.events_log.count("W1: idle nudge sent") == 1, "events: idle nudge sent is not exactly once")
+    must(not any(msg.startswith("[wab] Толчок") and msg != text for _, _, msg in a.received), "another nudge text")
+
+
+def oracle_coderabbit(run):
+    """An unavailable CodeRabbit (#72): the wave recorded the role, the gate did not count it against the PR."""
+    w = run.world
+    manifest = json.loads((w.run_dir / "W2" / "superarmanda" / "manifest.json").read_text(encoding="utf-8"))
+    rabbit = manifest["tasks"]["T1"]["results"].get("coderabbit")
+    must(rabbit and rabbit["status"] == "unavailable", f"W2 did not record coderabbit=unavailable: {rabbit}")
+    must(rabbit["head"] == manifest["head"], "the refusal was recorded on another head than the PR's")
+    must(w.gh()["prs"]["2"]["state"] == "MERGED", "W2's PR was not merged although only CodeRabbit refused")
+    must("coderabbit" not in " ".join(l for l in run.events_log.splitlines() if "W2: merge gate failed" in l),
+         "the gate counted the unavailable CodeRabbit against W2")
+
+
+def oracle_cleanup(run):
+    """The end of the chain closes only the run's own panes (#57): the dashboard of THIS run is gone; a pane without
+    a mark, a pane of another run, the owner's shell and a dashboard of an older run live, and so do their sessions."""
+    w, f = run.world, run.actor.foreign
+    must(set(f) == {"unmarked", "own dashboard", "owner shell", "old dashboard", "other run"}, f"foreign panes: {f}")
+    alive = w.panes()
+    for what in ("unmarked", "owner shell", "old dashboard", "other run"):
+        must(f[what] in alive, f"the pane «{what}» ({f[what]}), which is not the run's, was closed")
+    must(f["own dashboard"] not in alive, "the run's own dashboard pane is still open after the chain finished")
+    sessions = w.sessions()
+    must({"wab-w1", "wab-w2", "owner-work"} <= set(sessions), f"sessions left: {sorted(sessions)}")
+    for what, session in (("unmarked", "wab-w1"), ("other run", "wab-w2"), ("owner shell", "owner-work"),
+                          ("old dashboard", "owner-work")):
+        must(alive[f[what]][0] == session, f"{what} moved to {alive[f[what]][0]}")
+    must("chain sessions closed: sessions [], panes ['" + f["own dashboard"] + "']" in run.events_log,
+         "the dispatcher did not report closing the run's dashboard pane")
+
+
 def oracle_flow(run):
     """The scenario happened in order, as the dispatcher's own journal and the windows' inbox tell it."""
     w, a = run.world, run.actor
@@ -655,7 +829,7 @@ def oracle_flow(run):
                  f"[#2](https://github.com/{REPO}/pull/2)", "смержен", "волн: 2, PR: 2"):
         must(part in result, f"chain-result.md lacks «{part}»")
     # the windows are gone, and the notice of the end reached the (stand-in) status line
-    must(not list((w.tmux_state / "sessions").glob("*.json")), "a window is still open")
+    must(not [pid for pid, (_, p) in w.panes().items() if p["claude"]], "a wave's Claude pane is still open")
     shown = " ".join(" ".join(d["args"]) for d in w.jsonl(w.tmux_state / "display.jsonl"))
     must("цепочка завершена" in shown, "the end of the chain was not shown")
 
@@ -699,6 +873,15 @@ class OfflineChain(unittest.TestCase):
         kinds = [(d.get("type"), bool(d.get("isMeta"))) for d in map(json.loads, cleared.read_text(encoding="utf-8").splitlines())]
         must(("user", True) in kinds and ("system", False) in kinds, "the caveat and the /clear echo are in the new journal")
 
+    def test_idle_nudge_waits_for_background_work_then_pushes_once(self):
+        oracle_nudge(self.chain)
+
+    def test_unavailable_coderabbit_does_not_block_the_gate(self):
+        oracle_coderabbit(self.chain)
+
+    def test_cleanup_closes_only_the_runs_own_panes(self):
+        oracle_cleanup(self.chain)
+
     def test_runs_fast(self):
         must(self.seconds < 40, f"the scenario took {self.seconds:.0f} s")
 
@@ -729,6 +912,24 @@ class Mutations(unittest.TestCase):
     def test_without_context_measuring_the_chain_stalls_at_the_checkpoint(self):
         with self.assertRaises(Stalled):
             run_scenario("no_checkpoint", limit=40 * 60)
+
+    def test_a_nudge_that_ignores_the_process_tree_is_a_false_nudge(self):
+        run = run_scenario("no_children_check")
+        with self.assertRaisesRegex(AssertionError, "a false idle nudge"):
+            oracle_nudge(run)
+
+    def test_without_the_idle_nudge_the_silent_wave_is_never_pushed(self):
+        with self.assertRaises(Stalled):
+            run_scenario("no_nudge", limit=60 * 60)
+
+    def test_a_blocking_unavailable_coderabbit_stalls_the_chain(self):
+        with self.assertRaises(Stalled):
+            run_scenario("rabbit_blocks", limit=70 * 60)
+
+    def test_a_cleanup_that_does_not_check_ownership_kills_foreign_panes(self):
+        run = run_scenario("kill_any")
+        with self.assertRaisesRegex(AssertionError, "which is not the run's, was closed"):
+            oracle_cleanup(run)
 
     def test_without_the_decision_policy_the_chain_stalls(self):
         with self.assertRaises(Stalled):
