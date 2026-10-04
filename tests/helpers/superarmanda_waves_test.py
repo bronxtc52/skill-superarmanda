@@ -12327,13 +12327,58 @@ class W3Quote(Base):
 
     def test_blocked_notice_masks_a_secret_that_contains_the_options_separator(self):  # Astra r2
         # the split into question/options must not cut a secret away from its key before redact()
-        for value in ("variants:hunter2hunter2", "Варианты:hunter2hunter2", "x;Варианты:hunter2hunter2"):
+        for value in ("variants:hunter2hunter2", "Варианты:hunter2hunter2", "token=Варианты:hunter2hunter2"):
             with self.subTest(value=value):
                 status = f"BLOCKED: [class=question rec=A red=yes] password={value}"
                 _cfg, sent = self.blocked_text(status)
                 [msg] = [t for t in sent if "ждёт тебя" in t]
                 self.assertNotIn("hunter2hunter2", msg)
                 self.assertIn("рекомендация волны: A", msg)
+
+    # one character of every invisible class _INVISIBLE covers (W3 invariant): Cc, C1, Cf (zero width,
+    # bidi, soft hyphen, word joiner, BOM), Zl, Zp, variation selector, CGJ, Hangul filler, unassigned
+    # default-ignorable
+    INVISIBLES = ("\x01", "\x85", "\u200b", "\u200e", "\u00ad", "\u2060", "\ufeff", "\u2028", "\u2029",
+                  "\ufe0f", "\u034f", "\u3164", "\u2065")
+
+    def test_blocked_notice_masks_a_key_glued_by_an_invisible_character(self):  # Astra r3 (high)
+        # an invisible character inside the key hides `password=` from redact(); the separator inside the
+        # value would then carry the bare value into the options: the whole line is cleaned first
+        for ch in self.INVISIBLES:
+            for line in (f"password{ch}=variants:s3cr3tValue9", f"token{ch}=x;Варианты:s3cr3tValue9"):
+                with self.subTest(ch=hex(ord(ch)), line=line.split(ch)[0]):
+                    _cfg, sent = self.blocked_text(f"BLOCKED: [class=question rec=A red=yes] {line}")
+                    [msg] = [t for t in sent if "ждёт тебя" in t]
+                    self.assertNotIn("s3cr3t", msg)
+                    self.assertIn("рекомендация волны: A", msg)
+
+    def test_blocked_notice_never_shows_what_the_plain_quote_masks(self):  # the class, not the case
+        # whatever quote() hides in the whole question stays hidden after the split into question/options
+        value = "s3cr3tValue9"
+        shapes = ["password={v}", "password=variants:{v}", "token=Варианты:{v}", "x; Варианты: A token={v} | B",
+                  "ghp_{v}a1B2c3D4e5F6g7H8i9J0k1L2m3N4", "первая\ntoken={v}; Варианты: A | B"]
+        shapes += [f"password{ch}=variants:{{v}}" for ch in self.INVISIBLES]
+        shapes += [f"q; Варианты: A s3cr3t{ch}{{v}} | B" for ch in self.INVISIBLES]
+        for shape in shapes:
+            question = shape.format(v=value)
+            if value in wab.quote(question):
+                continue  # beyond redact()'s heuristic for any quote: not a property of the split
+            with self.subTest(shape=shape):
+                _cfg, sent = self.blocked_text(f"BLOCKED: [class=question rec=A red=yes] {question}")
+                [msg] = [t for t in sent if "ждёт тебя" in t]
+                self.assertNotIn(value, msg)
+                self.assertNotIn("s3cr3t", msg)
+
+    def test_blocked_notice_masks_an_invisible_character_in_the_options(self):  # Astra r3 (high)
+        for ch in self.INVISIBLES:
+            for opt in (f"A token=s3cr3t{ch}Value9 | B нет", f"A pass{ch}word=s3cr3tValue9 | B нет",
+                        f"A s3cr3t{ch}Value9 | B нет"):
+                with self.subTest(ch=hex(ord(ch)), opt=opt.split(ch)[0]):
+                    _cfg, sent = self.blocked_text(
+                        f"BLOCKED: [class=question rec=A red=yes] вопрос; Варианты: {opt}")
+                    [msg] = [t for t in sent if "ждёт тебя" in t]
+                    self.assertNotIn("s3cr3t", msg)
+                    self.assertNotIn("Value9", msg)
 
     def test_blocked_notice_with_a_huge_question_still_fits_and_keeps_the_answer_path(self):
         cfg, sent = self.blocked_text(self.LABELLED.format(question="очень длинный вопрос " * 400))
