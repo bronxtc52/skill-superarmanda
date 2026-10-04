@@ -1,0 +1,8 @@
+      1       0 52-07:49:39 /usr/lib/systemd/systemd --system --deserialize=173
+2034867 3791957       02:33 claude --permission-mode auto --append-system-prompt-file <run_dir>/system-prompt.md --name wab-waves-tails-W1 --session-id 00000000-0000-4000-8000-000000000000
+2048167 2034867       00:28 /bin/bash -c source /home/user/.claude/shell-snapshots/snapshot-bash-1791113511216-u6l1ik.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'until grep -q done /tmp/claude-1000/<project>/<session>/scratchpad/never.output 2>/dev/null; do sleep 5; done' < /dev/null && pwd -P >| /tmp/claude-91f2-cwd
+2048168 2034867       00:28 /bin/bash -c source /home/user/.claude/shell-snapshots/snapshot-bash-1791113511216-u6l1ik.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'until ! pgrep -f "run-tests.sh|superarmanda-review.test.sh"; do sleep 5; done' < /dev/null && pwd -P >| /tmp/claude-87d6-cwd
+2048169 2034867       00:28 /bin/bash -c source /home/user/.claude/shell-snapshots/snapshot-bash-1791113511216-u6l1ik.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'sleep 600' < /dev/null && pwd -P >| /tmp/claude-40ed-cwd
+2048172 2048169       00:28 sleep 600
+2050638 2048168       00:03 sleep 5
+2050628 2048167       00:03 sleep 5

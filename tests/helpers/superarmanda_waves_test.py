@@ -210,6 +210,9 @@ class Base(unittest.TestCase):
         patch("require_tmux")
         # nothing may reach GitHub: no PR is known unless a test sets one (see MergeGateBase)
         patch("find_pr", return_value=None)
+        # the process tree of the window (#68) is not read from the test machine: no children by default;
+        # ProcessFacts / BgBase put the real function back over a faked `ps`
+        patch("wave_children", return_value=[])
         patch("_send_telegram", side_effect=lambda cfg, text: self.tg.append(text))
         sleeper = mock.patch("time.sleep")
         sleeper.start()
@@ -12689,6 +12692,617 @@ class W3NoticeQuoteGuard(Base):
                "    put_notice(w, 'idle', '1', f'x {status}')\n"
                "    put_notice(w, 'idle', '1', f'x {quote(status)}')\n")
         self.assertEqual(len(_unquoted_wave_text(src)), 4, _unquoted_wave_text(src))
+
+
+# ---------------------------------------------------------------- W1 (#68): background tails and the idle nudge
+PROCS = Path(__file__).resolve().parent.parent / "fixtures" / "processes"
+REAL_WAVE_CHILDREN = getattr(wab, "wave_children", None)
+REAL_PROCESS_TABLE = getattr(wab, "process_table", None)
+
+
+def procs(name):
+    """A real process-tree snapshot of a wave window (tests/fixtures/processes/README.md)."""
+    return (PROCS / name).read_text(encoding="utf-8")
+
+
+LOOPS_CLAUDE = "2034867"
+IDLE_CLAUDE = "2064409"
+
+
+def _bg_events(cfg, needle):
+    p = cfg["run_dir"] / "events.log"
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    return [l for l in text.splitlines() if needle in l]
+
+
+class ProcessFacts(Base):
+    """A: the process table and the children of the wave's Claude, from `ps` (never `pgrep -f`)."""
+
+    def setUp(self):
+        super().setUp()
+        self.ps_text, self.ps_rc, self.ps_raise, self.display = procs("ps-claude-bg-loops.txt"), 0, None, LOOPS_CLAUDE
+        self.ps_calls = []
+        base = wab.sh
+
+        def sh(*args, **kw):
+            if args[:1] == ("ps",):
+                self.ps_calls.append(args)
+                if self.ps_raise:
+                    raise self.ps_raise
+                return subprocess.CompletedProcess(args, self.ps_rc, self.ps_text, "ps: boom")
+            if args[:1] == ("tmux",) and "display-message" in args:
+                self.tmux_calls.append(args)
+                if self.display is None:
+                    return subprocess.CompletedProcess(args, 1, "", "no server")
+                return subprocess.CompletedProcess(args, 0, self.display + "\n", "")
+            return base(*args, **kw)
+
+        p = mock.patch.object(wab, "sh", side_effect=sh)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_ps_argv_and_table_of_the_live_snapshot(self):
+        self.assertEqual(wab.PS_ARGV, ("ps", "-ww", "-A", "-o", "pid=,ppid=,etime=,args="))
+        table = REAL_PROCESS_TABLE()
+        self.assertEqual(self.ps_calls[0][:6], wab.PS_ARGV)
+        self.assertEqual(table[2034867]["name"], "claude")
+        self.assertEqual(table[2048167]["ppid"], 2034867)
+        self.assertEqual(table[2048167]["age"], 28)
+        self.assertEqual(table[2048167]["name"], "bash")
+        self.assertEqual(table[1]["age"], 52 * 86400 + 7 * 3600 + 49 * 60 + 39)
+        self.assertEqual(table[2048172]["name"], "sleep")
+        self.assertIn("eval 'sleep 600'", table[2048169]["args"])
+
+    def test_etime_forms(self):
+        for etime, secs in (("02:33", 153), ("1:02:03", 3723), ("3-04:05:06", 3 * 86400 + 4 * 3600 + 5 * 60 + 6)):
+            self.ps_text = f"  10     1 {etime} /bin/sleep 1\n"
+            self.assertEqual(REAL_PROCESS_TABLE()[10]["age"], secs, etime)
+
+    def test_any_failure_is_one_error(self):
+        cases = [("oserror", {"ps_raise": OSError("no ps")}), ("rc", {"ps_rc": 1}),
+                 ("timeout", {"ps_raise": subprocess.TimeoutExpired("ps", 10)}),
+                 ("garbage", {"ps_text": "not a process table\n"}), ("empty", {"ps_text": ""}),
+                 ("half", {"ps_text": procs("ps-claude-idle.txt") + "xx yy\n"})]
+        for label, over in cases:
+            with self.subTest(label):
+                self.ps_text, self.ps_rc, self.ps_raise = procs("ps-claude-bg-loops.txt"), 0, None
+                for k, v in over.items():
+                    setattr(self, k, v)
+                with self.assertRaises(wab.ProcFactsError):
+                    REAL_PROCESS_TABLE()
+
+    def test_children_of_the_claude_of_the_pane(self):
+        kids = REAL_WAVE_CHILDREN({}, {"tmux": "wv-w1"})
+        self.assertEqual(sorted(k["pid"] for k in kids), [2048167, 2048168, 2048169])
+        by = {k["pid"]: k for k in kids}
+        self.assertEqual([d["name"] for d in by[2048169]["tree"]], ["sleep"])
+        self.assertEqual(by[2048169]["tree"][0]["pid"], 2048172)
+        self.assertEqual(by[2048169]["name"], "bash")
+        self.assertTrue(any("display-message" in c and "#{pane_pid}" in c for c in self.tmux_calls))
+        self.assertTrue(any("-t" in c and "=wv-w1:" in c for c in self.tmux_calls if "display-message" in c))
+
+    def test_no_children_of_an_idle_claude(self):
+        self.ps_text, self.display = procs("ps-claude-idle.txt"), IDLE_CLAUDE
+        self.assertEqual(REAL_WAVE_CHILDREN({}, {"tmux": "wv-w1"}), [])
+
+    def test_pane_pid_failures_and_a_pid_missing_from_the_table(self):
+        for label, display in (("tmux fails", None), ("not a number", "abc"), ("empty", ""), ("unknown pid", "999")):
+            with self.subTest(label):
+                self.display = display
+                with self.assertRaises(wab.ProcFactsError):
+                    REAL_WAVE_CHILDREN({}, {"tmux": "wv-w1"})
+
+    def test_no_pgrep_f_in_the_dispatcher(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        self.assertNotRegex(src, r"""["']p(?:grep|kill)["']""")  # no process is ever looked up by pattern
+
+
+class BgBase(Base):
+    """The watch tick with a wave window whose process tree is a real snapshot."""
+
+    NUDGE = 20
+
+    def setUp(self):
+        super().setUp()
+        if REAL_WAVE_CHILDREN is not None:  # the shared setUp stubs the tree out for every other class
+            p = mock.patch.object(wab, "wave_children", REAL_WAVE_CHILDREN)
+            p.start()
+            self.addCleanup(p.stop)
+        self.ps_text, self.ps_rc, self.ps_raise, self.display = procs("ps-claude-idle.txt"), 0, None, IDLE_CLAUDE
+        base = wab.sh
+
+        def sh(*args, **kw):
+            if args[:1] == ("ps",):
+                if self.ps_raise:
+                    raise self.ps_raise
+                return subprocess.CompletedProcess(args, self.ps_rc, self.ps_text, "ps: boom")
+            if args[:1] == ("tmux",) and "display-message" in args:
+                if self.display is None:
+                    return subprocess.CompletedProcess(args, 1, "", "no server")
+                return subprocess.CompletedProcess(args, 0, self.display + "\n", "")
+            return base(*args, **kw)
+
+        p = mock.patch.object(wab, "sh", side_effect=sh)
+        p.start()
+        self.addCleanup(p.stop)
+        self.cfg, self.path = self.chain(idle_nudge_minutes=self.NUDGE)
+        self.pane = live("30-main.txt")
+        self.ansi = live("30-main.ansi")
+        self.journal = self.transcript("s1", [asst(inp=1000, out=10)])
+        self.agents = self.journal.parent / "s1" / "subagents"
+        self.agents.mkdir(parents=True)
+        self.age_journals(30 * 60)
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+            sessions=["s1"], pane_digest=wab.pane_digest(self.pane), pane_changed=time.time() - 30 * 60,
+            activity_at=time.time() - 30 * 60)}})
+        self.set_status(self.cfg, "W1", "RUNNING")
+
+    def age_journals(self, secs):
+        t = time.time() - secs
+        for f in [self.journal, *self.agents.glob("*.jsonl")]:
+            os.utime(f, (t, t))
+
+    def tick(self, n=1):
+        for _ in range(n):
+            wab.tick(self.cfg, wab.load_state(self.cfg))
+
+    def rec(self):
+        return self.get_state(self.cfg)["waves"]["W1"]
+
+    def patch_state(self, **kw):
+        st = self.get_state(self.cfg)
+        st["waves"]["W1"].update(kw)
+        self.put_state(self.cfg, st)
+
+    def nudges(self):
+        return [s for s in self.sent if s[0] == "text" and "[wab] Толчок" in s[2]]
+
+    def only(self, *keep):
+        """Keep the pids of `keep` (and their descendants) from the loops snapshot, plus the claude."""
+        out = []
+        for line in procs("ps-claude-bg-loops.txt").splitlines():
+            pid, ppid = line.split()[:2]
+            if pid in (LOOPS_CLAUDE, "1") or pid in keep or ppid in keep:
+                out.append(line)
+        return "\n".join(out) + "\n"
+
+    def loops(self, text=None):
+        self.ps_text, self.display = text or procs("ps-claude-bg-loops.txt"), LOOPS_CLAUDE
+
+
+class BackgroundTails(BgBase):
+    """B: shells left over from before /clear, or idle for long, are reported once per episode."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_state(pane_changed=time.time())  # the nudge is not under test here
+        self.tails = lambda: _bg_events(self.cfg, "фоновые хвосты")
+
+    def test_one_event_per_episode_over_loops_started_before_clear(self):
+        self.loops()
+        self.patch_state(cleared_at=time.time() - 5)  # the loops are 28 s old: started before /clear
+        self.tick()
+        ev = self.tails()
+        self.assertEqual(len(ev), 1, ev)
+        for pid in ("2048167", "2048168", "2048169"):
+            self.assertIn(f"pid {pid}", ev[0])
+        self.assertIn("запущен до /clear", ev[0])
+        self.assertIn("until grep -q done", ev[0])  # the command inside eval '…', not the shell-snapshot prefix
+        self.assertNotIn("shell-snapshots", ev[0])
+        self.assertEqual(sorted(t["pid"] for t in self.rec()["bg_tails"]), [2048167, 2048168, 2048169])
+        self.assertEqual(self.rec()["bg_tails"][0].keys() >= {"pid", "why", "age"}, True)
+        self.tick()  # the same snapshot: the same episode
+        self.assertEqual(len(self.tails()), 1)
+        self.assertEqual(self.tg, [])  # an event and the dashboard only
+        self.assertEqual(self.sent, [])  # no killing, no message into the window
+        self.ps_text, self.display = procs("ps-claude-idle.txt"), IDLE_CLAUDE  # the tails are gone
+        self.tick()
+        self.assertNotIn("bg_tails", self.rec())
+        self.assertNotIn("bg_tails", self.rec().get("notified", {}))
+        self.assertEqual(len(self.tails()), 1)
+        self.loops()  # a new episode: one more event
+        self.tick()
+        self.assertEqual(len(self.tails()), 2)
+
+    def test_a_changed_set_is_a_new_event(self):
+        self.loops()
+        self.patch_state(cleared_at=time.time() - 5)
+        self.tick()
+        self.loops(self.only("2048167", "2048169"))
+        self.tick()
+        self.assertEqual(len(self.tails()), 2)
+
+    def test_loops_started_after_clear_are_not_tails(self):
+        self.loops()
+        self.patch_state(cleared_at=time.time() - 120)  # /clear two minutes ago: the loops are newer
+        self.tick()
+        self.assertEqual(self.tails(), [])
+        self.assertNotIn("bg_tails", self.rec())
+
+    def test_no_clear_yet_and_young_shells_are_not_tails(self):
+        self.loops()
+        self.tick()
+        self.assertEqual(self.tails(), [])
+
+    def test_the_pgrep_loop_idle_for_long_is_a_tail(self):
+        """the live pgrep -f loop (it finds itself): 35 min of `sleep 5` children and nothing else"""
+        text = procs("ps-claude-bg-loops.txt").replace("2048168 2034867       00:28", "2048168 2034867       35:28")
+        self.loops(text)
+        self.tick()
+        ev = self.tails()
+        self.assertEqual(len(ev), 1, ev)
+        self.assertIn("pid 2048168", ev[0])
+        self.assertIn("pgrep -f", ev[0])
+        self.assertIn("только sleep", ev[0])
+        self.assertIn("35 мин", ev[0])
+        self.assertNotIn("pid 2048167", ev[0])  # young
+
+    def test_a_long_shell_with_real_work_is_not_a_tail(self):
+        text = procs("ps-claude-bg-loops.txt").replace("2048168 2034867       00:28", "2048168 2034867       35:28")
+        text = text.replace("2050638 2048168       00:03 sleep 5", "2050638 2048168       00:03 node build.js")
+        self.loops(text)
+        self.tick()
+        self.assertEqual(self.tails(), [])
+
+    def test_the_threshold_constant(self):
+        self.assertEqual(wab.LOOSE_SHELL_MINUTES, 30)
+
+    def test_a_long_shell_without_children_is_a_tail(self):
+        self.loops(self.only("2048168").replace("2048168 2034867       00:28", "2048168 2034867     1:00:28")
+                   .replace("2050638 2048168       00:03 sleep 5\n", ""))
+        self.tick()
+        self.assertEqual(len(self.tails()), 1)
+
+    def test_ps_error_is_one_event_per_episode_and_the_tick_goes_on(self):
+        self.ps_raise = OSError("no ps")
+        self.tick(2)
+        ev = _bg_events(self.cfg, "дерево процессов недоступно")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertIn("no ps", ev[0])
+        self.ps_raise = None
+        self.tick()  # readable again: the episode is over
+        self.ps_raise = OSError("no ps")
+        self.tick()
+        self.assertEqual(len(_bg_events(self.cfg, "дерево процессов недоступно")), 2)
+
+    def test_the_cleared_at_is_saved_with_the_clear(self):
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+            phase="clearing", sessions=["s1"])}})
+        before = time.time()
+        self.tick()
+        rec = self.rec()
+        self.assertTrue(before - 1 <= rec["cleared_at"] <= time.time() + 1, rec.get("cleared_at"))
+
+    def test_the_dashboard_shows_the_tails(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        w = {"tokens": 1000, "bg_tails": [{"pid": 1, "why": "x", "age": 5}, {"pid": 2, "why": "x", "age": 5}]}
+        self.assertIn("⚠ хвосты: 2", dash.ctx_cell(w, 300000, 20).plain)
+        self.assertNotIn("хвосты", dash.ctx_cell({"tokens": 1000}, 300000, 20).plain)
+
+
+class IdleNudge(BgBase):
+    """C: a RUNNING wave that has gone silent with nothing alive behind it gets one push."""
+
+    def typed_screen(self, text):
+        """The live screen 30-typed with `text` in the input line instead of the owner's draft."""
+        lines = live("30-typed.ansi").split("\n")
+        i = next(i for i, l in enumerate(lines) if "\u276f\u00a0" in l and "/model" not in l)
+        lines[i] = "\x1b[39m\u276f\u00a0" + text
+        return "\n".join(lines)
+
+    def typed_nudge(self, minutes=20):
+        return self.typed_screen(wab.idle_nudge_text(minutes))
+
+    def test_idle_screen_and_stopped_journals_get_exactly_one_nudge(self):
+        self.tick()
+        self.assertEqual(len(self.nudges()), 1, self.sent)
+        text = self.nudges()[0][2]
+        self.assertIn("20+ мин", text)
+        self.assertIn("status=RUNNING", text)
+        self.assertIn("BLOCKED", text)
+        ev = _bg_events(self.cfg, "idle nudge sent")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertIn("20 min", ev[0])
+        self.assertFalse([t for t in self.tg if "Толчок" in t])  # an event and a message into the window only
+        self.tick()  # the same episode (the screen did not change): not twice
+        self.assertEqual(len(self.nudges()), 1)
+        self.assertEqual(len(_bg_events(self.cfg, "idle nudge sent")), 1)
+
+    def test_the_idle_notice_is_untouched(self):
+        self.tick()
+        self.assertTrue(any("молчит" in t for t in self.tg), self.tg)
+
+    def test_the_nudge_goes_through_deliver(self):
+        calls = []
+        real = wab._deliver
+
+        def spy(cfg, st, wave, what, send, text, precheck=None):
+            calls.append((what, send, precheck is not None))
+            return real(cfg, st, wave, what, send, text, precheck=precheck)
+
+        with mock.patch.object(wab, "_deliver", side_effect=spy):
+            self.tick()
+        self.assertIn(("idle nudge", wab.send_text, True), calls)
+
+    def test_a_fresh_agent_journal_means_no_nudge(self):
+        agent = self.agents / "agent-1.jsonl"
+        agent.write_text(asst(inp=5) + "\n", encoding="utf-8")  # written just now
+        self.tick(2)
+        self.assertEqual(self.nudges(), [])
+
+    def test_a_fresh_write_seen_only_by_mtime_means_no_nudge(self):
+        self.tick()  # sends the first nudge
+        self.sent.clear()
+        agent = self.agents / "agent-2.jsonl"
+        agent.write_text(asst(inp=5) + "\n", encoding="utf-8")
+        self.patch_state(pane_digest="other", pane_changed=time.time() - 30 * 60, activity_at=time.time() - 30 * 60,
+                         activity_files={str(agent): os.stat(agent).st_mtime, str(self.journal): os.stat(self.journal).st_mtime})
+        self.tick()
+        self.assertEqual(self.nudges(), [])
+
+    def test_a_recent_screen_change_means_no_nudge(self):
+        self.patch_state(pane_changed=time.time() - 5 * 60)
+        self.tick()
+        self.assertEqual(self.nudges(), [])
+
+    def test_a_silent_child_means_no_nudge(self):
+        self.loops(self.only("2048169"))  # `sleep 600` in a shell: silent but alive
+        self.tick(2)
+        self.assertEqual(self.nudges(), [])
+
+    def test_any_live_child_means_no_nudge(self):
+        self.loops()
+        self.tick(2)
+        self.assertEqual(self.nudges(), [])
+        self.ps_text = procs("ps-claude-idle.txt") + f"{IDLE_CLAUDE[:-1]}7 {IDLE_CLAUDE}   00:10 node server.js\n"
+        self.tick()
+        self.assertEqual(self.nudges(), [])
+
+    def test_a_waiting_shell_loop_is_live_work(self):
+        self.loops(self.only("2048167"))  # `until … do sleep 5; done`: a waiting loop, not an idle child
+        self.tick()
+        self.assertEqual(self.nudges(), [])
+
+    def test_unreadable_process_tree_means_no_nudge_and_an_event_with_the_reason(self):
+        cases = {"oserror": lambda: setattr(self, "ps_raise", OSError("no ps")),
+                 "rc": lambda: setattr(self, "ps_rc", 2),
+                 "garbage": lambda: setattr(self, "ps_text", "garbage\n"),
+                 "display-message": lambda: setattr(self, "display", None)}
+        for label, breakit in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                breakit()
+                self.tick(2)
+                self.assertEqual(self.nudges(), [])
+                ev = _bg_events(self.cfg, "дерево процессов недоступно")
+                self.assertEqual(len(ev), 1, ev)
+
+    def test_nudge_off_and_bad_values(self):
+        self.cfg, _ = self.chain(idle_nudge_minutes=0)
+        self.tick(2)
+        self.assertEqual(self.nudges(), [])
+        self.assertEqual(self.cfg["idle_nudge_minutes"], 0)
+        for bad in (-1, "20", True, False, float("nan"), float("inf"), 1441, None, [20]):
+            with self.subTest(bad=bad):
+                doc = {"chain": CHAIN, "run_id": RUN_ID, "waves": ["W1"], "idle_nudge_minutes": bad}
+                p = self.tmp / "cfg" / "bad.json"
+                p.write_text(json.dumps(doc), encoding="utf-8")
+                with self.assertRaises(SystemExit) as ctx:
+                    wab.load_chain(p)
+                self.assertIn("idle_nudge_minutes", str(ctx.exception))
+
+    def test_default_is_twenty_and_it_is_tunable(self):
+        cfg, _ = self.chain(idle_nudge_minutes=None)
+        self.assertEqual(cfg["idle_nudge_minutes"], 20)
+        self.assertIn("idle_nudge_minutes", wab.TUNABLE)
+        cfg2, _ = self.chain(idle_nudge_minutes=1440)
+        self.assertEqual(cfg2["idle_nudge_minutes"], 1440)
+        cfg3, _ = self.chain(idle_nudge_minutes=2.5)
+        self.assertEqual(cfg3["idle_nudge_minutes"], 2.5)
+
+    def test_live_screens_dialogs_menus_and_typed_text_block_the_nudge(self):
+        for name in ("trust", "menu", "typed"):
+            with self.subTest(name):
+                self.setUp()
+                self.pane, self.ansi = live(f"30-{name}.txt"), live(f"30-{name}.ansi")
+                self.patch_state(pane_digest=wab.pane_digest(self.pane))
+                self.tick(2)
+                self.assertEqual(self.nudges(), [])
+        self.setUp()
+        self.tick()
+        self.assertEqual(len(self.nudges()), 1)  # the live main screen: allowed
+
+    def test_the_exit_menu_blocks_the_nudge(self):
+        self.pane = ("Exit?\n  ❯ 1. Exit and stop tasks\n    2. Move to background and exit\n"
+                     "    3. Stay\n\n Enter to confirm · Esc to cancel\n")
+        self.patch_state(pane_digest=wab.pane_digest(self.pane))
+        self.tick()
+        self.assertEqual(self.nudges(), [])
+
+    def test_the_status_changing_under_the_lock_means_no_nudge(self):
+        real_enter = wab._InputLock.__enter__
+
+        def enter(lock):
+            self.set_status(self.cfg, "W1", "BLOCKED: need an answer")  # the wave moved while we waited
+            return real_enter(lock)
+
+        with mock.patch.object(wab._InputLock, "__enter__", enter):
+            self.tick()
+        self.assertEqual(self.nudges(), [])
+        self.assertEqual(_bg_events(self.cfg, "idle nudge sent"), [])
+
+    def test_the_screen_changing_under_the_lock_means_no_nudge(self):
+        real_enter = wab._InputLock.__enter__
+
+        def enter(lock):
+            self.ansi = live("30-typed.ansi")
+            return real_enter(lock)
+
+        with mock.patch.object(wab._InputLock, "__enter__", enter):
+            self.tick()
+        self.assertEqual(self.nudges(), [])
+
+    def test_a_child_appearing_under_the_lock_means_no_nudge(self):
+        real_enter = wab._InputLock.__enter__
+
+        def enter(lock):
+            self.loops()
+            return real_enter(lock)
+
+        with mock.patch.object(wab._InputLock, "__enter__", enter):
+            self.tick()
+        self.assertEqual(self.nudges(), [])
+
+    def test_only_a_running_wave_with_a_bound_session_is_nudged(self):
+        for label, st, over in (("not RUNNING", "BLOCKED: q", {}), ("no session", "RUNNING", {"sessions": []}),
+                                ("awaiting", "RUNNING", {"await_session": True}),
+                                ("pending_enter", "RUNNING", {"pending_enter": "alarm"}),
+                                ("checkpoint", "RUNNING", {"phase": "checkpoint", "checkpoint_sent": True,
+                                                           "checkpoint_at": time.time()})):
+            with self.subTest(label):
+                self.setUp()
+                self.set_status(self.cfg, "W1", st)
+                self.patch_state(**over)
+                self.tick(2)
+                self.assertEqual(self.nudges(), [])
+
+    def test_a_typed_nudge_whose_wave_left_running_is_abandoned(self):
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок")
+        self.set_status(self.cfg, "W1", "BLOCKED: asks")
+        self.tick()
+        rec = self.rec()
+        self.assertNotIn("pending_enter", rec)
+        self.assertNotIn("pending_clear", rec)  # cleared on the screen at once
+        self.assertEqual(self.nudges(), [])
+
+    def test_an_enter_only_retry_of_a_typed_nudge(self):
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = self.typed_nudge()  # our text is in the input: the retry must not call it stale
+        with mock.patch.object(wab, "submit") as submit:
+            self.tick()
+        self.assertEqual(self.nudges(), [])  # nothing typed again
+        self.assertTrue(submit.called)
+
+    def test_a_journal_written_while_waiting_for_the_lock_means_no_nudge(self):
+        real_enter = wab._InputLock.__enter__
+
+        def enter(lock):
+            (self.agents / "late.jsonl").write_text(asst(inp=5) + "\n", encoding="utf-8")  # the agent wrote
+            return real_enter(lock)
+
+        with mock.patch.object(wab._InputLock, "__enter__", enter):
+            self.tick()
+        self.assertEqual(self.nudges(), [])
+        self.assertEqual(_bg_events(self.cfg, "idle nudge sent"), [])
+
+    def test_a_screen_changed_while_waiting_for_the_lock_means_no_nudge(self):
+        real_enter = wab._InputLock.__enter__
+
+        def enter(lock):
+            self.pane = self.pane + "\nthe wave printed something\n"  # empty input, but a new screen
+            return real_enter(lock)
+
+        with mock.patch.object(wab._InputLock, "__enter__", enter):
+            self.tick()
+        self.assertEqual(self.nudges(), [])
+
+    def test_an_undelivered_nudge_is_cleared_before_another_delivery(self):
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = self.typed_nudge()  # the nudge text is in the input
+        st = wab.load_state(self.cfg)
+        self.assertTrue(wab._deliver(self.cfg, st, "W1", "alarm", wab.send_text, "ALARM TEXT"))
+        kinds = [k for k, _, t in self.sent]
+        self.assertEqual(kinds, ["clear", "text"], self.sent)  # cleared first, then the alarm
+        self.assertNotIn("pending_clear", st["waves"]["W1"])
+        self.assertNotEqual(st["waves"]["W1"].get("pending_enter"), "idle nudge")
+
+    def test_nothing_is_typed_over_a_nudge_that_cannot_be_cleared(self):
+        self.clear_works = False
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = self.typed_nudge()
+        st = wab.load_state(self.cfg)
+        self.assertFalse(wab._deliver(self.cfg, st, "W1", "alarm", wab.send_text, "ALARM TEXT"))
+        self.assertEqual([t for k, _, t in self.sent if k == "text"], [])
+        self.assertTrue(st["waves"]["W1"].get("pending_clear"))  # held: the next delivery tries again
+
+    def test_a_nudge_itself_is_not_abandoned_by_its_own_retry(self):
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = self.typed_nudge()
+        with mock.patch.object(wab, "submit") as submit:
+            self.tick()
+        self.assertTrue(submit.called)
+        self.assertEqual(self.clear_keys, [])
+
+    def test_a_retry_over_the_owners_text_presses_nothing_and_clears_nothing(self):
+        for label, text in (("replaced", "owner draft"), ("extended", wab.idle_nudge_text(20) + " и ещё"),
+                            ("cut", wab.idle_nudge_text(20)[:40])):
+            with self.subTest(label):
+                self.setUp()
+                self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+                self.ansi = self.typed_screen(text)
+                with mock.patch.object(wab, "submit") as submit:
+                    self.tick(2)
+                self.assertFalse(submit.called)
+                self.assertEqual(self.enters, [])
+                self.assertEqual(self.clear_keys, [])
+                self.assertNotIn("pending_enter", self.rec())
+                self.assertNotIn("pending_clear", self.rec())
+                self.assertEqual(self.nudges(), [])
+                self.assertEqual(len(_bg_events(self.cfg, "idle nudge dropped: the input holds another text")), 1)
+
+    def test_the_owner_edits_the_text_while_waiting_for_the_lock(self):
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = self.typed_nudge()
+        real_enter = wab._InputLock.__enter__
+
+        def enter(lock):
+            self.ansi = self.typed_screen("owner draft")
+            return real_enter(lock)
+
+        with mock.patch.object(wab._InputLock, "__enter__", enter), mock.patch.object(wab, "submit") as submit:
+            self.tick()
+        self.assertFalse(submit.called)
+        self.assertEqual(self.clear_keys, [])  # the stale path did not clear the draft
+        self.assertNotIn("pending_enter", self.rec())
+        self.assertNotIn("pending_clear", self.rec())
+
+    def test_another_delivery_leaves_the_owners_text_alone(self):
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = self.typed_screen("owner draft")
+        st = wab.load_state(self.cfg)
+        self.assertFalse(wab._deliver(self.cfg, st, "W1", "alarm", wab.send_text, "ALARM TEXT"))
+        self.assertEqual(self.clear_keys, [])  # the draft is not cleared
+        self.assertEqual([t for k, _, t in self.sent if k == "text"], [])  # and nothing typed over it
+        self.assertNotIn("pending_enter", st["waves"]["W1"])
+        self.assertNotIn("pending_clear", st["waves"]["W1"])
+
+    def test_no_enter_into_a_menu_or_dialog_or_a_blank_capture_on_retry(self):
+        for label, pane, ansi in (("menu", live("30-menu.txt"), live("30-menu.ansi")),
+                                  ("trust", live("30-trust.txt"), live("30-trust.ansi")),
+                                  ("blank capture", "", "")):
+            with self.subTest(label):
+                self.setUp()
+                self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+                self.pane, self.ansi = pane, ansi
+                with mock.patch.object(wab, "submit") as submit:
+                    self.tick(2)
+                self.assertFalse(submit.called)
+                self.assertEqual(self.enters, [])
+                self.assertEqual(self.nudges(), [])
+                self.assertFalse([c for c in self.tmux_calls if "Enter" in c])
+
+    def test_protocol_text(self):
+        text = (WAVES / "PROTOCOL.md").read_text(encoding="utf-8")
+        self.assertIn("TaskStop", text)
+        self.assertRegex(text, r"HANDOFF_READY[^\n]*\n?[^\n]*(фонов|TaskStop)|(фонов|TaskStop)[^\n]*HANDOFF_READY")
+        self.assertIn("pgrep -f", text)
+        self.assertIn("pkill -f", text)
+        self.assertIn("по PID", text)
+        self.assertIn("[wab] Толчок", text)
+        self.assertIn("В полёте", text)
 
 
 class Packaging(unittest.TestCase):
