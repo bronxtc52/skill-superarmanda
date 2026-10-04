@@ -13895,6 +13895,183 @@ class ChainCleanup(Base):
         self.assertTrue(any("@wab_run_dir" in c and str(cfg["run_dir"]) in c for c in sets), sets)
 
 
+EVENTS = Path(__file__).resolve().parent.parent / "fixtures" / "events"
+
+
+class DashEvents(unittest.TestCase):
+    """«📜 События» for a human (#69): the type of an event -> a short Russian phrase, a folded pulse.
+    The fixtures are LIVE logs (tests/fixtures/events/README.md); the lines marked EMITTER FORMAT below
+    have no live sample and follow the event(...) calls of wab.py."""
+
+    # live types the fixture is allowed to leave raw (none today; list a type here on purpose)
+    RAW_ALLOWED = ()
+
+    def setUp(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        self.dash = dash
+
+    @staticmethod
+    def _msgs(name):
+        out = []
+        for line in (EVENTS / name).read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                out.append(line.partition(" ")[2].partition(" ")[2] if line[:2] == "20" else line)
+        return out
+
+    def test_every_live_line_has_a_human_phrase(self):
+        raw = []
+        total = 0
+        for name in ("waves-finish-events.log", "waves-tails-events.log"):
+            for msg in self._msgs(name):
+                total += 1
+                phrase, details, colour, known = self.dash.humanize_event(msg)
+                if not known and not msg.startswith(self.RAW_ALLOWED):
+                    raw.append(msg[:90])
+        self.assertGreater(total, 200)
+        self.assertEqual(raw, [], f"unrecognised event types in the live fixture: {raw[:5]}")
+
+    def test_blocked_says_who_is_needed(self):
+        h = self.dash.humanize_event
+        phrase, details, colour, known = h(
+            "W3: BLOCKED: [class=blocked_cap rec=owner red=no] blocked w3: кап 3/3 в прогоне r1")
+        self.assertTrue(known)
+        self.assertIn("W3", phrase)
+        self.assertIn("твоего решения", phrase)
+        self.assertIn("попыт", phrase)  # the cap: out of attempts to fix a review finding
+        self.assertIn("red", colour)
+        self.assertIsNotNone(details)
+        self.assertIn("class=blocked_cap", details)
+        phrase, _, _, _ = h("W3: BLOCKED: [class=needs_decision rec=invariant red=yes] x")
+        self.assertIn("твоего решения", phrase)  # red=yes: the owner
+        phrase, _, _, _ = h("W3: BLOCKED: [class=question rec=fix red=no] x")
+        self.assertNotIn("твоего", phrase)  # a policy episode: not the owner
+        self.assertIn("W3", phrase)
+        phrase, _, _, _ = h("W3: BLOCKED: no label at all")
+        self.assertIn("твоего", phrase)  # no label: it goes to the owner
+        pulse, _, _, known = h("W3: phase=running ctx=199k restarts=0 status=BLOCKED: [class=blocked_cap rec=owner red=no] x")
+        self.assertTrue(known)
+        self.assertIn("твоего решения", pulse)
+
+    def test_merge_and_checkpoint_phrases(self):
+        h = self.dash.humanize_event
+        cases = {
+            "W1: merge gate passed, merge of PR #12 requested at abcdef123456": ("PR #12", "мердж"),
+            "W1: PR #12 MERGED, base not known (PR: 'x', chain: 'y')": ("PR #12", "смерж"),
+            "W1: merge gate waits: Codex не завершил ревью": ("гейт", "ждёт"),
+            "W1: merge gate failed: Codex: 2 замечания P1": ("гейт", "не пройден"),
+            "W2: context 250000 >= 240000, checkpoint requested": ("W2", "контрольн"),
+            "W2: handoff ready, /clear + /update (restart #1)": ("W2", "перезапуск"),
+            "W2: handoff ready, /clear + /superarmanda --resume (restart #2)": ("W2", "перезапуск"),  # EMITTER FORMAT
+            "W2: new session 3ad76723-1140-4b67-9abd-b9b72531cf22 bound by marker": ("W2", "сесси"),
+            "W2: policy auto-answer: class=needs_decision rec=invariant": ("W2", "автоответ"),
+            "W2: policy cap reached (3/3): class=question rec=fix goes to the owner": ("W2", "лимит"),  # EMITTER FORMAT
+            "W2: launched in tmux wf-w2, cwd /tmp/x": ("W2", "запущен"),
+            "W2: DONE": ("W2", "готова"),
+            "W2: DONE, awaiting merge by the coordinator": ("W2", "мердж"),  # EMITTER FORMAT
+            "watch started, ctx_limit=240000": ("слежение", "начато"),
+            "watch stopped: no current wave": ("слежение", "остановлено"),
+            "chain finished": ("цепочка", "завершена"),
+            "chain sessions closed: sessions ['a'], panes ['%1']": ("tmux", "закрыт"),  # EMITTER FORMAT
+            "telegram: wave-autobot: стартовала волна W1.": ("уведомление", "отправлено"),
+            "telegram FAILED (TimeoutExpired): wave-autobot: x": ("не доставлено", "telegram"),  # EMITTER FORMAT
+            "display-message failed (OSError): x": ("не доставлено", "tmux"),  # EMITTER FORMAT
+            "notify(skipped): wave-autobot: x": ("не настроен", "уведомл"),  # EMITTER FORMAT
+            "W4: pane idle 15+ min, status=RUNNING": ("W4", "молчит"),
+            "W4: idle nudge sent (15 min, no live background work)": ("W4", "толчок"),  # EMITTER FORMAT
+            "W4: idle nudge dropped: the input holds another text (left untouched)": ("W4", "толчок"),  # EMITTER FORMAT
+            "W2: фоновые хвосты в окне волны: pid 3217426 (30 мин без работы)": ("W2", "фонов"),
+            "W2: дерево процессов недоступно: ps failed": ("W2", "дерево"),  # EMITTER FORMAT
+            "W2: alarm: PR #7 checks completed and Codex finished at abcdef123456": ("PR #7", "проверки"),
+            "W2: say: РЕШЕНИЕ КООРДИНАТОРА: вариант new_run": ("W2", "окно"),
+            "admission: host policy, cc-autonomy prepare -> /tmp/x": ("клон", "допуск"),
+            "W2: workdir /tmp/x detached on origin/main (abc)": ("W2", "рабоч"),
+            "W2: window is not in auto mode": ("W2", "авто"),
+            "W2: permission prompt on screen": ("W2", "разреш"),  # EMITTER FORMAT
+            "W2: tmux session wf-w2 is gone (status=RUNNING)": ("W2", "закрылось"),  # EMITTER FORMAT
+            "W2: owner-handover: PR #5 смержен владельцем (head abc, merge def)": ("PR #5", "смерж"),
+        }
+        for msg, needles in cases.items():
+            phrase, details, colour, known = h(msg)
+            self.assertTrue(known, msg)
+            for n in needles:
+                self.assertIn(n.lower(), phrase.lower(), (msg, phrase))
+            self.assertLess(len(phrase), 200, msg)
+
+    def test_unknown_line_is_raw_and_shortened(self):
+        msg = "W9: something nobody has seen yet " + "x" * 400
+        phrase, details, colour, known = self.dash.humanize_event(msg)
+        self.assertFalse(known)
+        self.assertTrue(phrase.startswith("W9: something nobody"))
+        self.assertLessEqual(len(phrase), 140)
+        self.assertIsNone(details)
+
+    def test_secrets_are_masked_in_phrase_and_details(self):
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        for msg in (f"W9: unknown thing with {token} inside",
+                    f"W1: say: РЕШЕНИЕ: используй {token} для входа",
+                    f"W1: BLOCKED: [class=question rec=fix red=no] {token} в цитате",
+                    f"W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=question rec=fix red=no] {token}"):
+            phrase, details, colour, known = self.dash.humanize_event(msg)
+            self.assertNotIn(token, phrase + (details or ""), msg)
+        phrase, details, _, _ = self.dash.humanize_event("W1: BLOCKED: [class=question rec=fix red=no] password=hunter2hunter2 тут")
+        self.assertNotIn("hunter2", phrase + (details or ""))
+
+    @staticmethod
+    def _pulse(hh, ctx, status="RUNNING", phase="running", restarts=0, wave="W1"):
+        return f"2026-10-04 {hh} {wave}: phase={phase} ctx={ctx}k restarts={restarts} status={status}"
+
+    def test_identical_pulses_fold_into_one_line(self):
+        lines = [self._pulse(f"10:0{i}:00Z", 100 + i) for i in range(6)]  # ctx grows: not a change
+        items = self.dash.fold_events(lines)
+        self.assertEqual(len(items), 1, items)
+        self.assertIn("без изменений с 10:00 (×6)", items[0][1])
+
+    def test_pulse_change_breaks_the_fold(self):
+        lines = ([self._pulse(f"10:0{i}:00Z", 100) for i in range(3)]
+                 + [self._pulse(f"10:1{i}:00Z", 100, status="BLOCKED: [class=question rec=fix red=no] q") for i in range(3)])
+        items = self.dash.fold_events(lines)
+        self.assertEqual(len(items), 2, items)
+        self.assertIn("(×3)", items[0][1])
+        self.assertIn("(×3)", items[1][1])
+        # another event between pulses breaks the fold too; restarts is a change; another wave is one
+        mixed = [self._pulse("10:00:00Z", 1), self._pulse("10:01:00Z", 1),
+                 "2026-10-04 10:02:00Z W1: DONE", self._pulse("10:03:00Z", 1), self._pulse("10:04:00Z", 1)]
+        self.assertEqual(len(self.dash.fold_events(mixed)), 3)
+        self.assertEqual(len(self.dash.fold_events([self._pulse("10:00:00Z", 1), self._pulse("10:01:00Z", 1, restarts=1)])), 2)
+        self.assertEqual(len(self.dash.fold_events([self._pulse("10:00:00Z", 1), self._pulse("10:01:00Z", 1, wave="W2")])), 2)
+
+    def test_events_panel_folds_before_it_cuts_the_tail(self):
+        from rich.console import Console
+        run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        lines = ["2026-10-04 09:00:00Z W1: launched in tmux wf-w1, cwd /tmp/x"]
+        lines += [self._pulse(f"10:{i // 60:02d}:{i % 60:02d}Z", 100 + i) for i in range(50)]
+        (run_dir / "events.log").write_text("\n".join(lines) + "\nbroken line without a time\n", encoding="utf-8")
+        buf = io.StringIO()
+        Console(file=buf, width=120, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}, n=12))
+        out = buf.getvalue()
+        self.assertIn("запущен", out)  # 50 pulses did not push the launch out of the last 12
+        self.assertIn("×50", out)
+        self.assertIn("broken line", out)
+
+    def test_events_panel_renders_on_the_live_fixture(self):
+        from rich.console import Console
+        run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        shutil.copy(EVENTS / "waves-finish-events.log", run_dir / "events.log")
+        buf = io.StringIO()
+        Console(file=buf, width=120, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}, n=30))
+        self.assertIn("События", buf.getvalue())
+        empty = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, empty, True)
+        buf = io.StringIO()
+        Console(file=buf, width=120, color_system=None).print(self.dash.events_panel({"run_dir": empty}))
+        self.assertIn("событий пока нет", buf.getvalue())
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")

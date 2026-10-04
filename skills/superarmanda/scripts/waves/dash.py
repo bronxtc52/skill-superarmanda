@@ -437,18 +437,219 @@ def current_panel(cfg, st):
                  title=f"⚙ Текущая волна {wave}", border_style="magenta")
 
 
-def events_panel(cfg, n=12):
+# ---------- «📜 События»: an event type -> a short phrase for a human ----------
+# The full line stays in events.log; here it is a phrase with an emoji, the technical part (class=,
+# SHA, pid, paths) goes grey on a second line. Everything shown passes wab.redact(owner_paths=False):
+# the text of an event may quote the wave.
+_WAVE = r"(?P<w>[A-Za-z]\w*)"
+_PULSE = re.compile(_WAVE + r": phase=(?P<phase>\S*) ctx=(?P<ctx>\S*) restarts=(?P<restarts>\S*) status=(?P<status>.*)", re.S)
+_BLOCKED_ANY = re.compile(_WAVE + r": BLOCKED:(?P<rest>.*)", re.S)
+_CAP_WHY = {  # BLOCKED class -> why the wave waits (plain words)
+    "blocked_cap": "кончились попытки исправить замечание ревью",
+    "needs_decision": "нужно решение по спорному месту",
+    "question": "у волны вопрос",
+    "plan_mismatch": "план расходится с принятым",
+    "merge_gate": "гейт мерджа не пройден",
+}
+OWNER_RED, POLICY_YELLOW, OK_GREEN, INFO_GREY, WARN_YELLOW = "bold red", "yellow", "green", "grey70", "yellow"
+_NEEDS_OWNER_CLASSES = ("plan_mismatch", "merge_gate")
+
+
+def _clip(text, limit):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _blocked_phrase(wave, rest):
+    """BLOCKED text (after `BLOCKED:`) -> (phrase, details, colour). Who is needed comes from the label:
+    rec=owner, red=yes, a class only the owner answers or no valid label -> the owner; else the policy."""
+    label = wab.parse_blocked_label("BLOCKED:" + rest)
+    if label is None:
+        return (f"⏸ {wave} ждёт твоего решения", _clip(rest, 200) or None, OWNER_RED)
+    why = _CAP_WHY.get(label["class"], "нужно решение")
+    owner = label["rec"] == "owner" or label["red"] or label["class"] in _NEEDS_OWNER_CLASSES
+    who = "твоего решения" if owner else "решения (политика или координатор)"
+    tech = f"class={label['class']} rec={label['rec']} red={'yes' if label['red'] else 'no'}"
+    details = tech + (f" · {_clip(label['question'], 160)}" if label["question"] else "")
+    return (f"⏸ {wave} ждёт {who}: {why}", details, OWNER_RED if owner else POLICY_YELLOW)
+
+
+def _pulse_phrase(m):
+    wave, status = m["w"], m["status"]
+    if status.startswith("BLOCKED:"):
+        return _blocked_phrase(wave, status[len("BLOCKED:"):])
+    word = {"RUNNING": "работает", "STARTING": "стартует", "RESUMING": "поднимается после /clear",
+            "HANDOFF_READY": "готов handoff", "DONE": "закончила работу"}.get(status, status[:40])
+    where = f", фаза {m['phase']}" if m["phase"] not in ("running", "") else ""
+    return (f"⚙ {wave} {word}{where}", f"ctx={m['ctx']} restarts={m['restarts']}", INFO_GREY)
+
+
+def _wave_rules():
+    """(regex, builder) for lines `Wn: <text>`; the builder gets the match and returns (phrase, details, colour)."""
+    w = lambda rx: re.compile(_WAVE + r": " + rx, re.S)  # noqa: E731
+    return [
+        (w(r"merge gate passed, merge of PR #(?P<n>\d+) requested at (?P<sha>\S+)"),
+         lambda m: (f"✅ {m['w']}: PR #{m['n']} отправлен в мердж", f"sha {m['sha']}", OK_GREEN)),
+        (w(r"merge gate passed with accepted limitations: (?P<t>.*)"),
+         lambda m: (f"✅ {m['w']}: гейт мерджа пройден с принятыми оговорками", m["t"], OK_GREEN)),
+        (w(r"merge gate passed with (?P<k>\d+) open threads(?P<t>.*)"),
+         lambda m: (f"⏸ {m['w']}: гейт пройден, но {m['k']} открытых тредов — нужен ты (скрипт владельца)", m["t"].lstrip("; "), OWNER_RED)),
+        (w(r"merge gate passed, (?P<t>.*)"),
+         lambda m: (f"⏸ {m['w']}: гейт пройден, мердж за тобой", m["t"], OWNER_RED)),
+        (w(r"merge gate waits: (?P<t>.*)"),
+         lambda m: (f"⏳ {m['w']}: гейт мерджа ждёт", m["t"], WARN_YELLOW)),
+        (w(r"merge gate failed: (?P<t>.*)"),
+         lambda m: (f"❌ {m['w']}: гейт мерджа не пройден", m["t"], OWNER_RED)),
+        (w(r"PR #(?P<n>\d+) MERGED(?P<t>.*)"),
+         lambda m: (f"🎉 {m['w']}: PR #{m['n']} смержен", m["t"].lstrip(", "), OK_GREEN)),
+        (w(r"PR #(?P<n>\d+) merge result unknown; handed to the owner: (?P<t>.*)"),
+         lambda m: (f"⏸ {m['w']}: итог мерджа PR #{m['n']} неизвестен, нужен ты", m["t"], OWNER_RED)),
+        (w(r"owner-handover: PR #(?P<n>\d+) смержен владельцем(?P<t>.*)"),
+         lambda m: (f"🎉 {m['w']}: PR #{m['n']} смержен тобой", m["t"].strip(" ()"), OK_GREEN)),
+        (w(r"alarm: PR #(?P<n>\d+) checks completed and Codex finished at (?P<sha>\S+)"),
+         lambda m: (f"🔔 {m['w']}: PR #{m['n']} — проверки и ревью Codex завершены", f"head {m['sha']}", INFO_GREY)),
+        (w(r"alarm: PR facts not collected: (?P<t>.*)"),
+         lambda m: (f"⚠ {m['w']}: не удалось собрать факты о PR", m["t"], WARN_YELLOW)),
+        (w(r"context (?P<c>\d+) >= (?P<l>\d+), checkpoint requested"),
+         lambda m: (f"💾 {m['w']}: контекст разросся, просим контрольную точку", f"ctx {m['c']} из {m['l']}", WARN_YELLOW)),
+        (w(r"handoff ready, (?P<t>.*?) \(restart #(?P<n>\d+)\)"),
+         lambda m: (f"💾 {m['w']}: handoff готов, перезапуск головы №{m['n']}", m["t"], WARN_YELLOW)),
+        (w(r"new session (?P<sid>\S+) bound by marker"),
+         lambda m: (f"🔗 {m['w']}: новая сессия после /clear подхвачена", None, INFO_GREY)),
+        (w(r"policy auto-answer: (?P<t>.*)"),
+         lambda m: (f"🤖 {m['w']}: автоответ по политике, ответ владельца не нужен", m["t"], POLICY_YELLOW)),
+        (w(r"policy cap reached \((?P<u>\d+)/(?P<c>\d+)\)(?P<t>.*)"),
+         lambda m: (f"⏸ {m['w']}: лимит автоответов исчерпан ({m['u']}/{m['c']}), дальше решаешь ты", m["t"].lstrip(": "), OWNER_RED)),
+        (w(r"policy answer not sent: (?P<t>.*)"),
+         lambda m: (f"🤖 {m['w']}: автоответ не отправлен", m["t"], INFO_GREY)),
+        (w(r"launched in tmux (?P<s>\S+?),? cwd (?P<d>.*)"),
+         lambda m: (f"🚀 {m['w']} запущена в окне {m['s']}", m["d"], OK_GREEN)),
+        (w(r"DONE, (?P<t>.*)"),
+         lambda m: (f"✔ {m['w']} готова, ждёт мерджа", m["t"], OK_GREEN)),
+        (w(r"DONE\s*$"),
+         lambda m: (f"✔ {m['w']} готова", None, OK_GREEN)),
+        (w(r"pane idle (?P<m>\S+) min, status=(?P<s>.*)"),
+         lambda m: (f"💤 {m['w']} молчит {m['m']} мин", f"status={m['s']}", OWNER_RED)),
+        (w(r"idle nudge sent \((?P<t>.*)\)"),
+         lambda m: (f"👉 {m['w']}: толчок молчащему окну отправлен", m["t"], WARN_YELLOW)),
+        (w(r"idle nudge dropped: (?P<t>.*)"),
+         lambda m: (f"👉 {m['w']}: толчок отменён, в поле ввода чужой текст", m["t"], INFO_GREY)),
+        (w(r"фоновые хвосты в окне волны: (?P<t>.*)"),
+         lambda m: (f"🧵 {m['w']}: в окне висят фоновые хвосты", m["t"], WARN_YELLOW)),
+        (w(r"дерево процессов недоступно: (?P<t>.*)"),
+         lambda m: (f"⚠ {m['w']}: дерево процессов недоступно, хвосты не проверены", m["t"], WARN_YELLOW)),
+        (w(r"say: (?P<t>.*)"),
+         lambda m: (f"💬 {m['w']}: в окно волны написали", m["t"], INFO_GREY)),
+        (w(r"workdir (?P<d>\S+) detached on (?P<t>.*)"),
+         lambda m: (f"📂 {m['w']}: рабочая копия готова", f"{m['d']} · {m['t']}", INFO_GREY)),
+        (w(r"window is not in auto mode"),
+         lambda m: (f"⚠ {m['w']}: окно вышло из авто-режима", None, OWNER_RED)),
+        (w(r"permission prompt on screen"),
+         lambda m: (f"⚠ {m['w']}: на экране запрос разрешения", None, OWNER_RED)),
+        (w(r"tmux session (?P<s>\S+) is gone(?P<t>.*)"),
+         lambda m: (f"✖ {m['w']}: окно {m['s']} закрылось", m["t"].strip(" ()"), OWNER_RED)),
+    ]
+
+
+def _plain_rules():
+    p = lambda rx: re.compile(rx, re.S)  # noqa: E731
+    return [
+        (p(r"watch started(?P<t>.*)"), lambda m: ("👀 слежение начато", m["t"].lstrip(", "), OK_GREEN)),
+        (p(r"watch stopped: (?P<t>.*)"), lambda m: ("🛑 слежение остановлено", m["t"], WARN_YELLOW)),
+        (p(r"chain finished"), lambda m: ("🏁 цепочка завершена", None, OK_GREEN)),
+        (p(r"chain sessions closed: (?P<t>.*)"), lambda m: ("🧹 окна tmux цепочки закрыты", m["t"], OK_GREEN)),
+        (p(r"telegram FAILED (?P<t>.*)"), lambda m: ("⚠ уведомление не доставлено (telegram)", m["t"], OWNER_RED)),
+        (p(r"display-message failed (?P<t>.*)"), lambda m: ("⚠ уведомление не доставлено (tmux)", m["t"], OWNER_RED)),
+        (p(r"notify\(skipped\): (?P<t>.*)"), lambda m: ("📪 Telegram не настроен, уведомление только в tmux", m["t"], WARN_YELLOW)),
+        (p(r"telegram: (?P<t>.*)"), lambda m: ("📨 уведомление отправлено", m["t"], INFO_GREY)),
+        (p(r"Ctrl\+\\ (?P<t>.*)"), lambda m: ("⌨ клавиша Ctrl+\\ — окно волны поверх дашборда", m["t"], INFO_GREY)),
+        (p(r"admission: (?P<t>.*)"), lambda m: ("🛂 клон репозитория: допуск и выбор копии", m["t"], INFO_GREY)),
+    ]
+
+
+_WAVE_RULES, _PLAIN_RULES = _wave_rules(), _plain_rules()
+
+
+def _safe(text):
+    return wab.redact(text, limit=400, owner_paths=False)
+
+
+def humanize_event(msg):
+    """One events.log message (without the time) -> (phrase, details, colour, known). `known` is False
+    for a type nobody described: the phrase is then the raw line cut to ~140 characters. Phrase and
+    details are masked with wab.redact; the raw line is not changed in events.log."""
+    msg = msg.strip()
+    result = None
+    m = _PULSE.fullmatch(msg)
+    if m:
+        result = _pulse_phrase(m)
+    else:
+        m = _BLOCKED_ANY.fullmatch(msg)
+        if m:
+            result = _blocked_phrase(m["w"], m["rest"])
+        else:
+            for rx, build in _WAVE_RULES + _PLAIN_RULES:
+                m = rx.fullmatch(msg)
+                if m:
+                    result = build(m)
+                    break
+    if result is None:
+        return (_safe(msg[:140]), None, INFO_GREY, False)
+    phrase, details, colour = result
+    return (_safe(phrase), _safe(_clip(details, 160)) if details else None, colour, True)
+
+
+def _pulse_key(msg):
+    m = _PULSE.fullmatch(msg.strip())
+    return (m["w"], m["phase"], m["status"], m["restarts"]) if m else None
+
+
+def fold_events(lines):
+    """Raw events.log lines -> [(time `HH:MM:SS`, phrase, details, colour)]. Consecutive pulses that keep
+    the wave, phase, status and restarts fold into one «без изменений с HH:MM (×N)» (ctx may grow); any
+    other event, or a changed pulse, ends the series. A line without a time is shown as it is."""
+    items, series = [], None  # series: [key, first_hhmm, count, last_ts, humanized]
+
+    def flush():
+        nonlocal series
+        if series is None:
+            return
+        key, first, count, ts, (phrase, details, colour, _) = series
+        if count > 1:
+            phrase = f"{phrase} · без изменений с {first} (×{count})"
+        items.append((ts, phrase, details, colour))
+        series = None
+
+    for line in lines:
+        if re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ ", line):  # `YYYY-MM-DD HH:MM:SSZ msg`
+            ts, msg = line[11:19], line[20:].lstrip()
+        else:
+            ts, msg = "", line
+        key = _pulse_key(msg)
+        if key is not None:
+            if series is not None and series[0] == key:
+                series[2] += 1
+                series[3] = ts
+                continue
+            flush()
+            series = [key, ts[:5], 1, ts, humanize_event(msg)]
+            continue
+        flush()
+        phrase, details, colour, _ = humanize_event(msg)
+        items.append((ts, phrase, details, colour))
+    flush()
+    return items
+
+
+def events_panel(cfg, n=12, tail=400):
     p = cfg["run_dir"] / "events.log"
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()[-n:] if p.exists() else []
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()[-tail:] if p.exists() else []
     t = Text()
-    for l in lines:
-        ts, _, msg = l.partition(" ")
-        colour = ("red" if any(k in msg for k in ("BLOCKED", "gone", "FAILED", "idle", "permission", "auto mode"))
-                  else "yellow" if any(k in msg for k in ("checkpoint", "handoff", "/clear"))
-                  else "green" if any(k in msg for k in ("DONE", "launched", "finished"))
-                  else "grey70")
-        t.append(ts[11:19] + " ", style="grey50")
-        t.append(msg[:140] + "\n", style=colour)
+    for ts, phrase, details, colour in fold_events([l for l in lines if l.strip()])[-n:]:
+        t.append((ts + " ") if ts else "", style="grey50")
+        t.append(phrase + "\n", style=colour)
+        if details:
+            t.append("         " + details + "\n", style="grey50")
     return Panel(t or Text("событий пока нет", style="grey50"), title="📜 События", border_style="blue")
 
 
