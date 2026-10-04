@@ -584,7 +584,7 @@ def humanize_event(msg):
     # Masking comes FIRST, over the WHOLE line, the way notices are masked: a token that holds an invisible or
     # control character is masked whole (it may glue or split a secret). Every cut below (phrases, details,
     # the raw line) then works on masked text, so a limit cannot split a secret into a piece redact() misses.
-    msg = wab._clean_redact(msg, 10 ** 7, owner_paths=False)
+    msg = wab._clean_redact(msg.replace("\r", "\x00"), 10 ** 7, owner_paths=False)  # a \r would split a token
     msg = _CONTROL.sub("·", msg).strip()  # what is left (a tab, a line break): a visible sign for the terminal
     result = None
     m = _PULSE.fullmatch(msg)
@@ -653,21 +653,23 @@ def fold_events(lines):
 EVENTS_READ_LIMIT = 4 * 1024 * 1024  # bytes of events.log read from the end at most
 
 
-def tail_items(path, n, limit=EVENTS_READ_LIMIT):
+def tail_items(path, n, limit=EVENTS_READ_LIMIT, block=64 * 1024):
     """The last `n` folded items of events.log. The file is read from the END in growing blocks until the
     fold gives n+1 items (so the oldest one shown is a whole series, however many pulses it holds), the
-    start of the file, or `limit` bytes: then what there is is shown. Never reads the whole of a huge file."""
+    start of the file, or `limit` bytes: then what there is is shown. Never reads the whole of a huge file.
+    A record ends at b"\\n" only (and the \\r of a CRLF): str.splitlines would also cut at U+2028/2029, NEL, VT, FF,
+    FS/GS/RS and split a secret in two before it is masked. Bytes are split first, so a block border in the
+    middle of a UTF-8 character costs only the (dropped) cut first line."""
     try:
         with open(path, "rb") as f:
             size = f.seek(0, os.SEEK_END)
-            block = 64 * 1024
             while True:
                 want = min(block, limit, size)
                 f.seek(size - want)
-                raw = f.read(want).decode("utf-8", errors="replace")
-                lines = raw.splitlines()
+                chunks = f.read(want).split(b"\n")
                 if want < size:
-                    lines = lines[1:]  # the first line of a block is cut: drop it
+                    chunks = chunks[1:]  # the first line of a block is cut: drop it
+                lines = [c.decode("utf-8", errors="replace").removesuffix("\r") for c in chunks]
                 items = fold_events([l for l in lines if l.strip()])
                 if len(items) > n or want >= size or want >= limit:
                     return items[-n:]

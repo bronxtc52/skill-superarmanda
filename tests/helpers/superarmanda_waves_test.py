@@ -14187,6 +14187,30 @@ class DashEvents(unittest.TestCase):
                  self._pulse("10:02:00Z", 1, wave="fix-a")]
         self.assertEqual(len(self.dash.fold_events(mixed)), 3)  # waves with a hyphen are not glued together
 
+    def test_a_record_is_split_only_at_a_newline(self):
+        # str.splitlines also cuts at U+2028/2029, NEL, VT, FF, FS/GS/RS: «password<sep>=hunter2…» fell in two and
+        # the second half was shown unmasked. A record of events.log ends at \n (and a CRLF's \r), nowhere else.
+        from rich.console import Console
+        seps = ["\u2028", "\u2029", "\x85", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\r"]
+        lines = []
+        for i, sep in enumerate(seps):
+            lines.append(f"2026-10-04 10:00:{i:02d}Z W1: say: password{sep}=hunter2hunter2 хвост «Привет»")
+        run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        path = run_dir / "events.log"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
+        buf = io.StringIO()
+        Console(file=buf, width=200, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}, n=20))
+        self.assertNotIn("hunter2", buf.getvalue())
+        self.assertEqual(buf.getvalue().count("в окно волны написали"), len(seps))  # one record each, none split
+        for block in (7, 50, 64 * 1024):  # a block border may fall anywhere, in the middle of a UTF-8 character too
+            items = self.dash.tail_items(path, 20, block=block)
+            self.assertEqual(len(items), len(seps), block)
+            self.assertNotIn("hunter2", " ".join(f"{i[1]} {i[2]}" for i in items), block)
+        crlf = run_dir / "crlf.log"
+        crlf.write_bytes(b"2026-10-04 10:00:00Z W1: DONE\r\n2026-10-04 10:00:01Z chain finished\r\n")
+        self.assertEqual([i[1] for i in self.dash.tail_items(crlf, 5)], ["✔ W1 готова", "🏁 цепочка завершена"])
+
     def test_events_panel_folds_before_it_cuts_the_tail(self):
         from rich.console import Console
         run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
