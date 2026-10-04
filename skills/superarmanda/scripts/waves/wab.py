@@ -580,6 +580,22 @@ def input_empty_reason(screen_ansi):
     return None
 
 
+def input_text(screen_ansi):
+    """The text in the input line of the screen (read with SGR, see pane_ansi), without the dim
+    placeholder, all whitespace removed (a long text wraps over several rows); None when there is no input
+    box (a dialog, a menu, an empty capture). Same region as input_empty_reason."""
+    raw = screen_ansi.splitlines()
+    plain = [_ESC_OTHER.sub("", _SGR.sub("", l)) for l in raw]
+    marks = [i for i, l in enumerate(plain) if INPUT_MARK in l and i > 0 and _is_rule(plain[i - 1])]
+    if not marks:
+        return None
+    top = marks[-1]
+    bottom = next((i for i in range(top + 1, len(plain)) if _is_rule(plain[i])), len(plain))
+    rows = [_undimmed(l).replace("\u2502", " ") for l in raw[top:bottom]]
+    rows[0] = rows[0].split(INPUT_MARK, 1)[1] if INPUT_MARK in rows[0] else ""
+    return "".join("".join(rows).split())
+
+
 def clear_input(name):
     """Empty the input line of the window; None on success, else the reason. Success only by the screen
     (input_empty_reason on `-e` snapshots), never by the keys sent. No input box on the screen (a dialog
@@ -2622,8 +2638,11 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None):
         if w.get("pending_enter") == IDLE_NUDGE_WHAT and what != IDLE_NUDGE_WHAT:
             # an undelivered idle nudge is the lowest priority: it is cleared out of the input (by the
             # screen) before any other text is typed, never typed over
-            if not _abandon_input(cfg, st, wave, w, f"{what} takes over from an undelivered idle nudge",
-                                  locked=True):
+            left = _abandon_nudge(cfg, st, wave, w, f"{what} takes over from an undelivered idle nudge",
+                                  locked=True)
+            if left == "foreign":
+                return False  # the owner's text is in the input: nothing is typed over it, nothing cleared
+            if left:
                 if once_per(w, "input_postponed", f"nudge:{what}"):
                     event(cfg, f"{wave}: {what} postponed: the undelivered idle nudge is not cleared yet")
                 return False
@@ -3845,13 +3864,43 @@ IDLE_NUDGE_WHAT = "idle nudge"
 IDLE_NUDGE_DEFAULT = 20  # minutes of silence (chain.json idle_nudge_minutes); 0 switches the nudge off
 
 
+IDLE_NUDGE_TEMPLATE = ("[wab] Толчок: окно молчит {m}+ мин при status=RUNNING, живых фоновых задач и агентов "
+                       "у сессии нет. Если ждала фоновую задачу или агента — они завершились: прочитай результат и "
+                       "продолжай. Если ждёшь владельца — запиши BLOCKED в status.")
+_NUDGE_IN_INPUT = re.compile("[0-9.]+".join(re.escape("".join(part.split()))
+                                            for part in IDLE_NUDGE_TEMPLATE.split("{m}")))
+
+
 def idle_nudge_text(minutes):
-    return (f"[wab] Толчок: окно молчит {minutes:g}+ мин при status=RUNNING, живых фоновых задач и агентов "
-            f"у сессии нет. Если ждала фоновую задачу или агента — они завершились: прочитай результат и "
-            f"продолжай. Если ждёшь владельца — запиши BLOCKED в status.")
+    return IDLE_NUDGE_TEMPLATE.replace("{m}", f"{minutes:g}")
 
 
-def _nudge_precheck(cfg, wave, w, digest, minutes):
+def _drop_nudge(cfg, st, wave, w):
+    """Forget a typed idle nudge WITHOUT touching the input line: it now holds another text (the owner's
+    draft). No keys, no `pending_clear`, no Enter."""
+    w.pop("pending_enter", None)
+    w.pop("pending_text_head", None)
+    save_state(cfg, st)
+    event(cfg, f"{wave}: idle nudge dropped: the input holds another text (left untouched)")
+
+
+def _nudge_is_foreign(w):
+    """True when the input line holds a text that is not our idle nudge (the owner replaced or extended
+    it); False when it is ours, empty, or there is no input box to judge by."""
+    typed = input_text(pane_ansi(w["tmux"]))
+    return bool(typed) and not _NUDGE_IN_INPUT.fullmatch(typed)
+
+
+def _abandon_nudge(cfg, st, wave, w, why, locked=False):
+    """Give up a typed idle nudge: None when nothing of it is left in the input, "foreign" when the field
+    holds another text (forgotten, field untouched), "stuck" when it could not be cleared (held)."""
+    if _nudge_is_foreign(w):
+        _drop_nudge(cfg, st, wave, w)
+        return "foreign"
+    return None if _abandon_input(cfg, st, wave, w, why, locked=locked) else "stuck"
+
+
+def _nudge_precheck(cfg, st, wave, w, digest, minutes):
     """What `_deliver` re-reads under the window's input lock, right before typing (or pressing Enter):
     the status file still says RUNNING, the screen shows no dialog and (for a fresh text) an empty input,
     nothing runs behind the window, and (fresh text only) the silence still holds: the screen is the one
@@ -3870,6 +3919,9 @@ def _nudge_precheck(cfg, wave, w, digest, minutes):
             latest = max(transcript_activity(w).values(), default=0)
             if time.time() - latest < minutes * 60:
                 return False
+        if w.get("pending_enter") == IDLE_NUDGE_WHAT and _nudge_is_foreign(w):
+            _drop_nudge(cfg, st, wave, w)  # before the stale path of _deliver could clear the owner's draft
+            return False
         why = input_empty_reason(pane_ansi(name))
         if why == NO_INPUT_BOX:
             return False  # no input box (a menu, a dialog, a blank capture): never an Enter, retry or not
@@ -3907,11 +3959,14 @@ def _idle_nudge_tick(cfg, st, wave, w, status, now, screen, children):
         if children is None or children:
             return  # the tree is unknown, or something runs behind the window
     elif not minutes:
-        _abandon_input(cfg, st, wave, w, "the idle nudge is switched off")
+        _abandon_nudge(cfg, st, wave, w, "the idle nudge is switched off")
         save_state(cfg, st)
         return
+    elif _nudge_is_foreign(w):
+        _drop_nudge(cfg, st, wave, w)  # not our text any more: no Enter, no clearing
+        return
     sent = _deliver(cfg, st, wave, IDLE_NUDGE_WHAT, send_text, idle_nudge_text(minutes or IDLE_NUDGE_DEFAULT),
-                    precheck=_nudge_precheck(cfg, wave, w, digest, minutes or IDLE_NUDGE_DEFAULT))
+                    precheck=_nudge_precheck(cfg, st, wave, w, digest, minutes or IDLE_NUDGE_DEFAULT))
     if sent:
         w.setdefault("notified", {})["nudge"] = digest
         save_state(cfg, st)
@@ -4549,7 +4604,7 @@ def _tick(cfg, st):
         save_state(cfg, st)
 
     if w.get("pending_enter") == IDLE_NUDGE_WHAT and (status != "RUNNING" or w.get("phase") != "running"):
-        _abandon_input(cfg, st, wave, w, "the wave left RUNNING")  # an idle nudge is about a silent RUNNING wave
+        _abandon_nudge(cfg, st, wave, w, "the wave left RUNNING")  # an idle nudge is about a silent RUNNING wave
         save_state(cfg, st)
 
     if w.get("pending_enter") == "policy answer" and w.get("policy_pending") != status:

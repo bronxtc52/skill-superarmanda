@@ -12974,7 +12974,10 @@ class BackgroundTails(BgBase):
         self.assertTrue(before - 1 <= rec["cleared_at"] <= time.time() + 1, rec.get("cleared_at"))
 
     def test_the_dashboard_shows_the_tails(self):
-        import dash
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
         w = {"tokens": 1000, "bg_tails": [{"pid": 1, "why": "x", "age": 5}, {"pid": 2, "why": "x", "age": 5}]}
         self.assertIn("⚠ хвосты: 2", dash.ctx_cell(w, 300000, 20).plain)
         self.assertNotIn("хвосты", dash.ctx_cell({"tokens": 1000}, 300000, 20).plain)
@@ -12982,6 +12985,16 @@ class BackgroundTails(BgBase):
 
 class IdleNudge(BgBase):
     """C: a RUNNING wave that has gone silent with nothing alive behind it gets one push."""
+
+    def typed_screen(self, text):
+        """The live screen 30-typed with `text` in the input line instead of the owner's draft."""
+        lines = live("30-typed.ansi").split("\n")
+        i = next(i for i, l in enumerate(lines) if "\u276f\u00a0" in l and "/model" not in l)
+        lines[i] = "\x1b[39m\u276f\u00a0" + text
+        return "\n".join(lines)
+
+    def typed_nudge(self, minutes=20):
+        return self.typed_screen(wab.idle_nudge_text(minutes))
 
     def test_idle_screen_and_stopped_journals_get_exactly_one_nudge(self):
         self.tick()
@@ -13167,7 +13180,7 @@ class IdleNudge(BgBase):
 
     def test_an_enter_only_retry_of_a_typed_nudge(self):
         self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
-        self.ansi = live("30-typed.ansi")  # the typed text is in the input: the retry must not call it stale
+        self.ansi = self.typed_nudge()  # our text is in the input: the retry must not call it stale
         with mock.patch.object(wab, "submit") as submit:
             self.tick()
         self.assertEqual(self.nudges(), [])  # nothing typed again
@@ -13198,7 +13211,7 @@ class IdleNudge(BgBase):
 
     def test_an_undelivered_nudge_is_cleared_before_another_delivery(self):
         self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
-        self.ansi = live("30-typed.ansi")  # the nudge text is in the input
+        self.ansi = self.typed_nudge()  # the nudge text is in the input
         st = wab.load_state(self.cfg)
         self.assertTrue(wab._deliver(self.cfg, st, "W1", "alarm", wab.send_text, "ALARM TEXT"))
         kinds = [k for k, _, t in self.sent]
@@ -13209,7 +13222,7 @@ class IdleNudge(BgBase):
     def test_nothing_is_typed_over_a_nudge_that_cannot_be_cleared(self):
         self.clear_works = False
         self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
-        self.ansi = live("30-typed.ansi")
+        self.ansi = self.typed_nudge()
         st = wab.load_state(self.cfg)
         self.assertFalse(wab._deliver(self.cfg, st, "W1", "alarm", wab.send_text, "ALARM TEXT"))
         self.assertEqual([t for k, _, t in self.sent if k == "text"], [])
@@ -13217,11 +13230,54 @@ class IdleNudge(BgBase):
 
     def test_a_nudge_itself_is_not_abandoned_by_its_own_retry(self):
         self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
-        self.ansi = live("30-typed.ansi")
+        self.ansi = self.typed_nudge()
         with mock.patch.object(wab, "submit") as submit:
             self.tick()
         self.assertTrue(submit.called)
         self.assertEqual(self.clear_keys, [])
+
+    def test_a_retry_over_the_owners_text_presses_nothing_and_clears_nothing(self):
+        for label, text in (("replaced", "owner draft"), ("extended", wab.idle_nudge_text(20) + " и ещё"),
+                            ("cut", wab.idle_nudge_text(20)[:40])):
+            with self.subTest(label):
+                self.setUp()
+                self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+                self.ansi = self.typed_screen(text)
+                with mock.patch.object(wab, "submit") as submit:
+                    self.tick(2)
+                self.assertFalse(submit.called)
+                self.assertEqual(self.enters, [])
+                self.assertEqual(self.clear_keys, [])
+                self.assertNotIn("pending_enter", self.rec())
+                self.assertNotIn("pending_clear", self.rec())
+                self.assertEqual(self.nudges(), [])
+                self.assertEqual(len(_bg_events(self.cfg, "idle nudge dropped: the input holds another text")), 1)
+
+    def test_the_owner_edits_the_text_while_waiting_for_the_lock(self):
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = self.typed_nudge()
+        real_enter = wab._InputLock.__enter__
+
+        def enter(lock):
+            self.ansi = self.typed_screen("owner draft")
+            return real_enter(lock)
+
+        with mock.patch.object(wab._InputLock, "__enter__", enter), mock.patch.object(wab, "submit") as submit:
+            self.tick()
+        self.assertFalse(submit.called)
+        self.assertEqual(self.clear_keys, [])  # the stale path did not clear the draft
+        self.assertNotIn("pending_enter", self.rec())
+        self.assertNotIn("pending_clear", self.rec())
+
+    def test_another_delivery_leaves_the_owners_text_alone(self):
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = self.typed_screen("owner draft")
+        st = wab.load_state(self.cfg)
+        self.assertFalse(wab._deliver(self.cfg, st, "W1", "alarm", wab.send_text, "ALARM TEXT"))
+        self.assertEqual(self.clear_keys, [])  # the draft is not cleared
+        self.assertEqual([t for k, _, t in self.sent if k == "text"], [])  # and nothing typed over it
+        self.assertNotIn("pending_enter", st["waves"]["W1"])
+        self.assertNotIn("pending_clear", st["waves"]["W1"])
 
     def test_no_enter_into_a_menu_or_dialog_or_a_blank_capture_on_retry(self):
         for label, pane, ansi in (("menu", live("30-menu.txt"), live("30-menu.ansi")),
