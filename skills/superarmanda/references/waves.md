@@ -356,6 +356,8 @@ ref не обновляет, а при merge queue вообще только с�
 Вердикт `pass` подтверждается вторым сбором фактов: если между чтениями изменилось критичное (check-run перезапущен,
 появилось ревью или замечание, треды, draft), вердикт `wait` «факты изменились во время сбора».
 
+`gate.py` в этой версии по-прежнему читает факты PR через REST (`gh api` GET; треды — GraphQL), осознанно: гейт работает в диспетчере, при сбое сбора отвечает `wait` (fail-closed, мерджа нет) и повторяет тик. Перевод гейта на GraphQL — отдельная задача (в `pr_review.py check` уже GraphQL, #20).
+
 Успех проверки — только `status == completed` и `conclusion == success` (`skipped`/`neutral` гейт не пропускает).
 **Codex завершил на HEAD** — только по (а) ревью `chatgpt-codex-connector[bot]` (тип Bot) с `commit_id == HEAD` и
 состоянием `COMMENTED`/`APPROVED`/`CHANGES_REQUESTED` (`PENDING`, `DISMISSED` — нет) или (б) комментарию этого бота с

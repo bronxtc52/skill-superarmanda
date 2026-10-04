@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only evidence checker for the GitHub PR-review gate."""
+"""Read-only evidence checker for the GitHub PR-review gate (GraphQL only)."""
 
 import argparse
 import json
@@ -262,35 +262,340 @@ def evaluate(
     return result
 
 
-def gh(*args):
+GRAPHQL_FAILED = "gh api graphql failed"
+MAX_PAGES = 50  # страниц одной коннекции; больше — fail-closed
+
+HEADER_QUERY = """query Header($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) { headRefOid isDraft state }
+  }
+}"""
+REVIEWS_QUERY = """query Reviews($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          databaseId url state body
+          commit { oid }
+          author { __typename login }
+        }
+      }
+    }
+  }
+}"""
+THREADS_QUERY = """query Threads($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved
+          comments(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              databaseId url body
+              commit { oid }
+              originalCommit { oid }
+              author { __typename login }
+              pullRequestReview { databaseId }
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+THREAD_COMMENTS_QUERY = """query ThreadComments($thread: ID!, $cursor: String) {
+  node(id: $thread) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          databaseId url body
+          commit { oid }
+          originalCommit { oid }
+          author { __typename login }
+          pullRequestReview { databaseId }
+        }
+      }
+    }
+  }
+}"""
+ISSUE_COMMENTS_QUERY = """query IssueComments($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { databaseId url body author { __typename login } }
+      }
+    }
+  }
+}"""
+CHECKS_QUERY = """query Checks($owner: String!, $name: String!, $head: GitObjectID!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    object(oid: $head) {
+      ... on Commit {
+        checkSuites(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id
+            app { slug }
+            checkRuns(first: 100) {
+              pageInfo { hasNextPage endCursor }
+              nodes { name status conclusion detailsUrl }
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+SUITE_RUNS_QUERY = """query SuiteRuns($suite: ID!, $cursor: String) {
+  node(id: $suite) {
+    ... on CheckSuite {
+      checkRuns(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { name status conclusion detailsUrl }
+      }
+    }
+  }
+}"""
+RESOLVE_QUERY = """query Resolve($owner: String!, $name: String!, $ref: String!) {
+  repository(owner: $owner, name: $name) {
+    object(expression: $ref) { ... on Commit { oid } }
+  }
+}"""
+
+
+def fail():
+    raise RuntimeError(GRAPHQL_FAILED)
+
+
+def graphql(query, variables=None):
+    """Одна read-only GraphQL-операция; любой сбой — одна фиксированная ошибка."""
+    cmd = ["gh", "api", "graphql", "--hostname", "github.com", "-f", f"query={query}"]
+    for key, value in (variables or {}).items():
+        if isinstance(value, bool):
+            fail()
+        elif isinstance(value, int):
+            cmd += ["-F", f"{key}={value}"]
+        elif isinstance(value, str):
+            cmd += ["-f", f"{key}={value}"]
+        else:
+            fail()
     try:
-        return json.loads(
+        reply = json.loads(
             subprocess.check_output(
-                ["gh", "api", "--hostname", "github.com", "--method", "GET", *args],
-                text=True,
-                stderr=subprocess.PIPE,
-                timeout=20,
+                cmd, text=True, stderr=subprocess.PIPE, timeout=20
             )
         )
     except (
         OSError,
         subprocess.CalledProcessError,
         subprocess.TimeoutExpired,
-        json.JSONDecodeError,
+        ValueError,
     ) as exc:
-        raise RuntimeError("gh api read failed") from exc
+        raise RuntimeError(GRAPHQL_FAILED) from exc
+    if not isinstance(reply, dict) or "errors" in reply:
+        fail()
+    data = reply.get("data")
+    if not isinstance(data, dict):
+        fail()
+    return data
 
 
-def pages(endpoint):
-    result, page = [], 1
-    while True:
-        part = gh(f"{endpoint}?per_page=100&page={page}")
-        if not isinstance(part, list):
-            raise RuntimeError("gh api pagination response is not a list")
-        result.extend(part)
-        if len(part) < 100:
-            return result
-        page += 1
+def dig(value, *path):
+    """Вложенный объект по пути; пропуск, null или не-объект — fail-closed."""
+    for key in path:
+        if not isinstance(value, dict) or not isinstance(value.get(key), dict):
+            fail()
+        value = value[key]
+    return value
+
+
+def drain(fetch, first=None):
+    """Все узлы коннекции. fetch(cursor) -> коннекция; first — уже прочитанная первая страница."""
+    nodes, seen, cursor, page = [], set(), None, first
+    for _ in range(MAX_PAGES):
+        if page is None:
+            page = fetch(cursor)
+        info, part = page.get("pageInfo"), page.get("nodes")
+        if not isinstance(info, dict) or not isinstance(part, list):
+            fail()
+        if not all(isinstance(item, dict) for item in part):
+            fail()
+        more = info.get("hasNextPage")
+        if not isinstance(more, bool):
+            fail()
+        nodes.extend(part)
+        if not more:
+            return nodes
+        cursor = info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            fail()
+        seen.add(cursor)
+        page = None
+    fail()  # MAX_PAGES исчерпан, а страницы не кончились
+
+
+def actor(author):
+    """GraphQL-автор -> REST-форма: у бота логин с `[bot]`, тип Bot."""
+    if not isinstance(author, dict):
+        return {}
+    name, kind = author.get("login"), author.get("__typename")
+    if not (isinstance(name, str) and name and isinstance(kind, str)):
+        return {}
+    if kind == "Bot":
+        return {
+            "login": name if name.endswith("[bot]") else name + "[bot]",
+            "type": "Bot",
+        }
+    return {"login": name, "type": kind}
+
+
+def oid(node, key):
+    value = node.get(key)
+    value = value.get("oid") if isinstance(value, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def fetch_header(owner, name, number):
+    pull = dig(
+        graphql(HEADER_QUERY, {"owner": owner, "name": name, "number": number}),
+        "repository",
+        "pullRequest",
+    )
+    head = pull.get("headRefOid")
+    if not isinstance(head, str) or not head:
+        fail()
+    return {"head": {"sha": head}, "draft": pull.get("isDraft"), "state": pull.get("state")}
+
+
+def pull_connection(query, key, owner, name, number):
+    base = {"owner": owner, "name": name, "number": number}
+
+    def fetch(cursor):
+        variables = dict(base, cursor=cursor) if cursor else base
+        return dig(graphql(query, variables), "repository", "pullRequest", key)
+
+    return drain(fetch)
+
+
+def fetch_reviews(owner, name, number):
+    return [
+        {
+            "id": node.get("databaseId"),
+            "state": node.get("state"),
+            "body": node.get("body"),
+            "commit_id": oid(node, "commit"),
+            "html_url": node.get("url"),
+            "user": actor(node.get("author")),
+        }
+        for node in pull_connection(REVIEWS_QUERY, "reviews", owner, name, number)
+    ]
+
+
+def review_comment(node):
+    review = node.get("pullRequestReview")
+    return {
+        "id": node.get("databaseId"),
+        "body": node.get("body"),
+        "commit_id": oid(node, "commit"),
+        "original_commit_id": oid(node, "originalCommit"),
+        "pull_request_review_id": review.get("databaseId")
+        if isinstance(review, dict)
+        else None,
+        "html_url": node.get("url"),
+        "user": actor(node.get("author")),
+    }
+
+
+def fetch_review_comments(owner, name, number):
+    comments = []
+    for thread in pull_connection(THREADS_QUERY, "reviewThreads", owner, name, number):
+        tid, first = thread.get("id"), thread.get("comments")
+        if not isinstance(tid, str) or not isinstance(first, dict):
+            fail()
+
+        def more(cursor, tid=tid):
+            return dig(
+                graphql(THREAD_COMMENTS_QUERY, {"thread": tid, "cursor": cursor}),
+                "node",
+                "comments",
+            )
+
+        comments.extend(review_comment(node) for node in drain(more, first))
+    return comments
+
+
+def fetch_issue_comments(owner, name, number):
+    return [
+        {
+            "id": node.get("databaseId"),
+            "body": node.get("body"),
+            "html_url": node.get("url"),
+            "user": actor(node.get("author")),
+        }
+        for node in pull_connection(
+            ISSUE_COMMENTS_QUERY, "comments", owner, name, number
+        )
+    ]
+
+
+def fetch_checks(owner, name, head):
+    """Check runs коммита HEAD: информационно, на статус гейта не влияют."""
+    base = {"owner": owner, "name": name, "head": head}
+
+    def suites(cursor):
+        variables = dict(base, cursor=cursor) if cursor else base
+        found = dig(graphql(CHECKS_QUERY, variables), "repository", "object")
+        return dig(found, "checkSuites")
+
+    runs = []
+    for suite in drain(suites):
+        sid, first = suite.get("id"), suite.get("checkRuns")
+        if not isinstance(sid, str) or not isinstance(first, dict):
+            fail()
+        app = suite.get("app")
+        slug = app.get("slug") if isinstance(app, dict) else None
+
+        def more(cursor, sid=sid):
+            return dig(
+                graphql(SUITE_RUNS_QUERY, {"suite": sid, "cursor": cursor}),
+                "node",
+                "checkRuns",
+            )
+
+        for node in drain(more, first):
+            runs.append(
+                {
+                    "name": node.get("name"),
+                    "status": node.get("status"),
+                    "conclusion": node.get("conclusion"),
+                    "app": slug,
+                }
+            )
+    pending = [r["name"] for r in runs if r["status"] != "COMPLETED"]
+    failed = [
+        [r["name"], r["conclusion"]]
+        for r in runs
+        if r["status"] == "COMPLETED" and r["conclusion"] != "SUCCESS"
+    ]
+    return runs, {"total": len(runs), "pending": pending, "failed": failed}
+
+
+def resolve_ref(owner, name, ref):
+    """Полный SHA для сокращённого; любая неопределённость — None."""
+    try:
+        found = dig(
+            graphql(RESOLVE_QUERY, {"owner": owner, "name": name, "ref": ref}),
+            "repository",
+        ).get("object")
+    except RuntimeError:
+        return None
+    value = found.get("oid") if isinstance(found, dict) else None
+    return value if isinstance(value, str) and value else None
 
 
 def contains(parent, child):
@@ -393,35 +698,35 @@ def check(args):
     ):
         raise ValueError("--repo must be OWNER/NAME")
     output = safe_output(args.output, local_worktree(args.worktree))
-    base = f"repos/{args.repo}/pulls/{args.pr}"
-    first = gh(base)
-    reviews, review_comments, issue_comments = (
-        pages(base + "/reviews"),
-        pages(base + "/comments"),
-        pages(f"repos/{args.repo}/issues/{args.pr}/comments"),
-    )
+    owner, name = args.repo.split("/")
+
+    def snapshot():
+        return (
+            fetch_reviews(owner, name, args.pr),
+            fetch_review_comments(owner, name, args.pr),
+            fetch_issue_comments(owner, name, args.pr),
+        )
+
+    first = fetch_header(owner, name, args.pr)
+    reviews, review_comments, issue_comments = snapshot()
+    check_runs, checks = fetch_checks(owner, name, first["head"]["sha"])
     cache = {}
 
     def resolve(ref):
         if ref not in cache:
-            try:
-                cache[ref] = gh(f"repos/{args.repo}/commits/{ref}").get("sha")
-            except RuntimeError:
-                cache[ref] = None
+            cache[ref] = resolve_ref(owner, name, ref)
         return cache[ref]
 
     result = evaluate(
         first, reviews, review_comments, issue_comments, args.head, resolve
     )
-    second = (
-        pages(base + "/reviews"),
-        pages(base + "/comments"),
-        pages(f"repos/{args.repo}/issues/{args.pr}/comments"),
-    )
-    last = gh(base)  # Evidence is invalid if the PR moved during collection.
-    if ((last.get("head") or {}).get("sha")) != ((first.get("head") or {}).get("sha")):
+    # Информационные поля: статус гейта они не меняют.
+    result["check_runs"], result["checks"] = check_runs, checks
+    second = snapshot()
+    last = fetch_header(owner, name, args.pr)  # Evidence is invalid if the PR moved.
+    if last["head"]["sha"] != first["head"]["sha"]:
         result["status"] = "incomplete"
-        result["current_head"] = (last.get("head") or {}).get("sha")
+        result["current_head"] = last["head"]["sha"]
         result["limitations"].append("PR HEAD changed while collecting evidence")
     elif second != (reviews, review_comments, issue_comments):
         result["status"] = "incomplete"
