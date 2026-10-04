@@ -285,10 +285,32 @@ def rendered_diff(repo, base, head, limit):
                 process.stdout.close()
 
 
+NUMSTAT_OPTIONS = (
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--no-renames",
+    "--no-relative",
+)
+
+
 def has_binary_diff(repo, base, head):
+    """Бинарным считается только запись numstat, где ОБА первых поля равны «-».
+
+    Опции патча (``--unified`` из DIFF_OPTIONS) в команду не входят: иначе git
+    печатает после numstat ещё и сам патч, и ячейка «-» в TSV принимается за
+    маркер бинарника (issue #8). Формат ``-z`` — записи через NUL, путь без
+    экранирования, поэтому имя файла с табами не ломает разбор.
+    """
     with object_view(repo) as view:
-        rows = git(view, "diff", *DIFF_OPTIONS, "--numstat", base, head).splitlines()
-        return any("\t-\t" in row or row.startswith("-\t") for row in rows)
+        raw = git_raw(view, "diff", *NUMSTAT_OPTIONS, "--numstat", "-z", base, head)
+    for record in raw.decode("utf-8", errors="replace").split("\0"):
+        if not record:
+            continue
+        fields = record.split("\t", 2)
+        if len(fields) == 3 and fields[0] == "-" and fields[1] == "-":
+            return True
+    return False
 
 
 @contextmanager

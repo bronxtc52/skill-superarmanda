@@ -884,6 +884,32 @@ raise SystemExit(1)
         self.git("commit", "-qm", "binary")
         self.assertNotEqual(self.packet().returncode, 0)
 
+    def test_packet_accepts_text_with_dash_cells_and_tab_dash_tab_in_name(self):
+        """issue #8: numstat разбирается структурно, содержимое файла бинарником не считается."""
+        row = "agent\tdrafter\tagents/drafter.md\t16\t7781ead077f8\t-\t2026-08-28\tyes\n"
+        (self.repo / "inventory.tsv").write_text(row * 55, encoding="utf-8")
+        self.git("add", "inventory.tsv")
+        self.git("commit", "-qm", "tsv")
+        proc = self.packet()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        odd = self.repo / "odd\t-\tname.txt"
+        odd.write_text("text\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "odd name")
+        proc = self.packet()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assert_packet_ok()
+        self.assertEqual(self.review_run("claude-host").returncode, 0)
+
+    def test_packet_still_rejects_real_binary_among_text_changes(self):
+        (self.repo / "inventory.tsv").write_text("a\t-\tb\n", encoding="utf-8")
+        (self.repo / "binary.dat").write_bytes(b"\0binary")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "mixed")
+        proc = self.packet()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(self.packet_path.exists())
+
     def test_packet_text_inputs_are_bounded_regular_files(self):
         self.assertEqual(self.packet().returncode, 0)
         spec = importlib.util.spec_from_file_location("bounded_text_reader", REVIEW)
