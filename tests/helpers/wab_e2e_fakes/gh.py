@@ -9,16 +9,24 @@ Per PR the test sets what GitHub would show for the head: "ci" (none|in_progress
 "draft". Nothing is checked by the stand-in at merge time (GitHub without branch protection merges
 a red PR too): it RECORDS in merges.jsonl what was true at that moment, and the test's oracle judges.
 Exit 2 and a log entry for any verb the dispatcher is not expected to use.
+
+Bodies of the answers are LIVE GitHub answers (tests/fixtures/github/, README there): the stand-in
+only fills in the values it owns (sha, number, state, draft, check-run status/conclusion, which Codex
+evidence is present). The only answers not taken from GitHub: `gh pr merge` (a mutation, prints
+nothing), `gh pr create` (prints the URL of the new PR), `gh pr ready`.
 """
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
 import tempfile
 
 STATE = os.environ["FAKE_GH_STATE"]
-BOT = {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+FIXTURES = pathlib.Path(os.environ["FAKE_GH_FIXTURES"])
+CODEX_BOT = ("chatgpt-codex-connector[bot]", "chatgpt-codex-connector")
+ZERO = "0" * 40
 
 
 def jlog(name, obj):
@@ -59,13 +67,33 @@ def head_of(st, pr):
     return git(st["origin"], "rev-parse", "--verify", "-q", f"refs/heads/{pr['branch']}", check=False)
 
 
-def as_json(st, pr):
-    owner, _, name = st["repo"].partition("/")
-    mc = pr.get("merge_commit")
-    return {"number": pr["number"], "headRefOid": head_of(st, pr), "isDraft": bool(pr.get("draft")),
-            "state": pr["state"], "baseRefName": pr["base"],
-            "headRepositoryOwner": {"login": owner}, "headRepository": {"name": name},
-            "mergeCommit": {"oid": mc} if mc else None}
+def fixture(name, st, pr=None, head=None, **extra):
+    """A live answer from tests/fixtures/github with the placeholders filled in (README there)."""
+    pr = pr or {}
+    head = head or (head_of(st, pr) if pr else None) or ZERO
+    stale = (git(st["origin"], "rev-parse", f"{head}~1", check=False) if head != ZERO else None) or ZERO
+    owner, _, repo = st["repo"].partition("/")
+    base = (git(st["origin"], "rev-parse", "--verify", "-q", f"refs/heads/{pr['base']}", check=False) if pr else None) or ZERO
+    subs = {"{REPO}": st["repo"], "{OWNER}": owner, "{NAME}": repo, "{NODE}": "N", "{BASE}": base,
+            "{HEAD}": head, "{HEAD7}": head[:7], "{HEAD10}": head[:10],
+            "{STALE}": stale, "{STALE7}": stale[:7], "{STALE10}": stale[:10],
+            "{MERGE}": pr.get("merge_commit") or ZERO, "{NUMBER}": str(pr.get("number", 0)), **extra}
+    text = (FIXTURES / name).read_text(encoding="utf-8").replace('"{NUMBER}"', subs["{NUMBER}"])
+    for key, value in subs.items():
+        text = text.replace(key, value)
+    return json.loads(text)
+
+
+def as_json(st, pr, name="pr-view.json"):
+    """`gh pr view|list --json …`: the live answer, the values of the PR the stand-in owns overwritten."""
+    obj = fixture(name, st, pr)
+    items = obj if isinstance(obj, list) else [obj]
+    for item in items:
+        item.update({"isDraft": bool(pr.get("draft")), "state": pr["state"], "baseRefName": pr["base"]})
+        if "mergeCommit" in item:
+            mc = pr.get("merge_commit")
+            item["mergeCommit"] = {"oid": mc} if mc else None
+    return obj
 
 
 def find(st, ref):
@@ -93,7 +121,7 @@ def pr_cmd(st, args):
     elif sub == "list":
         want = [p for p in st["prs"].values() if p["branch"] == opt(rest, "--head")
                 and p["base"] == opt(rest, "--base") and head_of(st, p)]
-        print(json.dumps([pick(as_json(st, p), opt(rest, "--json")) for p in want]))
+        print(json.dumps([pick(as_json(st, p, "pr-list.json")[0], opt(rest, "--json")) for p in want]))
     elif sub == "view":
         pr = find(st, rest[0])
         if pr is None:
@@ -138,35 +166,64 @@ def merge(st, pr, rest):
 def api_cmd(st, args):
     path = args[0].split("?")[0]
     if path == "graphql":
-        print(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {
-            "pageInfo": {"hasNextPage": False}, "nodes": []}}}}}))
+        number = int(next(a.split("=", 1)[1] for a in args if a.startswith("number=")))
+        pr = st["prs"].get(str(number))
+        out = fixture("review-threads.json", st, pr)
+        if pr is None or pr["codex"] == "none":  # no Codex review, so no thread of it
+            out["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"] = []
+        print(json.dumps(out))
         return
     parts = path.split("/")  # repos/<owner>/<name>/...
     if parts[:3] != ["repos", *st["repo"].split("/")]:
         fail(f"unexpected api path {path}")
     tail = parts[3:]
+    if tail[0] == "commits" and len(tail) == 2:  # `commits/<short>`: how the gate resolves a short sha
+        full = git(st["origin"], "rev-parse", "--verify", "-q", f"{tail[1]}^{{commit}}", check=False)
+        if full is None:
+            fail("HTTP 404 Not Found")
+        print(json.dumps(fixture("commit.json", st, head=full)))
+        return
     if tail[0] == "commits" and len(tail) == 3 and tail[2] == "check-runs":
         pr = next((p for p in st["prs"].values() if head_of(st, p) == tail[1]), None)
         if pr is None:
             fail("HTTP 404 Not Found")
-        runs = {"none": [], "in_progress": [{"id": 1, "name": "ci", "status": "in_progress", "conclusion": None}],
-                "failure": [{"id": 1, "name": "ci", "status": "completed", "conclusion": "failure"}],
-                "success": [{"id": 1, "name": "ci", "status": "completed", "conclusion": "success"}]}[pr["ci"]]
-        print(json.dumps({"total_count": len(runs), "check_runs": runs}))
+        out = fixture("check-runs.json", st, pr)
+        runs = out["check_runs"]
+        if pr["ci"] == "none":
+            runs = []
+        for run in runs:  # the live runs are green; the other states change only the status fields
+            if pr["ci"] == "in_progress":
+                run.update({"status": "in_progress", "conclusion": None, "completed_at": None})
+            elif pr["ci"] == "failure":
+                run["conclusion"] = "failure"
+        out.update({"total_count": len(runs), "check_runs": runs})
+        print(json.dumps(out))
         return
     pr = st["prs"].get(tail[1]) if tail[0] in ("pulls", "issues") and len(tail) > 1 else None
     if pr is None:
         fail("HTTP 404 Not Found")
     head = head_of(st, pr)
+    codex = pr["codex"]
     if tail[0] == "pulls" and len(tail) == 2:
-        print(json.dumps({"state": "open" if pr["state"] == "OPEN" else "closed", "merged": pr["state"] == "MERGED",
-                          "draft": bool(pr.get("draft")), "head": {"sha": head}, "base": {"ref": pr["base"]}}))
+        out = fixture("pull.json", st, pr)
+        out.update({"state": "open" if pr["state"] == "OPEN" else "closed", "merged": pr["state"] == "MERGED",
+                    "draft": bool(pr.get("draft"))})
+        out["head"]["sha"], out["base"]["ref"] = head, pr["base"]
+        print(json.dumps(out))
     elif tail[0] == "pulls" and tail[2] == "reviews":
-        commit = {"head": head, "stale": git(st["origin"], "rev-parse", f"{head}~1", check=False)}.get(pr["codex"])
-        print(json.dumps([] if not commit else [{"id": 11, "user": BOT, "commit_id": commit, "state": "COMMENTED",
-                                                  "body": "Codex Review: Didn't find any major issues."}]))
-    elif tail[2] == "comments":
-        print("[]")
+        items = fixture("reviews.json", st, pr)  # the Codex review and the author's reply, as on the live PR
+        print(json.dumps([] if codex == "none" else items))
+    elif tail[0] == "pulls" and tail[2] == "comments":
+        items = fixture("review-comments.json", st, pr)
+        print(json.dumps([] if codex == "none" else items))
+    elif tail[0] == "issues" and tail[2] == "comments":
+        items = fixture("issue-comments.json", st, pr)
+        if codex == "none":  # Codex has not written anything yet
+            items = [i for i in items if i["user"]["login"] not in CODEX_BOT]
+        elif codex == "stale":  # everything Codex wrote is about the commit before the head
+            older = fixture("issue-comments.json", st, pr, head=git(st["origin"], "rev-parse", f"{head}~1", check=False) or ZERO)
+            items = [o if o["user"]["login"] in CODEX_BOT else i for i, o in zip(items, older)]
+        print(json.dumps(items))
     else:
         unexpected(args)
 

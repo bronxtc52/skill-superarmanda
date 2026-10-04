@@ -1,0 +1,19 @@
+{
+ "baseRefName": "main",
+ "headRefOid": "{HEAD}",
+ "headRepository": {
+  "id": "{NODE}",
+  "name": "{NAME}"
+ },
+ "headRepositoryOwner": {
+  "id": "{NODE}",
+  "name": "Owner",
+  "login": "{OWNER}"
+ },
+ "isDraft": false,
+ "mergeCommit": {
+  "oid": "{MERGE}"
+ },
+ "number": "{NUMBER}",
+ "state": "MERGED"
+}

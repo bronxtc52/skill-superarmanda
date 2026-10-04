@@ -136,6 +136,7 @@ class World:
             "GIT_COMMITTER_NAME": "e2e", "GIT_COMMITTER_EMAIL": "e2e@example.invalid",
             "WAB_TMUX_SOCKET": str(self.sock), "FAKE_TMUX_STATE": str(self.tmux_state),
             "FAKE_TMUX_FIXTURES": str(FIXTURES / "screens"), "FAKE_GH_STATE": str(self.gh_state),
+            "FAKE_GH_FIXTURES": str(FIXTURES / "github"),
         }
 
     # -- commands run in the test's own environment (never the host's)
@@ -626,10 +627,10 @@ def oracle_flow(run):
     must(s["head"] == s["origin_main"] == w.origin_git("rev-parse", "main~1"), f"W2 base is not the fresh origin main: {s}")
     # what was typed into the windows, in order
     order(by_wave["W1"], "[wave-autobot] Волна W1", "РЕШЕНИЕ ПО ПОЛИТИКЕ", "Гейт мерджа не пройден", "/exit")
-    must("проверки неуспешны: ci (failure)" in " ".join(by_wave["W1"]), "the gate failure did not name the red check")
+    must("проверки неуспешны: tests (macos-latest) (failure), tests (ubuntu-latest) (failure)" in " ".join(by_wave["W1"]), "the gate failure did not name the red check")
     order(by_wave["W2"], "[wave-autobot] Волна W2", "WAB-CHECKPOINT", "/clear", "/superarmanda --wave W2 --resume [wab:", "/exit")
     # the dispatcher's own journal: the gate waited for CI and for Codex, failed on red CI, then passed
-    for reason in ("проверки не завершены: ci", "Codex не завершил ревью HEAD"):
+    for reason in ("проверки не завершены: tests (macos-latest), tests (ubuntu-latest)", "Codex не завершил ревью HEAD"):
         must(reason in run.events_log, f"the gate never waited: {reason}")
     order(run.events_log.splitlines(),
           "W1: launched in tmux wab-w1", "W1: policy auto-answer: class=needs_decision rec=A",
