@@ -1126,11 +1126,32 @@ def _chars_of(categories):
                    if unicodedata.category(c) in categories)
 
 
+# Default_Ignorable_Code_Point of Unicode (DerivedCoreProperties.txt), as code point ranges: drawn as
+# nothing whatever their category. Most are Cf; the rest are combining marks and fillers (CGJ U+034F,
+# Hangul fillers U+115F U+1160 U+3164 U+FFA0, Khmer U+17B4 U+17B5, Mongolian FVS U+180B-U+180F,
+# variation selectors U+FE00-U+FE0F and U+E0100-U+E01EF).
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160), (0x17B4, 0x17B5),
+    (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F), (0x3164, 0x3164),
+    (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A), (0xE0000, 0xE0FFF))
+
+
+def _default_ignorable():
+    """The default-ignorable characters that _chars_of({"Cf", ...}) does not already hold: assigned
+    (category not Cn in the interpreter's tables) and not Cf/Cc/Zl/Zp."""
+    return [chr(c) for lo, hi in _DEFAULT_IGNORABLE_RANGES for c in range(lo, hi + 1)
+            if unicodedata.category(chr(c)) not in {"Cf", "Cc", "Zl", "Zp", "Cn"}]
+
+
 # A character that is invisible or breaks a line glues (`a<ZWSP>sk-...`) or splits (`sk-<ZWSP>...`) a
 # secret past redact(): controls (Cc, all but \n \t, \r is handled apart), format characters (Cf: zero
-# width, bidi marks, soft hyphen, tags...), line and paragraph separators (Zl, Zp). Any token that holds
-# one is masked whole. Unicode spaces (Zs) are separators like a plain space, never part of a token.
-_INVISIBLE = "\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f" + _chars_of({"Cf", "Zl", "Zp"})
+# width, bidi marks, soft hyphen, tags...), the other default-ignorable characters (variation
+# selectors such as U+FE0F, CGJ, Hangul fillers: `sk-<U+FE0F>ant-...` is drawn as `sk-ant-...`), line and
+# paragraph separators (Zl, Zp). Any token that holds one is masked whole. Unicode spaces (Zs) are
+# separators like a plain space, never part of a token.
+_INVISIBLE = ("\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f" + _chars_of({"Cf", "Zl", "Zp"})
+              + "".join(re.escape(c) for c in _default_ignorable()))
 _SPACES = " \\n\\t\\r" + _chars_of({"Zs"})
 _CONTROL = re.compile(f"[{_INVISIBLE}]")
 _CTRL_WORD = re.compile(f"[^{_SPACES}]*[{_INVISIBLE}][^{_SPACES}]*")
