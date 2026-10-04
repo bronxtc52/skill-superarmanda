@@ -137,6 +137,16 @@ for line in sys.stdin:
   if mode in ("limit_early","limit_early_wrong_thread","limit_early_wrong_turn"):
    # error приходит ДО ответа на turn/start
    out({"method":"error","params":{"error":{"codexErrorInfo":"usageLimitExceeded","message":"limit"},"willRetry":False,"threadId":"other" if mode=="limit_early_wrong_thread" else "t","turnId":"other" if mode=="limit_early_wrong_turn" else "u"}})
+  if mode in ("early_done_quota","early_done_other","early_done_wrong_turn"):
+   # успешный ответ и completed ДО ответа на turn/start, затем error того же turn (fix-loop 2)
+   out({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":{"type":"agentMessage","text":json.dumps({"ok":True})}}})
+   out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
+   out({"method":"error","params":{"error":{"codexErrorInfo":"otherError" if mode=="early_done_other" else "usageLimitExceeded","message":"x"},"willRetry":False,"threadId":"t","turnId":"zzz" if mode=="early_done_wrong_turn" else "u"}})
+  if mode=="early_err_first_done":
+   # порядок «error -> completed -> ответ turn/start»
+   out({"method":"error","params":{"error":{"codexErrorInfo":"usageLimitExceeded","message":"x"},"willRetry":False,"threadId":"t","turnId":"u"}})
+   out({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":{"type":"agentMessage","text":json.dumps({"ok":True})}}})
+   out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
   if mode=="early":
    out({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":{"type":"agentMessage","text":json.dumps({"ok":True})}}})
    out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
@@ -447,6 +457,25 @@ class Contract(unittest.TestCase):
         for mode in ("limit_early_wrong_thread", "limit_early_wrong_turn"):
             with self.subTest(mode=mode):
                 self.assertEqual(self.failure(mode), "review CLI failed: protocol")
+
+    def test_deferred_error_after_early_completed_turn_is_never_lost(self):
+        # fix-loop 2: error в pending не должен проиграть успешному turn/completed
+        for mode, expected in (
+            ("early_done_quota", "quota"),
+            ("early_done_other", "completion"),
+            ("early_done_wrong_turn", "protocol"),
+        ):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.failure(mode), "review CLI failed: " + expected)
+
+    def test_early_error_before_completed_turn_is_terminal_in_any_order(self):
+        self.assertEqual(
+            self.failure("early_err_first_done"), "review CLI failed: quota"
+        )
+
+    def test_early_completed_turn_without_error_still_passes(self):
+        response, meta = self.invoke("early")
+        self.assertEqual(response, {"ok": True})
 
     def test_error_during_thread_start_stays_protocol(self):
         self.assertEqual(

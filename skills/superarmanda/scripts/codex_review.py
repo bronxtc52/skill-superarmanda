@@ -660,6 +660,11 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
         turn_id = turn_obj.get("id") if isinstance(turn_obj, dict) else None
         if not isinstance(turn_id, str) or not turn_id:
             _fail("protocol")
+        # Отложенные до ответа на turn/start `error` проверяются ВСЕ и до чтения
+        # любого completion: иначе успешный turn/completed в pending проиграл бы им.
+        for queued in list(server.pending):
+            if queued.get("method") == "error":
+                _terminal_error(queued, thread_id, turn_id)
         messages, completed = [], None
         while completed is None:
             event = server.event()

@@ -11,7 +11,7 @@
   notification `error`, а `turn/completed` со статусом `failed` считал `completion`. Теперь
   `systemError` не обрывает чтение до терминального события, `codexErrorInfo: "usageLimitExceeded"`
   (из `error` и из `turn.error`) даёт `error_category: "quota"`, `error` принимается только для
-  текущих thread/turn и никогда не pass; `error` до ответа на `turn/start` тоже распознаётся.
+  текущих thread/turn и никогда не pass; `error` до ответа на `turn/start` тоже распознаётся и не перекрывается успешным `turn/completed` в очереди.
   ([#17](https://github.com/bronxtc52/skill-superarmanda/issues/17),
   [#10](https://github.com/bronxtc52/skill-superarmanda/issues/10))
 - `review.py packet` отказывал «diff contains binary changes» на текстовом TSV с ячейкой `-`:

@@ -94,7 +94,7 @@ once, keeping both artifacts. Never retry auth/quota failures automatically.
 `threadId` и `turnId` (иначе `protocol`) и никогда не бывает pass: `gate_ready` остаётся `false`.
 `error`, пришедший раньше ответа на `turn/start`, откладывается и проверяется после получения turn id
 (только для `turn/start`; при `initialize`, `config/read`, `thread/start` — прежний `protocol`).
-`willRetry: true` не делает `error` нетерминальным. Текст причины и account/plan payload в отчёт не копируются, только категория.
+Все отложенные `error` проверяются до чтения любого completion (успешный `turn/completed` в очереди их не перекрывает). `willRetry: true` не делает `error` нетерминальным. Текст причины и account/plan payload в отчёт не копируются, только категория.
 
 Бинарные изменения определяет `git diff --numstat -z` без опций патча: изменение бинарное, только
 если ПЕРВЫЕ ДВА поля записи равны `-`. Содержимое файлов (например ячейка `-` в TSV) и имена с
