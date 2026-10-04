@@ -574,11 +574,14 @@ def _safe(text):
     return wab.redact(text, limit=400, owner_paths=False)
 
 
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # C0, DEL and C1: ESC/CSI/OSC would reach the terminal
+
+
 def humanize_event(msg):
     """One events.log message (without the time) -> (phrase, details, colour, known). `known` is False
     for a type nobody described: the phrase is then the raw line cut to ~140 characters. Phrase and
     details are masked with wab.redact; the raw line is not changed in events.log."""
-    msg = msg.strip()
+    msg = _CONTROL.sub("·", msg).strip()  # a visible sign instead of a control character
     result = None
     m = _PULSE.fullmatch(msg)
     if m:
@@ -630,6 +633,7 @@ def fold_events(lines):
             if series is not None and series[0] == key:
                 series[2] += 1
                 series[3] = ts
+                series[4] = humanize_event(msg)  # the state shown is the LAST pulse's, the time is the first's
                 continue
             flush()
             series = [key, ts[:5], 1, ts, humanize_event(msg)]

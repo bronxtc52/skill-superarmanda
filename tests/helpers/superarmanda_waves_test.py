@@ -14086,6 +14086,35 @@ class DashEvents(unittest.TestCase):
         self.assertEqual(len(self.dash.fold_events([self._pulse("10:00:00Z", 1), self._pulse("10:01:00Z", 1, restarts=1)])), 2)
         self.assertEqual(len(self.dash.fold_events([self._pulse("10:00:00Z", 1), self._pulse("10:01:00Z", 1, wave="W2")])), 2)
 
+    def test_control_characters_never_reach_the_terminal(self):
+        from rich.console import Console
+        bad = "\x1b[31m red \x1b]0;title\x07 c1\x9b31m \x00 \x7f \x85"
+        bad_chars = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+        lines = [f"2026-10-04 10:00:00Z W9: unknown thing {bad}",
+                 f"2026-10-04 10:00:01Z W1: say: РЕШЕНИЕ {bad}",
+                 f"2026-10-04 10:00:02Z W1: BLOCKED: [class=question rec=fix red=no] {bad}",
+                 f"2026-10-04 10:00:03Z W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=question rec=fix red=no] {bad}",
+                 f"no time at all {bad}"]
+        for msg in (l[20:] for l in lines[:4]):
+            phrase, details, _, _ = self.dash.humanize_event(msg)
+            self.assertIsNone(bad_chars.search(phrase + (details or "")), (phrase, details))
+        run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        (run_dir / "events.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        buf = io.StringIO()
+        Console(file=buf, width=140, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}))
+        self.assertIsNone(re.search("[\x00-\x09\x0b-\x1f\x7f-\x9f]", buf.getvalue()), repr(buf.getvalue()))
+        self.assertIn("unknown thing", buf.getvalue())  # the text itself stays
+
+    def test_a_folded_series_shows_the_first_time_and_the_last_state(self):
+        lines = [self._pulse(f"10:0{i}:00Z", i) for i in range(6)]  # ctx 0k..5k
+        items = self.dash.fold_events(lines)
+        self.assertEqual(len(items), 1)
+        ts, phrase, details, _ = items[0]
+        self.assertIn("без изменений с 10:00 (×6)", phrase)
+        self.assertIn("ctx=5k", details)
+        self.assertNotIn("ctx=0k", details)
+
     def test_events_panel_folds_before_it_cuts_the_tail(self):
         from rich.console import Console
         run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
