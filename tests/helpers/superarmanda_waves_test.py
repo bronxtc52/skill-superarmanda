@@ -23,6 +23,7 @@ and live sessions are lost (incident W4, 2026-10-01):
 
 import atexit
 import contextlib
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -2561,9 +2562,11 @@ class KeysAndRegistry(Base):
                         self.assertTrue(wab.register_dash(cfg, path, "my-work", sock, "%7"))
                     n = len(flag)
                     setc = [c for c in self.tmux_calls if c[1 + n] == "set-option"]
-                    self.assertEqual(len(setc), 1)
+                    self.assertEqual(len(setc), 3)  # @wab_open, then the owner marks (#57)
                     self.assertEqual(list(setc[0][2 + n:6 + n]), ["-p", "-t", "%7", "@wab_open"])
                     self.assertEqual(setc[0][6 + n], f"{WAVES / 'wab-open'} {path.resolve()}")
+                    self.assertEqual(list(setc[1][2 + n:7 + n]), ["-p", "-t", "%7", "@wab_run", f"{CHAIN}/{RUN_ID}"])
+                    self.assertEqual(list(setc[2][2 + n:6 + n]), ["-p", "-t", "%7", "@wab_run_dir"])
                     self.assertIn("source-file", {c[1 + n] for c in self.tmux_calls})
                     for call in self.tmux_calls:
                         self.assertEqual(list(call[1:1 + n]), flag, call)
@@ -2571,11 +2574,13 @@ class KeysAndRegistry(Base):
 
     def test_unregister_unsets_the_option_on_the_same_server(self):
         wab.unregister_dash("my-work", "/p/x.sock", "%7")
-        self.assertEqual(self.tmux_calls[-1],
-                         ("tmux", "-S", "/p/x.sock", "set-option", "-p", "-u", "-t", "%7", "@wab_open"))
+        for i, opt in enumerate(("@wab_open", "@wab_run", "@wab_run_dir")):
+            self.assertEqual(self.tmux_calls[-3 + i],
+                             ("tmux", "-S", "/p/x.sock", "set-option", "-p", "-u", "-t", "%7", opt))
         wab.unregister_dash("my-work", "/p/x.sock")  # no pane known: the session option, as before
-        self.assertEqual(self.tmux_calls[-1],
-                         ("tmux", "-S", "/p/x.sock", "set-option", "-u", "-t", "=my-work:", "@wab_open"))
+        for i, opt in enumerate(("@wab_open", "@wab_run", "@wab_run_dir")):
+            self.assertEqual(self.tmux_calls[-3 + i],
+                             ("tmux", "-S", "/p/x.sock", "set-option", "-u", "-t", "=my-work:", opt))
 
     def test_foreign_binding_refusal_does_not_claim_the_key_toggles_the_popup(self):
         cfg, path = self.chain()
@@ -13395,6 +13400,242 @@ class IdleNudge(BgBase):
         self.assertIn("по PID", text)
         self.assertIn("[wab] Толчок", text)
         self.assertIn("В полёте", text)
+
+
+class ChainCleanup(Base):
+    """W3 (#57): closing the tmux sessions and panes of a finished chain, only the chain's own.
+    Real tmux on the private socket `-L wabtest-<pid>-cc` (the module under test is the unpatched copy)."""
+
+    def setUp(self):
+        super().setUp()
+        exe = shutil.which("tmux")
+        if not exe:
+            self.skipTest("tmux is not installed")
+        out = subprocess.run([exe, "-V"], capture_output=True, text=True, encoding="utf-8").stdout
+        ver = wab.parse_tmux_version(out)
+        if ver is None or ver < (3, 2):
+            self.skipTest(f"tmux {out.strip()!r} is older than 3.2")
+        self.exe = exe
+        self.sock = f"wabtest-{os.getpid()}-cc"
+        self.env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        self.addCleanup(lambda: subprocess.run([exe, "-L", self.sock, "kill-server"],
+                                               capture_output=True, env=self.env))
+        self.w = load_orig("wab_cleanup")
+        self.w.TMUX_SOCKET = self.sock
+        self.w._send_telegram = lambda cfg, text: None  # nothing leaves the machine
+        self.w.require_tmux = lambda: None
+
+    def tm(self, *args):
+        return subprocess.run([self.exe, "-L", self.sock, "-f", "/dev/null", *args], capture_output=True,
+                              text=True, encoding="utf-8", env=self.env)
+
+    def session(self, name, tag=None, run_dir=None, cmd="sleep 600"):
+        r = self.tm("new-session", "-d", "-s", name, "-x", "80", "-y", "24", cmd)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        if tag:
+            self.tm("set-option", "-t", f"={name}:", "@wab_run", tag)
+            self.tm("set-option", "-p", "-t", f"={name}:", "@wab_run", tag)
+        if run_dir:
+            self.tm("set-option", "-t", f"={name}:", "@wab_run_dir", str(run_dir))
+            self.tm("set-option", "-p", "-t", f"={name}:", "@wab_run_dir", str(run_dir))
+
+    def alive_names(self):
+        r = self.tm("list-sessions", "-F", "#{session_name}")
+        return set(r.stdout.split()) if r.returncode == 0 else set()
+
+    def pane_ids(self):
+        r = self.tm("list-panes", "-a", "-F", "#{pane_id}")
+        return set(r.stdout.split()) if r.returncode == 0 else set()
+
+    def cfg(self, **over):
+        cfg, path = self.chain(**over)
+        return self.w.load_chain(path), path
+
+    def finish(self, cfg):
+        (cfg["run_dir"] / "chain-result.md").write_text("done\n", encoding="utf-8")
+
+    def state_two_waves(self, cfg, phase1="done", phase2="awaiting_merge"):
+        self.put_state(cfg, {"current": "W2", "identity": self.w._pinned_identity(cfg), "waves": {
+            "W1": self.wave_rec("W1", phase=phase1), "W2": self.wave_rec("W2", phase=phase2)}})
+
+    def dash_pane(self, session, cfg, path, new_window=False):
+        """A pane of a dashboard of the chain: @wab_run and @wab_open set at pane level."""
+        if new_window:
+            self.assertEqual(self.tm("new-window", "-t", f"={session}:", "sleep 600").returncode, 0)
+        pane = self.tm("display-message", "-p", "-t", f"={session}:", "#{pane_id}").stdout.strip()
+        self.tm("set-option", "-p", "-t", pane, "@wab_run", f"{cfg['chain']}/{cfg['run_id']}")
+        self.tm("set-option", "-p", "-t", pane, "@wab_open", self.w.wab_open_value(path))
+        return pane
+
+    # --- 1. done closes the chain's own wave sessions, only them
+    def test_done_closes_own_wave_sessions_and_leaves_foreign_ones(self):
+        cfg, path = self.cfg()
+        tag = f"{CHAIN}/{RUN_ID}"
+        self.state_two_waves(cfg)
+        self.session("wv-w1", tag, cfg["run_dir"])
+        self.session("wv-w2", tag, cfg["run_dir"])
+        self.session("other-w1", "other/2026-01-01", "/nonexistent")  # a live chain of another run
+        self.session("plain", None)                                    # not a wab session at all
+        self.assertTrue(self.w.done_cmd(cfg))                          # exit 0: the window is gone
+        self.assertEqual(self.alive_names(), {"other-w1", "plain"})
+        self.assertIn("chain sessions closed", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    # --- 2. two chains in one tmux session: only the pane of the cleaned chain goes
+    def test_cleanup_kills_only_its_dashboard_pane(self):
+        cfg_a, path_a = self.cfg()
+        doc = json.loads(path_a.read_text(encoding="utf-8"))
+        doc["run_id"] = "2026-10-02"
+        path_b = path_a.parent / "chain-b.json"
+        path_b.write_text(json.dumps(doc), encoding="utf-8")
+        cfg_b = self.w.load_chain(path_b)
+        self.session("dashes", None)
+        pane_a = self.dash_pane("dashes", cfg_a, path_a)
+        pane_b = self.dash_pane("dashes", cfg_b, path_b, new_window=True)
+        self.finish(cfg_a)
+        self.put_state(cfg_a, {"current": None, "waves": {}})
+        res = self.w.cleanup_cmd(cfg_a)
+        self.assertEqual(res["panes"], [pane_a])
+        self.assertEqual(self.pane_ids(), {pane_b})
+        self.assertEqual(self.alive_names(), {"dashes"})
+
+    # --- 3. refusals and idempotence
+    def test_cleanup_refused_with_a_live_dispatcher_or_without_chain_result(self):
+        cfg, path = self.cfg()
+        self.state_two_waves(cfg)
+        self.session("wv-w1", f"{CHAIN}/{RUN_ID}", cfg["run_dir"])
+        with self.assertRaises(SystemExit) as ctx:  # not finished
+            self.w.cleanup_cmd(cfg)
+        self.assertIn("chain not finished", str(ctx.exception))
+        self.finish(cfg)
+        with wab._RunLock(cfg, "watch"):  # another module copy: a second descriptor on the lock file
+            with self.assertRaises(SystemExit) as ctx:
+                self.w.cleanup_cmd(cfg)
+        self.assertIn("dispatcher of this chain is alive", str(ctx.exception))
+        self.assertEqual(self.alive_names(), {"wv-w1"})
+        first = self.w.cleanup_cmd(cfg)
+        self.assertEqual(first["sessions"], ["wv-w1"])
+        events = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        again = self.w.cleanup_cmd(cfg)  # a repeat: no error, nothing closed, no new event
+        self.assertEqual((again["sessions"], again["panes"], again["warnings"]), ([], [], []))
+        self.assertEqual((cfg["run_dir"] / "events.log").read_text(encoding="utf-8"), events)
+        self.w.main(["wab.py", "cleanup", str(path)])  # the CLI too: exit 0
+
+    def test_cleanup_cli_refusal_exits_nonzero(self):
+        cfg, path = self.cfg()
+        self.put_state(cfg, {"current": "W1", "waves": {}})
+        with self.assertRaises(SystemExit) as ctx:
+            self.w.main(["wab.py", "cleanup", str(path)])
+        self.assertNotIn(ctx.exception.code, (0, None))
+
+    # --- 4. a reused session name belongs to somebody else
+    def test_a_session_name_reused_by_another_run_is_not_touched(self):
+        cfg, path = self.cfg()
+        self.state_two_waves(cfg)
+        self.finish(cfg)
+        self.session("wv-w1", "demo/2026-12-31", "/elsewhere")  # same prefix, another run
+        res = self.w.cleanup_cmd(cfg)
+        self.assertEqual(res["sessions"], [])
+        self.assertEqual(self.alive_names(), {"wv-w1"})
+        self.assertIn("not ours", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    # --- 5. no option at all: a warning, not a kill
+    def test_a_session_without_the_option_only_warns(self):
+        cfg, path = self.cfg()
+        self.state_two_waves(cfg)
+        self.finish(cfg)
+        self.session("wv-w1", None)
+        res = self.w.cleanup_cmd(cfg)
+        self.assertEqual(res["sessions"], [])
+        self.assertEqual(len(res["warnings"]), 1)
+        self.assertIn("wv-w1", res["warnings"][0])
+        self.assertEqual(self.alive_names(), {"wv-w1"})
+
+    def test_a_foreign_pane_in_our_session_stays_and_the_session_too(self):
+        cfg, path = self.cfg()
+        tag = f"{CHAIN}/{RUN_ID}"
+        self.state_two_waves(cfg)
+        self.finish(cfg)
+        self.session("wv-w1", tag, cfg["run_dir"])
+        self.assertEqual(self.tm("new-window", "-t", "=wv-w1:", "sleep 600").returncode, 0)
+        foreign = self.tm("display-message", "-p", "-t", "=wv-w1:", "#{pane_id}").stdout.strip()
+        self.tm("set-option", "-p", "-t", foreign, "@wab_run", "other/1")
+        res = self.w.cleanup_cmd(cfg)
+        self.assertEqual(res["sessions"], [])
+        self.assertEqual(self.alive_names(), {"wv-w1"})
+        self.assertEqual(self.pane_ids(), {foreign})
+
+    # --- 6. launch of the first wave warns about a FINISHED foreign chain only
+    def test_stale_chains_lists_finished_chains_without_a_dispatcher_only(self):
+        cfg, path = self.cfg()
+        other = self.tmp / "other-run"
+        live = self.tmp / "live-run"
+        open_run = self.tmp / "open-run"
+        for d in (other, live, open_run):
+            d.mkdir()
+        (other / "chain-result.md").write_text("x", encoding="utf-8")
+        (live / "chain-result.md").write_text("x", encoding="utf-8")
+        self.session("fin-w1", "fin/1", other)
+        self.session("live-w1", "live/1", live)
+        self.session("open-w1", "open/1", open_run)  # unfinished: no chain-result.md
+        self.session("mine-w1", f"{CHAIN}/{RUN_ID}", cfg["run_dir"])  # our own run: never stale
+        (live / "dispatcher.lock").write_text("", encoding="utf-8")
+        with open(live / "dispatcher.lock", "a", encoding="utf-8") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            found = self.w.stale_chains(cfg)
+        tags = [f["tag"] for f in found]
+        self.assertEqual(tags, ["fin/1"])
+        self.assertFalse((other / "dispatcher.lock").exists())  # the check creates nothing
+
+    def test_launch_of_the_first_wave_warns_and_closes_nothing(self):
+        cfg, path = self.chain()
+        self.alive = False
+        found = [{"tag": "old/1", "run_dir": "/x", "targets": ["old-w1"], "chain_file": "/x/chain.json"}]
+        prompt = self.tmp / "p.md"
+        prompt.write_text("task\n", encoding="utf-8")
+        err = io.StringIO()
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd), \
+                mock.patch.object(wab, "stale_chains", return_value=found), contextlib.redirect_stderr(err):
+            wab.launch(cfg, "W1", prompt)
+        self.assertIn("finished chain old/1 still has tmux", err.getvalue())
+        self.assertIn("cleanup /x/chain.json", err.getvalue())
+        self.assertFalse([c for c in self.tmux_calls if c[1] in ("kill-session", "kill-pane")])
+
+    def test_launch_of_a_later_wave_does_not_look_for_stale_chains(self):
+        cfg, path = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="awaiting_merge")}})
+        self.alive = False
+        prompt = self.tmp / "p.md"
+        prompt.write_text("task\n", encoding="utf-8")
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd), \
+                mock.patch.object(wab, "stale_chains", return_value=[]) as stale:
+            try:
+                wab.launch(cfg, "W2", prompt)
+            except SystemExit:
+                pass
+        stale.assert_not_called()
+
+    # --- ownership marks
+    def test_register_dash_marks_the_pane_with_the_run_and_unregister_clears_it(self):
+        cfg, path = self.cfg()
+        self.session("dashes", None)
+        pane = self.tm("display-message", "-p", "-t", "=dashes:", "#{pane_id}").stdout.strip()
+        self.assertTrue(self.w.register_dash(cfg, path, "dashes", self.sock, pane))
+        show = lambda o: self.tm("show-options", "-p", "-v", "-t", pane, o).stdout.strip()
+        self.assertEqual(show("@wab_run"), f"{CHAIN}/{RUN_ID}")
+        self.assertEqual(show("@wab_run_dir"), str(cfg["run_dir"]))
+        self.w.unregister_dash("dashes", self.sock, pane)
+        self.assertEqual((show("@wab_run"), show("@wab_run_dir"), show("@wab_open")), ("", "", ""))
+
+    def test_start_session_marks_the_session_and_its_pane(self):
+        cfg, path = self.chain()
+        self.alive = False
+        st = {"current": "W1", "waves": {"W1": self.wave_rec("W1", sessions=["sid-1"], phase="launching")}}
+        wab.start_session(cfg, st, "W1")
+        sets = [c for c in self.tmux_calls if c[1] == "set-option"]
+        tag = f"{CHAIN}/{RUN_ID}"
+        self.assertTrue(any("@wab_run" in c and tag in c and "-p" not in c for c in sets), sets)
+        self.assertTrue(any("@wab_run" in c and tag in c and "-p" in c for c in sets), sets)
+        self.assertTrue(any("@wab_run_dir" in c and str(cfg["run_dir"]) in c for c in sets), sets)
 
 
 class Packaging(unittest.TestCase):

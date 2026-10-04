@@ -6,6 +6,7 @@ Commands:
   wab.py watch  <chain.json>                        supervise until the chain ends
   wab.py status <chain.json>                        one-screen status
   wab.py done   <chain.json> [<wave>]               after the LAST wave's PR is merged: finish the chain
+  wab.py cleanup <chain.json>                       close the tmux sessions/panes of a FINISHED chain (chain-result.md)
   wab.py owner-merge <chain.json> <wave> <run_id> <sha>  gated merge by the owner (run by the generated script)
   wab.py owner-handover <chain.json> <wave> <run_id>  the owner merged the wave's PR himself: hand the chain on
   wab.py notify <chain.json> <text>                 Telegram message to the owner
@@ -2326,6 +2327,8 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     _check_launch_allowed(cfg, st, wave, name)
     if tmux_alive(name):
         raise SystemExit(f"tmux session {name} already exists")
+    if wave == cfg["waves"][0] and wave not in st["waves"]:
+        warn_stale_chains(cfg)  # a hint about finished chains' leftovers; nothing is closed here
     check_plan_pin(cfg)  # before prepare_clone, the workdir and the STARTING record
     wdir = wave_dir(cfg, wave)
     cur = st.get("current")
@@ -2487,6 +2490,7 @@ def start_session(cfg, st, wave):
     pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
     tmux("new-session", "-d", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
        "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", "-e", f"WAB_MAX_RUNS={cfg['max_runs']}", *pin, *cmd)
+    mark_owner(cfg, w["tmux"])
     w["phase"] = "starting"
     save_state(cfg, st)
 
@@ -4294,6 +4298,7 @@ def _complete_wave(cfg, st, wave, w, wdir, now):
     if last:
         event(cfg, "chain finished")
         flush_notices(cfg, st, w)
+        close_finished_chain(cfg, st)  # the chain's own windows and dashboard panes: none is left behind
         return False
     if not nxt.exists():
         return _stop_without_next(cfg, st, w, wave, now)
@@ -4824,13 +4829,15 @@ def register_dash(cfg, path, session, sock="", pane=None):
         event(cfg, f"Ctrl+\\ binding refused: {e}")
         print(f"wab: Ctrl+\\ binding refused: {e}", file=sys.stderr)
         return False
-    if pane:  # a pane id (%N) is itself exact
-        r = tmux_on(sock, "set-option", "-p", "-t", pane, "@wab_open", value, check=False)
-    else:
-        r = tmux_on(sock, "set-option", "-t", pane_target(session), "@wab_open", value, check=False)
-    if r.returncode != 0:
-        event(cfg, f"@wab_open not set: {r.stderr.strip() or r.stdout.strip()}")
-        return False
+    marks = (("@wab_open", value), ("@wab_run", run_tag(cfg)), ("@wab_run_dir", str(cfg["run_dir"])))
+    for opt, val in marks:  # @wab_run / @wab_run_dir: whose pane it is (close_chain_sessions, stale_chains)
+        if pane:  # a pane id (%N) is itself exact
+            r = tmux_on(sock, "set-option", "-p", "-t", pane, opt, val, check=False)
+        else:
+            r = tmux_on(sock, "set-option", "-t", pane_target(session), opt, val, check=False)
+        if r.returncode != 0:
+            event(cfg, f"{opt} not set: {r.stderr.strip() or r.stdout.strip()}")
+            return False
     if not _ensure_binding(cfg, sock):
         return False
     event(cfg, "Ctrl+\\ toggles the wave popup")
@@ -4840,10 +4847,231 @@ def register_dash(cfg, path, session, sock="", pane=None):
 def unregister_dash(session, sock="", pane=None):
     """Unset @wab_open of the dashboard's pane (else session) on exit, SIGTERM/SIGHUP.
     A killed pane or session needs no cleanup."""
-    if pane:
-        tmux_on(sock, "set-option", "-p", "-u", "-t", pane, "@wab_open", check=False)
+    for opt in ("@wab_open", "@wab_run", "@wab_run_dir"):
+        if pane:
+            tmux_on(sock, "set-option", "-p", "-u", "-t", pane, opt, check=False)
+        else:
+            tmux_on(sock, "set-option", "-u", "-t", pane_target(session), opt, check=False)
+
+
+def run_tag(cfg):
+    """Whose tmux things these are: `<chain>/<run_id>` (both plain names), stored in @wab_run."""
+    return f"{cfg['chain']}/{cfg['run_id']}"
+
+
+def mark_owner(cfg, name):
+    """Right after new-session: @wab_run and @wab_run_dir on the wave's session and on its first
+    pane, so that the end of the chain (and `cleanup`) closes only what this run started. A failure
+    is an event, the launch goes on."""
+    try:
+        for opt, val in (("@wab_run", run_tag(cfg)), ("@wab_run_dir", str(cfg["run_dir"]))):
+            for flag in ((), ("-p",)):
+                r = tmux("set-option", *flag, "-t", pane_target(name), opt, val, check=False)
+                if r.returncode != 0:
+                    event(cfg, f"{name}: {opt} not set: {r.stderr.strip() or r.stdout.strip()}")
+    except (OSError, subprocess.SubprocessError) as e:
+        event(cfg, f"{name}: owner marks not set: {type(e).__name__}")
+
+
+def tmux_opt(opt, session=None, pane=None):
+    """The value of a user option set exactly on that pane (else session), never an inherited one;
+    None when it is not set there or tmux fails. Read right before the action that depends on it."""
+    try:
+        if pane:
+            r = tmux("show-options", "-p", "-v", "-t", pane, opt, check=False)
+        else:
+            r = tmux("show-options", "-v", "-t", pane_target(session), opt, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (r.stdout.strip() or None) if r.returncode == 0 else None
+
+
+def _list_panes(session=None):
+    """[(pane id, session name)] of one session, or of the whole server; [] when tmux fails."""
+    try:
+        if session:
+            r = tmux("list-panes", "-s", "-t", pane_target(session), "-F", "#{pane_id}\t#{session_name}", check=False)
+        else:
+            r = tmux("list-panes", "-a", "-F", "#{pane_id}\t#{session_name}", check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    return [tuple(l.split("\t", 1)) for l in r.stdout.splitlines() if "\t" in l]
+
+
+def _wave_session_names(cfg, st):
+    names = []
+    for rec in (st.get("waves") or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        for r in (rec, *wave_attempts(rec)):
+            n = r.get("tmux") if isinstance(r, dict) else None
+            if isinstance(n, str) and n.startswith(cfg["tmux_prefix"]) and n not in names:
+                names.append(n)
+    return names
+
+
+def close_chain_sessions(cfg, st):
+    """The chain is finished (the caller checked chain-result.md): close the tmux sessions of its waves
+    and the dashboard panes, only the ones THIS run marked (@wab_run == run_tag, read at their own
+    level, never inherited, right before the kill). A session without the mark is only reported; one
+    marked by another run (the name was reused) is left alone. Returns {sessions, panes, warnings}.
+    Never raises on a tmux failure."""
+    tag = run_tag(cfg)
+    res = {"sessions": [], "panes": [], "warnings": []}
+    gone = set()
+
+    def warn(text):
+        res["warnings"].append(text)
+        event(cfg, text)
+
+    try:
+        for name in _wave_session_names(cfg, st):
+            if not tmux_alive(name):
+                continue
+            mark = tmux_opt("@wab_run", session=name)
+            if mark is None:
+                warn(f"{name}: no @wab_run mark, not closed (started by an older wab?); "
+                     f"close it yourself: tmux kill-session -t {name}")
+                continue
+            if mark != tag:
+                event(cfg, f"{name}: not ours (@wab_run={mark}, this run {tag}); left alone")
+                continue
+            panes = _list_panes(name)
+            ours = [pane for pane, _ in panes if tmux_opt("@wab_run", pane=pane) == tag]
+            if len(ours) == len(panes) and tmux_opt("@wab_run", session=name) == tag:
+                tmux("kill-session", "-t", session_target(name), check=False)
+                if not tmux_alive(name):
+                    res["sessions"].append(name)
+                    gone.update(pane for pane, _ in panes)
+                continue
+            for pane in ours:
+                if tmux_opt("@wab_run", pane=pane) == tag:
+                    tmux("kill-pane", "-t", pane, check=False)
+                    if pane not in {q for q, _ in _list_panes(name)}:
+                        res["panes"].append(pane)
+                        gone.add(pane)
+            event(cfg, f"{name}: has panes of other runs; only the panes of {tag} closed, the session stays")
+        chain_file = str(pathlib.Path(cfg.get("chain_file") or "").resolve()) if cfg.get("chain_file") else None
+        for pane, sess in _list_panes():
+            if pane in gone:
+                continue
+            opened = tmux_opt("@wab_open", pane=pane)
+            if not (opened and chain_file and opened.rsplit(None, 1)[-1] == chain_file):
+                continue
+            mark = tmux_opt("@wab_run", pane=pane)
+            if mark is None:
+                warn(f"pane {pane} (session {sess}) shows this chain's dashboard but has no @wab_run mark, "
+                     f"not closed; close it yourself: tmux kill-pane -t {pane}")
+            elif mark == tag:
+                tmux("kill-pane", "-t", pane, check=False)
+                if pane not in {q for q, _ in _list_panes()}:
+                    res["panes"].append(pane)
+        if res["sessions"] or res["panes"]:
+            event(cfg, f"chain sessions closed: sessions {res['sessions']}, panes {res['panes']}")
+    except (OSError, subprocess.SubprocessError) as e:
+        event(cfg, f"closing the chain's tmux sessions failed: {type(e).__name__}: {e}")
+    return res
+
+
+def close_finished_chain(cfg, st):
+    """close_chain_sessions when chain-result.md exists (the one sign of a finished chain);
+    None when it does not. Whatever fails is an event: the end of a chain must not break on it."""
+    if not (cfg["run_dir"] / "chain-result.md").exists():
+        return None
+    try:
+        return close_chain_sessions(cfg, st)
+    except Exception as e:  # noqa: BLE001
+        event(cfg, f"closing the chain's tmux sessions failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _dispatcher_alive(run_dir):
+    """Does somebody hold <run_dir>/dispatcher.lock? Opened for reading only (never created)."""
+    try:
+        fh = open(pathlib.Path(run_dir) / "dispatcher.lock", "r", encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True
+    finally:
+        fh.close()  # closing drops a lock we took
+
+
+def stale_chains(cfg):
+    """Finished chains of other runs (marked @wab_run != ours, chain-result.md, no dispatcher) that
+    still have tmux sessions or panes on this server: [{tag, run_dir, targets, chain_file}]."""
+    mine = run_tag(cfg)
+    found = {}
+
+    def add(tag, run_dir, target, chain_file=None):
+        if not tag or tag == mine or not run_dir:
+            return
+        rec = found.setdefault(tag, {"tag": tag, "run_dir": run_dir, "targets": [], "chain_file": None})
+        if target not in rec["targets"]:
+            rec["targets"].append(target)
+        rec["chain_file"] = rec["chain_file"] or chain_file
+
+    try:
+        r = tmux("list-sessions", "-F", "#{session_name}", check=False)
+        sessions = r.stdout.split() if r.returncode == 0 else []
+        marked = set()
+        for name in sessions:
+            tag = tmux_opt("@wab_run", session=name)
+            if tag:
+                marked.add((name, tag))
+                add(tag, tmux_opt("@wab_run_dir", session=name), name)
+        for p, sess in _list_panes():
+            tag = tmux_opt("@wab_run", pane=p)
+            if not tag or (sess, tag) in marked:
+                continue
+            opened = tmux_opt("@wab_open", pane=p)
+            add(tag, tmux_opt("@wab_run_dir", pane=p), f"{sess}:{p}", opened.rsplit(None, 1)[-1] if opened else None)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out = []
+    for rec in found.values():
+        try:
+            if (pathlib.Path(rec["run_dir"]) / "chain-result.md").exists() and not _dispatcher_alive(rec["run_dir"]):
+                out.append(rec)
+        except OSError:
+            continue
+    return out
+
+
+def warn_stale_chains(cfg):
+    """At the launch of the first wave: tell, never close. Silent on any failure."""
+    try:
+        for rec in stale_chains(cfg):
+            wab_py = f"python3 {shlex.quote(str(pathlib.Path(__file__).resolve()))}"
+            chain_file = rec.get("chain_file") or f"<chain.json of {rec['tag']}>"
+            text = (f"wab: finished chain {rec['tag']} still has tmux sessions/panes {rec['targets']}; "
+                    f"close them: {wab_py} cleanup {chain_file}")
+            event(cfg, text)
+            print(text, file=sys.stderr)
+    except Exception:  # noqa: BLE001 - a hint, never a reason to refuse a launch
+        pass
+
+
+def cleanup_cmd(cfg):
+    """`wab.py cleanup <chain.json>`: close the tmux sessions and panes of a FINISHED chain (chain-result.md
+    exists) that nobody runs any more. Refused while its dispatcher lives or before the chain is finished.
+    Repeatable: the second call closes nothing and says nothing in events.log."""
+    with _RunLock(cfg, "cleanup", busy="dispatcher of this chain is alive; wait for it or stop it first"):
+        st = load_state(cfg)
+        check_identity(cfg, st, "cleanup")  # refused when chain.json is not this run's; nothing is saved
+        if not (cfg["run_dir"] / "chain-result.md").exists():
+            raise SystemExit(f"wab: cleanup refused: chain not finished (no {cfg['run_dir'] / 'chain-result.md'})")
+        res = close_chain_sessions(cfg, st)
+    if res["sessions"] or res["panes"]:
+        print(f"wab: cleanup: closed sessions {res['sessions']}, panes {res['panes']}")
     else:
-        tmux_on(sock, "set-option", "-u", "-t", pane_target(session), "@wab_open", check=False)
+        print("wab: cleanup: nothing to close")
+    return res
 
 
 def drop_stale_btab(cfg, sock=""):
@@ -5043,13 +5271,22 @@ def done_cmd(cfg, wave=None):
             ack_wave_notices(w)  # a repeat call confirms too: only chain_done may still be owed
             save_state(cfg, st)
             flush_notices(cfg, st, w, force=True)  # a repeat call sends what was not delivered
+        window_closed = True
         if w.get("pending_exit"):  # e.g. a crash between the awaiting_merge save and /exit
             if wait_window_closed(cfg, st, w, push=w.get("tmux") not in pushed):
                 save_state(cfg, st)
             else:
-                event(cfg, f"{wave}: window {w.get('tmux')} still open after /exit; run done again "
-                           f"or close it ({attach_cmd(w.get('tmux') or '')})")
-                return False
+                window_closed = False
+        closed = close_finished_chain(cfg, st)  # the chain's own sessions and dashboard panes
+        if not window_closed:
+            name = w.get("tmux")
+            if closed and isinstance(name, str) and name in closed["sessions"]:
+                w.pop("pending_exit", None)  # the window is gone: closed by this call
+                save_state(cfg, st)
+                return True
+            event(cfg, f"{wave}: window {w.get('tmux')} still open after /exit; run done again "
+                       f"or close it ({attach_cmd(w.get('tmux') or '')})")
+            return False
         return True
 
 
@@ -5137,6 +5374,8 @@ def main(argv):
             print("wab: done: the chain is finished but the last wave's window is still open after /exit; "
                   "run done again (see events.log)", file=sys.stderr)
             sys.exit(3)
+    elif cmd == "cleanup" and len(argv) == 3:
+        cleanup_cmd(load_chain(path, create=False))
     elif cmd == "owner-merge" and len(argv) == 6:
         owner_merge(load_chain(path, create=False), argv[3], argv[4], argv[5])
     elif cmd == "owner-merge":

@@ -219,6 +219,10 @@ def main(argv):
         return
     if cmd in ("list-keys", "set-option", "source-file", "unbind-key", "bind-key"):
         return
+    if cmd in ("list-sessions", "list-panes"):  # (#57) no dashboards or foreign sessions in this world
+        return
+    if cmd == "show-options":  # (#57) a user option nobody set: like real tmux, rc 1 and a message
+        fail("invalid option: " + (args[-1] if args else ""), 1)
     jlog("calls.jsonl", {"unsupported": cmd, "argv": argv})
     fail(f"unsupported tmux command in the test stand-in: {cmd}", 2)
 
