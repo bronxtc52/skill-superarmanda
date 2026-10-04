@@ -161,6 +161,12 @@ def load_chain(path, create=True):
     if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 1000:
         raise SystemExit(f"chain.json: max_runs must be a whole number 1..1000 "
                          f"(superarmanda runs per wave), got {v!r}")
+    cfg.setdefault("idle_nudge_minutes", IDLE_NUDGE_DEFAULT)
+    v = cfg["idle_nudge_minutes"]
+    if isinstance(v, bool) or not isinstance(v, (int, float)) \
+            or (isinstance(v, float) and not math.isfinite(v)) or not 0 <= v <= 1440:
+        raise SystemExit(f"chain.json: idle_nudge_minutes must be a number 0..1440 (minutes of silence "
+                         f"before the nudge, 0 = no nudge), got {v!r}")
     tg = cfg.get("telegram")
     if tg and not isinstance(tg, dict):
         raise SystemExit("chain.json: telegram must be an object")
@@ -809,6 +815,155 @@ def transcript_activity(w):
         except OSError:
             continue
     return out
+
+
+# ---------- process facts: what still runs behind a wave window (#68) ----------
+#
+# The facts come from `ps` (a full table, parsed here), never from `pgrep -f`: a pattern given to
+# pgrep -f also matches the command line of the waiting loop that carries it (the wait never ends).
+# Anything that cannot be read or parsed is ProcFactsError: callers treat it as «unknown» and do
+# not act on it.
+
+PS_ARGV = ("ps", "-ww", "-A", "-o", "pid=,ppid=,etime=,args=")
+PS_TIMEOUT = 10  # seconds
+SHELL_NAMES = ("bash", "sh", "zsh", "dash", "fish")  # what Claude Code's Bash tool starts per command
+LOOSE_SHELL_MINUTES = 30  # a shell this old whose only descendants are `sleep` waits for nothing
+CLEAR_SLACK = 3  # seconds: a shell started this close before /clear was still the old session's
+
+
+class ProcFactsError(Exception):
+    """The process tree of a wave window could not be read (the reason is the message)."""
+
+
+def _etime_seconds(text):
+    """POSIX etime `[[dd-]hh:]mm:ss` -> seconds."""
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", text)
+    if not m:
+        raise ValueError(text)
+    d, h, mi, s = (int(x or 0) for x in m.groups())
+    return ((d * 24 + h) * 60 + mi) * 60 + s
+
+
+def process_table():
+    """{pid: {"ppid", "age" (seconds), "args", "name" (basename of the first word of args)}} of every
+    process of the machine, from one `ps`. Any failure is ProcFactsError."""
+    try:
+        r = sh(*PS_ARGV, check=False, timeout=PS_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        raise ProcFactsError(f"ps: timeout after {PS_TIMEOUT} s") from e
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ProcFactsError(f"ps: {type(e).__name__}: {e}"[:150]) from e
+    if r.returncode != 0:
+        raise ProcFactsError(f"ps: exit {r.returncode}: {(r.stderr or '').strip()[:100]}")
+    table = {}
+    for line in (r.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(None, 3)
+        try:
+            if len(parts) < 4:
+                raise ValueError(line)
+            pid, ppid, age = int(parts[0]), int(parts[1]), _etime_seconds(parts[2])
+        except ValueError as e:
+            raise ProcFactsError(f"ps: unparsable line {line[:60]!r}") from e
+        first = parts[3].split(None, 1)[0]
+        table[pid] = {"pid": pid, "ppid": ppid, "age": age, "args": parts[3],
+                      "name": first.rsplit("/", 1)[-1]}
+    if not table:
+        raise ProcFactsError("ps: empty table")
+    return table
+
+
+def claude_pid(w):
+    """PID of the process in the wave window's pane (Claude Code itself), by tmux."""
+    try:
+        r = tmux("display-message", "-p", "-t", pane_target(w["tmux"]), "#{pane_pid}", check=False)
+    except (OSError, subprocess.SubprocessError, KeyError) as e:
+        raise ProcFactsError(f"tmux display-message: {type(e).__name__}") from e
+    out = (r.stdout or "").strip()
+    if r.returncode != 0 or not out.isdigit():
+        raise ProcFactsError(f"tmux display-message: no pane pid ({out[:30] or 'rc ' + str(r.returncode)})")
+    return int(out)
+
+
+def wave_children(cfg, w):
+    """The direct children of the wave's Claude, each as its table row plus "tree": every descendant
+    row (children first-level excluded). ProcFactsError when the pid or the table cannot be had."""
+    pid = claude_pid(w)
+    table = process_table()
+    if pid not in table:
+        raise ProcFactsError(f"pane pid {pid} is not in the process table")
+    kids = {}
+    for row in table.values():
+        kids.setdefault(row["ppid"], []).append(row)
+    out = []
+    for child in sorted(kids.get(pid, []), key=lambda r: r["pid"]):
+        tree, todo, seen = [], list(kids.get(child["pid"], [])), {child["pid"]}
+        while todo:
+            row = todo.pop()
+            if row["pid"] in seen:
+                continue
+            seen.add(row["pid"])
+            tree.append(row)
+            todo.extend(kids.get(row["pid"], []))
+        out.append({**child, "tree": sorted(tree, key=lambda r: r["pid"])})
+    return out
+
+
+_EVAL_BODY = re.compile(r"eval '(.*)'\s*<\s*/dev/null")
+
+
+def _short_command(args, limit=80):
+    """What a background shell runs, for a one-line event: the part inside `eval '…'` of Claude
+    Code's wrapper when there is one, else the whole command line; masked and shortened."""
+    m = _EVAL_BODY.search(args)
+    return redact(m.group(1) if m else args, limit=limit)
+
+
+def _age_text(secs):
+    return f"{secs} с" if secs < 120 else f"{secs // 60} мин" if secs < 7200 else f"{secs // 3600} ч"
+
+
+def bg_tails(children, w, now):
+    """The wave's background shells that nobody waits for: [{"pid","why","age","args"}…]. A shell is a
+    tail when it started before the last /clear (`cleared_at`, with a small margin), or when it is older
+    than LOOSE_SHELL_MINUTES and everything under it is `sleep` (or nothing)."""
+    cleared = w.get("cleared_at")
+    cleared = cleared if num(cleared) is not None else None
+    tails = []
+    for c in children:
+        if c["name"] not in SHELL_NAMES:
+            continue
+        why = None
+        if cleared is not None and now - c["age"] < cleared - CLEAR_SLACK:
+            why = "запущен до /clear"
+        elif c["age"] > LOOSE_SHELL_MINUTES * 60 and all(d["name"] == "sleep" for d in c["tree"]):
+            why = f"{c['age'] // 60} мин без работы, только sleep"
+        if why:
+            tails.append({"pid": c["pid"], "why": why, "age": c["age"], "args": c["args"]})
+    return tails
+
+
+def _procs_unreadable(cfg, w, wave, err):
+    """One event per episode of an unreadable process tree (shared by the tails watch and the nudge)."""
+    if once_per(w, "procfacts", str(err)[:150]):
+        event(cfg, f"{wave}: дерево процессов недоступно: {err}")
+
+
+def _watch_bg_tails(cfg, st, wave, w, children, now):
+    """#68 item 2. One event per episode (the set of tail pids); no killing, no notice: the event and
+    the dashboard mark (`bg_tails`) only. An empty set ends the episode."""
+    tails = bg_tails(children, w, now)
+    if not tails:
+        w.get("notified", {}).pop("bg_tails", None)
+        w.pop("bg_tails", None)
+        return
+    w["bg_tails"] = [{"pid": t["pid"], "why": t["why"], "age": t["age"]} for t in tails]
+    key = ",".join(str(t["pid"]) for t in sorted(tails, key=lambda t: t["pid"]))
+    if once_per(w, "bg_tails", key):
+        items = "; ".join(f"pid {t['pid']} ({t['why']}, {_age_text(t['age'])}): {_short_command(t['args'])}"
+                          for t in tails)
+        event(cfg, f"{wave}: фоновые хвосты в окне волны: {items}")
 
 
 def session_marker(cfg, wave):
@@ -3678,6 +3833,92 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
     return True
 
 
+IDLE_NUDGE_WHAT = "idle nudge"
+IDLE_NUDGE_DEFAULT = 20  # minutes of silence (chain.json idle_nudge_minutes); 0 switches the nudge off
+
+
+def idle_nudge_text(minutes):
+    return (f"[wab] Толчок: окно молчит {minutes:g}+ мин при status=RUNNING, живых фоновых задач и агентов "
+            f"у сессии нет. Если ждала фоновую задачу или агента — они завершились: прочитай результат и "
+            f"продолжай. Если ждёшь владельца — запиши BLOCKED в status.")
+
+
+def _nudge_precheck(cfg, wave, w):
+    """What `_deliver` re-reads under the window's input lock, right before typing (or pressing Enter):
+    the status file still says RUNNING, the screen shows no dialog and (for a fresh text) an empty input,
+    and nothing runs behind the window. The tree unreadable: CollectError, nothing is sent."""
+    name, wdir = w["tmux"], wave_dir(cfg, wave)
+
+    def fresh():
+        if read(wdir / "status", on_error=None) != "RUNNING":
+            return False
+        txt = pane_text(name)
+        if any(m in txt for m in PERMISSION_MARKERS) or exit_dialog(txt) is not None:
+            return False
+        if w.get("pending_enter") != IDLE_NUDGE_WHAT and input_empty_reason(pane_ansi(name)) is not None:
+            return False  # the retry of a typed nudge has its own text in the input: only a fresh one is checked
+        try:
+            return not wave_children(cfg, w)
+        except ProcFactsError as e:
+            raise gate.CollectError(f"process tree: {e}") from e
+    return fresh
+
+
+def _idle_nudge_tick(cfg, st, wave, w, status, now, screen, children):
+    """#68 comment 1. A RUNNING wave whose screen and journals (main session and every agent) have been
+    silent for `idle_nudge_minutes`, with no child process under its Claude, gets ONE push per idle
+    episode (the screen digest). Everything unknown (tree, screen) means no push. The text goes through
+    `_deliver` like every other message into the window; a typed text whose Enter failed is retried
+    Enter-only, and is cleared when the wave leaves RUNNING (see _tick)."""
+    minutes = cfg.get("idle_nudge_minutes", IDLE_NUDGE_DEFAULT)
+    digest = screen["digest"]
+    retry = w.get("pending_enter") == IDLE_NUDGE_WHAT
+    if not retry:
+        if not minutes or status != "RUNNING" or w.get("pending_enter") or w.get("pending_clear"):
+            return
+        if w.get("notified", {}).get("nudge") == digest:
+            return  # this idle episode was nudged
+        latest = max(transcript_activity(w).values(), default=0)  # read here: a write after the tick began
+        if now - max(w.get("pane_changed") or now, w.get("activity_at") or 0, latest) < minutes * 60:
+            return
+        txt = screen["txt"]
+        if any(m in txt for m in PERMISSION_MARKERS) or exit_dialog(txt) is not None:
+            return
+        if input_empty_reason(pane_ansi(w["tmux"])) is not None:
+            return
+        if children is None or children:
+            return  # the tree is unknown, or something runs behind the window
+    elif not minutes:
+        _abandon_input(cfg, st, wave, w, "the idle nudge is switched off")
+        save_state(cfg, st)
+        return
+    sent = _deliver(cfg, st, wave, IDLE_NUDGE_WHAT, send_text, idle_nudge_text(minutes or IDLE_NUDGE_DEFAULT),
+                    precheck=_nudge_precheck(cfg, wave, w))
+    if sent:
+        w.setdefault("notified", {})["nudge"] = digest
+        save_state(cfg, st)
+        event(cfg, f"{wave}: idle nudge sent ({minutes:g} min, no live background work)")
+    elif sent is None:
+        save_state(cfg, st)  # stale under the lock: nothing sent, the next tick looks again
+
+
+def _bg_tick(cfg, st, wave, w, status, now, screen, awaiting):
+    """The background-work watch of a running wave: the tails of an old session and the idle nudge,
+    both on one reading of the process tree."""
+    if w.get("phase") != "running" or awaiting or not w.get("sessions"):
+        return
+    try:
+        children = wave_children(cfg, w)
+    except ProcFactsError as e:
+        children = None
+        _procs_unreadable(cfg, w, wave, e)
+    else:
+        w.get("notified", {}).pop("procfacts", None)
+        _watch_bg_tails(cfg, st, wave, w, children, now)
+    save_state(cfg, st)
+    _idle_nudge_tick(cfg, st, wave, w, status, now, screen, children)
+
+
 def _alarm_tick(cfg, st, wave, w, now):
     """A RUNNING wave with an open PR whose checks are all completed and on which Codex has finished
     gets ONE message per head with the results (so it need not poll them itself). The intent
@@ -4289,6 +4530,10 @@ def _tick(cfg, st):
             _abandon_input(cfg, st, wave, w, "the wave left RUNNING")
         save_state(cfg, st)
 
+    if w.get("pending_enter") == IDLE_NUDGE_WHAT and (status != "RUNNING" or w.get("phase") != "running"):
+        _abandon_input(cfg, st, wave, w, "the wave left RUNNING")  # an idle nudge is about a silent RUNNING wave
+        save_state(cfg, st)
+
     if w.get("pending_enter") == "policy answer" and w.get("policy_pending") != status:
         # the wave left that BLOCKED line: the half-sent answer is outdated. It may already have been
         # submitted (watch died before its final save), so it is charged to the cap: never one free
@@ -4325,6 +4570,7 @@ def _tick(cfg, st):
         if not _deliver(cfg, st, wave, "/clear", send_command, "/clear"):
             return True  # phase `clearing` is on disk: retried next tick
         w["phase"] = "updating"  # from here the resume message is never resent blindly
+        w["cleared_at"] = time.time()  # background shells older than this are the old session's (#68)
         w["await_session"] = True  # the next session is found by its marker, not by guesswork
         save_state(cfg, st)
         time.sleep(6)
@@ -4406,6 +4652,7 @@ def _tick(cfg, st):
             save_state(cfg, st)
             event(cfg, f"{wave}: pane idle {cfg['idle_minutes']}+ min, status={status}")
             flush_notices(cfg, st, w)
+    _bg_tick(cfg, st, wave, w, status, now, screen, awaiting)
     if w.get("phase") == "running" and status == "RUNNING" and cfg.get("repo"):
         _alarm_tick(cfg, st, wave, w, now)  # one message per head when checks and Codex are done
     save_state(cfg, st)
@@ -4543,7 +4790,7 @@ def _state_or_event(cfg):
 
 
 TUNABLE = ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds", "telegram",
-           "titles", "model", "plan_sha256", "max_auto_answers", "max_runs")
+           "titles", "model", "plan_sha256", "max_auto_answers", "max_runs", "idle_nudge_minutes")
 
 
 def _identity(cfg):

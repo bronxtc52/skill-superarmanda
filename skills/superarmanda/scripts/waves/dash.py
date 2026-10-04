@@ -238,11 +238,17 @@ def pipeline(cfg, st):
 FROZEN_MARK = "⚠ не меряется"  # the bound journal stands still while another one of the wave grows (#44)
 
 
+BG_TAILS_MARK = "⚠ хвосты"  # background shells left from before /clear or idle for long (#68)
+
+
 def ctx_cell(w, limit, width):
     """The context bar, with the frozen-context mark when the dispatcher found the session unbound."""
     cell = bar(w.get("tokens", 0), limit, width)
     if w.get("ctx_frozen"):
         cell.append(" " + FROZEN_MARK, style="bold yellow")
+    tails = w.get("bg_tails")
+    if isinstance(tails, list) and tails:  # shells nobody waits for: the dispatcher saw them (#68)
+        cell.append(f" {BG_TAILS_MARK}: {len(tails)}", style="bold yellow")
     return cell
 
 
