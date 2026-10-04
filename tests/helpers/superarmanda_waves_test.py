@@ -14115,6 +14115,43 @@ class DashEvents(unittest.TestCase):
         self.assertIn("ctx=5k", details)
         self.assertNotIn("ctx=0k", details)
 
+    def test_a_secret_cut_by_the_length_limit_does_not_leak_a_prefix(self):
+        secrets = ["ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+                   "sk-ant-api03-" + "Zy9Xw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe9Dc8Ba7",
+                   "password=hunter2hunter2hunter2xyz"]
+
+        def leaks(secret, *texts):
+            out = " ".join(t or "" for t in texts)
+            value = secret.split("=", 1)[-1] if secret.startswith("password=") else secret
+            return [value[i:i + 9] for i in range(len(value) - 8) if value[i:i + 9] in out]
+
+        for secret in secrets:
+            for start in range(100, 140, 5):  # the secret crosses the 140 border of a raw line
+                msg = "W9: " + "x" * (start - 4) + " " + secret + " tail"
+                phrase, details, _, known = self.dash.humanize_event(msg)
+                self.assertEqual(leaks(secret, phrase, details), [], (secret, start, phrase))
+            for start in range(100, 200, 7):  # ... and the 160 border of the details / the BLOCKED question
+                for msg in (f"W1: BLOCKED: [class=question rec=fix red=no] {'q' * start} {secret} tail",
+                            f"W1: say: {'q' * start} {secret} tail",
+                            f"W1: merge gate failed: {'q' * start} {secret} tail"):
+                    phrase, details, _, _ = self.dash.humanize_event(msg)
+                    self.assertEqual(leaks(secret, phrase, details), [], (secret, start, msg[:30], details))
+
+    def test_a_long_run_of_pulses_does_not_push_the_event_before_it_out(self):
+        from rich.console import Console
+        run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        lines = ["2026-10-04 09:59:00Z W1: launched in tmux wf-w1, cwd /tmp/x"]
+        for i in range(1000):
+            sec = i % 60
+            lines.append(self._pulse(f"10:{i // 60 % 60:02d}:{sec:02d}Z", 100 + i))
+        (run_dir / "events.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        buf = io.StringIO()
+        Console(file=buf, width=140, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}, n=12))
+        out = buf.getvalue()
+        self.assertIn("запущен", out)
+        self.assertIn("без изменений с 10:00 (×1000)", out)
+
     def test_events_panel_folds_before_it_cuts_the_tail(self):
         from rich.console import Console
         run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))

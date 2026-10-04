@@ -582,6 +582,9 @@ def humanize_event(msg):
     for a type nobody described: the phrase is then the raw line cut to ~140 characters. Phrase and
     details are masked with wab.redact; the raw line is not changed in events.log."""
     msg = _CONTROL.sub("·", msg).strip()  # a visible sign instead of a control character
+    # Masking comes FIRST, over the WHOLE line: every cut below (phrases, details, the raw line) then
+    # works on already masked text, so a secret cannot be split by a limit into a piece redact() misses.
+    msg = wab.redact(msg, limit=10 ** 7, owner_paths=False)
     result = None
     m = _PULSE.fullmatch(msg)
     if m:
@@ -611,13 +614,14 @@ def fold_events(lines):
     """Raw events.log lines -> [(time `HH:MM:SS`, phrase, details, colour)]. Consecutive pulses that keep
     the wave, phase, status and restarts fold into one «без изменений с HH:MM (×N)» (ctx may grow); any
     other event, or a changed pulse, ends the series. A line without a time is shown as it is."""
-    items, series = [], None  # series: [key, first_hhmm, count, last_ts, humanized]
+    items, series = [], None  # series: [key, first_hhmm, count, last_ts, last message]
 
     def flush():
         nonlocal series
         if series is None:
             return
-        key, first, count, ts, (phrase, details, colour, _) = series
+        key, first, count, ts, last = series
+        phrase, details, colour, _ = humanize_event(last)
         if count > 1:
             phrase = f"{phrase} · без изменений с {first} (×{count})"
         items.append((ts, phrase, details, colour))
@@ -633,10 +637,10 @@ def fold_events(lines):
             if series is not None and series[0] == key:
                 series[2] += 1
                 series[3] = ts
-                series[4] = humanize_event(msg)  # the state shown is the LAST pulse's, the time is the first's
+                series[4] = msg  # the state shown is the LAST pulse's, the time is the first's
                 continue
             flush()
-            series = [key, ts[:5], 1, ts, humanize_event(msg)]
+            series = [key, ts[:5], 1, ts, msg]
             continue
         flush()
         phrase, details, colour, _ = humanize_event(msg)
@@ -645,11 +649,35 @@ def fold_events(lines):
     return items
 
 
-def events_panel(cfg, n=12, tail=400):
-    p = cfg["run_dir"] / "events.log"
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()[-tail:] if p.exists() else []
+EVENTS_READ_LIMIT = 4 * 1024 * 1024  # bytes of events.log read from the end at most
+
+
+def tail_items(path, n, limit=EVENTS_READ_LIMIT):
+    """The last `n` folded items of events.log. The file is read from the END in growing blocks until the
+    fold gives n+1 items (so the oldest one shown is a whole series, however many pulses it holds), the
+    start of the file, or `limit` bytes: then what there is is shown. Never reads the whole of a huge file."""
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            block = 64 * 1024
+            while True:
+                want = min(block, limit, size)
+                f.seek(size - want)
+                raw = f.read(want).decode("utf-8", errors="replace")
+                lines = raw.splitlines()
+                if want < size:
+                    lines = lines[1:]  # the first line of a block is cut: drop it
+                items = fold_events([l for l in lines if l.strip()])
+                if len(items) > n or want >= size or want >= limit:
+                    return items[-n:]
+                block *= 4
+    except OSError:
+        return []
+
+
+def events_panel(cfg, n=12):
     t = Text()
-    for ts, phrase, details, colour in fold_events([l for l in lines if l.strip()])[-n:]:
+    for ts, phrase, details, colour in tail_items(cfg["run_dir"] / "events.log", n):
         t.append((ts + " ") if ts else "", style="grey50")
         t.append(phrase + "\n", style=colour)
         if details:
