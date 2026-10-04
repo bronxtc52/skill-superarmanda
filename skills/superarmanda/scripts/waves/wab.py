@@ -4887,16 +4887,17 @@ def tmux_opt(opt, session=None, pane=None):
 
 
 def _list_panes(session=None):
-    """[(pane id, session name)] of one session, or of the whole server; [] when tmux fails."""
+    """[(pane id, session name)] of one session, or of the whole server; None when tmux fails
+    (told apart from an empty, successful listing)."""
     try:
         if session:
             r = tmux("list-panes", "-s", "-t", pane_target(session), "-F", "#{pane_id}\t#{session_name}", check=False)
         else:
             r = tmux("list-panes", "-a", "-F", "#{pane_id}\t#{session_name}", check=False)
     except (OSError, subprocess.SubprocessError):
-        return []
+        return None
     if r.returncode != 0:
-        return []
+        return None
     return [tuple(l.split("\t", 1)) for l in r.stdout.splitlines() if "\t" in l]
 
 
@@ -4939,22 +4940,29 @@ def close_chain_sessions(cfg, st):
                 event(cfg, f"{name}: not ours (@wab_run={mark}, this run {tag}); left alone")
                 continue
             panes = _list_panes(name)
-            ours = [pane for pane, _ in panes if tmux_opt("@wab_run", pane=pane) == tag]
-            if len(ours) == len(panes) and tmux_opt("@wab_run", session=name) == tag:
-                tmux("kill-session", "-t", session_target(name), check=False)
-                if not tmux_alive(name):
-                    res["sessions"].append(name)
-                    gone.update(pane for pane, _ in panes)
+            if panes is None:
+                event(cfg, f"{name}: panes could not be listed; nothing closed in this session")
                 continue
-            for pane in ours:
+            ours = [pane for pane, _ in panes if tmux_opt("@wab_run", pane=pane) == tag]
+            if not ours:
+                warn(f"{name}: marked as ours but its panes have no @wab_run mark, not closed; "
+                     f"close it yourself: tmux kill-session -t {name}")
+                continue
+            closed = []
+            for pane in ours:  # never kill-session: tmux ends the session itself with its last pane
                 if tmux_opt("@wab_run", pane=pane) == tag:
                     tmux("kill-pane", "-t", pane, check=False)
-                    if pane not in {q for q, _ in _list_panes(name)}:
-                        res["panes"].append(pane)
-                        gone.add(pane)
-            event(cfg, f"{name}: has panes of other runs; only the panes of {tag} closed, the session stays")
+                    closed.append(pane)
+            if not tmux_alive(name):
+                res["sessions"].append(name)
+                gone.update(pane for pane, _ in panes)
+                continue
+            res["panes"].extend(closed)
+            gone.update(closed)
+            if closed and len(closed) < len(panes):
+                event(cfg, f"{name}: session stays: panes of other runs")
         chain_file = str(pathlib.Path(cfg.get("chain_file") or "").resolve()) if cfg.get("chain_file") else None
-        for pane, sess in _list_panes():
+        for pane, sess in _list_panes() or []:
             if pane in gone:
                 continue
             opened = tmux_opt("@wab_open", pane=pane)
@@ -4966,7 +4974,7 @@ def close_chain_sessions(cfg, st):
                      f"not closed; close it yourself: tmux kill-pane -t {pane}")
             elif mark == tag:
                 tmux("kill-pane", "-t", pane, check=False)
-                if pane not in {q for q, _ in _list_panes()}:
+                if pane not in {q for q, _ in _list_panes() or []}:
                     res["panes"].append(pane)
         if res["sessions"] or res["panes"]:
             event(cfg, f"chain sessions closed: sessions {res['sessions']}, panes {res['panes']}")
@@ -5025,7 +5033,7 @@ def stale_chains(cfg):
             if tag:
                 marked.add((name, tag))
                 add(tag, tmux_opt("@wab_run_dir", session=name), name)
-        for p, sess in _list_panes():
+        for p, sess in _list_panes() or []:
             tag = tmux_opt("@wab_run", pane=p)
             if not tag or (sess, tag) in marked:
                 continue

@@ -13564,6 +13564,42 @@ class ChainCleanup(Base):
         self.assertEqual(self.alive_names(), {"wv-w1"})
         self.assertEqual(self.pane_ids(), {foreign})
 
+    # --- round 1: never kill-session; a failed pane listing closes nothing
+    def test_a_failed_pane_listing_closes_nothing(self):
+        cfg, path = self.cfg()
+        self.state_two_waves(cfg)
+        self.finish(cfg)
+        self.session("wv-w1", f"{CHAIN}/{RUN_ID}", cfg["run_dir"])
+        self.assertEqual(self.tm("new-window", "-t", "=wv-w1:", "sleep 600").returncode, 0)
+        foreign = self.tm("display-message", "-p", "-t", "=wv-w1:", "#{pane_id}").stdout.strip()
+        self.tm("set-option", "-p", "-t", foreign, "@wab_run", "other/1")
+        before = self.pane_ids()
+        real, calls = self.w.tmux, []
+
+        def flaky(*args, **kw):
+            calls.append(args)
+            if args and args[0] == "list-panes":
+                return subprocess.CompletedProcess(args, 1, "", "server busy")
+            return real(*args, **kw)
+        self.w.tmux = flaky
+        res = self.w.cleanup_cmd(cfg)
+        self.assertEqual((res["sessions"], res["panes"]), ([], []))
+        self.assertFalse([c for c in calls if c[0] in ("kill-session", "kill-pane")], calls)
+        self.assertEqual(self.alive_names(), {"wv-w1"})
+        self.assertEqual(self.pane_ids(), before)
+
+    def test_a_marked_session_whose_panes_have_no_mark_only_warns(self):
+        cfg, path = self.cfg()
+        self.state_two_waves(cfg)
+        self.finish(cfg)
+        self.session("wv-w1", None)
+        self.tm("set-option", "-t", "=wv-w1:", "@wab_run", f"{CHAIN}/{RUN_ID}")  # session level only
+        res = self.w.cleanup_cmd(cfg)
+        self.assertEqual((res["sessions"], res["panes"]), ([], []))
+        self.assertEqual(len(res["warnings"]), 1)
+        self.assertIn("no @wab_run mark", res["warnings"][0])
+        self.assertEqual(self.alive_names(), {"wv-w1"})
+
     # --- 6. launch of the first wave warns about a FINISHED foreign chain only
     def test_stale_chains_lists_finished_chains_without_a_dispatcher_only(self):
         cfg, path = self.cfg()
