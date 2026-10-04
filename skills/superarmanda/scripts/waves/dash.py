@@ -235,6 +235,17 @@ def pipeline(cfg, st):
     return Group(t, sub)
 
 
+FROZEN_MARK = "⚠ не меряется"  # the bound journal stands still while another one of the wave grows (#44)
+
+
+def ctx_cell(w, limit, width):
+    """The context bar, with the frozen-context mark when the dispatcher found the session unbound."""
+    cell = bar(w.get("tokens", 0), limit, width)
+    if w.get("ctx_frozen"):
+        cell.append(" " + FROZEN_MARK, style="bold yellow")
+    return cell
+
+
 def waves_table(cfg, st):
     tb = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold cyan")
     for col, j in (("Волна", "left"), ("Статус", "left"), ("PR", "right"), ("Время", "right"), ("Контекст", "left"),
@@ -251,7 +262,7 @@ def waves_table(cfg, st):
         s = wave_stats(w)
         tb.add_row(
             Text(wave, style="bold"), Text(f"{icon} {label}", style=colour),
-            "" if wave_pr(w) is None else f"#{wave_pr(w)}", fmt_dur(wave_duration(w, now)), bar(w.get("tokens", 0), cfg["ctx_limit"], 16),
+            "" if wave_pr(w) is None else f"#{wave_pr(w)}", fmt_dur(wave_duration(w, now)), ctx_cell(w, cfg["ctx_limit"], 16),
             ktok(wave_peak(w)), str(wave_restarts(w)), str(s["turns"]), str(s["tools"]),
             str(s["agents"]), ktok(s["out"]), fmt_commits(wave_commits(w)))
     return tb
@@ -407,7 +418,7 @@ def current_panel(cfg, st):
     else:
         head.append(wab.attach_cmd(w["tmux"]), style="bold white on grey23")
         head.append(f"   статус: {status}", style="yellow" if key == "BLOCKED" else "green")
-    ctx = Group(Text("Контекст ", style="bold").append(bar(w.get("tokens", 0), cfg["ctx_limit"], 40)),
+    ctx = Group(Text("Контекст ", style="bold").append_text(ctx_cell(w, cfg["ctx_limit"], 40)),
                 Text("История  ", style="bold").append(spark(w.get("ctx_hist", []), cfg["ctx_limit"])))
     lines = [l for l in wab.pane_text(w["tmux"]).splitlines() if l.strip()][-14:]
     screen = Text("\n".join(l[:150] for l in lines), style="grey78")
