@@ -13173,6 +13173,56 @@ class IdleNudge(BgBase):
         self.assertEqual(self.nudges(), [])  # nothing typed again
         self.assertTrue(submit.called)
 
+    def test_a_journal_written_while_waiting_for_the_lock_means_no_nudge(self):
+        real_enter = wab._InputLock.__enter__
+
+        def enter(lock):
+            (self.agents / "late.jsonl").write_text(asst(inp=5) + "\n", encoding="utf-8")  # the agent wrote
+            return real_enter(lock)
+
+        with mock.patch.object(wab._InputLock, "__enter__", enter):
+            self.tick()
+        self.assertEqual(self.nudges(), [])
+        self.assertEqual(_bg_events(self.cfg, "idle nudge sent"), [])
+
+    def test_a_screen_changed_while_waiting_for_the_lock_means_no_nudge(self):
+        real_enter = wab._InputLock.__enter__
+
+        def enter(lock):
+            self.pane = self.pane + "\nthe wave printed something\n"  # empty input, but a new screen
+            return real_enter(lock)
+
+        with mock.patch.object(wab._InputLock, "__enter__", enter):
+            self.tick()
+        self.assertEqual(self.nudges(), [])
+
+    def test_an_undelivered_nudge_is_cleared_before_another_delivery(self):
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = live("30-typed.ansi")  # the nudge text is in the input
+        st = wab.load_state(self.cfg)
+        self.assertTrue(wab._deliver(self.cfg, st, "W1", "alarm", wab.send_text, "ALARM TEXT"))
+        kinds = [k for k, _, t in self.sent]
+        self.assertEqual(kinds, ["clear", "text"], self.sent)  # cleared first, then the alarm
+        self.assertNotIn("pending_clear", st["waves"]["W1"])
+        self.assertNotEqual(st["waves"]["W1"].get("pending_enter"), "idle nudge")
+
+    def test_nothing_is_typed_over_a_nudge_that_cannot_be_cleared(self):
+        self.clear_works = False
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = live("30-typed.ansi")
+        st = wab.load_state(self.cfg)
+        self.assertFalse(wab._deliver(self.cfg, st, "W1", "alarm", wab.send_text, "ALARM TEXT"))
+        self.assertEqual([t for k, _, t in self.sent if k == "text"], [])
+        self.assertTrue(st["waves"]["W1"].get("pending_clear"))  # held: the next delivery tries again
+
+    def test_a_nudge_itself_is_not_abandoned_by_its_own_retry(self):
+        self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+        self.ansi = live("30-typed.ansi")
+        with mock.patch.object(wab, "submit") as submit:
+            self.tick()
+        self.assertTrue(submit.called)
+        self.assertEqual(self.clear_keys, [])
+
     def test_no_enter_into_a_menu_or_dialog_or_a_blank_capture_on_retry(self):
         for label, pane, ansi in (("menu", live("30-menu.txt"), live("30-menu.ansi")),
                                   ("trust", live("30-trust.txt"), live("30-trust.ansi")),

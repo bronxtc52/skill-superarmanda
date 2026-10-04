@@ -2619,6 +2619,14 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None):
         event(cfg, f"{wave}: {what} postponed: {e}")
         return False
     try:
+        if w.get("pending_enter") == IDLE_NUDGE_WHAT and what != IDLE_NUDGE_WHAT:
+            # an undelivered idle nudge is the lowest priority: it is cleared out of the input (by the
+            # screen) before any other text is typed, never typed over
+            if not _abandon_input(cfg, st, wave, w, f"{what} takes over from an undelivered idle nudge",
+                                  locked=True):
+                if once_per(w, "input_postponed", f"nudge:{what}"):
+                    event(cfg, f"{wave}: {what} postponed: the undelivered idle nudge is not cleared yet")
+                return False
         if w.get("pending_clear") and not _settle_clear(cfg, st, wave, w, locked=True):
             # an earlier text may still sit in the input line: nothing is typed over it
             if once_per(w, "input_postponed", str(w["pending_clear"].get("what"))):
@@ -3843,10 +3851,11 @@ def idle_nudge_text(minutes):
             f"продолжай. Если ждёшь владельца — запиши BLOCKED в status.")
 
 
-def _nudge_precheck(cfg, wave, w):
+def _nudge_precheck(cfg, wave, w, digest, minutes):
     """What `_deliver` re-reads under the window's input lock, right before typing (or pressing Enter):
     the status file still says RUNNING, the screen shows no dialog and (for a fresh text) an empty input,
-    and nothing runs behind the window. The tree unreadable: CollectError, nothing is sent."""
+    nothing runs behind the window, and (fresh text only) the silence still holds: the screen is the one
+    the episode was decided on and no journal was written meanwhile (the wait for the lock is long). The tree unreadable: CollectError, nothing is sent."""
     name, wdir = w["tmux"], wave_dir(cfg, wave)
 
     def fresh():
@@ -3855,6 +3864,12 @@ def _nudge_precheck(cfg, wave, w):
         txt = pane_text(name)
         if any(m in txt for m in PERMISSION_MARKERS) or exit_dialog(txt) is not None:
             return False
+        if w.get("pending_enter") != IDLE_NUDGE_WHAT:
+            if pane_digest(txt) != digest:
+                return False
+            latest = max(transcript_activity(w).values(), default=0)
+            if time.time() - latest < minutes * 60:
+                return False
         why = input_empty_reason(pane_ansi(name))
         if why == NO_INPUT_BOX:
             return False  # no input box (a menu, a dialog, a blank capture): never an Enter, retry or not
@@ -3896,7 +3911,7 @@ def _idle_nudge_tick(cfg, st, wave, w, status, now, screen, children):
         save_state(cfg, st)
         return
     sent = _deliver(cfg, st, wave, IDLE_NUDGE_WHAT, send_text, idle_nudge_text(minutes or IDLE_NUDGE_DEFAULT),
-                    precheck=_nudge_precheck(cfg, wave, w))
+                    precheck=_nudge_precheck(cfg, wave, w, digest, minutes or IDLE_NUDGE_DEFAULT))
     if sent:
         w.setdefault("notified", {})["nudge"] = digest
         save_state(cfg, st)
