@@ -12325,6 +12325,16 @@ class W3Quote(Base):
         self.assertLessEqual(len(msg), wab.TG_MESSAGE_LIMIT)
         self.assertTrue(msg.startswith(cfg["chain"]))
 
+    def test_blocked_notice_masks_a_secret_that_contains_the_options_separator(self):  # Astra r2
+        # the split into question/options must not cut a secret away from its key before redact()
+        for value in ("variants:hunter2hunter2", "Варианты:hunter2hunter2", "x;Варианты:hunter2hunter2"):
+            with self.subTest(value=value):
+                status = f"BLOCKED: [class=question rec=A red=yes] password={value}"
+                _cfg, sent = self.blocked_text(status)
+                [msg] = [t for t in sent if "ждёт тебя" in t]
+                self.assertNotIn("hunter2hunter2", msg)
+                self.assertIn("рекомендация волны: A", msg)
+
     def test_blocked_notice_with_a_huge_question_still_fits_and_keeps_the_answer_path(self):
         cfg, sent = self.blocked_text(self.LABELLED.format(question="очень длинный вопрос " * 400))
         [msg] = [t for t in sent if "ждёт тебя" in t]

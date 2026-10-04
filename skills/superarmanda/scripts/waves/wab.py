@@ -4137,7 +4137,10 @@ def blocked_notice(cfg, wave, status, attach):
     label = parse_blocked_label(status)
     if label is None or label["class"] == "merge_gate":
         return plain
-    question, options = label["question"], ""
+    # mask the WHOLE question before it is split: a separator inside a secret's value
+    # (`password=variants:…`) would otherwise cut the value away from its key, and redact() would
+    # no longer see it as a secret. quote() below masks each part again.
+    question, options = redact(label["question"], limit=len(label["question"]) + 2, owner_paths=False), ""
     m = _OPTIONS.search(question)
     if m:
         question, options = question[:m.start()], question[m.end():]
