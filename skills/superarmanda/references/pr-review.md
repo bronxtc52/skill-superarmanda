@@ -37,7 +37,7 @@ actual CodeRabbit finding remains a finding.
 
 ### CodeRabbit: результат по факту ревью HEAD (1.0.2, #72)
 
-`check` кладёт в результат поле `coderabbit` = `{"status", "reason", "evidence_url"}`; оно есть всегда
+`check` кладёт в результат поле `coderabbit` = `{"status", "reason", "evidence_url"}`; оно есть всегда Если HEAD PR или evidence изменились между снимками, `coderabbit` тоже `pending` (как и `status` = `incomplete`).
 (при HEAD ≠ ожидаемому — `pending`). Основной `status` и список `findings` оно не меняет. Учитываются
 только элементы с login `coderabbitai[bot]` и типом `Bot`.
 

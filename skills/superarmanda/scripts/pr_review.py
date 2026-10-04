@@ -800,6 +800,10 @@ def check(args):
             fetch_issue_comments(owner, name, args.pr),
         )
 
+    def moved(reason):
+        # Результат CodeRabbit посчитан по первому снимку: данные сдвинулись, он недействителен.
+        return {"status": "pending", "reason": reason, "evidence_url": None}
+
     first = fetch_header(owner, name, args.pr)
     reviews, review_comments, issue_comments = snapshot()
     check_runs, checks = fetch_checks(owner, name, first["head"]["sha"])
@@ -821,11 +825,13 @@ def check(args):
         result["status"] = "incomplete"
         result["current_head"] = last["head"]["sha"]
         result["limitations"].append("PR HEAD changed while collecting evidence")
+        result["coderabbit"] = moved("PR HEAD changed while collecting evidence")
     elif second != (reviews, review_comments, issue_comments):
         result["status"] = "incomplete"
         result["limitations"].append(
             "review evidence changed while collecting evidence"
         )
+        result["coderabbit"] = moved("review evidence changed while collecting evidence")
     write(output, result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["status"] in ("pass", "findings", "incomplete") else 1

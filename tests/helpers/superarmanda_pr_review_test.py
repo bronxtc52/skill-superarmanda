@@ -1338,6 +1338,48 @@ class LivePr71Fixture(unittest.TestCase):
         self.assertNotIn("scope=ghh_", raw)
 
 
+class CodeRabbitResetOnMovingEvidence(unittest.TestCase):
+    """Смена HEAD или evidence между снимками сбрасывает и status, и coderabbit."""
+
+    LIVE_HEAD = LivePr71Fixture.LIVE_HEAD
+
+    def entries(self):
+        return json.loads((FIXTURES / "pr71-graphql.json").read_text("utf-8"))["entries"]
+
+    def run71(self, entries):
+        return run_check(
+            entries, head=self.LIVE_HEAD, repo="bronxtc52/skill-superarmanda", pr_no="71"
+        )
+
+    def assert_pending(self, result, text):
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn(text, result["limitations"])
+        cr = result["coderabbit"]
+        self.assertEqual(cr["status"], "pending")
+        self.assertTrue(isinstance(cr["reason"], str) and cr["reason"])
+        self.assertIsNone(cr["evidence_url"])
+        self.assertEqual(set(cr), {"status", "reason", "evidence_url"})
+
+    def test_head_change_between_snapshots_makes_coderabbit_pending(self):
+        entries = self.entries()
+        header = next(e for e in entries if e["name"] == "Header")
+        header["responses"][1]["data"]["repository"]["pullRequest"]["headRefOid"] = (
+            "f" * 40
+        )
+        proc, result, _ = self.run71(entries)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assert_pending(result, "PR HEAD changed while collecting evidence")
+
+    def test_evidence_change_between_snapshots_makes_coderabbit_pending(self):
+        entries = self.entries()
+        ic = next(e for e in entries if e["name"] == "IssueComments")
+        nodes = ic["responses"][1]["data"]["repository"]["pullRequest"]["comments"]["nodes"]
+        nodes[-1]["body"] = nodes[-1]["body"] + "\nedited between snapshots"
+        proc, result, _ = self.run71(entries)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assert_pending(result, "review evidence changed while collecting evidence")
+
+
 class GraphQLFailClosed(unittest.TestCase):
     def assert_refused(self, entries, expect_calls=True):
         proc, result, _ = run_check(entries)
