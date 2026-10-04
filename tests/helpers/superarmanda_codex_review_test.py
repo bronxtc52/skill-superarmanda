@@ -93,6 +93,7 @@ for line in sys.stdin:
   account={"type":"api" if mode=="auth" else "chatgpt","planType":"free" if mode=="free" else "pro"}
   response(i,account if mode=="bare_auth" else {"requiresOpenaiAuth":mode!="auth_not_required","account":account})
  elif m=="thread/start":
+  if mode=="limit_thread_start_error": out({"method":"error","params":{"error":{"codexErrorInfo":"usageLimitExceeded","message":"limit"},"willRetry":False,"threadId":"t","turnId":"u"}})
   if mode=="model": response(i,{"model":"other","modelProvider":"openai","thread":{"id":"t"}})
   else:
    if mode in ("thread_started_model","thread_started_provider","thread_started_wrong_id","correct_thread_started_identity"):
@@ -133,6 +134,9 @@ for line in sys.stdin:
    elif mode=="conflicting_start_provider": started.update({"model":"gpt-6-astra","modelProvider":"openai","model_provider":"other"})
    else: started.update({"model":"gpt-6-astra","modelProvider":"openai"})
    out({"method":"turn/started","params":started})
+  if mode in ("limit_early","limit_early_wrong_thread","limit_early_wrong_turn"):
+   # error приходит ДО ответа на turn/start
+   out({"method":"error","params":{"error":{"codexErrorInfo":"usageLimitExceeded","message":"limit"},"willRetry":False,"threadId":"other" if mode=="limit_early_wrong_thread" else "t","turnId":"other" if mode=="limit_early_wrong_turn" else "u"}})
   if mode=="early":
    out({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":{"type":"agentMessage","text":json.dumps({"ok":True})}}})
    out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
@@ -150,7 +154,9 @@ for line in sys.stdin:
    out({"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":100}}}})
    out({"method":"thread/status/changed","params":{"threadId":"t","status":{"type":"systemError"}}})
    if mode not in ("limit_turn_only","limit_silent"):
-    out({"method":"error","params":{"error":{"codexErrorInfo":info,"message":message,"additionalDetails":None},"willRetry":False,"threadId":tid,"turnId":"u"}})
+    err={"error":{"codexErrorInfo":info,"message":message,"additionalDetails":None},"willRetry":mode=="limit_retry","threadId":tid,"turnId":"u"}
+    if mode=="limit_no_ids": del err["threadId"], err["turnId"]
+    out({"method":"error","params":err})
    if mode not in ("limit_no_terminal","limit_silent"):
     out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"failed","error":{"codexErrorInfo":info,"message":message}}}})
   elif mode=="missing_ids":
@@ -433,6 +439,25 @@ class Contract(unittest.TestCase):
         self.assertEqual(
             self.failure("limit_wrong_thread"), "review CLI failed: protocol"
         )
+
+    def test_early_usage_limit_before_turn_start_reply_is_quota(self):
+        self.assertEqual(self.failure("limit_early"), "review CLI failed: quota")
+
+    def test_early_error_with_foreign_ids_is_protocol(self):
+        for mode in ("limit_early_wrong_thread", "limit_early_wrong_turn"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.failure(mode), "review CLI failed: protocol")
+
+    def test_error_during_thread_start_stays_protocol(self):
+        self.assertEqual(
+            self.failure("limit_thread_start_error"), "review CLI failed: protocol"
+        )
+
+    def test_error_without_ids_is_protocol(self):
+        self.assertEqual(self.failure("limit_no_ids"), "review CLI failed: protocol")
+
+    def test_retrying_usage_limit_error_is_still_terminal_quota(self):
+        self.assertEqual(self.failure("limit_retry"), "review CLI failed: quota")
 
     def test_system_error_without_terminal_event_keeps_timeout(self):
         self.assertEqual(

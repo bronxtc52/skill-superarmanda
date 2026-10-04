@@ -374,7 +374,13 @@ class _Server:
             _fail("protocol")
         return message
 
-    def request(self, method, params):
+    def request(self, method, params, defer_error=False):
+        """defer_error: notification `error` не отвергается, а откладывается.
+
+        Только для ответа на turn/start: ранний отказ (usageLimitExceeded) до
+        ответа проверит основной цикл через _terminal_error, когда известен turnId.
+        Для остальных запросов `error` по-прежнему protocol.
+        """
         ident = self.send(method, params)
         while True:
             message = self.receive()
@@ -386,6 +392,9 @@ class _Server:
                 if "error" in message or not isinstance(message.get("result"), dict):
                     _fail("protocol")
                 return message["result"]
+            if defer_error and message.get("method") == "error":
+                self.pending.append(message)
+                continue
             _reject_event(message)
             self.pending.append(message)
 
@@ -642,6 +651,7 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
                 "outputSchema": schema,
                 "input": [{"type": "text", "text": prompt, "text_elements": []}],
             },
+            defer_error=True,
         )
         turn_obj = turn.get("turn")
         _optional_identity(turn)
