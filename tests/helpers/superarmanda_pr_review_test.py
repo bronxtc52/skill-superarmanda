@@ -1155,15 +1155,43 @@ class GraphQLNormalization(unittest.TestCase):
         self.assertEqual(result["status"], "pass", result)
 
     def test_unresolvable_short_sha_is_not_pass(self):
-        for full in (None,):
+        # Успешный ответ: object null или не Commit (нет oid) -> None, не pass и не отказ.
+        for obj in (None, {}, {"__typename": "Tree"}):
             srv = Server().standard(issues=[g_issue(CLEAN)])
-            srv.resolve("aaaaaaaaaaaa", full)
+            srv.add(
+                "Resolve",
+                {"owner": "acme", "name": "widget", "ref": "aaaaaaaaaaaa"},
+                [{"data": {"repository": {"object": obj}}}],
+            )
             proc, result, _ = run_check(srv.entries)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertNotEqual(result["status"], "pass")
-        srv = Server().standard(issues=[g_issue(CLEAN)])  # no Resolve entry at all
+
+    def test_resolve_failure_is_a_refusal_not_findings(self):
+        # Нет записи Resolve: фейковый gh завершается rc 1 -> сбой gh.
+        srv = Server().standard(issues=[g_issue(CLEAN)])
         proc, result, _ = run_check(srv.entries)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotEqual(result["status"], "pass")
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertEqual(proc.stderr.strip(), "pr_review: gh api graphql failed")
+        self.assertNotIn("canary", proc.stderr)
+        self.assertIsNone(result)
+        # errors / нет repository в ответе Resolve.
+        for response in (
+            {"errors": [{"message": "private-diagnostic-canary"}]},
+            {"data": {"repository": None}},
+            {"data": None},
+        ):
+            srv = Server().standard(issues=[g_issue(CLEAN)])
+            srv.add(
+                "Resolve",
+                {"owner": "acme", "name": "widget", "ref": "aaaaaaaaaaaa"},
+                [response],
+            )
+            proc, result, _ = run_check(srv.entries)
+            self.assertEqual(proc.returncode, 2, proc.stdout)
+            self.assertEqual(proc.stderr.strip(), "pr_review: gh api graphql failed")
+            self.assertNotIn("canary", proc.stderr)
+            self.assertIsNone(result)
 
     def test_thread_comment_maps_commit_ids_and_review_id(self):
         thread = {
@@ -1347,6 +1375,10 @@ class GraphQLFailClosed(unittest.TestCase):
                     c = r["data"]["repository"]["pullRequest"]["reviews"]
                     c["pageInfo"] = {"hasNextPage": True, "endCursor": "Reviews-0"}
         self.assert_refused(srv.entries)
+        # Отказ сразу на втором повторе курсора, а не по MAX_PAGES.
+        _, _, calls = run_check(srv.entries)
+        reviews = [q for q in sent_queries(calls) if q.lstrip().startswith("query Reviews")]
+        self.assertLessEqual(len(reviews), 3, len(reviews))
 
     def test_missing_page_info_or_nodes_not_a_list(self):
         def no_info(r):

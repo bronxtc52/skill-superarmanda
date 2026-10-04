@@ -13,7 +13,8 @@
   `errors`, битая пагинация, повтор курсора или больше `MAX_PAGES` — rc 2 и одна фиксированная
   строка без сырой диагностики. Логин бота нормализуется (`[bot]`, тип `Bot`); короткий SHA
   резолвится через `object(expression:)`. В JSON добавлены информационные `check_runs` и `checks`
-  (на `status` не влияют).
+  (на `status` не влияют). Сбой GraphQL при резолве короткого SHA — тоже отказ rc 2, а не
+  `findings`; null/не-Commit по-прежнему «не резолвится» (не pass).
   ([#20](https://github.com/bronxtc52/skill-superarmanda/issues/20))
 
 ### Добавлено

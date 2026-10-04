@@ -586,14 +586,11 @@ def fetch_checks(owner, name, head):
 
 
 def resolve_ref(owner, name, ref):
-    """Полный SHA для сокращённого; любая неопределённость — None."""
-    try:
-        found = dig(
-            graphql(RESOLVE_QUERY, {"owner": owner, "name": name, "ref": ref}),
-            "repository",
-        ).get("object")
-    except RuntimeError:
-        return None
+    """Полный SHA для сокращённого; null/не-Commit — None. Сбой gh/GraphQL — RuntimeError."""
+    found = dig(
+        graphql(RESOLVE_QUERY, {"owner": owner, "name": name, "ref": ref}),
+        "repository",
+    ).get("object")
     value = found.get("oid") if isinstance(found, dict) else None
     return value if isinstance(value, str) and value else None
 

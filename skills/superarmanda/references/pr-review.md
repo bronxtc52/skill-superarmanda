@@ -45,7 +45,7 @@ Codex Review: Didn't find any major issues. :rocket:
 ```
 
 Its abbreviated SHA is resolved through GraphQL `repository.object(expression: SHORT_SHA)` (a
-Commit `oid`; an error, null or non-Commit means unresolved) and must
+Commit `oid`; null or non-Commit means unresolved, not pass; a gh/GraphQL failure or `errors` while resolving is a refusal, rc 2) and must
 equal the requested full SHA; prefix matching is not used. The same exact summary is accepted in
 a current `APPROVED` or `COMMENTED` Codex review body only after the review `commit_id` and
 resolved body SHA both match the requested full SHA, with no current attached inline comment.
