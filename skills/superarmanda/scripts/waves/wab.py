@@ -1916,7 +1916,7 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     # a working copy the chain already used (chain.json workdir, or the clone prepare gave the
     # first wave) still sits on the previous wave's branch: refresh it below; a fresh clone does not
     reused = bool(cfg.get("workdir")) or (bool(saved) and cwd == saved)
-    previous_window_closed(cfg, st, wave, restart, pushed)  # before the workdir is touched
+    previous_window_closed(cfg, st, wave, restart, pushed, force=by_dispatcher)  # before the workdir is touched
     if reused and cfg["waves"].index(wave) > 0 and not restart:
         refresh_workdir(cfg, wave, cwd)
     prev = st.get("current")
@@ -2383,6 +2383,19 @@ def resume(cfg, st):
 
 
 EXIT_WAIT = 30  # seconds the next launch waits for the previous wave's window after /exit
+# Claude Code answers /exit of a session with background tasks (shells, agents) with a menu:
+# «❯ 1. Exit and stop tasks / 2. Move to background and exit / 3. Stay». A finished wave owes
+# nothing to them: option 1, confirmed by Enter only while it is the highlighted one.
+EXIT_DIALOG = "Exit and stop tasks"
+
+
+def exit_dialog(text):
+    """None: no /exit menu on the screen; True: it is there with option 1 highlighted (Enter takes
+    it); False: it is there, but another option is highlighted (Enter would not exit)."""
+    tail = text.splitlines()[-15:]
+    if not any(EXIT_DIALOG in l for l in tail):
+        return None
+    return any(INPUT_MARK in l and EXIT_DIALOG in l for l in tail)
 
 
 def close_window(cfg, st, w):
@@ -2400,6 +2413,17 @@ def close_window(cfg, st, w):
         wave = next((k for k, r in (st.get("waves") or {}).items() if r is w), None) or name
         try:
             with _InputLock(cfg, wave):
+                menu = exit_dialog(pane_text(name))
+                if menu is not None:  # our /exit is being asked about the wave's background tasks
+                    if not menu:
+                        if once_per(w, "exit_blocked", "exit menu: option 1 not highlighted"):
+                            event(cfg, f"{wave}: /exit menu on screen, option 1 not highlighted; "
+                                       f"not confirmed, retried next tick")
+                        save_state(cfg, st)
+                        return False
+                    press_enter(name)
+                    event(cfg, f"{wave}: /exit menu confirmed: exit and stop the wave's background tasks")
+                    return True
                 if w.get("pending_enter"):
                     _abandon_input(cfg, st, wave, w, "the window is being closed", locked=True)
                 elif w.get("pending_clear"):
@@ -2452,14 +2476,19 @@ def wait_window_closed(cfg, st, w, push=True):
             return False
         if attempt == 0 and push:
             close_window(cfg, st, w)
+        elif attempt and exit_dialog(pane_text(name)):
+            close_window(cfg, st, w)  # the /exit menu came up after our /exit: confirm it
         time.sleep(1)
     return False
 
 
-def previous_window_closed(cfg, st, wave, restart, pushed=()):
+def previous_window_closed(cfg, st, wave, restart, pushed=(), force=False):
     """The wave before `wave` must not still run in its window when the shared workdir is switched
     under it: a pending /exit is pushed (unless it is in `pushed` already) and waited for
-    (EXIT_WAIT), else the launch is refused."""
+    (EXIT_WAIT), else the launch is refused. `force` (the dispatcher's own launch after a confirmed
+    DONE): a window of a `done` wave that outlived the wait is closed with kill-session instead of
+    stopping the chain for hours — its work is merged, only leftovers (a stuck menu, background
+    shells) keep it open."""
     idx = cfg["waves"].index(wave)
     if idx == 0 or restart:
         return
@@ -2469,6 +2498,13 @@ def previous_window_closed(cfg, st, wave, restart, pushed=()):
     name = before["tmux"]
     if wait_window_closed(cfg, st, before, push=name not in pushed):
         return  # the dropped flag is saved with the launch intent
+    if force and before.get("phase") == "done":
+        tmux("kill-session", "-t", session_target(name), check=False)
+        if not tmux_alive(name):
+            before.pop("pending_exit", None)
+            event(cfg, f"{wave}: previous wave session {name} did not obey /exit within {EXIT_WAIT} s; "
+                       f"closed with kill-session (the wave is done)")
+            return
     raise SystemExit(f"wab: wave {wave} refused: previous wave session {name} is still running; "
                      f"wait or close it ({attach_cmd(name)})")
 
