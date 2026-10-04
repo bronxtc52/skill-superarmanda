@@ -13173,6 +13173,21 @@ class IdleNudge(BgBase):
         self.assertEqual(self.nudges(), [])  # nothing typed again
         self.assertTrue(submit.called)
 
+    def test_no_enter_into_a_menu_or_dialog_or_a_blank_capture_on_retry(self):
+        for label, pane, ansi in (("menu", live("30-menu.txt"), live("30-menu.ansi")),
+                                  ("trust", live("30-trust.txt"), live("30-trust.ansi")),
+                                  ("blank capture", "", "")):
+            with self.subTest(label):
+                self.setUp()
+                self.patch_state(pending_enter="idle nudge", pending_text_head="[wab] Толчок: окно")
+                self.pane, self.ansi = pane, ansi
+                with mock.patch.object(wab, "submit") as submit:
+                    self.tick(2)
+                self.assertFalse(submit.called)
+                self.assertEqual(self.enters, [])
+                self.assertEqual(self.nudges(), [])
+                self.assertFalse([c for c in self.tmux_calls if "Enter" in c])
+
     def test_protocol_text(self):
         text = (WAVES / "PROTOCOL.md").read_text(encoding="utf-8")
         self.assertIn("TaskStop", text)

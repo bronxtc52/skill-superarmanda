@@ -3855,8 +3855,11 @@ def _nudge_precheck(cfg, wave, w):
         txt = pane_text(name)
         if any(m in txt for m in PERMISSION_MARKERS) or exit_dialog(txt) is not None:
             return False
-        if w.get("pending_enter") != IDLE_NUDGE_WHAT and input_empty_reason(pane_ansi(name)) is not None:
-            return False  # the retry of a typed nudge has its own text in the input: only a fresh one is checked
+        why = input_empty_reason(pane_ansi(name))
+        if why == NO_INPUT_BOX:
+            return False  # no input box (a menu, a dialog, a blank capture): never an Enter, retry or not
+        if why is not None and w.get("pending_enter") != IDLE_NUDGE_WHAT:
+            return False  # a fresh text needs an empty input; a retry has its own typed text in it
         try:
             return not wave_children(cfg, w)
         except ProcFactsError as e:
