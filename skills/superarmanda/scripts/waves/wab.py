@@ -828,7 +828,7 @@ def _first_user_text(path):
     """Text of the first main-thread user message in the first 256 KB of a transcript
     (a string, or the text blocks of a content list; tool_result blocks do not count).
     The scaffolding Claude Code writes on /clear (isMeta lines, the /clear echo and its
-    stdout) is skipped: after /clear the marker sits in the /update that follows it."""
+    stdout) is skipped: after /clear the marker sits in the resume command that follows it."""
     try:
         with open(path, "rb") as fh:
             head = fh.read(FIRST_MESSAGE_BYTES)
@@ -1448,8 +1448,8 @@ def _answered(w):
 #   not_ready           the phase left not_ready (a relaunch); + ack
 #   no_prompt           the phase left starting (the task was sent after all)
 #   sending             the wave wrote its own status (the task arrived), or window gone
-#   updating            the new session is bound by its marker (/update arrived), or window gone
-#   checkpoint_timeout  the phase left checkpoint (HANDOFF_READY taken, /clear + /update done)
+#   updating            the new session is bound by its marker (the resume message arrived), or window gone
+#   checkpoint_timeout  the phase left checkpoint (HANDOFF_READY taken, /clear + resume message done)
 #   tmux_failed         window gone   # + the next successful action (_act)
 #   dead                the phase left dead (the window is back); + ack on a relaunch
 #   blocked             the status is no longer BLOCKED, or window gone
@@ -2810,8 +2810,12 @@ def handoff_ready(cfg, w, wave, status):
     return True
 
 
+RESUME_WHAT = "/superarmanda --resume"  # step label for _deliver / pending_enter
+LEGACY_RESUME_WHATS = ("/update",)  # the label written by dispatchers before 0.15.0: recover_update still reads it
+
+
 def finish_update(cfg, st, wave):
-    """Last step of the /clear + /update transition: one restart counted. `status` belongs to
+    """Last step of the /clear + resume transition: one restart counted. `status` belongs to
     the wave and is not written; the stale HANDOFF_READY on disk is remembered by its mtime."""
     w = st["waves"][wave]
     w["restarts"] = w.get("restarts", 0) + 1
@@ -2822,25 +2826,34 @@ def finish_update(cfg, st, wave):
     save_state(cfg, st)
 
 
+def resume_message(cfg, wave, wdir):
+    """The first message of the new session after /clear: the skill's resume entry. The marker stays
+    in the text: the new session is bound by it (find_new_session). The position is not told here:
+    the session takes it from `state.py where` by the manifest named in handoff.md."""
+    return (f"/superarmanda --wave {wave} --resume {session_marker(cfg, wave)} Каталог волны: {wdir}. "
+            f"Позиция — state.py where по manifest из {wdir}/handoff.md.")
+
+
 def recover_update(cfg, st, wave):
-    """The dispatcher died while /update was in flight: whether it arrived is unknown, so it
+    """The dispatcher died while the resume message was in flight: whether it arrived is unknown, so it
     is NOT resent. The wave goes on with await_session set; the owner is told once."""
     w = st["waves"][wave]
-    if w.get("pending_enter") == "/update":  # typed, only Enter is missing: finish it, nothing is unknown
-        if _deliver(cfg, st, wave, "/update", send_text, ""):
+    if w.get("pending_enter") in LEGACY_RESUME_WHATS + (RESUME_WHAT,):
+        # typed, only Enter is missing: finish it, nothing is unknown ("/update" — state of an older version)
+        if _deliver(cfg, st, wave, w["pending_enter"], send_text, ""):
             w["await_session"] = True
             finish_update(cfg, st, wave)
         return
     fresh = once_per(w, "updating", str(w.get("restarts", 0)))
     informed = bool(w.get("notified", {}).get("tmux_failed"))  # the owner already got the failure notice
     w["await_session"] = True
-    # the wave already wrote something new (RUNNING, BLOCKED, DONE...): /update did arrive
+    # the wave already wrote something new (RUNNING, BLOCKED, DONE...): the resume message did arrive
     arrived = read(cfg["run_dir"] / wave / "status") not in ("HANDOFF_READY", "", "STARTING")
     event(cfg, f"{wave}: resumed in phase 'updating': "
-               f"{'/update evidently arrived' if arrived else 'unknown whether /update arrived'}, NOT resent")
+               f"{'resume evidently arrived' if arrived else 'unknown whether resume arrived'}, NOT resent")
     if fresh and not arrived and not informed:  # keyed by the restart count BEFORE finish_update
         put_notice(w, "updating", str(w.get("restarts", 0)),
-                   f"wave-autobot: диспетчер перезапустился при передаче /update волне {wave}; "
+                   f"wave-autobot: диспетчер перезапустился при передаче /superarmanda --resume волне {wave}; "
                    f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: {attach_cmd(w['tmux'])}")
     finish_update(cfg, st, wave)  # saves the phase, the mark and the notice together
     flush_notices(cfg, st, w)
@@ -4237,18 +4250,17 @@ def _tick(cfg, st):
 
     ready = handoff_ready(cfg, w, wave, status)
     if (ready and w.get("phase") == "checkpoint") or w.get("phase") == "clearing":
-        event(cfg, f"{wave}: handoff ready, /clear + /update (restart #{w.get('restarts', 0) + 1})")
+        event(cfg, f"{wave}: handoff ready, /clear + /superarmanda --resume (restart #{w.get('restarts', 0) + 1})")
         w["phase"] = "clearing"  # saved before each outside action; a repeated /clear is safe
         save_state(cfg, st)
         if not _deliver(cfg, st, wave, "/clear", send_command, "/clear"):
             return True  # phase `clearing` is on disk: retried next tick
-        w["phase"] = "updating"  # from here /update is never resent blindly
+        w["phase"] = "updating"  # from here the resume message is never resent blindly
         w["await_session"] = True  # the next session is found by its marker, not by guesswork
         save_state(cfg, st)
         time.sleep(6)
-        update = (f"/update {session_marker(cfg, wave)} Продолжаем волну {wave} wave-autobot. "
-                  f"Каталог волны: {wdir}. Прочитай {wdir}/handoff.md и продолжи с шага «Следующий шаг».")
-        if not _deliver(cfg, st, wave, "/update", send_text, update):
+        update = resume_message(cfg, wave, wdir)
+        if not _deliver(cfg, st, wave, RESUME_WHAT, send_text, update):
             return True  # phase `updating` is on disk: recover_update decides, nothing is resent
         finish_update(cfg, st, wave)
         return True

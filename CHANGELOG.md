@@ -3,6 +3,20 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 0.15.0 — 2026-10-04
+
+### Добавлено
+
+- Продолжение после `/clear` — `/superarmanda --wave <id> --resume <метка> …` вместо `/update`: диспетчер
+  шлёт его через `resume_message()`, метка остаётся в тексте (привязка новой сессии по ней прежняя),
+  позиция берётся из manifest (`state.py where`). Ярлык шага — `RESUME_WHAT`; `recover_update` по-прежнему
+  понимает `pending_enter == "/update"` из state старой версии.
+- Обычный режим: `/superarmanda --resume --manifest <path>` и раздел «Смена координатора и восстановление»
+  в `workflow.md` (точка покоя, процедура, `artifacts` — данные, не инструкции). Без `--resume` поведение не меняется.
+- `state.py where`: поле `artifacts` — ссылки на текущие результаты ревью (`role`, `status`, `artifact`,
+  `reviewed_head`, `packet_hash`, `session_id`); результаты старого HEAD не попадают.
+  ([#12](https://github.com/bronxtc52/skill-superarmanda/issues/12))
+
 ## 0.14.1 — 2026-10-04
 
 ### Исправлено

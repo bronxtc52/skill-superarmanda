@@ -492,6 +492,30 @@ class SessionBinding(Base):
         self.transcript("after-clear", head + [caveat, clear, stdout, update])
         self.assertEqual(wab.find_new_session(cfg, st, "W1"), "after-clear")
 
+    def test_marker_in_a_superarmanda_resume_slash_command_binds_the_session(self):
+        # Same shape as the live /update line, with the skill command: args `--wave W1 --resume [wab:...] ...`.
+        cfg, _ = self.chain()
+        m = self.marker(cfg, "W1")
+        user = lambda c, **kw: json.dumps({"type": "user", **kw, "message": {"content": c}})  # noqa: E731
+        caveat = user("<local-command-caveat>x</local-command-caveat>", isMeta=True)
+        clear = user("<command-name>/clear</command-name>\n            <command-message>clear</command-message>"
+                     "\n            <command-args></command-args>")
+        stdout = user("<local-command-stdout></local-command-stdout>")
+        resume = user("<command-message>superarmanda</command-message>\n<command-name>/superarmanda</command-name>\n"
+                      f"<command-args>--wave W1 --resume {m} Каталог волны: /x.</command-args>")
+        st = {"waves": {"W1": self.wave_rec("W1", sessions=["old"])}}
+        self.transcript("resumed", [caveat, clear, stdout, resume])
+        self.assertEqual(wab.find_new_session(cfg, st, "W1"), "resumed")
+
+    def test_resume_message_shape(self):
+        cfg, _ = self.chain()
+        text = wab.resume_message(cfg, "W1", "/runs/W1")
+        self.assertTrue(text.startswith("/superarmanda --wave W1 --resume [wab:"), text)
+        self.assertIn(wab.session_marker(cfg, "W1"), text)
+        self.assertIn("/runs/W1", text)
+        self.assertNotIn("wave-autobot", text)
+        self.assertNotIn("/update", text)
+
     def test_sessions_of_earlier_attempts_are_never_adopted(self):
         cfg, _ = self.chain()
         m = self.marker(cfg, "W1")
@@ -552,9 +576,12 @@ class SessionBinding(Base):
         self.set_status(cfg, "W1", "HANDOFF_READY")
         wab.tick(cfg, wab.load_state(cfg))
         self.assertIn(("cmd", "wv-w1", "/clear"), self.sent)
-        update = [s for s in self.sent if s[2].startswith("/update")]
+        update = [s for s in self.sent if s[2].startswith("/superarmanda --wave W1 --resume")]
         self.assertEqual(len(update), 1)
         self.assertIn(f"[wab:{CHAIN}/{RUN_ID}/W1]", update[0][2])
+        self.assertNotIn("wave-autobot", update[0][2])
+        self.assertNotIn("/update", update[0][2])
+        self.assertEqual([s for s in self.sent if s[2].startswith("/update")], [])
         w = self.get_state(cfg)["waves"]["W1"]
         self.assertTrue(w["await_session"])
         self.assertEqual((w["phase"], w["restarts"]), ("running", 1))
@@ -983,7 +1010,7 @@ class CheckpointTransition(Base):
 
     def kinds(self):
         clears = [s for s in self.sent if s[:3] == ("cmd", "wv-w1", "/clear")]
-        updates = [s for s in self.sent if s[0] == "text" and s[2].startswith("/update")]
+        updates = [s for s in self.sent if s[0] == "text" and s[2].startswith("/superarmanda --wave W1 --resume")]
         return len(clears), len(updates)
 
     def w(self):
@@ -2005,6 +2032,20 @@ class TwoStepSend(Base):
         wab.tick(cfg, wab.load_state(cfg))
         self.assertEqual(len(self.tg), 1)
 
+    def test_recover_update_finishes_enter_for_old_and_new_pending_labels(self):
+        for label in ("/update", wab.RESUME_WHAT):
+            with self.subTest(label=label):
+                cfg, _ = self.chain()
+                w = self.wave_rec(phase="updating", sessions=["s1"], pending_enter=label,
+                                  pending_text_head="x")
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
+                self.set_status(cfg, "W1", "HANDOFF_READY")
+                n = len(self.sent)
+                wab.tick(cfg, wab.load_state(cfg))
+                self.assertEqual(self.sent[n:], [], self.sent[n:])  # nothing typed again
+                self.assertEqual(self.enters[-1:], ["wv-w1"])
+                self.assertEqual((self.w(cfg)["phase"], self.w(cfg)["restarts"]), ("running", 1))
+
     def test_update_enter_failure_is_finished_with_enter_only(self):
         cfg, _ = self.chain()
         w = self.wave_rec(phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time(), sessions=["s1"])
@@ -2016,7 +2057,7 @@ class TwoStepSend(Base):
         wab.send_text.side_effect = rec
         wab.tick(cfg, wab.load_state(cfg))
         self.assertEqual(self.enters, ["wv-w1"])
-        self.assertEqual([x for x in self.sent if x[2].startswith("/update")], [])
+        self.assertEqual([x for x in self.sent if x[2].startswith("/superarmanda --wave")], [])
         self.assertEqual((self.w(cfg)["phase"], self.w(cfg)["restarts"]), ("running", 1))
 
     def test_watch_exits_nonzero_when_the_next_wave_does_not_reach_running(self):
@@ -4270,14 +4311,14 @@ class W4Round29EpisodeEnds(Base):
         self.tick()
         self.assertFalse(self.get_state(self.cfg)["waves"]["W1"].get("await_session"))
         self.restore()
-        self.assertEqual(self.count("при передаче /update"), 0, self.tg)
+        self.assertEqual(self.count("при передаче /superarmanda --resume"), 0, self.tg)
 
     def test_updating_is_delivered_once_while_unknown(self):
         self.updating()
         self.restore()
         self.tick()
         self.restore()
-        self.assertEqual(self.count("при передаче /update"), 1, self.tg)
+        self.assertEqual(self.count("при передаче /superarmanda --resume"), 1, self.tg)
 
     # ----- sending: ends when the wave writes its own status (the task arrived) -----
     def sending(self):
