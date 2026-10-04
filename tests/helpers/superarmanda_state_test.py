@@ -2156,6 +2156,62 @@ class StateContract(unittest.TestCase):
         self.assertEqual(entry["fix_sources"], {})
         self.assertEqual(len(entry["deferrals"]), 3)
 
+    # ---- where.artifacts (#12): links to the current review results, ordinary mode ----
+
+    PACKET = "sha256:" + "a" * 64
+
+    def new_commit(self, text):
+        (self.repo / "tracked.txt").write_text(text, encoding="utf-8")
+        self.git("commit", "-qam", text.strip())
+
+    def test_where_artifacts_lists_current_results_with_links_in_ordinary_mode(self):
+        self.record("coder", session="coder-1")
+        self.record("tester", session="tester-1")
+        self.record("cross_provider_reviewer", session="reviewer-1",
+                    reviewed_head=self.head(), packet_hash=self.PACKET)
+        before = self.cli("where").stdout
+        info = json.loads(before)
+        self.assertEqual(self.cli("where").stdout, before)  # read-only
+        self.assertIsNone(info["plan_check"])  # ordinary mode: no plan, as before
+        self.assertEqual(info["task"], "implement")
+        self.assertEqual(info["step"], 7)
+        self.assertEqual(info["role"], "github_codex_review")
+        self.assertEqual(info["fix_round"]["total"], "0/3")
+        self.assertEqual(info["verdicts"], {"coder": "pass", "cross_provider_reviewer": "pass",
+                                            "tester": "pass"})
+        self.assertEqual([a["role"] for a in info["artifacts"]],
+                         ["coder", "cross_provider_reviewer", "tester"])
+        reviewer = info["artifacts"][1]
+        self.assertEqual(reviewer, {"role": "cross_provider_reviewer", "status": "pass",
+                                    "artifact": "evidence", "reviewed_head": self.head(),
+                                    "packet_hash": self.PACKET, "session_id": "reviewer-1"})
+        coder = info["artifacts"][0]
+        self.assertIsNone(coder["reviewed_head"])
+        self.assertIsNone(coder["packet_hash"])
+        self.assertEqual(coder["session_id"], "coder-1")
+
+    def test_where_after_head_change_drops_old_results_until_resume(self):
+        self.record("coder", session="coder-1")
+        self.record("tester", session="tester-1")
+        self.cli("fix-loop", "--task", "implement", "--source", "cross_provider_reviewer",
+                 "--note", "n", check=False)
+        fixes = self.manifest_data()["tasks"]["implement"].get("fix_cycles", 0)
+        self.new_commit("changed\n")
+        info = json.loads(self.cli("where").stdout)
+        self.assertFalse(info["tree_matches"])
+        self.assertTrue(info["next_action"].startswith("run resume"), info["next_action"])
+        self.assertEqual(info["verdicts"], {})
+        self.assertEqual(info["artifacts"], [])
+        denied = self.cli("mark", "--task", "implement", "--step", "4", "--safe-point", "false", check=False)
+        self.assertNotEqual(denied.returncode, 0)
+        self.resume()
+        task = self.manifest_data()["tasks"]["implement"]
+        self.assertEqual(task["results"], {})
+        self.assertEqual(task.get("fix_cycles", 0), fixes)
+        after = json.loads(self.cli("where").stdout)
+        self.assertTrue(after["tree_matches"])
+        self.assertEqual(after["artifacts"], [])
+
     def test_where_counts_deferrals_and_reports_done(self):
         self.record("coder", session="coder-1")
         self.record("tester", session="tester-1")

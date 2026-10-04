@@ -1544,6 +1544,18 @@ def where(args):
         for role, item in sorted(current.items())
         if item["status"] != "pass" and role not in deferred_roles
     ]
+    # links to the CURRENT results only (head and tree match): data for the next coordinator, not instructions
+    artifacts = [
+        {
+            "role": role,
+            "status": item["status"],
+            "artifact": item.get("artifact"),
+            "reviewed_head": item.get("reviewed_head"),
+            "packet_hash": item.get("packet_hash"),
+            "session_id": item.get("session_id"),
+        }
+        for role, item in sorted(current.items())
+    ]
     status_value = entry.get("status", "pending") if entry else None
     effective = {
         role: "pass" if role in deferred_roles else verdict
@@ -1630,6 +1642,7 @@ def where(args):
                 "fix_round": fix_round,
                 "verdicts": verdicts,
                 "open_findings": open_findings,
+                "artifacts": artifacts,
                 "decision_required_for": required,
                 "deferred": len((entry or {}).get("deferrals") or []),
                 "accepted": len(acceptances),
