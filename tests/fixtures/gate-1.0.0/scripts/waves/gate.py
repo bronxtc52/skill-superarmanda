@@ -291,7 +291,6 @@ def manifest_problems(manifest, head, cwd_fingerprint):
         for role, other in sorted(results.items()):  # github_codex_review, coderabbit, ...
             if (role not in ("coder", "tester", "cross_provider_reviewer") and isinstance(other, dict)
                     and other.get("head") == head and other.get("status") != "pass"
-                    and not (role == "coderabbit" and other.get("status") == "unavailable")
                     and not _covered(entry, role, other)):
                 problems.append(f"задача {name}: {role} {other.get('status')}")
         coder = results.get("coder")

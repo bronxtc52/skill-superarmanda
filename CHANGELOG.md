@@ -3,6 +3,25 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 1.0.2 — 2026-10-04
+
+### Изменено
+
+- `pr_review.py check`: результат CodeRabbit определяется по факту ревью HEAD двумя каналами
+  доказательства (review на HEAD; сводный issue comment с маркером завершения и диапазоном, кончающимся на HEAD вне
+  блок-цитат, тела review не в счёт) и выдаётся полем `coderabbit` (`pass`/`findings`/`unavailable`/`pending`). `unavailable` —
+  только по явному отказу, в теле которого есть диапазон до HEAD (отказ без диапазона — `pending`); ложное «unavailable» больше не останавливает гейт мерджа (#72).
+- Пустое ревью CodeRabbit на HEAD — доказательство завершения, а не `incomplete` основного статуса.
+- Гейт мерджа: результат роли `coderabbit` `unavailable` на HEAD не блокирует (CodeRabbit необязателен);
+  остальные вердикты не менялись, совместимость с гейтом 1.0.0 закреплена тестом по замороженной копии
+  (`tests/fixtures/gate-1.0.0/`) (#72).
+- `references/pr-review.md`, `SKILL.md` (шаг 7): правило координатора — повторять `check` при
+  `pending`, через 30 минут после Codex записать `unavailable` по таймауту.
+
+### Добавлено
+
+- Фикстуры REST-ответов с живых PR (#70, #71, #592) в `tests/fixtures/pr-review/coderabbit/`.
+
 ## 1.0.1 — 2026-10-04
 
 ### Добавлено

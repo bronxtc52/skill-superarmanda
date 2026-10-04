@@ -24,6 +24,7 @@ and live sessions are lost (incident W4, 2026-10-01):
 import atexit
 import contextlib
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -7865,6 +7866,97 @@ def routes_for(repo="o/r", number=5, **over):
     }
     r.update(over)
     return r
+
+
+# ---------------------------------------------------------------- 1.0.2: coderabbit unavailable does not block
+def _frozen_gate_100():
+    """The 1.0.0 gate (tests/fixtures/gate-1.0.0), loaded under private names with ITS OWN state.py and
+    pr_review.py: it resolves siblings relative to its own file, so the current modules are untouched."""
+    path = Path(__file__).resolve().parents[1] / "fixtures" / "gate-1.0.0" / "scripts" / "waves" / "gate.py"
+    spec = importlib.util.spec_from_file_location("frozen_gate_1_0_0", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _with_role(role, res, **task):
+    m = green_manifest(**task)
+    m["tasks"]["T1"]["results"][role] = res
+    return m
+
+
+class GateCoderabbitUnavailable(unittest.TestCase):  # #72
+    def problems(self, manifest, module=None):
+        return (module or gate).manifest_problems(manifest, HEAD, FP)
+
+    def covered(self, kind, role="coderabbit"):
+        res = result("findings")
+        record = {"source": role, "note": "low", "head": HEAD, "result_sha256": gate.state.result_digest(res),
+                  "result_recorded_at": res.get("recorded_at"), "recorded_at": res.get("recorded_at")}
+        if kind == "acceptances":
+            record["severity"] = "medium"
+        return _with_role(role, res, **{kind: [record]})
+
+    def test_unavailable_on_head_is_not_a_problem(self):
+        self.assertEqual(self.problems(_with_role("coderabbit", result("unavailable"))), [])
+
+    def test_unavailable_on_head_gives_a_pass_verdict(self):
+        v = gate.evaluate(green_facts(), HEAD, _with_role("coderabbit", result("unavailable")), WORK, "main")
+        self.assertEqual((v["verdict"], v["reasons"]), ("pass", []))
+
+    def test_other_non_pass_statuses_still_block(self):
+        for status in ("error", "incomplete", "pending", "findings"):
+            with self.subTest(status=status):
+                self.assertTrue(self.problems(_with_role("coderabbit", result(status))))
+
+    def test_findings_with_defer_or_accept_pass(self):
+        for kind in ("deferrals", "acceptances"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.problems(self.covered(kind)), [])
+
+    def test_github_codex_review_unavailable_still_blocks(self):
+        self.assertTrue(self.problems(_with_role("github_codex_review", result("unavailable"))))
+
+    def test_missing_tester_and_unresolved_reviewer_findings_still_block(self):
+        m = _with_role("coderabbit", result("unavailable"))
+        del m["tasks"]["T1"]["results"]["tester"]
+        self.assertTrue(self.problems(m))
+        self.assertTrue(self.problems(_with_role("cross_provider_reviewer", result("findings"))))
+
+    def test_unavailable_of_another_head_is_not_this_heads_business(self):
+        self.assertEqual(self.problems(_with_role("coderabbit", result("unavailable", head=OLD))), [])
+
+    def test_verdicts_match_the_1_0_0_gate_except_coderabbit_unavailable(self):
+        old = _frozen_gate_100()
+        self.assertIsNot(old.state, gate.state)
+        cases = [
+            ("all pass", green_manifest(), False),
+            ("coderabbit pass", _with_role("coderabbit", result("pass")), False),
+            ("coderabbit findings without a decision", _with_role("coderabbit", result("findings")), True),
+            ("coderabbit findings + defer", self.covered("deferrals"), False),
+            ("coderabbit findings + accept", self.covered("acceptances"), False),
+            ("coderabbit error", _with_role("coderabbit", result("error")), True),
+            ("coderabbit incomplete", _with_role("coderabbit", result("incomplete")), True),
+            ("github_codex_review unavailable", _with_role("github_codex_review", result("unavailable")), True),
+            ("github_codex_review findings + defer", self.covered("deferrals", "github_codex_review"), False),
+            ("no tester", self._without("tester"), True),
+            ("reviewer findings without a decision", _with_role("cross_provider_reviewer", result("findings")), True),
+        ]
+        for name, manifest, blocked in cases:
+            with self.subTest(case=name):
+                self.assertEqual(bool(self.problems(manifest, old)), blocked, self.problems(manifest, old))
+                self.assertEqual(bool(self.problems(manifest)), blocked, self.problems(manifest))
+
+    def _without(self, role):
+        m = green_manifest()
+        del m["tasks"]["T1"]["results"][role]
+        return m
+
+    def test_the_only_intended_difference_is_coderabbit_unavailable(self):
+        old = _frozen_gate_100()
+        m = _with_role("coderabbit", result("unavailable"))
+        self.assertTrue(self.problems(m, old))  # the 1.0.0 gate refuses it (closed failure is fine)
+        self.assertEqual(self.problems(m), [])
 
 
 class GateCollect(unittest.TestCase):

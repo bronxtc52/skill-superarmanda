@@ -48,18 +48,6 @@ RABBIT_DRAFT_SKIP = re.compile(
     r"<!-- tips_start -->\n\n---\n\n\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands\.</sub>\n\n<!-- tips_end -->\Z",
     re.DOTALL,
 )
-RABBIT_DONE = re.compile(
-    r"No actionable comments were generated|Actionable comments posted: \d+"
-)
-RABBIT_RANGE = re.compile(
-    r"between ([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)(?![0-9a-fA-F])"
-    r" and ([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)(?![0-9a-fA-F])"
-)
-RABBIT_REFUSAL = re.compile(
-    r"review limit reached|rate limited|no credits available"
-    r"|reviews? (?:are |is )?disabled",
-    re.IGNORECASE,
-)
 
 
 def login(item):
@@ -104,88 +92,6 @@ def finding(source, item, reason):
     return value
 
 
-def outside_quotes(body):
-    """Строки тела вне блок-цитат: первая непробельная литера `>` — цитата."""
-    return "\n".join(
-        line for line in body.split("\n") if not line.lstrip().startswith(">")
-    )
-
-
-def range_ends(body):
-    return [match.group(2).lower() for match in RABBIT_RANGE.finditer(body)]
-
-
-def coderabbit_verdict(expected_head, reviews, review_comments, issue_comments):
-    """Результат CodeRabbit на HEAD по факту ревью; чистая функция без I/O.
-
-    Два канала доказательства: (а) review на HEAD; (б) сводный issue comment с
-    маркером завершения и диапазоном, кончающимся ровно на HEAD (тела review не
-    считаются). Явный отказ засчитывается, только если в его теле есть диапазон
-    с концом на HEAD. Остальное — pending: ждёт координатор.
-    """
-    head = (expected_head or "").lower()
-    verdict = lambda status, reason, evidence=None: {  # noqa: E731
-        "status": status,
-        "reason": reason,
-        "evidence_url": evidence,
-    }
-    attached = {}
-    found = None  # url первой HEAD-находки
-    for comment in review_comments:
-        body = text(comment)
-        if not trusted(comment, RABBIT) or not body:
-            continue
-        if (comment.get("commit_id") or "").lower() != head:
-            continue
-        attached.setdefault(comment.get("pull_request_review_id"), []).append(comment)
-        if not rabbit_boilerplate(body):
-            found = found or url(comment) or "inline comment"
-    proof = None  # url первого доказательства ревью HEAD
-    for review in reviews:
-        if not trusted(review, RABBIT):
-            continue
-        body, state = text(review), (review.get("state") or "").upper()
-        if (review.get("commit_id") or "").lower() == head:
-            if state in ("COMMENTED", "APPROVED", "CHANGES_REQUESTED"):
-                proof = proof or url(review)
-            has_text = bool(body) and not rabbit_boilerplate(body)
-            if has_text or attached.get(review.get("id")) or state in (
-                "CHANGES_REQUESTED",
-                "DISMISSED",
-            ):
-                found = found or url(review) or "review"
-    bodies = [
-        (url(item), text(item))
-        for item in (*reviews, *issue_comments)
-        if trusted(item, RABBIT) and text(item)
-    ]
-    summaries = [
-        (url(item), text(item))
-        for item in issue_comments
-        if trusted(item, RABBIT) and text(item)
-    ]
-    for where, body in summaries:
-        quoted_free = outside_quotes(body)
-        if RABBIT_DONE.search(quoted_free) and head in range_ends(quoted_free):
-            proof = proof or where
-    if found:
-        return verdict("findings", "CodeRabbit left findings on current HEAD", found)
-    if proof:
-        return verdict("pass", "CodeRabbit review of current HEAD is proven", proof)
-    for where, body in bodies:
-        match = RABBIT_REFUSAL.search(body)
-        if match and head in range_ends(body):
-            return verdict(
-                "unavailable", f"CodeRabbit refused: {match.group(0).lower()}", where
-            )
-    if any(
-        trusted(item, RABBIT) and RABBIT_DRAFT_SKIP.fullmatch(text(item))
-        for item in issue_comments
-    ):
-        return verdict("pending", "CodeRabbit skipped the draft PR")
-    return verdict("pending", "no CodeRabbit review bound to current HEAD yet")
-
-
 def evaluate(
     pr,
     reviews,
@@ -203,18 +109,10 @@ def evaluate(
         "evidence_urls": [],
         "findings": [],
         "limitations": [],
-        "coderabbit": {
-            "status": "pending",
-            "reason": "PR HEAD differs from expected SHA",
-            "evidence_url": None,
-        },
     }
     if head != expected_head:
         result["limitations"].append("PR HEAD differs from expected SHA")
         return result
-    result["coderabbit"] = coderabbit_verdict(
-        expected_head, reviews, review_comments, issue_comments
-    )
     codex_approved = False
     codex_clean_comment = False
     codex_seen = False
@@ -287,8 +185,9 @@ def evaluate(
                     )
             elif who == RABBIT:
                 result["limitations"].append(
-                    "empty CodeRabbit COMMENTED review on HEAD proves completion"
+                    "empty CodeRabbit COMMENTED review is incomplete"
                 )
+                blocking_incomplete = True
             elif who == CODEX:
                 result["limitations"].append(
                     "Codex COMMENTED review is not an explicit clean result"
@@ -805,10 +704,6 @@ def check(args):
             fetch_issue_comments(owner, name, args.pr),
         )
 
-    def moved(reason):
-        # Результат CodeRabbit посчитан по первому снимку: данные сдвинулись, он недействителен.
-        return {"status": "pending", "reason": reason, "evidence_url": None}
-
     first = fetch_header(owner, name, args.pr)
     reviews, review_comments, issue_comments = snapshot()
     check_runs, checks = fetch_checks(owner, name, first["head"]["sha"])
@@ -830,13 +725,11 @@ def check(args):
         result["status"] = "incomplete"
         result["current_head"] = last["head"]["sha"]
         result["limitations"].append("PR HEAD changed while collecting evidence")
-        result["coderabbit"] = moved("PR HEAD changed while collecting evidence")
     elif second != (reviews, review_comments, issue_comments):
         result["status"] = "incomplete"
         result["limitations"].append(
             "review evidence changed while collecting evidence"
         )
-        result["coderabbit"] = moved("review evidence changed while collecting evidence")
     write(output, result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["status"] in ("pass", "findings", "incomplete") else 1
