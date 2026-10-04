@@ -12229,7 +12229,7 @@ class W3Quote(Base):
                 self.fail(f"U+{ord(ch):04X} is not neutralised")
 
     # Default-ignorable characters outside Cf (Unicode DerivedCoreProperties: Default_Ignorable_Code_Point
-    # minus Cf/Cc/Zl/Zp and unassigned): drawn as nothing, so they glue or split a secret as well.
+    # minus Cf/Cc/Zl/Zp): drawn as nothing, so they glue or split a secret as well.
     IGNORABLE = ["\u034f", "\u115f", "\u1160", "\u17b4", "\u17b5", "\u180b", "\u180c", "\u180d",
                  "\u180f", "\u3164", "\ufe00", "\ufe0e", "\ufe0f", "\uffa0", "\U000e0100",
                  "\U000e01ef"]
@@ -12237,6 +12237,32 @@ class W3Quote(Base):
     def test_default_ignorable_characters_cannot_glue_or_split_a_secret(self):
         for ch in self.IGNORABLE:
             with self.subTest(ch=f"U+{ord(ch):04X}"):
+                glued = f"a{ch}{self.HEAD}{self.TAIL}"
+                split = f"ключ {self.HEAD}{ch}{self.TAIL} конец"
+                prefix = f"ключ sk-{ch}ant-abcdefghijklmnopqrstuvwx1234 конец"
+                for raw in (glued, split, prefix):
+                    if raw is prefix:
+                        check = lambda out: self.assertNotIn("abcdefghijklmnopqrstuvwx", out)
+                    else:
+                        check = self.secret_gone
+                    check(wab.quote(raw))
+                    check(wab.render_notice(wab.quote(raw)))
+                    check(wab.render_notice(raw))
+                    check(wab.render_notice(f"x\x02{raw}\x03 y"))
+                    check(wab._first_line(raw, 300))
+                    check(wab._first_line(wab.quote(raw), 300))
+                self.assertIn("конец", wab.render_notice(split))
+                self.assertIn("конец", wab.render_notice(wab.quote(prefix)))
+
+    # Default-ignorable code points UNASSIGNED in the interpreter's tables (category Cn): a terminal or
+    # Telegram draws them as nothing too, so `sk-<U+2065>ant-...` must not leave visible.
+    UNASSIGNED_IGNORABLE = ["\u2065", "\U000e0080", "\ufff0", "\ufff8", "\U000e0000", "\U000e0fff"]
+
+    def test_unassigned_default_ignorable_characters_cannot_glue_or_split_a_secret(self):
+        import unicodedata
+        for ch in self.UNASSIGNED_IGNORABLE:
+            with self.subTest(ch=f"U+{ord(ch):04X}"):
+                self.assertEqual(unicodedata.category(ch), "Cn")
                 glued = f"a{ch}{self.HEAD}{self.TAIL}"
                 split = f"ключ {self.HEAD}{ch}{self.TAIL} конец"
                 prefix = f"ключ sk-{ch}ant-abcdefghijklmnopqrstuvwx1234 конец"
@@ -12268,12 +12294,18 @@ class W3Quote(Base):
     def test_every_default_ignorable_character_masks_its_token(self):
         import unicodedata
         chars = wab._default_ignorable()
-        self.assertTrue(set(self.IGNORABLE) <= set(chars))
-        for ch in chars:  # the set is assigned, not Cf/Cc/Zl/Zp (those have their own test) and not a space
-            self.assertNotIn(unicodedata.category(ch), {"Cf", "Cc", "Zl", "Zp", "Zs", "Cn"})
-            out = wab.render_notice(wab.quote(f"{self.HEAD}{ch}{self.TAIL}"))
-            if "1234567890" in out or "AbCdEf" in out:
-                self.fail(f"U+{ord(ch):04X} is not neutralised")
+        self.assertTrue(set(self.IGNORABLE + self.UNASSIGNED_IGNORABLE) <= set(chars))
+        for ch in chars:  # not Cf/Cc/Zl/Zp (those are in _INVISIBLE by category) and not a space
+            self.assertNotIn(unicodedata.category(ch), {"Cf", "Cc", "Zl", "Zp", "Zs"})
+        # EVERY code point of Default_Ignorable_Code_Point, assigned or not (Cn), masks its token
+        every = [chr(c) for lo, hi in wab._DEFAULT_IGNORABLE_RANGES for c in range(lo, hi + 1)]
+        self.assertEqual(len(every), 4174)
+        for ch in every:
+            self.assertNotIn(unicodedata.category(ch), {"Cc", "Zl", "Zp", "Zs"})
+            for raw in (f"{self.HEAD}{ch}{self.TAIL}", f"sk-{ch}ant-abcdefghijklmnopqrstuvwx1234"):
+                for out in (wab.quote(raw), wab.render_notice(wab.quote(raw)), wab._first_line(raw, 300)):
+                    if any(s in out for s in ("1234567890", "AbCdEf", "abcdefghijklmnopqrstuvwx")):
+                        self.fail(f"U+{ord(ch):04X} is not neutralised: {out!r}")
 
     def test_unicode_spaces_separate_tokens_like_a_plain_space(self):
         for ch in ("\u00a0", "\u1680", "\u2000", "\u2003", "\u200a", "\u202f", "\u205f", "\u3000"):
