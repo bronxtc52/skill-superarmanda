@@ -13464,6 +13464,7 @@ class ChainCleanup(Base):
             self.assertEqual(self.tm("new-window", "-t", f"={session}:", "sleep 600").returncode, 0)
         pane = self.tm("display-message", "-p", "-t", f"={session}:", "#{pane_id}").stdout.strip()
         self.tm("set-option", "-p", "-t", pane, "@wab_run", f"{cfg['chain']}/{cfg['run_id']}")
+        self.tm("set-option", "-p", "-t", pane, "@wab_run_dir", str(cfg["run_dir"]))
         self.tm("set-option", "-p", "-t", pane, "@wab_open", self.w.wab_open_value(path))
         return pane
 
@@ -13594,11 +13595,55 @@ class ChainCleanup(Base):
         self.finish(cfg)
         self.session("wv-w1", None)
         self.tm("set-option", "-t", "=wv-w1:", "@wab_run", f"{CHAIN}/{RUN_ID}")  # session level only
+        self.tm("set-option", "-t", "=wv-w1:", "@wab_run_dir", str(cfg["run_dir"]))
         res = self.w.cleanup_cmd(cfg)
         self.assertEqual((res["sessions"], res["panes"]), ([], []))
         self.assertEqual(len(res["warnings"]), 1)
         self.assertIn("no @wab_run mark", res["warnings"][0])
         self.assertEqual(self.alive_names(), {"wv-w1"})
+
+    # --- round 2: ownership = @wab_run AND @wab_run_dir; only confirmed closures are reported
+    def test_two_runs_with_the_same_tag_and_session_name_are_told_apart_by_run_dir(self):
+        cfg_a, path_a = self.cfg()
+        doc = json.loads(path_a.read_text(encoding="utf-8"))
+        doc["run_dir"] = str(self.tmp / "runs-b")  # same chain and run_id, another run directory
+        path_b = path_a.parent / "chain-b.json"
+        path_b.write_text(json.dumps(doc), encoding="utf-8")
+        cfg_b = self.w.load_chain(path_b)
+        self.assertNotEqual(cfg_a["run_dir"], cfg_b["run_dir"])
+        self.state_two_waves(cfg_a)
+        self.finish(cfg_a)
+        tag = f"{CHAIN}/{RUN_ID}"
+        self.session("wv-w1", tag, cfg_b["run_dir"])          # the wave session of the NEW run
+        self.session("dashes", None)
+        pane_b = self.dash_pane("dashes", cfg_b, path_a)       # its dashboard, opened with A's chain.json
+        before = self.pane_ids()
+        res = self.w.cleanup_cmd(cfg_a)
+        self.assertEqual((res["sessions"], res["panes"]), ([], []))
+        self.assertEqual(self.alive_names(), {"wv-w1", "dashes"})
+        self.assertEqual(self.pane_ids(), before)
+        self.assertIn(pane_b, self.pane_ids())
+
+    def test_a_kill_pane_that_fails_is_not_reported_as_closed(self):
+        cfg, path = self.cfg()
+        self.state_two_waves(cfg)
+        self.finish(cfg)
+        self.session("wv-w1", f"{CHAIN}/{RUN_ID}", cfg["run_dir"])
+        self.session("dashes", None)
+        self.dash_pane("dashes", cfg, path)
+        real = self.w.tmux
+
+        def failing(*args, **kw):
+            if args and args[0] == "kill-pane":
+                return subprocess.CompletedProcess(args, 1, "", "cannot kill")
+            return real(*args, **kw)
+        self.w.tmux = failing
+        res = self.w.cleanup_cmd(cfg)
+        self.assertEqual((res["sessions"], res["panes"]), ([], []))
+        self.assertEqual(self.alive_names(), {"wv-w1", "dashes"})
+        events = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("kill-pane failed", events)
+        self.assertNotIn("chain sessions closed", events)
 
     # --- 6. launch of the first wave warns about a FINISHED foreign chain only
     def test_stale_chains_lists_finished_chains_without_a_dispatcher_only(self):

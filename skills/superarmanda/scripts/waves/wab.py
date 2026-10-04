@@ -4913,12 +4913,79 @@ def _wave_session_names(cfg, st):
     return names
 
 
+def _norm_dir(path):
+    try:
+        return str(pathlib.Path(path).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _ours(cfg, session=None, pane=None):
+    """Whose is this session / pane (options at ITS OWN level, read now, never inherited)?
+    "ours": @wab_run == run_tag AND @wab_run_dir names this run's directory (two chain.json may repeat
+    chain/run_id and a session name; the directory tells them apart). "unmarked": no @wab_run at all.
+    "foreign": anything else (another run, or the tag without a matching directory)."""
+    mark = tmux_opt("@wab_run", session=session, pane=pane)
+    if mark is None:
+        return "unmarked"
+    rdir = tmux_opt("@wab_run_dir", session=session, pane=pane)
+    if mark == run_tag(cfg) and rdir and _norm_dir(rdir) == _norm_dir(cfg["run_dir"]):
+        return "ours"
+    return "foreign"
+
+
+def _server_gone():
+    """True when tmux says there is no server any more (its last session ended)."""
+    try:
+        r = tmux("list-sessions", check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    text = r.stderr.lower()
+    return r.returncode != 0 and ("no server running" in text or "error connecting" in text)
+
+
+def _kill_pane(cfg, pane):
+    """kill-pane of a pane that is ours RIGHT NOW (re-read). True only when it is confirmed gone:
+    rc 0 and the pane is not in a successful listing (or the server ended with it). Else an event."""
+    if _ours(cfg, pane=pane) != "ours":
+        event(cfg, f"pane {pane}: no longer ours, not closed")
+        return False
+    r = tmux("kill-pane", "-t", pane, check=False)
+    if r.returncode != 0:
+        event(cfg, f"pane {pane}: kill-pane failed: {r.stderr.strip() or r.stdout.strip() or r.returncode}; not closed")
+        return False
+    left = _list_panes()
+    if left is None:
+        if _server_gone():
+            return True
+        event(cfg, f"pane {pane}: could not confirm it is gone (listing failed)")
+        return False
+    if pane in {q for q, _ in left}:
+        event(cfg, f"pane {pane}: still there after kill-pane")
+        return False
+    return True
+
+
+def _kill_pane_sent(cfg, pane):
+    """kill-pane of a pane of a wave session that is ours right now; True when tmux accepted it (rc 0).
+    Whether it is really gone is confirmed by the caller from one listing of the session."""
+    if _ours(cfg, pane=pane) != "ours":
+        event(cfg, f"pane {pane}: no longer ours, not closed")
+        return False
+    r = tmux("kill-pane", "-t", pane, check=False)
+    if r.returncode != 0:
+        event(cfg, f"pane {pane}: kill-pane failed: {r.stderr.strip() or r.stdout.strip() or r.returncode}; not closed")
+        return False
+    return True
+
+
 def close_chain_sessions(cfg, st):
     """The chain is finished (the caller checked chain-result.md): close the tmux sessions of its waves
-    and the dashboard panes, only the ones THIS run marked (@wab_run == run_tag, read at their own
-    level, never inherited, right before the kill). A session without the mark is only reported; one
-    marked by another run (the name was reused) is left alone. Returns {sessions, panes, warnings}.
-    Never raises on a tmux failure."""
+    and the dashboard panes, only the ones THIS run marked (`_ours`: @wab_run and @wab_run_dir, read at
+    their own level right before the kill). A session without the mark is only reported; one marked by
+    another run (the name was reused) is left alone. Sessions are never killed as such: their own panes
+    are, and tmux ends the session with its last pane. Only confirmed closures are returned:
+    {sessions, panes, warnings}. Never raises on a tmux failure."""
     tag = run_tag(cfg)
     res = {"sessions": [], "panes": [], "warnings": []}
     gone = set()
@@ -4931,51 +4998,58 @@ def close_chain_sessions(cfg, st):
         for name in _wave_session_names(cfg, st):
             if not tmux_alive(name):
                 continue
-            mark = tmux_opt("@wab_run", session=name)
-            if mark is None:
+            who = _ours(cfg, session=name)
+            if who == "unmarked":
                 warn(f"{name}: no @wab_run mark, not closed (started by an older wab?); "
                      f"close it yourself: tmux kill-session -t {name}")
                 continue
-            if mark != tag:
-                event(cfg, f"{name}: not ours (@wab_run={mark}, this run {tag}); left alone")
+            if who != "ours":
+                event(cfg, f"{name}: not ours (@wab_run={tmux_opt('@wab_run', session=name)}, "
+                           f"@wab_run_dir={tmux_opt('@wab_run_dir', session=name)}; this run {tag}, "
+                           f"{cfg['run_dir']}); left alone")
                 continue
             panes = _list_panes(name)
             if panes is None:
                 event(cfg, f"{name}: panes could not be listed; nothing closed in this session")
                 continue
-            ours = [pane for pane, _ in panes if tmux_opt("@wab_run", pane=pane) == tag]
+            ours = [pane for pane, _ in panes if _ours(cfg, pane=pane) == "ours"]
             if not ours:
                 warn(f"{name}: marked as ours but its panes have no @wab_run mark, not closed; "
                      f"close it yourself: tmux kill-session -t {name}")
                 continue
-            closed = []
-            for pane in ours:  # never kill-session: tmux ends the session itself with its last pane
-                if tmux_opt("@wab_run", pane=pane) == tag:
-                    tmux("kill-pane", "-t", pane, check=False)
-                    closed.append(pane)
+            attempted = [pane for pane in ours if _kill_pane_sent(cfg, pane)]
             if not tmux_alive(name):
                 res["sessions"].append(name)
                 gone.update(pane for pane, _ in panes)
                 continue
+            left = _list_panes(name)
+            if left is None:
+                event(cfg, f"{name}: could not confirm what was closed (listing failed)")
+                continue
+            still = {q for q, _ in left}
+            closed = [pane for pane in attempted if pane not in still]
             res["panes"].extend(closed)
             gone.update(closed)
             if closed and len(closed) < len(panes):
                 event(cfg, f"{name}: session stays: panes of other runs")
         chain_file = str(pathlib.Path(cfg.get("chain_file") or "").resolve()) if cfg.get("chain_file") else None
-        for pane, sess in _list_panes() or []:
+        listing = _list_panes()
+        if listing is None:
+            if not _server_gone():  # a gone server has no dashboards either: nothing to say
+                event(cfg, "dashboard panes could not be listed; none closed")
+            listing = []
+        for pane, sess in listing:
             if pane in gone:
                 continue
             opened = tmux_opt("@wab_open", pane=pane)
             if not (opened and chain_file and opened.rsplit(None, 1)[-1] == chain_file):
                 continue
-            mark = tmux_opt("@wab_run", pane=pane)
-            if mark is None:
+            who = _ours(cfg, pane=pane)
+            if who == "unmarked":
                 warn(f"pane {pane} (session {sess}) shows this chain's dashboard but has no @wab_run mark, "
                      f"not closed; close it yourself: tmux kill-pane -t {pane}")
-            elif mark == tag:
-                tmux("kill-pane", "-t", pane, check=False)
-                if pane not in {q for q, _ in _list_panes() or []}:
-                    res["panes"].append(pane)
+            elif who == "ours" and _kill_pane(cfg, pane):
+                res["panes"].append(pane)
         if res["sessions"] or res["panes"]:
             event(cfg, f"chain sessions closed: sessions {res['sessions']}, panes {res['panes']}")
     except (OSError, subprocess.SubprocessError) as e:
