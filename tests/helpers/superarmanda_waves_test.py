@@ -3842,7 +3842,7 @@ class W4Round27(Base):
             self.assertNotIn("outbox", old)  # an attempt is history, not a second outbox
         self.down = False
         wab.drain_notices(cfg)
-        self.assertEqual(sorted(t for t in self.tg if t.startswith("old")), ["old chain_done"])
+        self.assertEqual(sorted(t for t in self.tg if t.startswith("demo: old")), ["demo: old chain_done"])
 
     # ----- 2: only the confirmed wave is acknowledged; another wave keeps its notices -----
     def test_unconfirmed_waves_keep_their_notices(self):
@@ -4627,7 +4627,7 @@ class W4Round29EpisodeEnds(Base):
         self.put_state(self.cfg, {"current": None, "waves": {"W1": self.wave_rec(phase="done", outbox=box)}})
         self.restore()
         self.restore()
-        self.assertEqual(sorted(self.tg), ["old chain_done", "old done", "old no_next"])
+        self.assertEqual(sorted(self.tg), ["demo: old chain_done", "demo: old done", "demo: old no_next"])
 
 
 class W4Round37DashTerminalPhase(Base):
@@ -11735,7 +11735,7 @@ class W3DoneAttention(GateBase):
         self.assertTrue(self.tick())  # merged: «волна W1 завершена», W2 is launched by the dispatcher
         self.launch.assert_called_once()
         self.assertTrue(self.launch.call_args[1]["by_dispatcher"])
-        self.assertIn("notify(skipped): wave-autobot: волна W1 завершена", self.log())
+        self.assertIn("notify(skipped): demo: волна W1 завершена", self.log())
         self.assertEqual(_attention_exit(cfg), 0)
         self.assertFalse((cfg["run_dir"] / "ATTENTION").exists())
         self.assertNotIn("done", self.rec().get("attention") or {})
@@ -12249,6 +12249,164 @@ class W3Quote(Base):
                     if telegram:
                         self.assertTrue(any("цитата" in t.lower() for t in self.tg), self.tg)
 
+    # ----- #56: every notice and display-message is signed with the chain name -----
+    def test_every_notice_starts_with_the_chain_name(self):
+        for name, (_, proof) in self.SCENARIOS.items():
+            for telegram in (True, False):
+                with self.subTest(scenario=name, telegram=telegram):
+                    self.tg.clear()
+                    self.shown.clear()
+                    cfg = self.run_scenario(name, telegram)
+                    chain = cfg["chain"]
+                    sent = self.tg if telegram else self.shown
+                    self.assertTrue(sent, (name, telegram))
+                    for text in sent:
+                        self.assertTrue(text.startswith(chain), text)
+                        self.assertNotIn("wave-autobot", text)
+                    if not telegram:
+                        path = cfg["run_dir"] / "ATTENTION"
+                        att = path.read_text(encoding="utf-8") if path.exists() else ""
+                        if "signal:" in att:
+                            self.assertRegex(att, r"signal: " + re.escape(chain))
+
+    def test_notify_signs_unsigned_and_legacy_outbox_texts_once(self):
+        cfg, _ = self.chain_for(True)
+        chain = cfg["chain"]
+        wab.notify(cfg, "просто текст")
+        wab.notify(cfg, "wave-autobot: старая запись outbox")
+        wab.notify(cfg, f"{chain}: уже подписано")
+        self.assertEqual(self.tg[-3:], [f"{chain}: просто текст", f"{chain}: старая запись outbox",
+                                        f"{chain}: уже подписано"])
+
+    def test_a_hostile_chain_name_cannot_break_the_signature(self):
+        cfg, _ = self.chain_for(True)
+        cfg["chain"] = "x\n#(touch /tmp/p)\x02y"
+        signed = wab.sign(cfg, "тело")
+        self.assertEqual(len(signed.splitlines()), 1)
+        self.assertNotIn("\x02", signed)
+        self.assertTrue(signed.endswith(": тело"))
+
+    def test_no_notice_text_carries_a_hardcoded_wave_autobot_prefix(self):
+        import ast
+        tree = ast.parse((WAVES / "wab.py").read_text(encoding="utf-8"))
+        docstrings = {id(n.body[0].value) for n in ast.walk(tree)
+                      if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef))
+                      and n.body and isinstance(n.body[0], ast.Expr)
+                      and isinstance(n.body[0].value, ast.Constant)}
+        bad = [n.lineno for n in ast.walk(tree)
+               if isinstance(n, ast.Constant) and isinstance(n.value, str)
+               and id(n) not in docstrings and "wave-autobot: " in n.value]
+        # the single legacy marker (an old outbox entry) is allowed: _LEGACY_SIGN
+        legacy = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "_LEGACY_SIGN" for t in n.targets)]
+        self.assertEqual([l for l in bad if l not in legacy], [])
+
+    # ----- #67: the owner-facing BLOCKED notice carries the decision, not only a quote -----
+    LABELLED = ("BLOCKED: [class=blocked_cap rec=owner red=no] {question}; Варианты: A поднять кап | B принять как есть")
+
+    def blocked_text(self, status, telegram=True):
+        cfg, _ = self.chain_for(telegram)
+        self.put(cfg)
+        self.set_status(cfg, "W1", status)
+        self.tg.clear()
+        self.shown.clear()
+        wab.tick(cfg, wab.load_state(cfg))
+        return cfg, (self.tg if telegram else self.shown)
+
+    def test_blocked_notice_carries_class_red_question_options_and_where_to_answer(self):
+        question = "кап 2/2 на задаче T3, ключ ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8 и token=hunter2hunter2"
+        cfg, sent = self.blocked_text(self.LABELLED.format(question=question))
+        [msg] = [t for t in sent if "ждёт тебя" in t]
+        for part in ("blocked_cap", "красная зона: нет", "рекомендация волны: owner", "кап 2/2 на задаче T3", "A поднять кап",
+                     "B принять как есть", "attach -t", " say "):
+            self.assertIn(part, msg)
+        self.assertNotIn("a1B2c3D4e5F6g7H8", msg)
+        self.assertNotIn("hunter2hunter2", msg)
+        self.assertLessEqual(len(msg), wab.TG_MESSAGE_LIMIT)
+        self.assertTrue(msg.startswith(cfg["chain"]))
+
+    def test_blocked_notice_masks_a_secret_that_contains_the_options_separator(self):  # Astra r2
+        # the split into question/options must not cut a secret away from its key before redact()
+        for value in ("variants:hunter2hunter2", "Варианты:hunter2hunter2", "token=Варианты:hunter2hunter2"):
+            with self.subTest(value=value):
+                status = f"BLOCKED: [class=question rec=A red=yes] password={value}"
+                _cfg, sent = self.blocked_text(status)
+                [msg] = [t for t in sent if "ждёт тебя" in t]
+                self.assertNotIn("hunter2hunter2", msg)
+                self.assertIn("рекомендация волны: A", msg)
+
+    # one character of every invisible class _INVISIBLE covers (W3 invariant): Cc, C1, Cf (zero width,
+    # bidi, soft hyphen, word joiner, BOM), Zl, Zp, variation selector, CGJ, Hangul filler, unassigned
+    # default-ignorable
+    INVISIBLES = ("\x01", "\x85", "\u200b", "\u200e", "\u00ad", "\u2060", "\ufeff", "\u2028", "\u2029",
+                  "\ufe0f", "\u034f", "\u3164", "\u2065")
+
+    def test_blocked_notice_masks_a_key_glued_by_an_invisible_character(self):  # Astra r3 (high)
+        # an invisible character inside the key hides `password=` from redact(); the separator inside the
+        # value would then carry the bare value into the options: the whole line is cleaned first
+        for ch in self.INVISIBLES:
+            for line in (f"password{ch}=variants:s3cr3tValue9", f"token{ch}=x;Варианты:s3cr3tValue9"):
+                with self.subTest(ch=hex(ord(ch)), line=line.split(ch)[0]):
+                    _cfg, sent = self.blocked_text(f"BLOCKED: [class=question rec=A red=yes] {line}")
+                    [msg] = [t for t in sent if "ждёт тебя" in t]
+                    self.assertNotIn("s3cr3t", msg)
+                    self.assertIn("рекомендация волны: A", msg)
+
+    def test_blocked_notice_never_shows_what_the_plain_quote_masks(self):  # the class, not the case
+        # whatever quote() hides in the whole question stays hidden after the split into question/options
+        value = "s3cr3tValue9"
+        shapes = ["password={v}", "password=variants:{v}", "token=Варианты:{v}", "x; Варианты: A token={v} | B",
+                  "ghp_{v}a1B2c3D4e5F6g7H8i9J0k1L2m3N4", "первая\ntoken={v}; Варианты: A | B"]
+        shapes += [f"password{ch}=variants:{{v}}" for ch in self.INVISIBLES]
+        shapes += [f"q; Варианты: A s3cr3t{ch}{{v}} | B" for ch in self.INVISIBLES]
+        for shape in shapes:
+            question = shape.format(v=value)
+            if value in wab.quote(question):
+                continue  # beyond redact()'s heuristic for any quote: not a property of the split
+            with self.subTest(shape=shape):
+                _cfg, sent = self.blocked_text(f"BLOCKED: [class=question rec=A red=yes] {question}")
+                [msg] = [t for t in sent if "ждёт тебя" in t]
+                self.assertNotIn(value, msg)
+                self.assertNotIn("s3cr3t", msg)
+
+    def test_blocked_notice_masks_an_invisible_character_in_the_options(self):  # Astra r3 (high)
+        for ch in self.INVISIBLES:
+            for opt in (f"A token=s3cr3t{ch}Value9 | B нет", f"A pass{ch}word=s3cr3tValue9 | B нет",
+                        f"A s3cr3t{ch}Value9 | B нет"):
+                with self.subTest(ch=hex(ord(ch)), opt=opt.split(ch)[0]):
+                    _cfg, sent = self.blocked_text(
+                        f"BLOCKED: [class=question rec=A red=yes] вопрос; Варианты: {opt}")
+                    [msg] = [t for t in sent if "ждёт тебя" in t]
+                    self.assertNotIn("s3cr3t", msg)
+                    self.assertNotIn("Value9", msg)
+
+    def test_blocked_notice_with_a_huge_question_still_fits_and_keeps_the_answer_path(self):
+        cfg, sent = self.blocked_text(self.LABELLED.format(question="очень длинный вопрос " * 400))
+        [msg] = [t for t in sent if "ждёт тебя" in t]
+        self.assertLessEqual(len(msg), wab.TG_MESSAGE_LIMIT)
+        self.assertIn("attach -t", msg)
+        self.assertIn(" say ", msg)
+        self.assertIn("A поднять кап", msg)
+
+    def test_blocked_notice_first_line_only_of_a_multiline_question(self):
+        status = self.LABELLED.format(question="первая строка\nвторая строка с подробностями")
+        _cfg, sent = self.blocked_text(status)
+        [msg] = [t for t in sent if "ждёт тебя" in t]
+        self.assertIn("первая строка", msg)
+        self.assertNotIn("подробностями", msg)
+
+    def test_blocked_notice_without_or_with_a_broken_label_is_the_plain_quote(self):
+        for status in ("BLOCKED: просто вопрос без метки",
+                       "BLOCKED: [class=nope rec=owner red=no] испорченная метка",
+                       "BLOCKED: [class=blocked_cap rec=owner] нет red"):
+            with self.subTest(status=status):
+                _cfg, sent = self.blocked_text(status)
+                [msg] = [t for t in sent if "ждёт тебя" in t]
+                self.assertIn("Цитата волны", msg)
+                self.assertIn(status.split("] ")[-1] if "]" in status else "просто вопрос", msg)
+                self.assertIn("attach -t", msg)
+                self.assertNotIn("Класс:", msg)
+
     def test_the_quote_is_capped_and_the_message_fits(self):
         cfg, _ = self.chain_for(True, waves=["W1"])
         self.put(cfg)
@@ -12464,7 +12622,7 @@ class W3Quote(Base):
         cfg, _ = self.chain_for(True)
         wab.notify(cfg, "wave-autobot: password=hunter2hunter2 тест")
         self.assertNotIn("hunter2hunter2", self.tg[-1])
-        self.assertIn("wave-autobot: ", self.tg[-1])
+        self.assertTrue(self.tg[-1].startswith(cfg["chain"] + ": "), self.tg[-1])  # signed by the chain, #56
         self.assertNotIn("Цитата", self.tg[-1])
 
     def test_the_dispatchers_own_script_path_stays_whole(self):
@@ -12503,7 +12661,7 @@ def _unquoted_wave_text(src):
         if isinstance(node, ast.Call):
             fn = node.func
             name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
-            if name == "quote":
+            if name in ("quote", "blocked_notice"):  # blocked_notice quotes every wave text itself
                 quoted = True
             elif name in ("redact", "read") and not quoted:
                 bad.append(f"{name}() in a notice text, line {node.lineno}")

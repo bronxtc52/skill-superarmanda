@@ -1,0 +1,137 @@
+{
+ "sha": "{HEAD}",
+ "node_id": "{NODE}",
+ "commit": {
+  "author": {
+   "name": "{OWNER}",
+   "email": "owner@example.invalid",
+   "date": "2026-10-04T08:08:06Z"
+  },
+  "committer": {
+   "name": "{OWNER}",
+   "email": "owner@example.invalid",
+   "date": "2026-10-04T08:08:06Z"
+  },
+  "message": "Subject of the commit\n\nBody of the commit.",
+  "tree": {
+   "sha": "8521c118fc0823d13abfedbe9796b5c8d46e2732",
+   "url": "https://api.github.com/repos/{REPO}/git/trees/8521c118fc0823d13abfedbe9796b5c8d46e2732"
+  },
+  "url": "https://api.github.com/repos/{REPO}/git/commits/{HEAD}",
+  "comment_count": 0,
+  "verification": {
+   "verified": false,
+   "reason": "unsigned",
+   "signature": null,
+   "payload": null,
+   "verified_at": null
+  }
+ },
+ "url": "https://api.github.com/repos/{REPO}/commits/{HEAD}",
+ "html_url": "https://github.com/{REPO}/commit/{HEAD}",
+ "comments_url": "https://api.github.com/repos/{REPO}/commits/{HEAD}/comments",
+ "author": {
+  "login": "{OWNER}",
+  "id": 1,
+  "node_id": "{NODE}",
+  "avatar_url": "https://avatars.githubusercontent.com/u/1?v=4",
+  "gravatar_id": "",
+  "url": "https://api.github.com/users/{OWNER}",
+  "html_url": "https://github.com/{OWNER}",
+  "followers_url": "https://api.github.com/users/{OWNER}/followers",
+  "following_url": "https://api.github.com/users/{OWNER}/following{/other_user}",
+  "gists_url": "https://api.github.com/users/{OWNER}/gists{/gist_id}",
+  "starred_url": "https://api.github.com/users/{OWNER}/starred{/owner}{/repo}",
+  "subscriptions_url": "https://api.github.com/users/{OWNER}/subscriptions",
+  "organizations_url": "https://api.github.com/users/{OWNER}/orgs",
+  "repos_url": "https://api.github.com/users/{OWNER}/repos",
+  "events_url": "https://api.github.com/users/{OWNER}/events{/privacy}",
+  "received_events_url": "https://api.github.com/users/{OWNER}/received_events",
+  "type": "User",
+  "user_view_type": "public",
+  "site_admin": false
+ },
+ "committer": {
+  "login": "{OWNER}",
+  "id": 1,
+  "node_id": "{NODE}",
+  "avatar_url": "https://avatars.githubusercontent.com/u/1?v=4",
+  "gravatar_id": "",
+  "url": "https://api.github.com/users/{OWNER}",
+  "html_url": "https://github.com/{OWNER}",
+  "followers_url": "https://api.github.com/users/{OWNER}/followers",
+  "following_url": "https://api.github.com/users/{OWNER}/following{/other_user}",
+  "gists_url": "https://api.github.com/users/{OWNER}/gists{/gist_id}",
+  "starred_url": "https://api.github.com/users/{OWNER}/starred{/owner}{/repo}",
+  "subscriptions_url": "https://api.github.com/users/{OWNER}/subscriptions",
+  "organizations_url": "https://api.github.com/users/{OWNER}/orgs",
+  "repos_url": "https://api.github.com/users/{OWNER}/repos",
+  "events_url": "https://api.github.com/users/{OWNER}/events{/privacy}",
+  "received_events_url": "https://api.github.com/users/{OWNER}/received_events",
+  "type": "User",
+  "user_view_type": "public",
+  "site_admin": false
+ },
+ "parents": [
+  {
+   "sha": "{STALE}",
+   "url": "https://api.github.com/repos/{REPO}/commits/{STALE}",
+   "html_url": "https://github.com/{REPO}/commit/{STALE}"
+  }
+ ],
+ "stats": {
+  "total": 60,
+  "additions": 45,
+  "deletions": 15
+ },
+ "files": [
+  {
+   "sha": "c49c581df381417f66a317b4d4389810410652ba",
+   "filename": "path/to/file",
+   "status": "modified",
+   "additions": 2,
+   "deletions": 1,
+   "changes": 3,
+   "blob_url": "https://github.com/{REPO}/blob/{HEAD}/CHANGELOG.md",
+   "raw_url": "https://github.com/{REPO}/raw/{HEAD}/CHANGELOG.md",
+   "contents_url": "https://api.github.com/repos/{REPO}/contents/CHANGELOG.md?ref={HEAD}",
+   "patch": "{TEXT}"
+  },
+  {
+   "sha": "c47af716eb0cc867faf96971fae6ce8de3031c31",
+   "filename": "path/to/file",
+   "status": "modified",
+   "additions": 1,
+   "deletions": 1,
+   "changes": 2,
+   "blob_url": "https://github.com/{REPO}/blob/{HEAD}/skills%2Fsuperarmanda%2Freferences%2Fpr-review.md",
+   "raw_url": "https://github.com/{REPO}/raw/{HEAD}/skills%2Fsuperarmanda%2Freferences%2Fpr-review.md",
+   "contents_url": "https://api.github.com/repos/{REPO}/contents/skills%2Fsuperarmanda%2Freferences%2Fpr-review.md?ref={HEAD}",
+   "patch": "{TEXT}"
+  },
+  {
+   "sha": "62742cd50c897bafea7dbcb097f9cb090bbafa08",
+   "filename": "path/to/file",
+   "status": "modified",
+   "additions": 5,
+   "deletions": 8,
+   "changes": 13,
+   "blob_url": "https://github.com/{REPO}/blob/{HEAD}/skills%2Fsuperarmanda%2Fscripts%2Fpr_review.py",
+   "raw_url": "https://github.com/{REPO}/raw/{HEAD}/skills%2Fsuperarmanda%2Fscripts%2Fpr_review.py",
+   "contents_url": "https://api.github.com/repos/{REPO}/contents/skills%2Fsuperarmanda%2Fscripts%2Fpr_review.py?ref={HEAD}",
+   "patch": "{TEXT}"
+  },
+  {
+   "sha": "5a9701f814d32244e0735be6473a418e43a728e9",
+   "filename": "path/to/file",
+   "status": "modified",
+   "additions": 37,
+   "deletions": 5,
+   "changes": 42,
+   "blob_url": "https://github.com/{REPO}/blob/{HEAD}/tests%2Fhelpers%2Fsuperarmanda_pr_review_test.py",
+   "raw_url": "https://github.com/{REPO}/raw/{HEAD}/tests%2Fhelpers%2Fsuperarmanda_pr_review_test.py",
+   "contents_url": "https://api.github.com/repos/{REPO}/contents/tests%2Fhelpers%2Fsuperarmanda_pr_review_test.py?ref={HEAD}",
+   "patch": "{TEXT}"
+  }
+ ]
+}

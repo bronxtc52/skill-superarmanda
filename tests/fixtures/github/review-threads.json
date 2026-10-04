@@ -1,0 +1,29 @@
+{
+ "data": {
+  "repository": {
+   "pullRequest": {
+    "reviewThreads": {
+     "pageInfo": {
+      "hasNextPage": false
+     },
+     "nodes": [
+      {
+       "id": "{NODE}",
+       "isResolved": true,
+       "comments": {
+        "nodes": [
+         {
+          "author": {
+           "login": "chatgpt-codex-connector"
+          },
+          "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Propagate GraphQL failures while resolving review SHAs**\n\nWhen a clean review/comment contains an abbreviated SHA and the `Resolve` request fails because `gh` times out, returns GraphQL errors, or emits malformed data, this handler converts the operational failure to `None`. `check()` consequently writes a `findings` or `incomplete` result and exits 0, even though the new collection contract says any `gh` failure must abort with exit 2; callers can therefore mistake a failed evidence collection for a successfully collected gate result. Preserve `None` for a successful null/non-Commit response, but let `RuntimeError` propagate.\n\nUseful? React with 👍 / 👎."
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  }
+ }
+}

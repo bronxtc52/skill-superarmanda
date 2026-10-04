@@ -2294,6 +2294,27 @@ class StateContract(unittest.TestCase):
         self.record("tester", session="tester-1")
         self.record("cross_provider_reviewer", status=status, session=session)
 
+    def test_accept_and_defer_from_needs_fix_make_the_task_ready(self):  # #60 p.2
+        for flag in ("accept", "defer"):
+            with self.subTest(flag=flag):
+                self.setUp()
+                self.reviewed()
+                self.cli("fix-loop", "--task", "implement", "--outcome", "failed",
+                         "--source", "cross_provider_reviewer")
+                self.assertEqual(self.manifest_data()["tasks"]["implement"]["status"], "needs_fix")
+                entry = json.loads(getattr(self, flag)().stdout)
+                self.assertEqual(entry["status"], "ready_for_pr_review")
+
+    def test_accept_from_needs_fix_keeps_it_while_another_role_is_not_pass(self):  # #60 p.2
+        self.record("coder", session="coder-1")
+        self.record("tester", status="findings", session="tester-1")
+        self.record("cross_provider_reviewer", status="findings", session="reviewer-1")
+        self.cli("fix-loop", "--task", "implement", "--outcome", "failed",
+                 "--source", "tester")
+        self.assertEqual(self.manifest_data()["tasks"]["implement"]["status"], "needs_fix")
+        entry = json.loads(self.accept().stdout)
+        self.assertEqual(entry["status"], "needs_fix")
+
     def test_accept_records_acceptance_and_where_lists_it(self):
         self.reviewed()
         entry = json.loads(self.accept().stdout)
@@ -3760,7 +3781,7 @@ module.init(module.parser().parse_args(sys.argv[4:]))
     def test_damaged_max_runs_file_is_a_closed_refusal(self):
         wab = self.runs.parent
         wab.mkdir(parents=True, exist_ok=True)
-        for raw in ("", "\n", "x", "0", "-1", "1.5", "2 3", "1001"):
+        for raw in ("", "\n", "x", "0", "-1", "1.5", "2 3", "1001", "9" * 5000):
             with self.subTest(raw=raw):
                 (wab / "max-runs").write_text(raw, encoding="utf-8")
                 manifest, proc = self.init_run("d", env={"WAB_DIR": str(wab)})
@@ -3783,6 +3804,47 @@ module.init(module.parser().parse_args(sys.argv[4:]))
         self.assertIn("--defer", action)
         self.assertIn("--accept", action)
         self.assertNotIn("instead of a new fix round", action)
+
+    def set_live_cap(self, value):
+        (self.runs.parent).mkdir(parents=True, exist_ok=True)
+        (self.runs.parent / "max-runs").write_text(value, encoding="utf-8")
+
+    def where_live(self):
+        env = dict(os.environ, WAB_DIR=str(self.runs.parent))
+        proc = subprocess.run(
+            ["python3", str(STATE), "where", "--manifest", str(self.manifest)],
+            text=True, capture_output=True, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_where_follows_the_live_cap_down_and_up(self):  # #60 p.1
+        self.manifest, _ = self.init_run(
+            "a", extra=["--max-runs", 2, "--runs-file", self.runs])
+        info = self.where_live()
+        self.assertEqual((info["run"], info["last_run"]), ("1/2", False))
+        self.set_live_cap("1\n")
+        info = self.where_live()
+        self.assertEqual((info["run"], info["last_run"]), ("1/1", True))
+        self.set_live_cap("3\n")
+        info = self.where_live()
+        self.assertEqual((info["run"], info["last_run"]), ("1/3", False))
+
+    def test_where_raising_the_cap_clears_last_run_at_old_max(self):  # #60 p.1
+        flags = ["--max-runs", 2, "--runs-file", self.runs]
+        self.init_run("a", extra=flags)
+        self.manifest, _ = self.init_run("b", extra=flags)
+        self.assertTrue(self.where_live()["last_run"])  # no file: manifest value
+        self.set_live_cap("3")
+        info = self.where_live()
+        self.assertEqual((info["run"], info["last_run"]), ("2/3", False))
+
+    def test_where_with_a_broken_live_cap_file_falls_back_to_the_manifest(self):  # #60 p.1
+        self.manifest, _ = self.init_run(
+            "a", extra=["--max-runs", 2, "--runs-file", self.runs])
+        for junk in ("abc", "0", "", "-1", "99999999", "9" * 5000):  # 5000 digits: past int() str limit
+            self.set_live_cap(junk)
+            info = self.where_live()
+            self.assertEqual((info["run"], info["last_run"]), ("1/2", False), junk)
 
     def test_where_reports_the_run_and_the_last_run_hint(self):
         flags = ["--max-runs", 2, "--runs-file", self.runs]

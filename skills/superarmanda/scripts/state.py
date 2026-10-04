@@ -959,6 +959,9 @@ def plan_check(data):
 def parse_max_runs(value, origin):
     if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value) is None:
         fail(f"{origin} must be a positive integer, got {value!r}")
+    # length first: int() of a string past sys.int_info.str_digits_check_threshold raises ValueError
+    if len(value) > len(str(MAX_RUNS_LIMIT)):
+        fail(f"{origin} must be at most {MAX_RUNS_LIMIT}")
     number = int(value)
     if number > MAX_RUNS_LIMIT:
         fail(f"{origin} must be at most {MAX_RUNS_LIMIT}")
@@ -1000,6 +1003,26 @@ def run_counter_settings(args):
     else:
         limit = DEFAULT_MAX_RUNS
     return runs_file, limit
+
+
+def live_run_cap(manifest_cap):
+    """The cap `where` judges the run by. The dispatcher can change $WAB_DIR/max-runs while
+    the wave runs (the same source `init --from-plan` reads), so the manifest's frozen
+    run.max would call the last run wrongly after a raise or a cut. `where` is read-only and
+    must keep answering: a missing, unreadable or invalid file (not a positive integer within
+    MAX_RUNS_LIMIT) falls back to the manifest value, it is not an error."""
+    directory = os.environ.get("WAB_DIR")
+    if not directory:
+        return manifest_cap
+    try:
+        raw = (Path(directory) / "max-runs").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return manifest_cap
+    raw = raw.rstrip("\n")
+    if (re.fullmatch(r"[1-9][0-9]*", raw) is None or len(raw) > len(str(MAX_RUNS_LIMIT))
+            or int(raw) > MAX_RUNS_LIMIT):
+        return manifest_cap
+    return int(raw)
 
 
 def read_runs(path, wave_id):
@@ -1272,6 +1295,19 @@ def coverable_result(args, entry, data, location, flag):
     return result_entry
 
 
+def settle_after_cover(entry):
+    """A deferral/acceptance may complete the task. From needs_fix it may only promote to
+    ready_for_pr_review (every role pass or covered): update_task_status would otherwise
+    demote a still-open needs_fix to in_progress. blocked/needs_decision never get here."""
+    if entry["status"] != "needs_fix":
+        update_task_status(entry)
+    elif all(
+        effective_status(entry, role) == "pass"
+        for role in ("coder", "tester", "cross_provider_reviewer")
+    ):
+        entry["status"] = "ready_for_pr_review"
+
+
 def record_deferral(args, entry, data, location):
     """Defer low/P3-only findings of a reviewer to the next wave/task remainder.
     Spends no fix cycle, touches no per-source counter and is not a decision."""
@@ -1286,8 +1322,7 @@ def record_deferral(args, entry, data, location):
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }
     )
-    if entry["status"] != "needs_fix":
-        update_task_status(entry)
+    settle_after_cover(entry)
 
 
 def record_acceptance(args, entry, data, location):
@@ -1308,8 +1343,7 @@ def record_acceptance(args, entry, data, location):
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }
     )
-    if entry["status"] != "needs_fix":
-        update_task_status(entry)
+    settle_after_cover(entry)
 
 
 def record_decision(args, entry):
@@ -1561,8 +1595,9 @@ def where(args):
         for role, verdict in verdicts.items()
     }
     run = data.get("run") if isinstance(data.get("run"), dict) else None
-    run_label = f"{run['index']}/{run['max']}" if run else None
-    last_run = bool(run) and run["index"] == run["max"]
+    run_max = live_run_cap(run["max"]) if run else None
+    run_label = f"{run['index']}/{run_max}" if run else None
+    last_run = bool(run) and run["index"] >= run_max
     step, role, note = derive_step(entry, effective, last_run)
     position = data.get("position")
     precode = (
