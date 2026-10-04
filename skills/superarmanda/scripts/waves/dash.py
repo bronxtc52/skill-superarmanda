@@ -441,7 +441,7 @@ def current_panel(cfg, st):
 # The full line stays in events.log; here it is a phrase with an emoji, the technical part (class=,
 # SHA, pid, paths) goes grey on a second line. Everything shown passes wab.redact(owner_paths=False):
 # the text of an event may quote the wave.
-_WAVE = r"(?P<w>[A-Za-z]\w*)"
+_WAVE = "(?P<w>" + wab.WAVE_NAME.pattern + ")"  # the dispatcher's own notion of a wave name
 _PULSE = re.compile(_WAVE + r": phase=(?P<phase>\S*) ctx=(?P<ctx>\S*) restarts=(?P<restarts>\S*) status=(?P<status>.*)", re.S)
 _BLOCKED_ANY = re.compile(_WAVE + r": BLOCKED:(?P<rest>.*)", re.S)
 _CAP_WHY = {  # BLOCKED class -> why the wave waits (plain words)
@@ -581,10 +581,11 @@ def humanize_event(msg):
     """One events.log message (without the time) -> (phrase, details, colour, known). `known` is False
     for a type nobody described: the phrase is then the raw line cut to ~140 characters. Phrase and
     details are masked with wab.redact; the raw line is not changed in events.log."""
-    msg = _CONTROL.sub("·", msg).strip()  # a visible sign instead of a control character
-    # Masking comes FIRST, over the WHOLE line: every cut below (phrases, details, the raw line) then
-    # works on already masked text, so a secret cannot be split by a limit into a piece redact() misses.
-    msg = wab.redact(msg, limit=10 ** 7, owner_paths=False)
+    # Masking comes FIRST, over the WHOLE line, the way notices are masked: a token that holds an invisible or
+    # control character is masked whole (it may glue or split a secret). Every cut below (phrases, details,
+    # the raw line) then works on masked text, so a limit cannot split a secret into a piece redact() misses.
+    msg = wab._clean_redact(msg, 10 ** 7, owner_paths=False)
+    msg = _CONTROL.sub("·", msg).strip()  # what is left (a tab, a line break): a visible sign for the terminal
     result = None
     m = _PULSE.fullmatch(msg)
     if m:

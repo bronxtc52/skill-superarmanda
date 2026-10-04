@@ -14152,6 +14152,41 @@ class DashEvents(unittest.TestCase):
         self.assertIn("запущен", out)
         self.assertIn("без изменений с 10:00 (×1000)", out)
 
+    def test_an_invisible_character_inside_a_secret_does_not_hide_it(self):
+        # one representative of every class of wab._INVISIBLE: Cf (zero width, joiner, word joiner, BOM, soft
+        # hyphen, tag), Zl, Hangul fillers, variation selector, CGJ, an unassigned default-ignorable one, bidi
+        chars = ["\u200b", "\u200d", "\u2060", "\ufeff", "\u00ad", "\u2028", "\u3164", "\u115f", "\U000e0001",
+                 "\ufe0f", "\u034f", "\u2065", "\u202e", "\u2029", "\x00", "\x9b"]
+        token = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        for c in chars:
+            cases = [("password" + c + "=hunter2hunter2", "hunter2"),
+                     ("ghp_" + token[:18] + c + token[18:], token[:9]),
+                     ("sk-ant-api03-" + token[:12] + c + token[12:], token[14:23])]
+            for secret, fragment in cases:
+                for msg in (f"W1: say: {secret}", f"W9: unknown thing {secret} tail",
+                            f"W1: BLOCKED: [class=question rec=fix red=no] вопрос {secret}",
+                            f"W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=question rec=fix red=no] {secret}",
+                            f"W1: merge gate failed: {secret}"):
+                    phrase, details, _, _ = self.dash.humanize_event(msg)
+                    out = phrase + " " + (details or "")
+                    self.assertNotIn(fragment, out, (hex(ord(c[0])), msg[:40], out))
+                    self.assertNotIn("hunter2", out, (hex(ord(c[0])), msg[:40], out))
+
+    def test_wave_names_are_the_dispatchers_names(self):
+        h = self.dash.humanize_event
+        for wave in ("fix-input", "1", "w2-resume", "9a"):
+            phrase, details, _, known = h(f"{wave}: BLOCKED: [class=blocked_cap rec=owner red=no] x")
+            self.assertTrue(known, wave)
+            self.assertIn(wave, phrase)
+            self.assertIn("твоего решения", phrase)
+            items = self.dash.fold_events([self._pulse(f"10:0{i}:00Z", i, wave=wave) for i in range(6)])
+            self.assertEqual(len(items), 1, (wave, items))
+            self.assertIn("(×6)", items[0][1])
+            self.assertIn(wave, items[0][1])
+        mixed = [self._pulse("10:00:00Z", 1, wave="fix-a"), self._pulse("10:01:00Z", 1, wave="fix-b"),
+                 self._pulse("10:02:00Z", 1, wave="fix-a")]
+        self.assertEqual(len(self.dash.fold_events(mixed)), 3)  # waves with a hyphen are not glued together
+
     def test_events_panel_folds_before_it_cuts_the_tail(self):
         from rich.console import Console
         run_dir = Path(tempfile.mkdtemp(prefix="wabtest-"))
