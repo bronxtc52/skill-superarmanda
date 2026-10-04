@@ -11382,6 +11382,13 @@ class InputClear(GateBase):
                 self.assertIsNone(wab.exit_dialog(screen))
         self.assertTrue(wab.exit_dialog(self.EXIT_MENU))
 
+    def test_a_quoted_exit_menu_above_another_dialog_is_not_the_live_menu(self):
+        other = ("Do you want to proceed?\n❯ 1. Yes\n  2. No\n"
+                 "  Enter to confirm · Esc to cancel\n")
+        self.assertIsNone(wab.exit_dialog(self.EXIT_MENU + other))
+        self.assertIsNone(wab.exit_dialog(self.EXIT_MENU + "trailing output line\n"))
+        self.assertTrue(wab.exit_dialog("history line\n" + self.EXIT_MENU + "\n\n"))
+
     def test_close_window_survives_a_clearing_that_raises(self):
         self.done_with_typed_alarm()
         self.clear_works = False

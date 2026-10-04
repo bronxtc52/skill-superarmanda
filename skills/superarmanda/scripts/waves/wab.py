@@ -2389,24 +2389,24 @@ EXIT_WAIT = 30  # seconds the next launch waits for the previous wave's window a
 EXIT_DIALOG = "Exit and stop tasks"
 
 
+_EXIT_OPTIONS = (re.compile(r"^\s*(\u276f\s*)?1\.\s+Exit and stop tasks\s*$"),
+                 re.compile(r"^\s*(\u276f\s*)?2\.\s+Move to background and exit\s*$"),
+                 re.compile(r"^\s*(\u276f\s*)?3\.\s+Stay\s*$"))
+
+
 def exit_dialog(text):
-    """None: no /exit menu on the screen; True: it is there with option 1 highlighted (Enter takes
-    it); False: it is there, but another option is highlighted (Enter would not exit). The menu is
-    recognised only whole and live: its three options and the «Enter to confirm» hint, in this order
-    at the bottom, and no input box under them (a menu quoted in the history keeps the input box
-    below it, so ordinary output mentioning the option is not taken for the menu)."""
-    lines = text.splitlines()[-15:]
-    idx = [i for i, l in enumerate(lines) if EXIT_DIALOG in l]
-    if not idx:
+    """None: no live /exit menu; True: it is there with option 1 highlighted (Enter takes it);
+    False: it is there, but another option is highlighted (Enter would not exit). Recognised only as
+    one bounded menu at the very bottom: the «Enter to confirm» hint is the last non-empty line and
+    the three non-empty lines right above it are exactly the numbered options, in order. A menu
+    quoted in the output, or one with another dialog or the input box below it, is not the live one."""
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) < 4 or "Enter to confirm" not in lines[-1]:
         return None
-    i = idx[-1]
-    rest = lines[i + 1:]
-    tail = "\n".join(rest)
-    if not ("Move to background and exit" in tail and "Stay" in tail and "Enter to confirm" in tail):
+    opts = lines[-4:-1]
+    if not all(rx.match(l) for rx, l in zip(_EXIT_OPTIONS, opts)):
         return None
-    if any(INPUT_MARK in l and k > 0 and _is_rule(rest[k - 1]) for k, l in enumerate(rest)):
-        return None  # an input box below: the «menu» is history, not the live dialog
-    return INPUT_MARK in lines[i]
+    return INPUT_MARK in opts[0]
 
 
 def close_window(cfg, st, w):
