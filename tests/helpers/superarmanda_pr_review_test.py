@@ -679,28 +679,768 @@ class EvaluateContract(unittest.TestCase):
         self.assertEqual(stale["status"], "pass")
 
 
+FIXTURES = ROOT / "tests" / "fixtures" / "pr-review"
+
+# Fake `gh`: serves GraphQL read-only from a fixture of
+# {"entries": [{"name", "variables", "responses": [...]}]}. The n-th identical
+# request gets responses[n] (the last one repeats). Anything that is not
+# `api graphql`, not a `query`, or has no entry exits non-zero.
 FAKE_GH = r"""#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 
 argv = sys.argv[1:]
 log = Path(os.environ["PR_REVIEW_GH_LOG"])
 log.open("a", encoding="utf-8").write(json.dumps(argv) + "\n")
-if argv[:5] != ["api", "--hostname", "github.com", "--method", "GET"]:
-    print("only read-only GET is permitted", file=sys.stderr)
+if argv[:4] != ["api", "graphql", "--hostname", "github.com"]:
+    print("only `api graphql` is permitted", file=sys.stderr)
     raise SystemExit(91)
-endpoint = argv[5]
+query, variables, rest = None, {}, argv[4:]
+while rest:
+    flag, pair, rest = rest[0], rest[1], rest[2:]
+    key, value = pair.split("=", 1)
+    if flag == "-f" and key == "query":
+        query = value
+    elif flag == "-f":
+        variables[key] = value
+    elif flag == "-F":
+        variables[key] = int(value)
+    else:
+        raise SystemExit(92)
+if query is None or not query.lstrip().startswith("query") or "mutation" in query:
+    print("only read-only queries are permitted", file=sys.stderr)
+    raise SystemExit(93)
+name = re.match(r"\s*query\s+(\w+)", query).group(1)
 data = json.loads(Path(os.environ["PR_REVIEW_FIXTURE"]).read_text(encoding="utf-8"))
-value = data.get(endpoint, [])
-if isinstance(value, dict) and "_sequence" in value:
-    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-    occurrence = sum(call[5] == endpoint for call in calls) - 1
-    value = value["_sequence"][occurrence]
-if isinstance(value, list) and value and isinstance(value[0], list):
-    page = int(endpoint.rsplit("page=", 1)[1]) - 1
-    value = value[page] if page < len(value) else []
-print(json.dumps(value))
+entries = data["entries"] if isinstance(data, dict) else data
+calls = []
+for line in log.read_text(encoding="utf-8").splitlines():
+    call = json.loads(line)
+    seen = {}
+    rest2 = call[4:]
+    while rest2:
+        flag, pair, rest2 = rest2[0], rest2[1], rest2[2:]
+        k, v = pair.split("=", 1)
+        seen[k] = v if flag == "-f" else int(v)
+    calls.append(seen)
+match = [e for e in entries if e["name"] == name and e["variables"] == variables]
+if not match:
+    print("private-diagnostic-canary: no fixture for " + name, file=sys.stderr)
+    raise SystemExit(1)
+occurrence = sum(
+    1 for c in calls
+    if {k: v for k, v in c.items() if k != "query"} == variables
+    and re.match(r"\s*query\s+(\w+)", c["query"]).group(1) == name
+) - 1
+responses = match[0]["responses"]
+print(json.dumps(responses[min(occurrence, len(responses) - 1)]))
 """
+
+
+def gactor(login="chatgpt-codex-connector", kind="Bot"):
+    return {"__typename": kind, "login": login}
+
+
+def g_review(state="APPROVED", sha=HEAD, body="", ident=1, who=None):
+    return {
+        "databaseId": ident,
+        "url": f"https://review/{ident}",
+        "state": state,
+        "body": body,
+        "commit": {"oid": sha} if sha else None,
+        "author": who or gactor(),
+    }
+
+
+def g_comment(body, sha=HEAD, orig=None, ident=1, review_id=None, who=None):
+    return {
+        "databaseId": ident,
+        "url": f"https://thread-comment/{ident}",
+        "body": body,
+        "commit": {"oid": sha},
+        "originalCommit": {"oid": orig or sha},
+        "author": who or gactor(),
+        "pullRequestReview": {"databaseId": review_id} if review_id else None,
+    }
+
+
+def g_issue(body, ident=1, who=None):
+    return {
+        "databaseId": ident,
+        "url": f"https://issue/{ident}",
+        "body": body,
+        "author": who or gactor(),
+    }
+
+
+def g_suite(sid, runs, app="github-actions"):
+    return {"id": sid, "app": {"slug": app}, "runs": runs}
+
+
+def g_run(name="ci", status="COMPLETED", conclusion="SUCCESS"):
+    return {
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "detailsUrl": f"https://run/{name}",
+    }
+
+
+class Snap:
+    """Explicit per-read contents: first read, second read."""
+
+    def __init__(self, first, second):
+        self.items = [first, second]
+
+
+def snaps(value):
+    return value.items if isinstance(value, Snap) else [value, value]
+
+
+def conn(nodes, i, total, tag):
+    return {
+        "nodes": nodes,
+        "pageInfo": {"hasNextPage": i < total - 1, "endCursor": f"{tag}-{i}"},
+    }
+
+
+class Server:
+    """Builds fixture entries; every list is served in pages with cursors."""
+
+    def __init__(self, owner="acme", name="widget", number=42, size=100):
+        self.base = {"owner": owner, "name": name, "number": number}
+        self.size, self.entries = size, []
+
+    def add(self, name, variables, responses):
+        self.entries.append(
+            {"name": name, "variables": variables, "responses": responses}
+        )
+
+    def paged(self, name, variables, snapshots, wrap, tag=None, size=None):
+        tag, size = tag or name, size or self.size
+        chunks = [
+            [s[i : i + size] for i in range(0, len(s), size)] or [[]] for s in snapshots
+        ]
+        total = len(chunks[0])
+        assert all(len(c) == total for c in chunks), "page counts must match"
+        for i in range(total):
+            vars_ = dict(variables)
+            if i:
+                vars_["cursor"] = f"{tag}-{i - 1}"
+            self.add(name, vars_, [wrap(conn(c[i], i, total, tag)) for c in chunks])
+
+    def header(self, heads=(HEAD, HEAD), draft=False, state="OPEN"):
+        self.add(
+            "Header",
+            self.base,
+            [
+                {
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "headRefOid": h,
+                                "isDraft": draft,
+                                "state": state,
+                            }
+                        }
+                    }
+                }
+                for h in heads
+            ],
+        )
+
+    def resolve(self, ref, full):
+        obj = {"oid": full} if full else None
+        self.add(
+            "Resolve",
+            {"owner": self.base["owner"], "name": self.base["name"], "ref": ref},
+            [{"data": {"repository": {"object": obj}}}],
+        )
+
+    def threads(self, thread_snaps):
+        built = []
+        for specs in snaps(thread_snaps):
+            nodes = []
+            for spec in specs:
+                comments = spec["comments"]
+                first, more = comments[:100], comments[100:]
+                tid = spec["id"]
+                if more:
+                    pages = [comments[i : i + 100] for i in range(100, len(comments), 100)]
+                    total = len(pages) + 1
+                    for i, page in enumerate(pages, start=1):
+                        vars_ = {"thread": tid, "cursor": f"tc-{tid}-{i - 1}"}
+                        self.add(
+                            "ThreadComments",
+                            vars_,
+                            [
+                                {
+                                    "data": {
+                                        "node": {
+                                            "comments": conn(page, i, total, f"tc-{tid}")
+                                        }
+                                    }
+                                }
+                            ],
+                        )
+                    cmts = conn(first, 0, total, f"tc-{tid}")
+                else:
+                    cmts = conn(first, 0, 1, f"tc-{tid}")
+                nodes.append(
+                    {"id": tid, "isResolved": spec.get("resolved", False), "comments": cmts}
+                )
+            built.append(nodes)
+        self.paged(
+            "Threads",
+            self.base,
+            built,
+            lambda c: {"data": {"repository": {"pullRequest": {"reviewThreads": c}}}},
+        )
+
+    def checks(self, suites, head=HEAD):
+        nodes = []
+        for suite in suites:
+            runs = suite["runs"]
+            first = runs[:100]
+            sid = suite["id"]
+            total = max(1, -(-len(runs) // 100))
+            for i in range(1, total):
+                self.add(
+                    "SuiteRuns",
+                    {"suite": sid, "cursor": f"sr-{sid}-{i - 1}"},
+                    [
+                        {
+                            "data": {
+                                "node": {
+                                    "checkRuns": conn(
+                                        runs[i * 100 : (i + 1) * 100], i, total, f"sr-{sid}"
+                                    )
+                                }
+                            }
+                        }
+                    ],
+                )
+            nodes.append(
+                {
+                    "id": sid,
+                    "app": suite["app"],
+                    "checkRuns": conn(first, 0, total, f"sr-{sid}"),
+                }
+            )
+        self.paged(
+            "Checks",
+            {
+                "owner": self.base["owner"],
+                "name": self.base["name"],
+                "head": head,
+            },
+            [nodes],
+            lambda c: {"data": {"repository": {"object": {"checkSuites": c}}}},
+        )
+
+    def standard(
+        self,
+        heads=(HEAD, HEAD),
+        reviews=(),
+        threads=(),
+        issues=(),
+        suites=None,
+        size=None,
+    ):
+        if size:
+            self.size = size
+        self.header(heads)
+        self.paged(
+            "Reviews",
+            self.base,
+            snaps(list(reviews) if not isinstance(reviews, Snap) else reviews),
+            lambda c: {"data": {"repository": {"pullRequest": {"reviews": c}}}},
+        )
+        self.threads(threads if isinstance(threads, Snap) else list(threads))
+        self.paged(
+            "IssueComments",
+            self.base,
+            snaps(list(issues) if not isinstance(issues, Snap) else issues),
+            lambda c: {"data": {"repository": {"pullRequest": {"comments": c}}}},
+        )
+        self.checks(
+            [g_suite("S1", [g_run()])] if suites is None else suites, head=heads[0]
+        )
+        return self
+
+
+def run_check(entries, head=HEAD, extra=(), repo="acme/widget", pr_no="42", cwd=None):
+    """Run the real CLI against a fake `gh`; returns (proc, result|None, calls)."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        bindir = root / "bin"
+        bindir.mkdir()
+        fake = bindir / "gh"
+        fake.write_text(FAKE_GH, encoding="utf-8")
+        fake.chmod(0o755)
+        log, fixture, output = (
+            root / "calls.jsonl",
+            root / "fixture.json",
+            root / "evidence.json",
+        )
+        fixture.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+        env = {
+            **os.environ,
+            "PATH": str(bindir) + os.pathsep + os.environ["PATH"],
+            "PR_REVIEW_GH_LOG": str(log),
+            "PR_REVIEW_FIXTURE": str(fixture),
+        }
+        proc = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "check",
+                "--repo",
+                repo,
+                "--pr",
+                pr_no,
+                "--head",
+                head,
+                "--output",
+                str(output),
+                *extra,
+            ],
+            text=True,
+            capture_output=True,
+            env=env,
+            cwd=cwd,
+        )
+        result = (
+            json.loads(output.read_text(encoding="utf-8")) if output.exists() else None
+        )
+        calls = (
+            [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+            if log.exists()
+            else []
+        )
+        return proc, result, calls
+
+
+def sent_queries(calls):
+    out = []
+    for call in calls:
+        for flag, pair in zip(call, call[1:]):
+            if flag == "-f" and pair.startswith("query="):
+                out.append(pair[len("query=") :])
+    return out
+
+
+CLEAN = "Codex Review: Didn't find any major issues. :rocket:\n\n**Reviewed commit:** `aaaaaaaaaaaa`"
+
+
+def load_variants():
+    data = json.loads((FIXTURES / "codex-clean-variants.json").read_text("utf-8"))
+    return data["variants"]
+
+
+class CleanVariantsFixture(unittest.TestCase):
+    """#5: 18 live Codex clean-answer variants (captured 2026-10-04)."""
+
+    def test_fixture_is_the_live_capture(self):
+        variants = load_variants()
+        self.assertEqual(len(variants), 18)
+        for v in variants:
+            self.assertEqual(
+                set(v), {"body", "reviewed_short", "resolved_full", "source_url"}
+            )
+
+    def evaluate(self, body, full, resolved, who=None, expected=None):
+        return MODULE.evaluate(
+            pr(full),
+            [],
+            [],
+            [issue(body, who=who)],
+            expected or full,
+            lambda ref: resolved.get(ref),
+        )
+
+    def test_every_live_variant_is_recognized_and_passes_when_it_resolves_to_head(self):
+        for v in load_variants():
+            with self.subTest(url=v["source_url"]):
+                body = MODULE.text({"body": v["body"]})
+                self.assertEqual(MODULE.clean_commit(body), v["reviewed_short"])
+                result = self.evaluate(
+                    v["body"], v["resolved_full"], {v["reviewed_short"]: v["resolved_full"]}
+                )
+                self.assertEqual(result["status"], "pass", result)
+
+    def test_mutations_of_every_variant_never_pass(self):
+        def footer(body):
+            if "Reviews are triggered" in body:
+                return body.replace("Reviews are triggered", "Reviews are triggerd")
+            return body + "\n<details>x</details>"
+
+        mutations = {
+            "extra line": lambda b: b + "\nextra line",
+            "markup in phrase": lambda b: b.replace(
+                "major issues.", "major issues. <b>x</b>", 1
+            ),
+            "changed footer": footer,
+            "phrase over 48": lambda b: b.replace(
+                "major issues.", "major issues. " + "x" * 49, 1
+            ),
+            "changed marker": lambda b: b.replace("Reviewed commit", "Reviewed  commit"),
+            "other line": lambda b: b.replace("Didn't find", "Did find", 1),
+        }
+        for v in load_variants():
+            full, short = v["resolved_full"], v["reviewed_short"]
+            for label, mutate in mutations.items():
+                with self.subTest(url=v["source_url"], mutation=label):
+                    body = mutate(v["body"])
+                    self.assertNotEqual(body, v["body"])
+                    result = self.evaluate(body, full, {short: full})
+                    self.assertNotEqual(result["status"], "pass")
+            with self.subTest(url=v["source_url"], mutation="other SHA"):
+                other = "d" * 40
+                self.assertNotEqual(
+                    self.evaluate(v["body"], full, {short: other})["status"], "pass"
+                )
+            with self.subTest(url=v["source_url"], mutation="User with same login"):
+                user = {"login": "chatgpt-codex-connector", "type": "User"}
+                self.assertNotEqual(
+                    self.evaluate(v["body"], full, {short: full}, who=user)["status"],
+                    "pass",
+                )
+
+    def test_variants_pass_end_to_end_through_graphql_normalization(self):
+        v = load_variants()[0]
+        full, short = v["resolved_full"], v["reviewed_short"]
+        srv = Server()
+        srv.standard(heads=(full, full), issues=[g_issue(v["body"])])
+        srv.resolve(short, full)
+        proc, result, _ = run_check(srv.entries, head=full)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["status"], "pass", result)
+
+
+class GraphQLNormalization(unittest.TestCase):
+    def test_bot_login_gets_suffix_and_user_with_same_login_is_untrusted(self):
+        srv = Server().standard(
+            reviews=[g_review(who=gactor("chatgpt-codex-connector", "User"))]
+        )
+        proc, result, _ = run_check(srv.entries)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotEqual(result["status"], "pass")
+        srv = Server().standard(reviews=[g_review()])
+        proc, result, _ = run_check(srv.entries)
+        self.assertEqual(result["status"], "pass", result)
+
+    def test_missing_author_is_not_trusted(self):
+        review_ = g_review()
+        review_["author"] = None
+        proc, result, _ = run_check(Server().standard(reviews=[review_]).entries)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotEqual(result["status"], "pass")
+
+    def test_stale_codex_review_and_clean_comment_do_not_pass(self):
+        srv = Server().standard(reviews=[g_review(sha=OLD)])
+        proc, result, _ = run_check(srv.entries)
+        self.assertNotEqual(result["status"], "pass")
+        self.assertIn(
+            "Codex review is stale or lacks the full current commit_id",
+            result["limitations"],
+        )
+        srv = Server().standard(issues=[g_issue(CLEAN)])
+        srv.resolve("aaaaaaaaaaaa", OLD)
+        proc, result, _ = run_check(srv.entries)
+        self.assertNotEqual(result["status"], "pass")
+        srv = Server().standard(issues=[g_issue(CLEAN)])
+        srv.resolve("aaaaaaaaaaaa", HEAD)
+        proc, result, _ = run_check(srv.entries)
+        self.assertEqual(result["status"], "pass", result)
+
+    def test_unresolvable_short_sha_is_not_pass(self):
+        # Успешный ответ: object null или не Commit (нет oid) -> None, не pass и не отказ.
+        for obj in (None, {}, {"__typename": "Tree"}):
+            srv = Server().standard(issues=[g_issue(CLEAN)])
+            srv.add(
+                "Resolve",
+                {"owner": "acme", "name": "widget", "ref": "aaaaaaaaaaaa"},
+                [{"data": {"repository": {"object": obj}}}],
+            )
+            proc, result, _ = run_check(srv.entries)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotEqual(result["status"], "pass")
+
+    def test_resolve_failure_is_a_refusal_not_findings(self):
+        # Нет записи Resolve: фейковый gh завершается rc 1 -> сбой gh.
+        srv = Server().standard(issues=[g_issue(CLEAN)])
+        proc, result, _ = run_check(srv.entries)
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertEqual(proc.stderr.strip(), "pr_review: gh api graphql failed")
+        self.assertNotIn("canary", proc.stderr)
+        self.assertIsNone(result)
+        # errors / нет repository в ответе Resolve.
+        for response in (
+            {"errors": [{"message": "private-diagnostic-canary"}]},
+            {"data": {"repository": None}},
+            {"data": None},
+        ):
+            srv = Server().standard(issues=[g_issue(CLEAN)])
+            srv.add(
+                "Resolve",
+                {"owner": "acme", "name": "widget", "ref": "aaaaaaaaaaaa"},
+                [response],
+            )
+            proc, result, _ = run_check(srv.entries)
+            self.assertEqual(proc.returncode, 2, proc.stdout)
+            self.assertEqual(proc.stderr.strip(), "pr_review: gh api graphql failed")
+            self.assertNotIn("canary", proc.stderr)
+            self.assertIsNone(result)
+
+    def test_thread_comment_maps_commit_ids_and_review_id(self):
+        thread = {
+            "id": "T1",
+            "comments": [g_comment("bug", sha=HEAD, orig=OLD, ident=9, review_id=1)],
+        }
+        srv = Server().standard(reviews=[g_review()], threads=[thread])
+        proc, result, _ = run_check(srv.entries)
+        self.assertEqual(result["status"], "findings")
+        found = result["findings"][0]
+        self.assertEqual(found["source"], "review_comment")
+        self.assertEqual(found["commit_id"], HEAD)
+        self.assertEqual(found["original_commit_id"], OLD)
+        self.assertEqual(found["author"], CODEX)
+        self.assertEqual(found["url"], "https://thread-comment/9")
+
+
+class GraphQLPagination(unittest.TestCase):
+    def test_all_thread_pages_are_read_and_last_page_finding_is_found(self):
+        threads = [
+            {"id": f"T{n}", "comments": [g_comment("old", sha=OLD, ident=n)]}
+            for n in range(4)
+        ]
+        threads.append(
+            {"id": "T4", "comments": [g_comment("real bug", sha=HEAD, ident=77)]}
+        )
+        srv = Server().standard(threads=threads, size=2)
+        proc, result, calls = run_check(srv.entries)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["status"], "findings")
+        self.assertEqual([f["url"] for f in result["findings"]], ["https://thread-comment/77"])
+        thread_calls = [q for q in sent_queries(calls) if q.lstrip().startswith("query Threads")]
+        self.assertGreaterEqual(len(thread_calls), 6)  # 3 pages, read twice
+        self.assertIn(
+            "pageInfo", thread_calls[0]
+        )
+
+    def test_thread_with_more_than_100_comments_is_drained(self):
+        comments = [g_comment("old", sha=OLD, ident=n) for n in range(1, 250)]
+        comments.append(g_comment("late bug", sha=HEAD, ident=999))
+        srv = Server().standard(threads=[{"id": "BIG", "comments": comments}])
+        proc, result, calls = run_check(srv.entries)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["status"], "findings")
+        self.assertEqual([f["url"] for f in result["findings"]], ["https://thread-comment/999"])
+        self.assertTrue(
+            any(q.lstrip().startswith("query ThreadComments") for q in sent_queries(calls))
+        )
+
+    def test_reviews_and_issue_comments_on_multiple_pages(self):
+        noise = [g_review("COMMENTED", HEAD, "", n, gactor("someone", "User")) for n in range(1, 5)]
+        srv = Server().standard(reviews=noise + [g_review(ident=50)], size=2)
+        proc, result, _ = run_check(srv.entries)
+        self.assertEqual(result["status"], "pass", result)
+        issues = [g_issue("hi", ident=n, who=gactor("someone", "User")) for n in range(1, 5)]
+        srv = Server().standard(issues=issues + [g_issue(CLEAN, ident=60)], size=2)
+        srv.resolve("aaaaaaaaaaaa", HEAD)
+        proc, result, _ = run_check(srv.entries)
+        self.assertEqual(result["status"], "pass", result)
+
+    def test_check_runs_suite_and_nested_run_pagination_with_summary(self):
+        runs = [g_run(f"job{n}") for n in range(120)]
+        runs.append(g_run("slow", "IN_PROGRESS", None))
+        runs.append(g_run("bad", "COMPLETED", "FAILURE"))
+        suites = [g_suite(f"S{n}", [g_run(f"s{n}")], app=f"app{n}") for n in range(3)]
+        suites.append(g_suite("BIG", runs))
+        srv = Server().standard(reviews=[g_review()], suites=suites, size=2)
+        proc, result, calls = run_check(srv.entries)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["status"], "pass")  # checks never change status
+        self.assertEqual(result["checks"]["total"], 3 + 122)
+        self.assertEqual(result["checks"]["pending"], ["slow"])
+        self.assertEqual(result["checks"]["failed"], [["bad", "FAILURE"]])
+        self.assertIn(
+            {"name": "s1", "status": "COMPLETED", "conclusion": "SUCCESS", "app": "app1"},
+            result["check_runs"],
+        )
+        self.assertTrue(
+            any(q.lstrip().startswith("query SuiteRuns") for q in sent_queries(calls))
+        )
+
+
+class LivePr71Fixture(unittest.TestCase):
+    """Живые ответы GraphQL по bronxtc52/skill-superarmanda#71 (записаны самим check)."""
+
+    LIVE_HEAD = "98b72fc0900086732249dea82c6014c380500893"
+    OLD_HEAD = "9306e856ed0e2927d96e17b4c60103f18ea0f700"
+    THREAD_URL = "https://github.com/bronxtc52/skill-superarmanda/pull/71#discussion_r4176410524"
+
+    def entries(self):
+        return json.loads((FIXTURES / "pr71-graphql.json").read_text("utf-8"))["entries"]
+
+    def run71(self, head):
+        return run_check(self.entries(), head=head, repo="bronxtc52/skill-superarmanda", pr_no="71")
+
+    def test_live_head_is_findings_not_pass_with_the_expected_evidence(self):
+        proc, result, calls = self.run71(self.LIVE_HEAD)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # Codex оставил чистый комментарий на 98b72fc (он распознан и резолвится в HEAD),
+        # но inline-тред с 9306e85 перенесён GitHub на текущий HEAD (commit.oid == HEAD,
+        # originalCommit.oid == 9306e85), а три комментария CodeRabbit — не шаблон
+        # пропуска. Поэтому честный статус — findings, а не pass.
+        self.assertEqual(result["status"], "findings")
+        self.assertEqual(result["current_head"], self.LIVE_HEAD)
+        threads = [f for f in result["findings"] if f["source"] == "review_comment"]
+        self.assertEqual([f["url"] for f in threads], [self.THREAD_URL])
+        self.assertEqual(threads[0]["commit_id"], self.LIVE_HEAD)
+        self.assertEqual(threads[0]["original_commit_id"], self.OLD_HEAD)
+        self.assertEqual(
+            [f["author"] for f in result["findings"] if f["source"] == "issue_comment"],
+            ["coderabbitai[bot]"] * 3,
+        )
+        self.assertNotIn(
+            "https://github.com/bronxtc52/skill-superarmanda/pull/71#issuecomment-5977422763",
+            [f["url"] for f in result["findings"]],
+        )
+        # Чистый комментарий на старом HEAD (9306e85) не резолвится в текущий.
+        self.assertIn(
+            "Codex clean comment does not resolve to current full SHA",
+            result["limitations"],
+        )
+        self.assertEqual(result["checks"], {"total": 2, "pending": [], "failed": []})
+        self.assertEqual(
+            sorted(r["name"] for r in result["check_runs"]),
+            ["tests (macos-latest)", "tests (ubuntu-latest)"],
+        )
+        for call in calls:
+            self.assertEqual(call[:4], ["api", "graphql", "--hostname", "github.com"])
+        for query in sent_queries(calls):
+            self.assertTrue(query.lstrip().startswith("query"))
+            self.assertNotIn("mutation", query)
+
+    def test_old_head_is_incomplete_head_differs(self):
+        proc, result, _ = self.run71(self.OLD_HEAD)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("PR HEAD differs from expected SHA", result["limitations"])
+        self.assertEqual(result["current_head"], self.LIVE_HEAD)
+
+    def test_fixture_has_no_leaked_coderabbit_scope_token(self):
+        raw = (FIXTURES / "pr71-graphql.json").read_text("utf-8")
+        self.assertNotIn("scope=ghh_", raw)
+
+
+class GraphQLFailClosed(unittest.TestCase):
+    def assert_refused(self, entries, expect_calls=True):
+        proc, result, _ = run_check(entries)
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertEqual(proc.stderr.strip(), "pr_review: gh api graphql failed")
+        self.assertNotIn("canary", proc.stderr)
+        self.assertIsNone(result)
+
+    def tamper(self, name, mutate, **kw):
+        srv = Server().standard(**kw)
+        for entry in srv.entries:
+            if entry["name"] == name:
+                entry["responses"] = [mutate(json.loads(json.dumps(r))) for r in entry["responses"]]
+                break
+        return srv.entries
+
+    def test_errors_key_in_response(self):
+        def add_errors(r):
+            r["errors"] = [{"message": "private-diagnostic-canary"}]
+            return r
+
+        self.assert_refused(self.tamper("Reviews", add_errors))
+
+    def test_has_next_page_without_end_cursor(self):
+        def broken(r):
+            info = r["data"]["repository"]["pullRequest"]["reviews"]["pageInfo"]
+            info.update(hasNextPage=True, endCursor=None)
+            return r
+
+        self.assert_refused(self.tamper("Reviews", broken))
+
+    def test_repeated_cursor(self):
+        srv = Server().standard(reviews=[g_review(ident=n) for n in range(1, 5)], size=2)
+        for entry in srv.entries:
+            if entry["name"] == "Reviews" and entry["variables"].get("cursor"):
+                for r in entry["responses"]:
+                    c = r["data"]["repository"]["pullRequest"]["reviews"]
+                    c["pageInfo"] = {"hasNextPage": True, "endCursor": "Reviews-0"}
+        self.assert_refused(srv.entries)
+        # Отказ сразу на втором повторе курсора, а не по MAX_PAGES.
+        _, _, calls = run_check(srv.entries)
+        reviews = [q for q in sent_queries(calls) if q.lstrip().startswith("query Reviews")]
+        self.assertLessEqual(len(reviews), 3, len(reviews))
+
+    def test_missing_page_info_or_nodes_not_a_list(self):
+        def no_info(r):
+            del r["data"]["repository"]["pullRequest"]["comments"]["pageInfo"]
+            return r
+
+        def bad_nodes(r):
+            r["data"]["repository"]["pullRequest"]["comments"]["nodes"] = {}
+            return r
+
+        self.assert_refused(self.tamper("IssueComments", no_info))
+        self.assert_refused(self.tamper("IssueComments", bad_nodes))
+
+    def test_pull_request_null_and_missing_data(self):
+        def null_pr(r):
+            r["data"]["repository"]["pullRequest"] = None
+            return r
+
+        self.assert_refused(self.tamper("Header", null_pr))
+        self.assert_refused(self.tamper("Reviews", lambda r: {"data": None}))
+
+    def test_check_runs_failure_is_fatal_not_an_empty_list(self):
+        def no_object(r):
+            r["data"]["repository"]["object"] = None
+            return r
+
+        self.assert_refused(self.tamper("Checks", no_object))
+        entries = [e for e in Server().standard().entries if e["name"] != "Checks"]
+        self.assert_refused(entries)
+
+    def test_gh_crash_has_no_raw_diagnostics(self):
+        entries = [e for e in Server().standard().entries if e["name"] != "Reviews"]
+        self.assert_refused(entries)
+
+    def test_max_pages_exceeded(self):
+        def endless(query, variables=None):
+            cursor = (variables or {}).get("cursor")
+            n = 0 if cursor is None else int(cursor.split("-")[1]) + 1
+            return {
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": HEAD,
+                        "isDraft": False,
+                        "state": "OPEN",
+                        "reviews": {
+                            "nodes": [],
+                            "pageInfo": {"hasNextPage": True, "endCursor": f"c-{n}"},
+                        },
+                    }
+                }
+            }
+
+        calls = []
+
+        def counting(query, variables=None):
+            calls.append(query)
+            return endless(query, variables)
+
+        with mock.patch.object(MODULE, "graphql", side_effect=counting):
+            with self.assertRaisesRegex(RuntimeError, "^gh api graphql failed$"):
+                MODULE.fetch_reviews("acme", "widget", 42)
+        self.assertEqual(len(calls), MODULE.MAX_PAGES)
 
 
 class GhBoundaryContract(unittest.TestCase):
@@ -720,7 +1460,9 @@ class GhBoundaryContract(unittest.TestCase):
                     pr=7,
                     head=HEAD,
                 )
-                with self.subTest(repo=name), mock.patch.object(MODULE, "gh") as remote:
+                with self.subTest(repo=name), mock.patch.object(
+                    MODULE, "graphql"
+                ) as remote:
                     with self.assertRaisesRegex(
                         ValueError, "--repo must be OWNER/NAME"
                     ):
@@ -729,12 +1471,50 @@ class GhBoundaryContract(unittest.TestCase):
         self.assertIsNotNone(MODULE.REPOSITORY.fullmatch("owner/.github"))
 
     def test_github_failures_do_not_expose_raw_diagnostics(self):
-        failure = subprocess.CalledProcessError(
-            1, ["gh"], stderr=b"private-diagnostic-canary"
+        failures = (
+            subprocess.CalledProcessError(1, ["gh"], stderr=b"private-diagnostic-canary"),
+            OSError("private-diagnostic-canary"),
+            subprocess.TimeoutExpired(["gh"], 20),
         )
-        with mock.patch.object(MODULE.subprocess, "check_output", side_effect=failure):
-            with self.assertRaisesRegex(RuntimeError, "^gh api read failed$"):
-                MODULE.gh("repos/owner/name/pulls/7")
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(
+                MODULE.subprocess, "check_output", side_effect=failure
+            ):
+                with self.assertRaisesRegex(RuntimeError, "^gh api graphql failed$"):
+                    MODULE.graphql("query Header { viewer { login } }")
+
+    def test_malformed_graphql_responses_are_sanitized(self):
+        for raw in (
+            "not json private-diagnostic-canary",
+            "[]",
+            "null",
+            '{"errors":[{"message":"private-diagnostic-canary"}]}',
+            '{"errors":[],"data":{}}',
+            '{"nodata":1}',
+            '{"data":null}',
+        ):
+            with self.subTest(raw=raw), mock.patch.object(
+                MODULE.subprocess, "check_output", return_value=raw
+            ):
+                with self.assertRaisesRegex(RuntimeError, "^gh api graphql failed$"):
+                    MODULE.graphql("query Header { viewer { login } }")
+
+    def test_graphql_argv_is_read_only_and_variables_are_typed(self):
+        with mock.patch.object(
+            MODULE.subprocess, "check_output", return_value='{"data":{"a":1}}'
+        ) as call:
+            self.assertEqual(
+                MODULE.graphql("query X { a }", {"owner": "acme", "number": 7}),
+                {"a": 1},
+            )
+        argv = call.call_args.args[0]
+        self.assertEqual(
+            argv[:5], ["gh", "api", "graphql", "--hostname", "github.com"]
+        )
+        self.assertIn("query=query X { a }", argv)
+        self.assertEqual(argv[argv.index("owner=acme") - 1], "-f")
+        self.assertEqual(argv[argv.index("number=7") - 1], "-F")
+        self.assertEqual(call.call_args.kwargs["timeout"], 20)
 
     def test_metadata_resolution_failures_are_sanitized_before_gh_access(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -759,40 +1539,27 @@ class GhBoundaryContract(unittest.TestCase):
         self,
     ):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            worktree = root / "synthetic-git"
+            worktree = Path(directory) / "synthetic-git"
             worktree.mkdir()
             subprocess.run(["git", "init", "-q", str(worktree)], check=True)
-            bindir = root / "bin"
+            bindir = Path(directory) / "bin"
             bindir.mkdir()
             fake = bindir / "gh"
             fake.write_text(FAKE_GH, encoding="utf-8")
             fake.chmod(0o755)
-            log, fixture = root / "calls.jsonl", root / "fixture.json"
-            fixture.write_text("{}", encoding="utf-8")
-            env = os.environ.copy()
-            env.update(
-                {
-                    "PATH": str(bindir) + os.pathsep + env["PATH"],
-                    "PR_REVIEW_GH_LOG": str(log),
-                    "PR_REVIEW_FIXTURE": str(fixture),
-                }
-            )
+            log, fixture = Path(directory) / "calls.jsonl", Path(directory) / "f.json"
+            fixture.write_text("[]", encoding="utf-8")
+            env = {
+                **os.environ,
+                "PATH": str(bindir) + os.pathsep + os.environ["PATH"],
+                "PR_REVIEW_GH_LOG": str(log),
+                "PR_REVIEW_FIXTURE": str(fixture),
+            }
             proc = subprocess.run(
                 [
-                    "python3",
-                    str(SCRIPT),
-                    "check",
-                    "--repo",
-                    "github-owner/github-name",
-                    "--pr",
-                    "7",
-                    "--head",
-                    HEAD,
-                    "--worktree",
-                    str(worktree),
-                    "--output",
-                    str(worktree / "evidence.json"),
+                    "python3", str(SCRIPT), "check", "--repo", "github-owner/github-name",
+                    "--pr", "7", "--head", HEAD, "--worktree", str(worktree),
+                    "--output", str(worktree / "evidence.json"),
                 ],
                 text=True,
                 capture_output=True,
@@ -804,164 +1571,42 @@ class GhBoundaryContract(unittest.TestCase):
                 log.exists(), "the local output guard must run before GitHub access"
             )
 
-    def test_paginated_get_only_collection_and_head_change_fail_closed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            bindir = root / "bin"
-            bindir.mkdir()
-            fake = bindir / "gh"
-            fake.write_text(FAKE_GH, encoding="utf-8")
-            fake.chmod(0o755)
-            log, fixture, output = (
-                root / "calls.jsonl",
-                root / "fixture.json",
-                root / "evidence.json",
-            )
-            base = "repos/acme/widget/pulls/42"
-            clean = "Codex Review: Didn't find any major issues. :rocket:\n\n**Reviewed commit:** `aaaaaaaaaaaa`"
-            # A full first page forces the second API page; its clean evidence
-            # would otherwise pass, so the changed final PR head must win.
-            first_page = [
-                {
-                    "id": n,
-                    "user": actor("someone", "User"),
-                    "state": "COMMENTED",
-                    "commit_id": HEAD,
-                    "body": "",
-                }
-                for n in range(100)
-            ]
-            first_page.append(review(ident=201))
-            fixture.write_text(
-                json.dumps(
-                    {
-                        base: {"_sequence": [pr(HEAD), pr(MOVED)]},
-                        base + "/reviews?per_page=100&page=1": [first_page, first_page],
-                        base + "/reviews?per_page=100&page=2": [
-                            [review(ident=202)],
-                            [review(ident=202)],
-                        ],
-                        base + "/comments?per_page=100&page=1": [[], []],
-                        "repos/acme/widget/issues/42/comments?per_page=100&page=1": [
-                            [issue(clean)],
-                            [issue(clean)],
-                        ],
-                        "repos/acme/widget/commits/aaaaaaaaaaaa": {"sha": HEAD},
-                    }
-                ),
-                encoding="utf-8",
-            )
-            env = os.environ.copy()
-            env.update(
-                {
-                    "PATH": str(bindir) + os.pathsep + env["PATH"],
-                    "PR_REVIEW_GH_LOG": str(log),
-                    "PR_REVIEW_FIXTURE": str(fixture),
-                }
-            )
-            proc = subprocess.run(
-                [
-                    "python3",
-                    str(SCRIPT),
-                    "check",
-                    "--repo",
-                    "acme/widget",
-                    "--pr",
-                    "42",
-                    "--head",
-                    HEAD,
-                    "--output",
-                    str(output),
-                ],
-                text=True,
-                capture_output=True,
-                env=env,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            result = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(result["status"], "incomplete")
-            self.assertEqual(result["current_head"], MOVED)
-            self.assertIn(
-                "PR HEAD changed while collecting evidence", result["limitations"]
-            )
-            calls = [
-                json.loads(line)
-                for line in log.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertTrue(
-                calls
-                and all(
-                    call[:5] == ["api", "--hostname", "github.com", "--method", "GET"]
-                    for call in calls
-                )
-            )
-            endpoints = [call[5] for call in calls]
-            self.assertIn(base + "/reviews?per_page=100&page=2", endpoints)
-            self.assertIn("repos/acme/widget/commits/aaaaaaaaaaaa", endpoints)
+    def test_all_requests_are_graphql_queries_and_head_change_fails_closed(self):
+        # A multi-page review list whose second page would pass on its own;
+        # the final PR head differs, so the clean evidence must not win.
+        noise = [g_review("COMMENTED", HEAD, "", n, gactor("someone", "User")) for n in range(1, 4)]
+        srv = Server().standard(
+            heads=(HEAD, MOVED), reviews=noise + [g_review(ident=201)], size=2
+        )
+        proc, result, calls = run_check(srv.entries)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["current_head"], MOVED)
+        self.assertIn("PR HEAD changed while collecting evidence", result["limitations"])
+        self.assertTrue(calls)
+        self.assertTrue(all(call[:4] == ["api", "graphql", "--hostname", "github.com"] for call in calls))
+        queries = sent_queries(calls)
+        self.assertEqual(len(queries), len(calls))
+        for query in queries:
+            self.assertTrue(query.lstrip().startswith("query"), query[:40])
+            self.assertNotIn("mutation", query)
+        rest = [a for call in calls for a in call if a.startswith("repos/")]
+        self.assertEqual(rest, [])
 
     def test_current_finding_added_during_second_snapshot_is_incomplete(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            bindir = root / "bin"
-            bindir.mkdir()
-            fake = bindir / "gh"
-            fake.write_text(FAKE_GH, encoding="utf-8")
-            fake.chmod(0o755)
-            log, fixture, output = (
-                root / "calls.jsonl",
-                root / "fixture.json",
-                root / "evidence.json",
+        srv = Server().standard(
+            reviews=Snap(
+                [g_review()],
+                [g_review(), g_review("COMMENTED", HEAD, "new finding", 2)],
             )
-            base = "repos/acme/widget/pulls/42"
-            fixture.write_text(
-                json.dumps(
-                    {
-                        base: {"_sequence": [pr(HEAD), pr(HEAD)]},
-                        base + "/reviews?per_page=100&page=1": {
-                            "_sequence": [
-                                [review()],
-                                [review(), review("COMMENTED", HEAD, "new finding", 2)],
-                            ]
-                        },
-                        base + "/comments?per_page=100&page=1": {"_sequence": [[], []]},
-                        "repos/acme/widget/issues/42/comments?per_page=100&page=1": {
-                            "_sequence": [[], []]
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            env = {
-                **os.environ,
-                "PATH": str(bindir) + os.pathsep + os.environ["PATH"],
-                "PR_REVIEW_GH_LOG": str(log),
-                "PR_REVIEW_FIXTURE": str(fixture),
-            }
-            proc = subprocess.run(
-                [
-                    "python3",
-                    str(SCRIPT),
-                    "check",
-                    "--repo",
-                    "acme/widget",
-                    "--pr",
-                    "42",
-                    "--head",
-                    HEAD,
-                    "--output",
-                    str(output),
-                ],
-                text=True,
-                capture_output=True,
-                env=env,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            result = json.loads(output.read_text())
-            self.assertEqual(result["status"], "incomplete")
-            self.assertIn(
-                "review evidence changed while collecting evidence",
-                result["limitations"],
-            )
+        )
+        proc, result, _ = run_check(srv.entries)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn(
+            "review evidence changed while collecting evidence", result["limitations"]
+        )
+
 
 
 if __name__ == "__main__":

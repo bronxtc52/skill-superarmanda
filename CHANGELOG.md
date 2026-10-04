@@ -3,6 +3,31 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 0.17.0 — 2026-10-04
+
+### Исправлено
+
+- `pr_review.py check` собирает evidence через GraphQL (`gh api graphql`, только `query`), а не REST:
+  под вторичным лимитом GitHub любой REST GET отвечал 403, GraphQL работал. Полная пагинация
+  reviews, reviewThreads (с дочиткой комментариев треда), issue comments и check runs; любой сбой,
+  `errors`, битая пагинация, повтор курсора или больше `MAX_PAGES` — rc 2 и одна фиксированная
+  строка без сырой диагностики. Логин бота нормализуется (`[bot]`, тип `Bot`); короткий SHA
+  резолвится через `object(expression:)`. В JSON добавлены информационные `check_runs` и `checks`
+  (на `status` не влияют). Сбой GraphQL при резолве короткого SHA — тоже отказ rc 2, а не
+  `findings`; null/не-Commit по-прежнему «не резолвится» (не pass).
+  ([#20](https://github.com/bronxtc52/skill-superarmanda/issues/20))
+
+### Добавлено
+
+- Фикстура 18 живых вариантов чистого ответа Codex и живые GraphQL-ответы PR #71; тест проверяет
+  каждый вариант и его мутации.
+  ([#5](https://github.com/bronxtc52/skill-superarmanda/issues/5))
+
+### Примечание
+
+- `gate.py` (гейт мерджа волн) пока читает факты PR через REST/GraphQL как раньше: при сбое он отвечает
+  `wait` и повторяет тик; перевод на GraphQL — отдельной задачей.
+
 ## 0.16.0 — 2026-10-04
 
 ### Исправлено

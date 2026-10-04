@@ -3,11 +3,25 @@
 `SUPERARMANDA_DIR` задаётся для выбранного host в [profiles.md](profiles.md).
 
 `python3 "$SUPERARMANDA_DIR/scripts/pr_review.py" check --repo OWNER/NAME --pr N --head FULL_SHA --output OUTSIDE_REPO.json [--worktree LOCAL_CHECKOUT]`
-performs only `gh api --method GET` requests. It fetches reviews, line comments and issue
-comments page by page, then fetches the PR again. A changed head, a missing full `commit_id`,
+sends only GraphQL `query` operations through `gh api graphql` (read-only; never a `mutation`, no REST).
+It reads the PR header (`headRefOid`, `isDraft`, `state`), then **every page** of reviews, review
+threads (and, per thread, every page of its comments), issue comments and the check runs of the
+HEAD commit (suites, then each suite's runs), and finally reads the PR header again. Pagination is
+fail-closed: a missing `pageInfo`, non-list `nodes`, `hasNextPage` without `endCursor`, a repeated
+cursor, more than `MAX_PAGES` (50) pages of one connection, a null `pullRequest`, an `errors` key,
+no `data`, or any `gh` failure ends the run with exit code 2 and the fixed message
+`pr_review: gh api graphql failed` (raw diagnostics are never shown). GraphQL was chosen because
+under a secondary REST rate limit every REST GET returned 403 while GraphQL kept working (#20).
+Authors are normalized to the REST shape the rules were written for: a `Bot` gets the `[bot]`
+suffix and type `Bot`; any other type (a `User` named `chatgpt-codex-connector` included) is never
+trusted; a missing author is untrusted. The evidence is read twice; a changed head or a changed
+snapshot is `incomplete`. A changed head, a missing full `commit_id`,
 unknown bot format, pending result, auth/API failure, or incomplete evidence never passes.
 The JSON result contains `status`, `current_head`, `draft`, evidence URLs, findings and
-limitations. Exit code 0 means the read-only evidence collection succeeded, including
+limitations, plus the informational `check_runs` (`name`, `status`, `conclusion`, `app`) and
+`checks` (`total`, `pending` names, `failed` pairs; only `COMPLETED` + `SUCCESS` counts as
+passed). They never change `status`, which is about the review only; unreadable check runs
+fail the whole run instead of producing an empty list. Exit code 0 means the read-only evidence collection succeeded, including
 `findings` or `incomplete`; it is **not** a passed review gate. The coordinator must
 inspect JSON `status`, verify current-HEAD completion and explicitly dispose of
 every finding before recording approval. Never use shell exit status as approval.
@@ -30,7 +44,8 @@ Codex Review: Didn't find any major issues. :rocket:
 **Reviewed commit:** `f4b817dec1`
 ```
 
-Its abbreviated SHA is resolved through `gh api repos/OWNER/NAME/commits/SHORT_SHA` and must
+Its abbreviated SHA is resolved through GraphQL `repository.object(expression: SHORT_SHA)` (a
+Commit `oid`; null or non-Commit means unresolved, not pass; a gh/GraphQL failure or `errors` while resolving is a refusal, rc 2) and must
 equal the requested full SHA; prefix matching is not used. The same exact summary is accepted in
 a current `APPROVED` or `COMMENTED` Codex review body only after the review `commit_id` and
 resolved body SHA both match the requested full SHA, with no current attached inline comment.
@@ -58,6 +73,11 @@ is always the pair (`gh api`-resolved commit SHA equals the requested full HEAD)
 comments/findings at that HEAD), exactly as for the legacy format. A Codex comment containing
 `<!-- codex-pull-request-review-summary -->` records completion only and never proves a clean
 review. Other formats are incomplete.
+
+The 18 live Codex clean-answer variants (all phrases observed, `tests/fixtures/pr-review/codex-clean-variants.json`)
+are recognized by a test, together with mutations of each (extra line, markup or over-long phrase,
+altered footer, other SHA, a `User` with the same login) that never pass (#5). Live GraphQL answers
+for PR #71 (`pr71-graphql.json`) replay the whole `check` against a fake `gh`.
 
 Each trusted current-HEAD inline comment is emitted independently of its parent review with its
 `commit_id` and `original_commit_id`; its reason states that it applies to the current HEAD. A stale,
