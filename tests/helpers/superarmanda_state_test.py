@@ -1081,6 +1081,54 @@ class StateContract(unittest.TestCase):
             (result["reviewed_head"], result["packet_hash"]), (new_head, packet_hash)
         )
 
+    def reviewer_record(self, packet_hash, session, check=True):
+        self.git("commit", "--allow-empty", "-qm", "review target " + session)
+        self.resume()
+        head = self.head()
+        proc = self.record(
+            "cross_provider_reviewer",
+            session=session,
+            reviewed_head=head,
+            packet_hash=packet_hash,
+            check=check,
+        )
+        return proc
+
+    def test_packet_hash_bare_hex_is_accepted_and_stored_canonically(self):
+        """issue #3: review.py пишет голый 64-hex, state хранит sha256:<hex>."""
+        bare = "ab12" * 16
+        self.reviewer_record(bare, "reviewer-bare")
+        result = self.manifest_data()["tasks"]["implement"]["results"][
+            "cross_provider_reviewer"
+        ]
+        self.assertEqual(result["packet_hash"], "sha256:" + bare)
+
+    def test_packet_hash_prefixed_form_is_still_stored_as_is(self):
+        prefixed = "sha256:" + "cd34" * 16
+        self.reviewer_record(prefixed, "reviewer-prefixed")
+        result = self.manifest_data()["tasks"]["implement"]["results"][
+            "cross_provider_reviewer"
+        ]
+        self.assertEqual(result["packet_hash"], prefixed)
+
+    def test_packet_hash_other_forms_are_rejected(self):
+        bad = {
+            "uppercase bare": "AB12" * 16,
+            "uppercase prefixed": "sha256:" + "AB12" * 16,
+            "short bare": "ab12" * 15,
+            "long bare": "ab12" * 17,
+            "short prefixed": "sha256:" + "ab12" * 15,
+            "other prefix": "sha1:" + "ab12" * 16,
+            "double prefix": "sha256:sha256:" + "ab12" * 16,
+            "non hex": "zz" * 32,
+            "empty": "",
+        }
+        for label, value in bad.items():
+            with self.subTest(label=label):
+                proc = self.reviewer_record(value, "reviewer-" + label.replace(" ", "-"), check=False)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("packet_hash must be", proc.stderr)
+
     def test_reviewer_pass_requires_reviewed_head_and_packet_hash(self):
         missing_head = self.record(
             "cross_provider_reviewer",
@@ -3954,6 +4002,78 @@ class DeferralIdentity(unittest.TestCase):  # #36 п.3: a deferral covers one ex
         entry["deferrals"][0]["result_sha256"] = st.result_digest(a)
         self.assertTrue(st.is_deferred(entry, "cross_provider_reviewer", a))
         self.assertFalse(st.is_deferred(entry, "cross_provider_reviewer", b))
+
+class Sha256RepositoryState(unittest.TestCase):
+    """issue #2: репозиторий с --object-format=sha256, полные 64-hex ID."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name) / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q", "--object-format=sha256", "-b", "main")
+        self.git("config", "user.email", "tester@example.invalid")
+        self.git("config", "user.name", "State Tester")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        self.git("commit", "-qm", "base")
+        self.base = self.git("rev-parse", "HEAD")
+        self.git("commit", "--allow-empty", "-qm", "change")
+        self.head = self.git("rev-parse", "HEAD")
+        self.manifest = Path(self.tmp.name) / "run.json"
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *map(str, args)],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+
+    def cli(self, command, *args):
+        return subprocess.run(
+            ["python3", str(STATE), command, "--manifest", str(self.manifest), *map(str, args)],
+            text=True, capture_output=True,
+        )
+
+    def test_init_and_task_result_accept_full_64_hex_ids(self):
+        self.assertEqual((len(self.base), len(self.head)), (64, 64))
+        proc = self.cli(
+            "init", "--repo", self.repo, "--base", self.base, "--head", self.head,
+            "--run-id", "sha256-run",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(self.manifest.read_text(encoding="utf-8"))
+        self.assertEqual((data["base"], data["head"]), (self.base, self.head))
+        proc = self.cli(
+            "task-result", "--task", "implement", "--role", "coder", "--status", "pass",
+            "--session-id", "coder-1", "--head", self.head, "--artifact", "evidence",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.cli(
+            "task-result", "--task", "implement", "--role", "tester", "--status", "pass",
+            "--session-id", "tester-1", "--head", self.head, "--artifact", "evidence",
+        )
+        proc = self.cli(
+            "task-result", "--task", "implement", "--role", "cross_provider_reviewer",
+            "--status", "pass", "--session-id", "xp-1", "--head", self.head,
+            "--artifact", "evidence", "--reviewed-head", self.head,
+            "--packet-hash", "ef56" * 16,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(self.manifest.read_text(encoding="utf-8"))["tasks"]["implement"]["results"]["cross_provider_reviewer"]
+        self.assertEqual(result["reviewed_head"], self.head)
+        self.assertEqual(result["packet_hash"], "sha256:" + "ef56" * 16)
+
+    def test_abbreviated_head_is_rejected(self):
+        self.cli(
+            "init", "--repo", self.repo, "--base", self.base, "--head", self.head,
+            "--run-id", "sha256-run",
+        )
+        proc = self.cli(
+            "task-result", "--task", "implement", "--role", "coder", "--status", "pass",
+            "--session-id", "coder-1", "--head", self.head[:40], "--artifact", "evidence",
+        )
+        self.assertNotEqual(proc.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

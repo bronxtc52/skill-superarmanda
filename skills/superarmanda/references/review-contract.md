@@ -34,8 +34,13 @@ envelope v1 не переписываются; автоматическое до
 request как `session_id`; не приписывайте сервису конкретную модель без подтверждения GitHub.
 
 При записи результата `reviewed_head` — полный hexadecimal Git commit ID пакета, без сокращения
-или нормализации. Cross-provider `pass` несёт `packet_hash` ровно в форме
-`sha256:<64 lowercase hex>`; GitHub Codex `pass` вместо него несёт HTTPS URL evidence artifact.
+или нормализации (для репозитория с `--object-format=sha256` это полный 64-hex ID; сокращённый не
+принимается). Cross-provider `pass` несёт `packet_hash`: `state.py task-result --packet-hash`
+принимает и голый 64 lowercase hex (так его пишет `review.py` в envelope и в `packet_hash` ответа
+ревьюера), и `sha256:<64 lowercase hex>`, а хранит всегда каноническую форму `sha256:<hex>`; верхний
+регистр, другая длина и другой префикс отвергаются. Отчёт `review.py run` дополнительно несёт поле
+`state_packet_hash` — готовое `sha256:<hex>` для state; `packet_hash` envelope не меняется, старые
+пакеты загружаются как раньше. GitHub Codex `pass` вместо него несёт HTTPS URL evidence artifact.
 State хранит эти значения как metadata. Coordinator подтверждает существование артефакта и
 `gate_ready: true` adapter report перед записью pass.
 
@@ -78,6 +83,23 @@ payloads, configuration and raw server diagnostics are not copied into reports.
 The Astra adapter has a single deadline across setup and inference. A failed call
 is preserved as an error; the coordinator may explicitly retry a transient failure
 once, keeping both artifacts. Never retry auth/quota failures automatically.
+
+Исчерпанная подписка Astra: после `turn/started` App Server шлёт `account/rateLimits/updated`,
+`thread/status/changed {status:{type:"systemError"}}`, notification `error` с
+`codexErrorInfo: "usageLimitExceeded"` и `turn/completed` со статусом `failed`. `systemError`
+сам по себе ревью не обрывает: адаптер читает дальше в рамках общего дедлайна до терминального
+`error` или `turn/completed` текущего thread/turn; без терминального события остаётся прежний
+`timeout`. `usageLimitExceeded` (из `error` или из `turn.error`) даёт `error_category: "quota"`,
+прочие `codexErrorInfo` — `completion`. Notification `error` принимается только для текущих
+`threadId` и `turnId` (иначе `protocol`) и никогда не бывает pass: `gate_ready` остаётся `false`.
+`error`, пришедший раньше ответа на `turn/start`, откладывается и проверяется после получения turn id
+(только для `turn/start`; при `initialize`, `config/read`, `thread/start` — прежний `protocol`).
+Все отложенные `error` проверяются до чтения любого completion (успешный `turn/completed` в очереди их не перекрывает). `willRetry: true` не делает `error` нетерминальным. Текст причины и account/plan payload в отчёт не копируются, только категория.
+
+Бинарные изменения определяет `git diff --numstat -z` без опций патча: изменение бинарное, только
+если ПЕРВЫЕ ДВА поля записи равны `-`. Содержимое файлов (например ячейка `-` в TSV) и имена с
+табами бинарником не считаются. Изолированное bare-представление объектов создаётся с тем же
+`--object-format` (sha1 или sha256), что и у исходного репозитория.
 
 Astra accepts the default 512 KiB packet bound; `--max-bytes` can lower the loader
 limit but does not raise Astra's fixed prompt cap. A larger custom packet can be

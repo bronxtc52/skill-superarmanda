@@ -3,6 +3,30 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 0.16.0 — 2026-10-04
+
+### Исправлено
+
+- Исчерпанная подписка Astra (Codex App Server) давала `protocol`, а не `quota`: адаптер не знал
+  notification `error`, а `turn/completed` со статусом `failed` считал `completion`. Теперь
+  `systemError` не обрывает чтение до терминального события, `codexErrorInfo: "usageLimitExceeded"`
+  (из `error` и из `turn.error`) даёт `error_category: "quota"`, `error` принимается только для
+  текущих thread/turn и никогда не pass; `error` до ответа на `turn/start` тоже распознаётся и не перекрывается успешным `turn/completed` в очереди.
+  ([#17](https://github.com/bronxtc52/skill-superarmanda/issues/17),
+  [#10](https://github.com/bronxtc52/skill-superarmanda/issues/10))
+- `review.py packet` отказывал «diff contains binary changes» на текстовом TSV с ячейкой `-`:
+  `numstat` запускался с опциями патча и печатал после статистики сам патч, а поиск `\t-\t` шёл
+  по всему выводу. Теперь `--numstat -z` без патча, бинарная запись — только когда первые два
+  поля равны `-`.
+  ([#8](https://github.com/bronxtc52/skill-superarmanda/issues/8))
+- `review.py packet` падал (rc=2) в репозитории с `--object-format=sha256`: bare-представление
+  объектов создавалось с SHA-1. Теперь формат берётся у источника.
+  ([#2](https://github.com/bronxtc52/skill-superarmanda/issues/2))
+- Packet hash: `state.py task-result --packet-hash` принимает и голый 64-hex из `review.py`, и
+  `sha256:<hex>`, хранит всегда `sha256:<hex>`; отчёт `review.py run` получил поле
+  `state_packet_hash`. Envelope и `packet_hash` старого формата не менялись.
+  ([#3](https://github.com/bronxtc52/skill-superarmanda/issues/3))
+
 ## 0.15.0 — 2026-10-04
 
 ### Добавлено

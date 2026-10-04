@@ -285,10 +285,32 @@ def rendered_diff(repo, base, head, limit):
                 process.stdout.close()
 
 
+NUMSTAT_OPTIONS = (
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--no-renames",
+    "--no-relative",
+)
+
+
 def has_binary_diff(repo, base, head):
+    """Бинарным считается только запись numstat, где ОБА первых поля равны «-».
+
+    Опции патча (``--unified`` из DIFF_OPTIONS) в команду не входят: иначе git
+    печатает после numstat ещё и сам патч, и ячейка «-» в TSV принимается за
+    маркер бинарника (issue #8). Формат ``-z`` — записи через NUL, путь без
+    экранирования, поэтому имя файла с табами не ломает разбор.
+    """
     with object_view(repo) as view:
-        rows = git(view, "diff", *DIFF_OPTIONS, "--numstat", base, head).splitlines()
-        return any("\t-\t" in row or row.startswith("-\t") for row in rows)
+        raw = git_raw(view, "diff", *NUMSTAT_OPTIONS, "--numstat", "-z", base, head)
+    for record in raw.decode("utf-8", errors="replace").split("\0"):
+        if not record:
+            continue
+        fields = record.split("\t", 2)
+        if len(fields) == 3 and fields[0] == "-" and fields[1] == "-":
+            return True
+    return False
 
 
 @contextmanager
@@ -297,11 +319,24 @@ def object_view(repo):
     objects = Path(git(repo, "rev-parse", "--git-path", "objects"))
     if not objects.is_absolute():
         objects = (repo / objects).resolve()
+    # Формат объектов bare-вида обязан совпасть с источником (sha1/sha256):
+    # alternates с чужим форматом не читаются (issue #2).
+    object_format = git(repo, "rev-parse", "--show-object-format")
+    if object_format not in {"sha1", "sha256"}:
+        fail("unsupported Git object format")
     with tempfile.TemporaryDirectory(prefix="superarmanda-git-objects-") as temporary:
         view = Path(temporary) / "view.git"
         try:
             subprocess.run(
-                ["git", "init", "--bare", "--template=", "-q", str(view)],
+                [
+                    "git",
+                    "init",
+                    "--bare",
+                    "--template=",
+                    f"--object-format={object_format}",
+                    "-q",
+                    str(view),
+                ],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -1040,6 +1075,15 @@ def verify_packet_repo(repo, envelope):
         fail("packet context is not canonical")
 
 
+def state_packet_hash(envelope):
+    """Форма packet hash для ``state.py task-result --packet-hash``.
+
+    Поле ``packet_hash`` конверта остаётся голым 64-hex (старые пакеты читаются
+    как раньше); state хранит каноническую форму ``sha256:<hex>`` (issue #3).
+    """
+    return "sha256:" + envelope["packet_hash"]
+
+
 def write_result(output, value):
     atomic_write(output, canonical(value) + b"\n")
 
@@ -1132,6 +1176,7 @@ def review(args):
                     "response": response,
                     "profile": args.profile,
                     "requested_model": requested,
+                    "state_packet_hash": state_packet_hash(envelope),
                     "auth": {"subscription": metadata["auth"]},
                     "attempts": [{"state": "ok", "returncode": 0}],
                     "observed_models": metadata["observed_models"],
@@ -1168,6 +1213,7 @@ def review(args):
                         "response": response,
                         "profile": args.profile,
                         "requested_model": requested,
+                        "state_packet_hash": state_packet_hash(envelope),
                         "auth": auth,
                         "attempts": attempts,
                         "gate_ready": False,

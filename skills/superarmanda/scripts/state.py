@@ -1168,23 +1168,22 @@ def result(args):
         fail("session_id is already used by another task or role for this run")
     if args.reviewed_head is not None and args.reviewed_head != args.head:
         fail("reviewed_head differs from result head")
-    packet_is_sha256 = (
-        args.packet_hash is not None
-        and len(args.packet_hash) == 71
-        and args.packet_hash.startswith("sha256:")
-        and all(character in "0123456789abcdef" for character in args.packet_hash[7:])
-    )
-    if args.packet_hash is not None and not packet_is_sha256:
-        fail("packet_hash must be sha256:<64 lowercase hex characters>")
+    packet_hash = args.packet_hash
+    if packet_hash is not None:
+        # review.py пишет голый 64-hex, в манифесте хранится только sha256:<hex>
+        digest = packet_hash.removeprefix("sha256:")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            fail("packet_hash must be sha256:<64 lowercase hex characters>")
+        packet_hash = "sha256:" + digest
     if args.role == "cross_provider_reviewer" and args.status == "pass":
-        if args.reviewed_head is None or args.packet_hash is None:
+        if args.reviewed_head is None or packet_hash is None:
             fail("cross-provider pass requires reviewed_head and packet_hash")
     if args.role == "github_codex_review" and args.status == "pass":
         if args.reviewed_head is None or not (args.artifact or "").startswith(
             "https://"
         ):
             fail("GitHub Codex pass requires reviewed_head and HTTPS artifact URL")
-        if args.packet_hash is not None:
+        if packet_hash is not None:
             fail("GitHub Codex review does not accept packet_hash")
     entry["session_roles"][args.session_id] = args.role
     entry["results"][args.role] = {
@@ -1193,7 +1192,7 @@ def result(args):
         "session_id": args.session_id,
         "artifact": args.artifact,
         "reviewed_head": args.reviewed_head,
-        "packet_hash": args.packet_hash,
+        "packet_hash": packet_hash,
         "tree_fingerprint": data["tree_fingerprint"],
         "recorded_at": now(),
         # unique per recorded result: a byte-identical rerun (same session, same second)

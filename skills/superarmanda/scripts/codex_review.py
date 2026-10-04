@@ -374,7 +374,13 @@ class _Server:
             _fail("protocol")
         return message
 
-    def request(self, method, params):
+    def request(self, method, params, defer_error=False):
+        """defer_error: notification `error` не отвергается, а откладывается.
+
+        Только для ответа на turn/start: ранний отказ (usageLimitExceeded) до
+        ответа проверит основной цикл через _terminal_error, когда известен turnId.
+        Для остальных запросов `error` по-прежнему protocol.
+        """
         ident = self.send(method, params)
         while True:
             message = self.receive()
@@ -386,6 +392,9 @@ class _Server:
                 if "error" in message or not isinstance(message.get("result"), dict):
                     _fail("protocol")
                 return message["result"]
+            if defer_error and message.get("method") == "error":
+                self.pending.append(message)
+                continue
             _reject_event(message)
             self.pending.append(message)
 
@@ -469,6 +478,30 @@ def _reject_event(message, thread_id=None, turn_id=None):
             "reasoning",
         }:
             _fail("execution")
+
+
+def _error_category(error):
+    """Только исчерпанная подписка выделена в quota; всё прочее — completion."""
+    if isinstance(error, dict) and error.get("codexErrorInfo") == "usageLimitExceeded":
+        return "quota"
+    return "completion"
+
+
+def _terminal_error(event, thread_id, turn_id):
+    """Notification `error` — только сигнал терминального отказа текущего turn.
+
+    Никогда не успех: функция всегда завершается исключением. Чужой или
+    отсутствующий threadId/turnId — protocol. Текст причины и account/plan
+    payload в отчёт не попадают, остаётся только категория.
+    """
+    params = event.get("params")
+    if (
+        not isinstance(params, dict)
+        or params.get("threadId") != thread_id
+        or params.get("turnId") != turn_id
+    ):
+        _fail("protocol")
+    _fail(_error_category(params.get("error")))
 
 
 def _thread_settings(params):
@@ -618,6 +651,7 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
                 "outputSchema": schema,
                 "input": [{"type": "text", "text": prompt, "text_elements": []}],
             },
+            defer_error=True,
         )
         turn_obj = turn.get("turn")
         _optional_identity(turn)
@@ -626,12 +660,19 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
         turn_id = turn_obj.get("id") if isinstance(turn_obj, dict) else None
         if not isinstance(turn_id, str) or not turn_id:
             _fail("protocol")
+        # Отложенные до ответа на turn/start `error` проверяются ВСЕ и до чтения
+        # любого completion: иначе успешный turn/completed в pending проиграл бы им.
+        for queued in list(server.pending):
+            if queued.get("method") == "error":
+                _terminal_error(queued, thread_id, turn_id)
         messages, completed = [], None
         while completed is None:
             event = server.event()
             if "id" in event and "method" in event:
                 _fail("execution")
             method = event.get("method")
+            if method == "error":
+                _terminal_error(event, thread_id, turn_id)
             if method == "turn/completed":
                 _reject_event(event, thread_id, turn_id)
                 params = event.get("params")
@@ -643,6 +684,8 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
                     or final_turn.get("id") != turn_id
                     or final_turn.get("status") != "completed"
                 ):
+                    if isinstance(final_turn, dict) and final_turn.get("id") == turn_id:
+                        _fail(_error_category(final_turn.get("error")))
                     _fail("completion")
                 _optional_identity(final_turn)
                 completed = final_turn

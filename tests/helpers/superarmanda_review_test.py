@@ -884,6 +884,134 @@ raise SystemExit(1)
         self.git("commit", "-qm", "binary")
         self.assertNotEqual(self.packet().returncode, 0)
 
+    def test_packet_accepts_text_with_dash_cells_and_tab_dash_tab_in_name(self):
+        """issue #8: numstat разбирается структурно, содержимое файла бинарником не считается."""
+        row = "agent\tdrafter\tagents/drafter.md\t16\t7781ead077f8\t-\t2026-08-28\tyes\n"
+        (self.repo / "inventory.tsv").write_text(row * 55, encoding="utf-8")
+        self.git("add", "inventory.tsv")
+        self.git("commit", "-qm", "tsv")
+        proc = self.packet()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        odd = self.repo / "odd\t-\tname.txt"
+        odd.write_text("text\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "odd name")
+        proc = self.packet()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assert_packet_ok()
+        self.assertEqual(self.review_run("claude-host").returncode, 0)
+
+    def sha256_repo(self):
+        """Второй репозиторий с --object-format=sha256 (issue #2)."""
+        repo = self.root / "repo256"
+        repo.mkdir()
+        run = lambda *a: subprocess.run(
+            ["git", "-C", str(repo), *a], text=True, capture_output=True, check=True
+        ).stdout.strip()
+        run("init", "-q", "--object-format=sha256", "-b", "main")
+        run("config", "user.email", "tester@example.invalid")
+        run("config", "user.name", "Review Tester")
+        (repo / "app.txt").write_text("base\n", encoding="utf-8")
+        run("add", "app.txt")
+        run("commit", "-qm", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "app.txt").write_text("changed\n", encoding="utf-8")
+        run("commit", "-qam", "change")
+        return repo, base, run("rev-parse", "HEAD")
+
+    def test_packet_and_run_work_in_sha256_object_format_repository(self):
+        repo, base, head = self.sha256_repo()
+        self.assertEqual((len(base), len(head)), (64, 64))
+        out = self.root / "packet256.json"
+        proc = subprocess.run(
+            self.command(
+                "packet", "--repo", repo, "--base", base, "--head", head,
+                "--requirements", self.requirements, "--test-evidence", self.evidence,
+                "--output", out,
+            ),
+            text=True, capture_output=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        envelope = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(envelope["packet"]["head"], head)
+        for profile in ("codex-host", "claude-host"):
+            with self.subTest(profile=profile):
+                proc = subprocess.run(
+                    self.command(
+                        "run", "--repo", repo, "--packet", out, "--profile", profile,
+                        "--output", self.result_path, "--timeout", 5,
+                    ),
+                    text=True, capture_output=True, env=self.mock_env(),
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.result()["response"]["reviewed_head"], head)
+
+    def state_cli(self, manifest, command, *args):
+        return subprocess.run(
+            ["python3", str(REVIEW.with_name("state.py")), command, "--manifest", str(manifest), *map(str, args)],
+            text=True, capture_output=True,
+        )
+
+    def test_packet_to_run_to_state_task_result_with_report_hash(self):
+        """issue #3: значение из отчёта run принимается state как есть, голый hash — тоже."""
+        self.assert_packet_ok()
+        envelope = json.loads(self.packet_path.read_text(encoding="utf-8"))
+        bare = envelope["packet_hash"]
+        self.assertRegex(bare, r"^[0-9a-f]{64}$")
+        self.assertEqual(self.review_run("claude-host").returncode, 0)
+        result = self.result()
+        self.assertEqual(result["state_packet_hash"], "sha256:" + bare)
+        self.assertEqual(result["response"]["packet_hash"], bare)
+        for label, value in (("report", result["state_packet_hash"]), ("bare", bare)):
+            with self.subTest(form=label):
+                manifest = self.root / f"state-{label}.json"
+                proc = self.state_cli(
+                    manifest, "init", "--repo", self.repo, "--base", self.base,
+                    "--head", self.head_value, "--run-id", label,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                for role in ("coder", "tester"):
+                    self.state_cli(
+                        manifest, "task-result", "--task", "implement", "--role", role,
+                        "--status", "pass", "--session-id", role + label,
+                        "--head", self.head_value, "--artifact", "evidence",
+                    )
+                proc = self.state_cli(
+                    manifest, "task-result", "--task", "implement",
+                    "--role", "cross_provider_reviewer", "--status", "pass",
+                    "--session-id", "xp" + label, "--head", self.head_value,
+                    "--artifact", str(self.result_path),
+                    "--reviewed-head", result["response"]["reviewed_head"],
+                    "--packet-hash", value,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                stored = json.loads(manifest.read_text(encoding="utf-8"))["tasks"]["implement"]["results"]["cross_provider_reviewer"]
+                self.assertEqual(stored["packet_hash"], "sha256:" + bare)
+
+    def test_legacy_packet_envelope_fixture_loads_unchanged(self):
+        """Конверт, сгенерированный кодом 0.15 до issue #3, проходит loader как раньше."""
+        spec = importlib.util.spec_from_file_location("legacy_loader", REVIEW)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fixture = ROOT / "tests" / "fixtures" / "packet-envelope-0.15.json"
+        envelope, raw = module.load_packet(fixture, 1024 * 1024)
+        self.assertEqual(raw, fixture.read_bytes())
+        self.assertEqual(
+            envelope["packet_hash"],
+            "2c0967c19ef54fe2e717ddbad95dc31a7a0c40f87429b2646f4716ad7b952e93",
+        )
+        self.assertEqual(module.state_packet_hash(envelope), "sha256:" + envelope["packet_hash"])
+        self.assertEqual(set(envelope), {"packet", "packet_hash", "byte_size"})
+
+    def test_packet_still_rejects_real_binary_among_text_changes(self):
+        (self.repo / "inventory.tsv").write_text("a\t-\tb\n", encoding="utf-8")
+        (self.repo / "binary.dat").write_bytes(b"\0binary")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "mixed")
+        proc = self.packet()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(self.packet_path.exists())
+
     def test_packet_text_inputs_are_bounded_regular_files(self):
         self.assertEqual(self.packet().returncode, 0)
         spec = importlib.util.spec_from_file_location("bounded_text_reader", REVIEW)
@@ -1177,6 +1305,15 @@ raise SystemExit(1)
         self.assertEqual(auth["program"], "claude")
         self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "fable")
         self.assertEqual(len(self.logs()), 2)
+
+    def test_astra_usage_limit_is_reported_as_quota_in_run_result(self):
+        # issue #17/#10: исчерпанная подписка Codex — это quota, а не protocol
+        self.assert_packet_ok()
+        proc = self.review_run("claude-host", "limit")
+        self.assertNotEqual(proc.returncode, 0)
+        result = self.result()
+        self.assertEqual(result["error_category"], "quota")
+        self.assertFalse(result["gate_ready"])
 
     def test_codex_adapter_verifies_app_server_model_subscription_and_capabilities(
         self,

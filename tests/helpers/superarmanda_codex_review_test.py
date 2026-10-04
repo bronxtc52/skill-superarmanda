@@ -93,6 +93,7 @@ for line in sys.stdin:
   account={"type":"api" if mode=="auth" else "chatgpt","planType":"free" if mode=="free" else "pro"}
   response(i,account if mode=="bare_auth" else {"requiresOpenaiAuth":mode!="auth_not_required","account":account})
  elif m=="thread/start":
+  if mode=="limit_thread_start_error": out({"method":"error","params":{"error":{"codexErrorInfo":"usageLimitExceeded","message":"limit"},"willRetry":False,"threadId":"t","turnId":"u"}})
   if mode=="model": response(i,{"model":"other","modelProvider":"openai","thread":{"id":"t"}})
   else:
    if mode in ("thread_started_model","thread_started_provider","thread_started_wrong_id","correct_thread_started_identity"):
@@ -133,6 +134,19 @@ for line in sys.stdin:
    elif mode=="conflicting_start_provider": started.update({"model":"gpt-6-astra","modelProvider":"openai","model_provider":"other"})
    else: started.update({"model":"gpt-6-astra","modelProvider":"openai"})
    out({"method":"turn/started","params":started})
+  if mode in ("limit_early","limit_early_wrong_thread","limit_early_wrong_turn"):
+   # error приходит ДО ответа на turn/start
+   out({"method":"error","params":{"error":{"codexErrorInfo":"usageLimitExceeded","message":"limit"},"willRetry":False,"threadId":"other" if mode=="limit_early_wrong_thread" else "t","turnId":"other" if mode=="limit_early_wrong_turn" else "u"}})
+  if mode in ("early_done_quota","early_done_other","early_done_wrong_turn"):
+   # успешный ответ и completed ДО ответа на turn/start, затем error того же turn (fix-loop 2)
+   out({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":{"type":"agentMessage","text":json.dumps({"ok":True})}}})
+   out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
+   out({"method":"error","params":{"error":{"codexErrorInfo":"otherError" if mode=="early_done_other" else "usageLimitExceeded","message":"x"},"willRetry":False,"threadId":"t","turnId":"zzz" if mode=="early_done_wrong_turn" else "u"}})
+  if mode=="early_err_first_done":
+   # порядок «error -> completed -> ответ turn/start»
+   out({"method":"error","params":{"error":{"codexErrorInfo":"usageLimitExceeded","message":"x"},"willRetry":False,"threadId":"t","turnId":"u"}})
+   out({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":{"type":"agentMessage","text":json.dumps({"ok":True})}}})
+   out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
   if mode=="early":
    out({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":{"type":"agentMessage","text":json.dumps({"ok":True})}}})
    out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
@@ -141,6 +155,20 @@ for line in sys.stdin:
   elif mode=="approval": out({"method":"commandExecution/requestApproval","params":{}})
   elif mode=="wrongid": out({"method":"turn/completed","params":{"threadId":"other","turn":{"id":"u","status":"completed"}}})
   elif mode=="missing": pass
+  elif mode.startswith("limit"):
+   # Последовательность снята с живого прогона при исчерпанной подписке (issue #17).
+   info="otherError" if mode=="limit_other" else "usageLimitExceeded"
+   tid="other" if mode=="limit_wrong_thread" else "t"
+   message="You've hit your usage limit. Upgrade to Pro, or try again at Oct 5th, 2026 3:35 AM."
+   out({"method":"turn/started","params":{"threadId":"t","turn":{"id":"u"}}})
+   out({"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":100}}}})
+   out({"method":"thread/status/changed","params":{"threadId":"t","status":{"type":"systemError"}}})
+   if mode not in ("limit_turn_only","limit_silent"):
+    err={"error":{"codexErrorInfo":info,"message":message,"additionalDetails":None},"willRetry":mode=="limit_retry","threadId":tid,"turnId":"u"}
+    if mode=="limit_no_ids": del err["threadId"], err["turnId"]
+    out({"method":"error","params":err})
+   if mode not in ("limit_no_terminal","limit_silent"):
+    out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"failed","error":{"codexErrorInfo":info,"message":message}}}})
   elif mode=="missing_ids":
    out({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"{}"}}})
    out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
@@ -395,6 +423,75 @@ class Contract(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "review CLI failed: " + category),
             ):
                 self.invoke(mode, timeout)
+
+    def failure(self, mode, timeout=5):
+        with self.assertRaises(ValueError) as caught:
+            self.invoke(mode, timeout=timeout)
+        return str(caught.exception)
+
+    def test_usage_limit_after_system_error_is_quota(self):
+        # issue #17/#10: systemError не обрывает чтение, error/usageLimitExceeded -> quota
+        self.assertEqual(
+            self.failure("limit"), "review CLI failed: quota"
+        )
+
+    def test_usage_limit_only_in_failed_turn_is_quota(self):
+        self.assertEqual(
+            self.failure("limit_turn_only"), "review CLI failed: quota"
+        )
+
+    def test_other_error_info_is_not_quota(self):
+        self.assertEqual(
+            self.failure("limit_other"), "review CLI failed: completion"
+        )
+
+    def test_error_notification_with_foreign_thread_is_protocol(self):
+        self.assertEqual(
+            self.failure("limit_wrong_thread"), "review CLI failed: protocol"
+        )
+
+    def test_early_usage_limit_before_turn_start_reply_is_quota(self):
+        self.assertEqual(self.failure("limit_early"), "review CLI failed: quota")
+
+    def test_early_error_with_foreign_ids_is_protocol(self):
+        for mode in ("limit_early_wrong_thread", "limit_early_wrong_turn"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.failure(mode), "review CLI failed: protocol")
+
+    def test_deferred_error_after_early_completed_turn_is_never_lost(self):
+        # fix-loop 2: error в pending не должен проиграть успешному turn/completed
+        for mode, expected in (
+            ("early_done_quota", "quota"),
+            ("early_done_other", "completion"),
+            ("early_done_wrong_turn", "protocol"),
+        ):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.failure(mode), "review CLI failed: " + expected)
+
+    def test_early_error_before_completed_turn_is_terminal_in_any_order(self):
+        self.assertEqual(
+            self.failure("early_err_first_done"), "review CLI failed: quota"
+        )
+
+    def test_early_completed_turn_without_error_still_passes(self):
+        response, meta = self.invoke("early")
+        self.assertEqual(response, {"ok": True})
+
+    def test_error_during_thread_start_stays_protocol(self):
+        self.assertEqual(
+            self.failure("limit_thread_start_error"), "review CLI failed: protocol"
+        )
+
+    def test_error_without_ids_is_protocol(self):
+        self.assertEqual(self.failure("limit_no_ids"), "review CLI failed: protocol")
+
+    def test_retrying_usage_limit_error_is_still_terminal_quota(self):
+        self.assertEqual(self.failure("limit_retry"), "review CLI failed: quota")
+
+    def test_system_error_without_terminal_event_keeps_timeout(self):
+        self.assertEqual(
+            self.failure("limit_silent", timeout=2), "review CLI failed: timeout"
+        )
 
     def test_usage_boolean_counts_are_not_reported(self):
         _, metadata = self.invoke("usage_bool")
