@@ -9896,6 +9896,44 @@ class ManifestDashboard(Base):
                      "#31", "Codex", "нет результата", "step 6 coder: continue task T1"):
             self.assertIn(part, text)
 
+    def test_verdict_row_shows_the_second_reviewer(self):
+        """1.2.2 (W2): the second review of a high-risk task sits in the row of the verdicts, next to
+        the first one: «—» while it is owed, its verdict once recorded; below high only when recorded."""
+        cfg = self.running()
+        repo = self.tmp / "gitrepo"
+        repo.mkdir()
+        git = ["git", "-C", str(repo), "-c", "user.email=a@b", "-c", "user.name=n"]
+        subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "i"], check=True)
+        head = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        manifest = cfg["run_dir"] / "W1" / "superarmanda" / "manifest.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+
+        def fresh(risk):
+            manifest.unlink(missing_ok=True)
+            self.dash.MANIFEST_CACHE.clear()
+            self.state(manifest, "init", "--repo", str(repo), "--base", head, "--head", head, "--risk", risk)
+            self.state(manifest, "task-result", "--task", "T1", "--role", "coder", "--status", "pass",
+                       "--session-id", "s1", "--head", head, *(["--model", "fable"] if risk == "high" else []))
+
+        def row():
+            self.dash.MANIFEST_CACHE.clear()
+            return next(line for line in self.frame(cfg).splitlines() if "вердикты" in line)
+
+        fresh("high")
+        line = row()
+        self.assertRegex(line, r"cross_provider_reviewer: —\s+second_reviewer: —\s+github_codex_review: —")
+        self.state(manifest, "task-result", "--task", "T1", "--role", "second_reviewer", "--status", "unavailable",
+                   "--session-id", "s2", "--head", head)
+        line = row()
+        self.assertRegex(line, r"cross_provider_reviewer: —\s+second_reviewer: unavailable\s+github_codex_review: —")
+        self.assertEqual(line.count("second_reviewer"), 1)
+        fresh("medium")
+        self.assertNotIn("second_reviewer", row())
+        self.state(manifest, "task-result", "--task", "T1", "--role", "second_reviewer", "--status", "pass",
+                   "--session-id", "s3", "--head", head)
+        self.assertRegex(row(), r"cross_provider_reviewer: —\s+second_reviewer: pass\s+github_codex_review: —")
+
     def test_pr_falls_back_to_gate_pr_and_the_table_has_a_pr_column(self):
         cfg = self.running(gate_pr=44)
         text = self.frame(cfg)

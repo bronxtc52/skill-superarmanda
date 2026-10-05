@@ -278,6 +278,7 @@ MANIFEST_POLL_SECONDS = 15  # `state.py where` is a subprocess: not more often t
 WHERE_TIMEOUT = 10
 MANIFEST_CACHE = {}  # manifest path -> (signature, taken at, result)
 VERDICT_ROLES = ("tester", "cross_provider_reviewer", "github_codex_review", "coderabbit")
+SECOND_REVIEWER = "second_reviewer"  # manifest version 2: the second task review (required for a high-risk task)
 ARTIFACT_LIMIT = 2 * 1024 * 1024  # bytes of a findings artifact read for the frame
 SEVERITIES = ("critical", "high", "medium", "low", "P0", "P1", "P2", "P3")
 
@@ -397,7 +398,10 @@ def manifest_lines(cfg, wave, w):
     if isinstance(acc, int) and not isinstance(acc, bool) and acc > 0:
         head.append(f"   принято {acc}", style="grey62")
     verdicts = where.get("verdicts") if isinstance(where.get("verdicts"), dict) else {}
-    roles = [*VERDICT_ROLES, *(r for r in verdicts if r not in VERDICT_ROLES)]
+    # the second review sits next to the first one: owed («—») by a high-risk task, else shown once recorded
+    second = [SECOND_REVIEWER] if where.get("risk") == "high" or SECOND_REVIEWER in verdicts else []
+    shown = [r for role in VERDICT_ROLES for r in ([role, *second] if role == "cross_provider_reviewer" else [role])]
+    roles = [*shown, *(r for r in verdicts if r not in shown)]
     vt = Text("вердикты  ", style="bold")
     for r in roles:
         v = verdicts.get(r)
