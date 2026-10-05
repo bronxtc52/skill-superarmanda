@@ -137,9 +137,9 @@ if name == "claude":
         requested = argv[argv.index("--model") + 1]
         expected = {"fable": "claude-fable-5-1", "claude-opus-5-5": "claude-opus-5-5"}[requested]
         if mode == "opus_stale_pin": expected = "claude-opus-4-8"
-        # Claude CLI 2.1.283 loads built-in plugins even under --safe-mode;
+        # Claude CLI 2.1.283 loads built-in plugins even under --safe-mode (2.1.289 added a third);
         # only a process-level enabledPlugins=false removes them from init.
-        builtins = ["agents-md@builtin", "telemetry@builtin"]
+        builtins = ["agents-md@builtin", "telemetry@builtin", "cc-plugin-plugin-authoring@builtin"]
         if mode == "claude_new_builtin": builtins.append("future@builtin")
         disabled = {}
         if "--settings" in argv:
@@ -156,6 +156,12 @@ if name == "claude":
         if mode == "claude_assistant_before_init":
             print(json.dumps({"type": "assistant", "message": {"model": expected, "content": [{"type": "tool_use", "name": "StructuredOutput", "input": response}]}}))
         print(json.dumps(init))
+        if mode == "claude_line_separators":
+            # U+2028, U+2029 and NEL are legal unescaped inside a JSON string: the stream is JSONL,
+            # only "\n" ends an event (tester-2 F2)
+            blocks = [{"type": "text", "text": "quote\u2028{ x"}, {"type": "text", "text": "error"},
+                      {"type": "text", "text": "a\u2029{\"error\": \"rate_limit\"}\u0085{ b"}]
+            print(json.dumps({"type": "assistant", "message": {"model": expected, "content": blocks}}, ensure_ascii=False))
         if mode == "claude_duplicate_init":
             duplicate_init = dict(init)
             duplicate_init["model"] = "claude-opus-5"
@@ -1226,7 +1232,8 @@ raise SystemExit(1)
         settings = json.loads(review["argv"][review["argv"].index("--settings") + 1])
         self.assertEqual(
             settings,
-            {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False}},
+            {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False,
+                                "cc-plugin-plugin-authoring@builtin": False}},
         )
         self.assertIn("--safe-mode", review["argv"])
         self.assertTrue(
@@ -1308,7 +1315,8 @@ raise SystemExit(1)
         self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "claude-opus-5-5")
         self.assertEqual(
             json.loads(review["argv"][review["argv"].index("--settings") + 1]),
-            {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False}},
+            {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False,
+                                "cc-plugin-plugin-authoring@builtin": False}},
         )
         result = self.result()
         self.assertEqual(result["requested_model"], "claude-opus-5-5")
@@ -1439,6 +1447,17 @@ raise SystemExit(1)
                     report = self.result_path.read_text(encoding="utf-8")
                     for leak in ("session limit", "usage credits", "Unauthorized", "quota-evidence"):
                         self.assertNotIn(leak, report)
+
+    def test_line_separators_inside_model_text_do_not_break_the_stream(self):
+        """tester-2 F2: a stream event ends at "\\n" only; U+2028/U+2029/NEL in the model's text
+        are neither a provider signal nor a broken event."""
+        self.assert_packet_ok()
+        for profile in ("codex-host", "codex-host-opus"):
+            with self.subTest(profile=profile):
+                self.result_path.unlink(missing_ok=True)
+                proc = self.review_run(profile, "claude_line_separators")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual((self.result()["status"], self.result()["gate_ready"]), ("pass", True))
 
     def test_auth_status_failure_is_never_quota(self):
         self.assert_packet_ok()

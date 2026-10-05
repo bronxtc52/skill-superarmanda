@@ -31,9 +31,20 @@
   авторизации с таким словом в выводе получал `quota` и открывал запасной Opus). Признак auth, таймаута,
   транспорта или отказа рядом с сигналом квоты — не `quota`. Изменение поведения: сбой, где о квоте говорит
   только текст stderr, теперь `cli_exit`.
+- Запасной Opus только вместо Fable, которая ревью не дала: запись `codex-host-opus` — отказ, если у задачи на
+  этом HEAD уже есть `pass` или `findings` профиля `codex-host` в любой из двух ролей ревью. Непокрытые `findings`
+  роли ревью задачи `high` нельзя заменить повторным `task-result` на том же HEAD: сначала `fix-loop --defer`,
+  `--accept` или исправление (новый HEAD). Для `medium`, `low` и manifest `version: 1` — как раньше.
+- `review.py` выключает третий встроенный плагин Claude CLI 2.1.289 `cc-plugin-plugin-authoring@builtin`: без этого
+  `init.plugins` непуст и ревью профилей `codex-host`/`codex-host-opus` не получает `gate_ready: true`. Правило
+  «новый или не выключенный плагин оставляет `gate_ready: false`» остаётся.
+- `review.py` делит поток `stream-json` только по `\n`: U+2028, U+2029 и NEL в тексте модели больше не роняют
+  успешное ревью и не читаются как событие.
 - `state.py` сверяет отчёт ревью с его же профилем (`requested_model`, `observed_models` по таблице
   `review.PROFILE_MODELS`) и требует `session_id` ревью; один отчёт или одна сессия ревью не закрывает обе роли
-  (`review_session_id` в результате). Подлинность неподписанного отчёта по-прежнему не доказывается.
+  (`review_session_id` в результате). `observed_models`: у Astra ровно одна модель, у Claude-профилей основная
+  модель в `modelUsage` и `primary_model_verified: true` для `pass` и `findings`. Подлинность неподписанного
+  отчёта по-прежнему не доказывается.
 - `where` отдаёт `risk`, `review_policy`, а в `artifacts` — `model`, `profile`, `fallback_for`, `quota_evidence`.
 - Документация: таблица моделей по риску и шаблон брифа с `state.py role-model` (`profiles.md`), команда ревью
   задачи `high` и определение quota evidence (`review-contract.md`), шаблон тела PR со строкой о запасном

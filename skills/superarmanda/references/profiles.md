@@ -146,8 +146,9 @@ MCP-сервер или плагин, в том числе встроенный,
 произойдёт до отключения. `mcpServerStatus/list` вызывается только после
 проверки конфига. Пагинация статуса (`nextCursor`) — отказ, а не догрузка.
 `thread/settings/updated` также требует `approvalsReviewer` = `user`.
-Claude CLI 2.1.283 даже под `--safe-mode` загружает встроенные плагины
-`agents-md@builtin` и `telemetry@builtin`. Оба Claude-профиля передают только
+Claude CLI даже под `--safe-mode` загружает встроенные плагины: 2.1.283 —
+`agents-md@builtin` и `telemetry@builtin`, 2.1.289 — ещё и
+`cc-plugin-plugin-authoring@builtin` (три плагина). Оба Claude-профиля передают только
 дочернему процессу `--settings '{"enabledPlugins":{…:false}}'`; пользовательские
 настройки не меняются. `init.plugins` по-прежнему обязан быть пустым: новый или
 не выключенный плагин оставляет `gate_ready: false`. В отчёте

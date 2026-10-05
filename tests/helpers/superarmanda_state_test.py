@@ -4746,6 +4746,166 @@ class HighRiskReviews(PolicyBase):
         self.assertEqual(self.entry()["status"], "in_progress")
         self.assertIn("same review", self.where()["next_action"])
 
+    def test_opus_is_refused_once_fable_reviewed_this_head_and_packet(self):
+        """tester-2 F1: the fallback stands in for a Fable that gave no review, never over one."""
+        for status, mode in (("findings", "findings"), ("pass", "success")):
+            for fable_role, opus_role in (("second_reviewer", "second_reviewer"),
+                                          ("cross_provider_reviewer", "second_reviewer")):
+                with self.subTest(fable=status, fable_role=fable_role, opus_role=opus_role):
+                    self.init()
+                    self.code_and_test()
+                    quota = self.report("codex-host", "quota_failure")
+                    # its own session: the CLI doubles give Fable and Opus one session id
+                    opus = self.edited(self.report("codex-host-opus"), session_id="opus-review-session")
+                    if fable_role != "cross_provider_reviewer":
+                        self.review("cross_provider_reviewer", "claude-host")
+                    self.review(fable_role, "codex-host", mode, status=status)
+                    # open findings in the very role are refused one rule earlier (no rerun over them)
+                    needle = "open findings" if (status, fable_role) == ("findings", opus_role) else "codex-host review"
+                    self.record_refused(opus_role, needle=needle,
+                                        **self.review_flags(opus, quota_evidence=str(quota)))
+                    self.assertEqual(self.entry()["results"][fable_role]["profile"], "codex-host")
+                    self.assertEqual(self.entry()["results"][fable_role]["status"], status)
+        # covered findings of Fable are still a Fable review: Opus cannot replace them either
+        self.init()
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        self.review("second_reviewer", "codex-host", "findings", status="findings")
+        self.ok("fix-loop", "--task", "t1", "--defer", "--source", "second_reviewer", "--note", "low: nit")
+        self.record_refused("second_reviewer", needle="codex-host review",
+                            **self.review_flags(opus, quota_evidence=str(quota)))
+        # a Fable that only failed (quota, then auth) leaves the fallback open, as before
+        self.init()
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        self.record("second_reviewer", "error", artifact=str(quota))
+        entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+
+    def test_open_findings_of_a_review_are_not_replaced_without_a_disposition(self):
+        """A second run of the same profile on the same HEAD cannot wipe findings of a high-risk task."""
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        self.review("second_reviewer", "codex-host", "findings", status="findings")
+        clean = self.edited(self.report("codex-host"), session_id="second-fable-run")
+        for status, flags in (("pass", self.review_flags(clean)), ("error", {}), ("unavailable", {}),
+                              ("incomplete", {})):
+            with self.subTest(status=status):
+                self.record_refused("second_reviewer", status, needle="fix-loop", **flags)
+        self.assertEqual(self.entry()["results"]["second_reviewer"]["status"], "findings")
+        # the other role and the non-review roles are not held by it
+        self.record("tester", model="fable")
+        self.review("cross_provider_reviewer", "claude-host")
+        # a recorded disposition releases the role
+        self.ok("fix-loop", "--task", "t1", "--accept", "--source", "second_reviewer",
+                "--severity", "low", "--note", "false positive: context was missing")
+        entry = self.record("second_reviewer", **self.review_flags(clean))
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        # after a fix the HEAD is new: resume drops the findings and the cycle goes on
+        self.review("second_reviewer", "codex-host", "findings", status="findings")
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
+        self.change("fixed\n")
+        self.resume()
+        self.code_and_test()
+        self.packet()
+        self.review("cross_provider_reviewer", "claude-host")
+        entry, _ = self.review("second_reviewer", "codex-host")
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        # below high, and so for 1.2.0 manifests, a rerun replaces findings as before
+        self.init(risk="medium")
+        self.record("coder")
+        self.record("tester")
+        self.record("cross_provider_reviewer", "findings")
+        entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+
+    def test_no_command_promotes_a_high_task_with_one_review(self):
+        """Fable review, missing context a: every path that recomputes a status uses the task's risk."""
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+
+        def assert_not_ready():
+            self.assertNotEqual(self.entry()["status"], "ready_for_pr_review")
+            self.assertNotEqual(self.ok("status")["tasks"]["t1"]["status"], "ready_for_pr_review")
+            where = self.where()
+            self.assertEqual((where["step"], where["role"]), (5, "second_reviewer"))
+            self.assertNotEqual(where["task_status"], "ready_for_pr_review")
+
+        assert_not_ready()
+        self.resume()
+        assert_not_ready()
+        self.ok("mark", "--task", "t1", "--step", "5", "--safe-point", "true")
+        assert_not_ready()
+        self.assertEqual(self.ok("fix-loop", "--task", "t1", "--outcome", "pass")["status"], "needs_verification")
+        assert_not_ready()
+        self.record("tester", model="fable")
+        assert_not_ready()
+        self.ok("task-risk", "--task", "t1", "--risk", "high")
+        assert_not_ready()
+        # the status functions have no default that falls back to the rules of 1.2.0
+        module = _load("superarmanda_state_signatures", STATE)
+        for name in ("update_task_status", "task_ready", "settle_after_cover", "is_complete"):
+            with self.subTest(function=name):
+                with self.assertRaises(TypeError):
+                    getattr(module, name)(*([self.entry()] + ([self.head(), "t"] if name == "is_complete" else [])))
+
+    def test_raised_task_risk_survives_resume_onto_a_new_head(self):
+        """Fable review, missing context b."""
+        self.init(risk="low")
+        self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.record("coder", model="fable")
+        self.change("next\n")
+        self.assertEqual(self.resume()["invalidated_tasks"], ["t1"])
+        self.assertEqual(self.entry()["risk"], "high")
+        self.assertEqual(self.where()["risk"], "high")
+        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["model"], FABLE)
+        self.record_refused("coder", model="sonnet")
+        self.refused("task-risk", "--task", "t1", "--risk", "medium")
+
+    def test_reviewed_head_of_the_second_reviewer_must_be_the_result_head(self):
+        """Fable review, missing context c."""
+        self.code_and_test()
+        fable = self.report("codex-host")
+        for wrong in (self.base, "0" * 40, self.head()[:12], "HEAD"):
+            with self.subTest(reviewed_head=wrong):
+                flags = self.review_flags(fable)
+                flags["reviewed_head"] = wrong
+                self.record_refused("second_reviewer", needle="reviewed_head", **flags)
+        for wrong in ("sha256:" + "0" * 64, "ab12" * 16, "nonsense"):
+            with self.subTest(packet_hash=wrong):
+                self.record_refused("second_reviewer", **self.review_flags(fable, packet_hash=wrong))
+        stored = self.record("second_reviewer", **self.review_flags(fable))["results"]["second_reviewer"]
+        self.assertEqual((stored["reviewed_head"], stored["packet_hash"]), (self.head(), self.packet_hash))
+        self.init(risk="medium")
+        self.record_refused("second_reviewer", reviewed_head=self.base, packet_hash="ab12" * 16,
+                            needle="reviewed_head")
+
+    def test_observed_models_of_a_report_are_checked_as_far_as_live_reports_allow(self):
+        """tester-2 F4: the primary model must be there AND verified; Astra observes exactly one."""
+        self.code_and_test()
+        astra = self.report("claude-host")
+        fable = self.report("codex-host")
+        body = json.loads(fable.read_text(encoding="utf-8"))
+        unverified = dict(body["capabilities"], primary_model_verified=False)
+        cases = {
+            "astra with a second model": self.edited(astra, observed_models=["gpt-6-astra", SONNET]),
+            "astra observed twice": self.edited(astra, observed_models=["gpt-6-astra", "gpt-6-astra"]),
+            "astra as an object": self.edited(astra, observed_models={"gpt-6-astra": {}}),
+            "fable as a list": self.edited(fable, observed_models=[FABLE]),
+            "fable pass with unverified primary model": self.edited(fable, capabilities=unverified),
+            "fable pass without capabilities": self.edited(fable, capabilities=None),
+            "fable usage is not an object": self.edited(fable, observed_models={FABLE: 1}),
+        }
+        for label, report in cases.items():
+            with self.subTest(case=label):
+                self.record_refused("second_reviewer", **self.review_flags(report))
+        # ancillary modelUsage entries beside a verified primary model are legitimate (review-contract.md)
+        ancillary = self.edited(fable, observed_models=dict(body["observed_models"],
+                                                             **{"claude-haiku-4-5-20251001": {"inputTokens": 1}}))
+        self.record("cross_provider_reviewer", **self.review_flags(astra))
+        entry = self.record("second_reviewer", **self.review_flags(ancillary))
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+
     def test_quota_evidence_is_only_for_the_opus_profile(self):
         self.code_and_test()
         quota = self.report("codex-host", "quota_failure")

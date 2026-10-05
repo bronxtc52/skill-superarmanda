@@ -135,7 +135,9 @@ creates one manifest atomically.
 - `task-result --quota-evidence <путь>` — только с отчётом профиля `codex-host-opus` у ревью
   задачи high; правила — в [review-contract.md](review-contract.md). В результат ревью high
   пишутся `profile`, `artifact_sha256`, `review_session_id`, а для запасного Opus — `fallback_for` и
-  `quota_evidence`. Один отчёт или одна сессия ревью не закрывает обе роли ревью задачи.
+  `quota_evidence`. Один отчёт или одна сессия ревью не закрывает обе роли ревью задачи. Opus не
+  записывается, если Fable уже дала `pass` или `findings` на этом HEAD; непокрытые `findings` роли
+  ревью задачи high не заменяются повторным `task-result` на том же HEAD (сначала `fix-loop`).
 - `where` дополнительно отдаёт `risk` (эффективный риск задачи), `review_policy`, а в `artifacts` —
   `model`, `profile`, `fallback_for`, `quota_evidence`. Причина, по которой задача high не готова
   (не та модель, не та пара профилей, разные пакеты, Opus без подтверждения квоты), стоит в

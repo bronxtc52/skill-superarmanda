@@ -891,13 +891,16 @@ def high_risk_gaps(entry, results):
 
 
 def task_ready(entry, risk):
-    """The single readiness rule of a task for its effective risk (None: manifest version 1)."""
+    """The single readiness rule of a task for its effective risk (None: manifest version 1).
+    `risk` has no default here or in any caller that recomputes a status: a forgotten argument
+    must be an error, never a silent return to the rules of 1.2.0. Callers take it from
+    `task_risk(data, entry)`."""
     if not all(effective_status(entry, role) == "pass" for role in required_roles(risk)):
         return False
     return risk != "high" or not high_risk_gaps(entry, entry["results"])
 
 
-def update_task_status(entry, risk=None):
+def update_task_status(entry, risk):
     """Only coder, tester and the task review(s) can make a task PR-ready.
     Coder and tester need pass; a reviewer may also be findings + deferral/acceptance.
     A high-risk task (manifest version 2) also needs Fable models and the second review."""
@@ -1375,6 +1378,22 @@ def result(args):
             f"{entry['decision_required_for']}: run fix-loop --decision ..."
         )
     model = result_model(args, risk)
+    if risk == "high" and args.role in REVIEW_ROLES:
+        # A rerun on the same HEAD must not wipe findings nobody disposed of: that would turn
+        # `findings` into `pass` (or into nothing) without a fix-loop. After a fix the HEAD is
+        # new and `resume` has already dropped the old result.
+        previous = entry["results"].get(args.role)
+        if (
+            isinstance(previous, dict)
+            and previous.get("status") == "findings"
+            and previous.get("head") == data["head"]
+            and previous.get("tree_fingerprint") == data["tree_fingerprint"]
+            and not is_covered(entry, args.role, previous)
+        ):
+            fail(
+                f"{args.role} has open findings on this HEAD: record fix-loop --defer or "
+                "--accept for them, or fix the code (new HEAD) after fix-loop --outcome failed"
+            )
     owner = session_owners(data).get(args.session_id)
     if owner is not None and owner != (args.task, args.role):
         fail("session_id is already used by another task or role for this run")
@@ -1521,11 +1540,17 @@ def verified_review(args, risk, packet_hash, entry):
         fail(f"review report status {report.get('status')!r} differs from --status {args.status}")
     # The report must agree with itself: the model review.py requests for this profile and
     # the model it observed running. One edited `profile` field does not make another review.
-    _cli, requested, observed = review_profile_models()[profile]
+    # review.py writes `observed_models` as the adapter's list for Astra (exactly the one model)
+    # and as the CLI's modelUsage object for the Claude profiles, where entries of ancillary
+    # CLI calls beside the primary model are legitimate. So the object is not compared as a
+    # whole; the primary model must be there and `primary_model_verified` must be true.
+    cli, requested, observed = review_profile_models()[profile]
     models = report.get("observed_models")
-    if report.get("requested_model") != requested or not (
-        isinstance(models, (list, dict)) and observed in models
-    ):
+    if cli == "claude":
+        models_fit = isinstance(models, dict) and isinstance(models.get(observed), dict)
+    else:
+        models_fit = models == [observed]
+    if report.get("requested_model") != requested or not models_fit:
         fail(f"review report models do not belong to profile {profile}")
     session = report.get("session_id")
     if not isinstance(session, str) or not session:
@@ -1545,12 +1570,14 @@ def verified_review(args, risk, packet_hash, entry):
     isolation = capabilities.get("tool_isolation")
     if args.status == "pass" and report.get("gate_ready") is not True:
         fail("review report is not gate_ready: it cannot be recorded as pass")
-    if args.status == "findings" and not (
+    if not (
         capabilities.get("primary_model_verified") is True
         and isinstance(isolation, str)
         and isolation != "unverified"
     ):
-        fail("review report has no verified model and tool isolation: findings are not recorded")
+        fail(
+            f"review report has no verified model and tool isolation: {args.status} is not recorded"
+        )
     if report.get("state_packet_hash") != packet_hash:
         fail("review report state_packet_hash differs from --packet-hash")
     response = report.get("response")
@@ -1561,6 +1588,21 @@ def verified_review(args, risk, packet_hash, entry):
         if args.quota_evidence is not None:
             fail(f"--quota-evidence is only allowed with a {OPUS_PROFILE} report, got {profile}")
         return fields
+    # The fallback stands in for a Fable that gave NO review of this HEAD. A recorded Fable
+    # pass or findings (in either role, covered or not) proves Fable was available: an older
+    # quota report must not let Opus replace or outvote it.
+    for role in REVIEW_ROLES:
+        previous = entry["results"].get(role)
+        if (
+            isinstance(previous, dict)
+            and previous.get("profile") == FABLE_PROFILE
+            and previous.get("status") in ("pass", "findings")
+            and previous.get("head") == args.head
+        ):
+            fail(
+                f"{role} already holds a {FABLE_PROFILE} review ({previous['status']}) of this "
+                f"HEAD: {OPUS_PROFILE} is a fallback only when {FABLE_PROFILE} gave no review"
+            )
     if args.quota_evidence is None:
         fail(
             f"a {OPUS_PROFILE} review is accepted only with --quota-evidence "
@@ -1695,7 +1737,7 @@ def coverable_result(args, entry, data, location, flag):
     return result_entry
 
 
-def settle_after_cover(entry, risk=None):
+def settle_after_cover(entry, risk):
     """A deferral/acceptance may complete the task. From needs_fix it may only promote to
     ready_for_pr_review (every role pass or covered): update_task_status would otherwise
     demote a still-open needs_fix to in_progress. blocked/needs_decision never get here."""
@@ -1705,7 +1747,7 @@ def settle_after_cover(entry, risk=None):
         entry["status"] = "ready_for_pr_review"
 
 
-def record_deferral(args, entry, data, location, risk=None):
+def record_deferral(args, entry, data, location, risk):
     """Defer low/P3-only findings of a reviewer to the next wave/task remainder.
     Spends no fix cycle, touches no per-source counter and is not a decision."""
     result_entry = coverable_result(args, entry, data, location, "--defer")
@@ -1722,7 +1764,7 @@ def record_deferral(args, entry, data, location, risk=None):
     settle_after_cover(entry, risk)
 
 
-def record_acceptance(args, entry, data, location, risk=None):
+def record_acceptance(args, entry, data, location, risk):
     """Accept a reviewer's findings of any severity as a known limitation (#54).
     Like a deferral it spends no fix cycle and is bound to the exact result; unlike
     a deferral it records the severity so medium/high ones reach the PR body."""
@@ -1767,7 +1809,7 @@ def record_decision(args, entry):
     entry["status"] = "needs_fix"
 
 
-def record_fix_outcome(args, entry, data, location, risk=None):
+def record_fix_outcome(args, entry, data, location, risk):
     if entry["status"] == "needs_decision":
         fail(
             "decision required for source "
@@ -1851,7 +1893,7 @@ def current_gaps(entry, head, tree, risk):
     return high_risk_gaps(entry, current_results(entry, head, tree))
 
 
-def is_complete(entry, head, tree, risk=None):
+def is_complete(entry, head, tree, risk):
     step, role, _note = derive_step(
         entry,
         current_verdicts(entry, head, tree),

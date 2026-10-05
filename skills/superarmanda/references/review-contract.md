@@ -75,7 +75,11 @@ python3 "$SUPERARMANDA_DIR/scripts/state.py" task-result --manifest <path> --tas
 `response.reviewed_head` не равен HEAD. Отчёт обязан быть согласован сам с собой: `requested_model`
 и `observed_models` должны принадлежать его профилю по таблице `PROFILE_MODELS` из `review.py`
 (`claude-host` → `gpt-6-astra`; `codex-host` → запрошена `fable`, наблюдается `claude-fable-5-1`;
-`codex-host-opus` → `claude-opus-5-5`), а `session_id` ревью — непустая строка. Один и тот же
+`codex-host-opus` → `claude-opus-5-5`), а `session_id` ревью — непустая строка. У Astra
+`observed_models` — ровно один элемент; у Claude-профилей это объект `modelUsage`, где рядом с
+основной моделью допустимы записи вспомогательных вызовов CLI, поэтому целиком он не
+сравнивается: основная модель обязана в нём быть, а `capabilities.primary_model_verified: true`
+и проверенная изоляция инструментов требуются и для `pass`, и для `findings`. Один и тот же
 отчёт или одна сессия ревью не закрывает обе роли: вторая запись — отказ. В результат пишутся
 `profile`, `artifact_sha256` (SHA-256 байтов отчёта) и `review_session_id`. `error`, `unavailable`
 и `incomplete` отчёта не требуют и pass не дают. Известная граница: отчёт не подписан, поэтому
@@ -99,6 +103,19 @@ python3 "$SUPERARMANDA_DIR/scripts/state.py" task-result --manifest <path> --tas
 или пакета, отчёт без этих двух полей (написанный до 1.2.1) не подходят. В результат пишутся
 `fallback_for: codex-host` и `quota_evidence: {artifact, sha256}`; оба пути видны в `where`.
 `--quota-evidence` с любым другим профилем — отказ.
+
+Запасной Opus заменяет только Fable, которая ревью НЕ дала. Если у задачи в любой из двух ролей
+ревью уже записан результат профиля `codex-host` со статусом `pass` или `findings` на этом HEAD
+(в том числе покрытый `--defer`/`--accept`), запись `codex-host-opus` — отказ: такой результат
+доказывает, что Fable была доступна, и прежний отчёт квоты его не отменяет.
+
+Повторный прогон не стирает находки. У задачи high результат роли ревью со статусом `findings`
+на текущем HEAD, не покрытый `fix-loop --defer`/`--accept`, нельзя заменить новым `task-result`
+этой роли (любого статуса и профиля): сначала разбор находок. После исправления кода HEAD новый,
+`resume` сам убирает старый результат, и штатный цикл не меняется. Ложную находку координатор
+принимает `fix-loop --accept --severity low --note "<почему>"` и после этого может повторить
+ревью. При риске medium и low и для manifest `version: 1` повторная запись, как и раньше,
+заменяет результат.
 
 Категорию `quota` у Claude-профилей `review.py` выводит только из сигнала провайдера: событие
 потока `assistant`, которое CLI пишет сам, с верхнеуровневым `error: "rate_limit"` (живые строки —

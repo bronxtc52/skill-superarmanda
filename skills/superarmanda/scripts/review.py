@@ -747,7 +747,14 @@ def authenticated(cli, timeout, env, cwd):
 
 
 DISABLED_BUILTIN_PLUGINS = json.dumps(
-    {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False}},
+    {
+        "enabledPlugins": {
+            "agents-md@builtin": False,
+            "telemetry@builtin": False,
+            # Claude CLI 2.1.289 loads this one under --safe-mode as well
+            "cc-plugin-plugin-authoring@builtin": False,
+        }
+    },
     separators=(",", ":"),
 )
 
@@ -804,6 +811,13 @@ def expected_primary_model(profile):
     return observed if cli == "claude" else None
 
 
+def stream_lines(stdout):
+    """Events of a Claude stream-json output. The format is JSONL: only "\n" ends an event.
+    `str.splitlines()` would also cut at U+2028, U+2029, NEL and the other separators that are
+    legal unescaped inside a JSON string, that is inside the model's text."""
+    return stdout.split("\n")
+
+
 def response_from_stdout(cli, stdout, expected_model="claude-fable-5-1"):
     if cli == "codex":
         messages, completed = [], False
@@ -843,7 +857,7 @@ def response_from_stdout(cli, stdout, expected_model="claude-fable-5-1"):
         return json_value(messages[0], "Codex agent message"), {"events": "completed"}
     events = [
         json_value(line, "Claude stream event")
-        for line in stdout.splitlines()
+        for line in stream_lines(stdout)
         if line.strip()
     ]
     if any(not isinstance(event, dict) for event in events):
@@ -1070,7 +1084,7 @@ def claude_provider_errors(stdout):
     A line that is not one JSON object is not an event and carries no signal; an event line
     with duplicate keys, or an `error` that is not a string, is recorded as `invalid`."""
     codes = set()
-    for line in stdout.splitlines():
+    for line in stream_lines(stdout):
         line = line.strip()
         if not line.startswith("{"):
             continue
