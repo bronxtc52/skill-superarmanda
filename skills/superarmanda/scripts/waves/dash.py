@@ -299,7 +299,7 @@ def manifest_where(cfg, wave):
     hit = MANIFEST_CACHE.get(path)
     if hit and hit[0] == sig and 0 <= now - hit[1] < MANIFEST_POLL_SECONDS:
         return hit[2]
-    result = wab.manifest_where_of(path, WHERE_TIMEOUT)
+    result = wab.manifest_where_of(path, cfg["run_dir"] / wave, WHERE_TIMEOUT)
     MANIFEST_CACHE[path] = (sig, now, result)
     return result
 

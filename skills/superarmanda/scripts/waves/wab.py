@@ -3416,12 +3416,14 @@ def read_manifest(cfg, wave):
     return data if isinstance(data, dict) else None
 
 
-def manifest_where_of(path, timeout=WHERE_TIMEOUT):
+def manifest_where_of(path, wave_dir, timeout=WHERE_TIMEOUT):
     """`state.py where --manifest <path>` (never parsed here): the printed JSON object, or
-    {"error": short reason}. Never raises."""
+    {"error": short reason}. Never raises. `where` judges the last run by the LIVE cap
+    `$WAB_DIR/max-runs`, so the child gets WAB_DIR of THIS wave whatever the caller's environment says."""
     try:
+        env = dict(os.environ, WAB_DIR=str(pathlib.Path(wave_dir).resolve()))
         proc = subprocess.run([sys.executable, str(STATE_PY), "where", "--manifest", str(path)],
-                              capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+                              capture_output=True, text=True, encoding="utf-8", timeout=timeout, env=env)
         if proc.returncode != 0:
             lines = [l.strip() for l in (proc.stderr or proc.stdout).splitlines() if l.strip()]
             raise ValueError(lines[-1] if lines else f"rc {proc.returncode}")
@@ -5680,7 +5682,7 @@ def manifest_status_line(cfg, wave):
             return f"  manifest: {why}"
         if not path.exists():
             return None
-        where = manifest_where_of(path)
+        where = manifest_where_of(path, cfg["run_dir"] / wave)
         if where.get("error"):
             return f"  manifest: {where['error']}"
         verdicts = where.get("verdicts") if isinstance(where.get("verdicts"), dict) else {}

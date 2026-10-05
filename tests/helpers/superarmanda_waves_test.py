@@ -14595,6 +14595,34 @@ class CurrentRunManifest(Base):
         self.assertIn("шаг", text)
         self.assertIn("вердикты", text)
 
+    def live_cap_setup(self):
+        (self.wave / "max-runs").write_text("3\n", encoding="utf-8")
+        other = self.tmp / "other-wave"
+        other.mkdir()
+        (other / "max-runs").write_text("5\n", encoding="utf-8")
+        return other
+
+    def test_status_judges_the_run_by_the_cap_of_this_wave(self):
+        other = self.live_cap_setup()
+        for env in ({}, {"WAB_DIR": str(other)}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                if not env:
+                    os.environ.pop("WAB_DIR", None)
+                text = self.status_text()
+                self.assertIn("прогон 2/3 ", text)
+                self.assertNotIn("2/3!", text)
+
+    def test_dashboard_judges_the_run_by_the_cap_of_this_wave(self):
+        dash = self.dash()
+        other = self.live_cap_setup()
+        for env in ({}, {"WAB_DIR": str(other)}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                if not env:
+                    os.environ.pop("WAB_DIR", None)
+                dash.MANIFEST_CACHE.clear()
+                where = dash.manifest_where(self.cfg, "W1")
+                self.assertEqual((where.get("run"), where.get("last_run")), ("2/3", False), where)
+
     def test_status_shows_the_refusal_and_survives_it(self):
         self.set_runs("{not json")
         text = self.status_text()
