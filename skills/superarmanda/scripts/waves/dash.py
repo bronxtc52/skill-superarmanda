@@ -277,7 +277,6 @@ def waves_table(cfg, st):
 MANIFEST_POLL_SECONDS = 15  # `state.py where` is a subprocess: not more often than this per manifest
 WHERE_TIMEOUT = 10
 MANIFEST_CACHE = {}  # manifest path -> (signature, taken at, result)
-STATE_PY = pathlib.Path(__file__).resolve().parent.parent / "state.py"
 VERDICT_ROLES = ("tester", "cross_provider_reviewer", "github_codex_review", "coderabbit")
 ARTIFACT_LIMIT = 2 * 1024 * 1024  # bytes of a findings artifact read for the frame
 SEVERITIES = ("critical", "high", "medium", "low", "P0", "P1", "P2", "P3")
@@ -289,7 +288,9 @@ def manifest_where(cfg, wave):
     (a failure too) is reused only while the manifest is unchanged (mtime, size) AND younger than
     MANIFEST_POLL_SECONDS: `where` also depends on the repository, so it is asked again after the
     interval; a changed manifest is asked at once."""
-    path = cfg["run_dir"] / wave / "superarmanda" / "manifest.json"
+    path, why = wab.current_manifest(cfg, wave)
+    if path is None:
+        return {"error": why}
     try:
         stat = path.stat()
     except OSError:
@@ -298,19 +299,7 @@ def manifest_where(cfg, wave):
     hit = MANIFEST_CACHE.get(path)
     if hit and hit[0] == sig and 0 <= now - hit[1] < MANIFEST_POLL_SECONDS:
         return hit[2]
-    try:
-        proc = subprocess.run([sys.executable, str(STATE_PY), "where", "--manifest", str(path)],
-                              capture_output=True, text=True, encoding="utf-8", timeout=WHERE_TIMEOUT)
-        if proc.returncode != 0:
-            lines = [l.strip() for l in (proc.stderr or proc.stdout).splitlines() if l.strip()]
-            raise ValueError(lines[-1] if lines else f"rc {proc.returncode}")
-        result = json.loads(proc.stdout)
-        if not isinstance(result, dict):
-            raise ValueError("where: not an object")
-    except subprocess.TimeoutExpired:
-        result = {"error": f"state.py where: таймаут {WHERE_TIMEOUT} с"}
-    except (OSError, ValueError) as e:
-        result = {"error": str(e)[:150]}
+    result = wab.manifest_where_of(path, WHERE_TIMEOUT)
     MANIFEST_CACHE[path] = (sig, now, result)
     return result
 

@@ -28,6 +28,7 @@ SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
 COMMIT_CELL = re.compile(r"`([0-9a-f]{7,40})`")
 WAVE = re.compile(r"[A-Za-z0-9_-]+")
 RUN_ID = re.compile(r"[A-Za-z0-9._-]+")
+MANIFEST_MISSING = "manifest отсутствует или нечитаем"
 MERGED_OUTSIDE = "PR уже смержен вне гейта"  # wab.py names `owner-handover` in the BLOCKED line of this reason
 THREADS_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
@@ -267,7 +268,7 @@ def _shape_problems(manifest, tasks):
 def manifest_problems(manifest, head, cwd_fingerprint):
     """Why the manifest does not vouch for `head` (empty list: it does)."""
     if not isinstance(manifest, dict):
-        return ["manifest отсутствует или нечитаем"]
+        return [MANIFEST_MISSING]
     problems = []
     for key in sorted(k for k in manifest if k not in state.MANIFEST_KEYS):
         problems.append(f"manifest: unknown record type {key!r}: this gate cannot judge it")

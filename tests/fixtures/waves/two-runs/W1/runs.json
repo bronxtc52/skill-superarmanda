@@ -1,0 +1,18 @@
+{
+  "runs": [
+    {
+      "created_at": "2026-10-04T11:33:04+00:00",
+      "index": 1,
+      "manifest": "@WAVE_DIR@/superarmanda/manifest.json",
+      "plan_sha256": "f42a437bb92a2aa83254cfc47c4241404a6733b6981f2f4c64e36289effdd4f2"
+    },
+    {
+      "created_at": "2026-10-04T12:29:14+00:00",
+      "index": 2,
+      "manifest": "@WAVE_DIR@/superarmanda/manifest-run2.json",
+      "plan_sha256": "f42a437bb92a2aa83254cfc47c4241404a6733b6981f2f4c64e36289effdd4f2"
+    }
+  ],
+  "version": 1,
+  "wave": "W1"
+}
