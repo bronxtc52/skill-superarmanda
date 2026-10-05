@@ -176,7 +176,7 @@ acceptance (`state.is_covered`) counts as passed for readiness and for the wave 
 bound to a result of the current head and tree (`accepted_record`): after `resume` onto a new head
 the older records stay in the manifest as history but are neither counted in `accepted` nor listed.
 `init --from-plan` counts
-runs of a wave when `WAB_DIR` or `--runs-file` names a counter file (`runs.json`): the limit is
+runs of a wave when `WAB_DIR` or `--runs-file` names a counter file (`runs.json`; the dispatcher takes the current manifest from its last record): the limit is
 `--max-runs`, else the file `$WAB_DIR/max-runs` (the live value kept by the dispatcher; damaged or
 not a whole number 1..1000 is a closed refusal), else `WAB_MAX_RUNS`, else 2; beyond it `init` refuses and creates no manifest; the
 manifest gets `run: {index, max}`, and `where` reports `run` and `last_run` judged by the LIVE cap (`$WAB_DIR/max-runs`; a missing or invalid file falls back to the manifest `max`, `where` never fails on it). The counter is written before the manifest, so a process killed between the two writes leaves a counted run without a manifest (the cap is never exceeded; the budget only shrinks). Task IDs are coordinator-approved identifiers: renaming a

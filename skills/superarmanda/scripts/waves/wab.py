@@ -3319,13 +3319,124 @@ def workdir_state(cwd):
     return {"clean": clean, "head": head_rev(cwd), "fingerprint": fingerprint}
 
 
-def read_manifest(cfg, wave):
-    """<wave dir>/superarmanda/manifest.json as written by state.py; None when it cannot be read."""
-    try:
-        data = json.loads((cfg["run_dir"] / wave / "superarmanda" / "manifest.json").read_text(encoding="utf-8"))
+STATE_PY = pathlib.Path(__file__).resolve().parent.parent / "state.py"
+WHERE_TIMEOUT = 10
+RUNS_LIMIT = 2 * 1024 * 1024  # bytes of runs.json read by current_manifest
+
+
+def _current_manifest(cfg, wave):
+    """The manifest of the wave's CURRENT run: (path, None), or (None, reason) for a closed refusal.
+    No `<wave dir>/runs.json`, or an empty list of runs: the standard `<wave dir>/superarmanda/manifest.json`
+    (the file itself may not exist yet: that is "no manifest", not an error here). Otherwise the last
+    record of runs.json (as `state.py init` wrote it), which must name an existing regular file whose
+    physical path (symlinks resolved) lies inside the physical directory of this wave. A refusal never
+    falls back to the standard path: the gate would judge another run than the one that is going on.
+    The reasons are short and quote nothing from the files."""
+    wdir = cfg["run_dir"] / wave
+    standard = wdir / "superarmanda" / "manifest.json"  # the only place that names it
+    runs_file = wdir / "runs.json"
+    if not os.path.lexists(runs_file):
+        return standard, None
+    try:  # a FIFO without a writer or a symlink must not hang or redirect the gate
+        fd = os.open(runs_file, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)  # bytes, decoded below (encoding utf-8)
     except (OSError, ValueError):
+        return None, "runs.json не обычный файл или нечитаем"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "runs.json не обычный файл"
+        raw = b""
+        while len(raw) <= RUNS_LIMIT:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return None, "runs.json нечитаем или не JSON"
+    finally:
+        os.close(fd)
+    if len(raw) > RUNS_LIMIT:
+        return None, "runs.json слишком большой"
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:  # UnicodeDecodeError is a ValueError
+        return None, "runs.json нечитаем или не JSON"
+    if (not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("wave"), str)
+            or not isinstance(data.get("runs"), list) or not all(isinstance(r, dict) for r in data["runs"])):
+        return None, "runs.json неподдерживаемого формата"
+    if data["wave"] != wave:
+        return None, "runs.json принадлежит другой волне"
+    if not data["runs"]:
+        return standard, None
+    last = data["runs"][-1]
+    index = last.get("index") if isinstance(last.get("index"), int) and not isinstance(last.get("index"), bool) else len(data["runs"])
+    named = last.get("manifest")
+    if not isinstance(named, str) or not named or not os.path.isabs(named):
+        return None, f"в записи прогона {index} нет абсолютного пути manifest"
+    try:
+        found = pathlib.Path(named).resolve(strict=True)
+    except FileNotFoundError:
+        return None, f"запись прогона {index} указывает на несуществующий файл"
+    except (OSError, RuntimeError, ValueError):  # NUL, a lone surrogate (UnicodeEncodeError)
+        return None, f"путь manifest записи прогона {index} не разрешается"
+    try:
+        inside = found.is_relative_to(wdir.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None, "каталог волны не разрешается"
+    if not inside:
+        return None, f"manifest прогона {index} вне каталога волны"
+    try:
+        regular = found.is_file()
+    except (OSError, ValueError):
+        regular = False
+    if not regular:
+        return None, f"manifest прогона {index} не обычный файл"
+    return found, None
+
+
+def current_manifest(cfg, wave):
+    """The invariant of the choice of the run: it never raises. Any failure of reading or parsing
+    runs.json or of checking its record (RecursionError of a deeply nested file, an encoding error,
+    anything unexpected; not BaseException) is a closed refusal (None, reason), never the standard path."""
+    try:
+        return _current_manifest(cfg, wave)
+    except Exception:  # noqa: BLE001 - fail closed; the reason quotes nothing from the files
+        return None, "runs.json не разбирается или запись прогона не проверяется"
+
+
+def read_manifest(cfg, wave):
+    """The current run's manifest (see current_manifest) as written by state.py; None when there is
+    none, it cannot be read or the choice of the run was refused (gate_check names the reason)."""
+    path, why = current_manifest(cfg, wave)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - OSError, ValueError, RecursionError of a nested file: no manifest
         return None
     return data if isinstance(data, dict) else None
+
+
+def manifest_where_of(path, wave_dir, timeout=WHERE_TIMEOUT):
+    """`state.py where --manifest <path>` (never parsed here): the printed JSON object, or
+    {"error": short reason}. Never raises. `where` judges the last run by the LIVE cap
+    `$WAB_DIR/max-runs`, so the child gets WAB_DIR of THIS wave whatever the caller's environment says."""
+    try:
+        env = dict(os.environ, WAB_DIR=str(pathlib.Path(wave_dir).resolve()))
+        proc = subprocess.run([sys.executable, str(STATE_PY), "where", "--manifest", str(path)],
+                              capture_output=True, text=True, encoding="utf-8", timeout=timeout, env=env)
+        if proc.returncode != 0:
+            lines = [l.strip() for l in (proc.stderr or proc.stdout).splitlines() if l.strip()]
+            raise ValueError(lines[-1] if lines else f"rc {proc.returncode}")
+        result = json.loads(proc.stdout)
+        if not isinstance(result, dict):
+            raise ValueError("where: not an object")
+    except subprocess.TimeoutExpired:
+        return {"error": f"state.py where: таймаут {timeout} с"}
+    except (OSError, ValueError) as e:
+        return {"error": str(e)[:150]}
+    except RecursionError:
+        return {"error": "state.py where: ответ не разбирается"}
+    return result
 
 
 def gate_check(cfg, wave, w):
@@ -3338,8 +3449,14 @@ def gate_check(cfg, wave, w):
             return dict(base, verdict="fail", reasons=["PR ветки волны не найден"])
         base["number"] = pr.get("number")  # kept even if the facts below fail: the hand-off names the PR (#34)
         facts = gate_facts(cfg, pr)
-        v = gate.evaluate(facts, pr["headRefOid"], read_manifest(cfg, wave), workdir_state(w["cwd"]),
+        manifest = read_manifest(cfg, wave)
+        v = gate.evaluate(facts, pr["headRefOid"], manifest, workdir_state(w["cwd"]),
                           base_branch_of(cfg, w["cwd"]))
+        if manifest is None:  # a refused choice of the run says why, instead of "manifest missing"
+            why = current_manifest(cfg, wave)[1]
+            if why:  # fail closed, the reason first; the other reasons (MERGED_OUTSIDE ...) stay
+                v = dict(v, verdict="fail", reasons=[f"manifest: {why}"] + [r for r in v["reasons"]
+                                                                          if r != gate.MANIFEST_MISSING])
         v["number"] = pr["number"]
         if v["verdict"] == "pass" and gate.critical(gate_facts(cfg, pr)) != gate.critical(facts):
             # a CI rerun or a new finding between the reads: the pass would rest on stale facts
@@ -5556,6 +5673,28 @@ def say_cmd(cfg, wave, text_file):
     return True
 
 
+def manifest_status_line(cfg, wave):
+    """One line about the superarmanda manifest of the wave's current run for `status`; None when the
+    wave has no manifest yet. Never raises: a refusal or a failing `where` is a line with the reason."""
+    try:
+        path, why = current_manifest(cfg, wave)
+        if path is None:
+            return f"  manifest: {why}"
+        if not path.exists():
+            return None
+        where = manifest_where_of(path, cfg["run_dir"] / wave)
+        if where.get("error"):
+            return f"  manifest: {where['error']}"
+        verdicts = where.get("verdicts") if isinstance(where.get("verdicts"), dict) else {}
+        vt = " ".join(f"{r}={v}" for r, v in verdicts.items()) or "—"
+        run = where.get("run")
+        run = f"{run}{'!' if where.get('last_run') is True else ''}" if isinstance(run, str) and run else "—"
+        return (f"  superarmanda: шаг {where.get('step')} ({where.get('role')}) "
+                f"задача {where.get('task')} [{where.get('task_status')}] прогон {run} вердикты: {vt}")
+    except Exception as e:  # noqa: BLE001 - `status` must answer whatever one manifest looks like
+        return f"  manifest: {type(e).__name__}"
+
+
 def status_cmd(cfg):
     st = load_state(cfg)
     print("current:", st.get("current"))
@@ -5563,6 +5702,9 @@ def status_cmd(cfg):
         print(f"{wave}: tmux={w.get('tmux')} phase={w.get('phase')} ctx={w.get('tokens', 0) // 1000}k "
               f"restarts={w.get('restarts', 0)} sessions={len(w.get('sessions') or [])} "
               f"status={read(cfg['run_dir'] / wave / 'status')}")
+        line = manifest_status_line(cfg, wave)
+        if line:
+            print(line)
 
 
 def main(argv):

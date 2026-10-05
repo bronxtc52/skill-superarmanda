@@ -14240,6 +14240,423 @@ class DashEvents(unittest.TestCase):
         self.assertIn("событий пока нет", buf.getvalue())
 
 
+# ---------------------------------------------------------------- #76: the manifest of the CURRENT run
+TWO_RUNS = ROOT / "tests" / "fixtures" / "waves" / "two-runs" / "W1"
+
+
+class CurrentRunManifest(Base):
+    """The merge gate, the dashboard and `wab.py status` read the manifest of the wave's last run
+    (`runs.json`), not a fixed path. Fixture: the live wave W1 of waves-tails (two runs)."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg, self.path = self.chain(waves=["W1"], merge_gate="auto")
+        self.wave = self.cfg["run_dir"] / "W1"
+        self.wave.mkdir(parents=True, exist_ok=True)
+        self.wave = self.wave.resolve()
+        self.repo = self.tmp / "gitrepo"
+        self.repo.mkdir()
+        git = ["git", "-C", str(self.repo), "-c", "user.email=a@b", "-c", "user.name=n"]
+        subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "i"], check=True)
+        (self.wave / "superarmanda").mkdir()
+        for name in ("manifest.json", "manifest-run2.json"):
+            text = (TWO_RUNS / "superarmanda" / name).read_text(encoding="utf-8").replace("@REPO@", str(self.repo))
+            (self.wave / "superarmanda" / name).write_text(text, encoding="utf-8")
+        self.runs = (TWO_RUNS / "runs.json").read_text(encoding="utf-8").replace("@WAVE_DIR@", str(self.wave))
+        (self.wave / "runs.json").write_text(self.runs, encoding="utf-8")
+        self.r1 = json.loads((self.wave / "superarmanda" / "manifest.json").read_text(encoding="utf-8"))
+        self.r2 = json.loads((self.wave / "superarmanda" / "manifest-run2.json").read_text(encoding="utf-8"))
+
+    # ----- the gate over fixtures: only GitHub and the working copy are faked -----
+    def gate(self, manifest=None):
+        manifest = manifest or self.r2
+        head = manifest["head"]
+        facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": head, "base": "main"},
+                            reviews=[{"user": BOT, "commit_id": head, "state": "COMMENTED"}])
+        work = {"clean": True, "head": head, "fingerprint": manifest["tree_fingerprint"]}
+        pr = {"number": 7, "headRefOid": head, "isDraft": False, "state": "OPEN"}
+        with mock.patch.object(wab, "find_pr", return_value=pr), \
+                mock.patch.object(wab, "base_branch_of", return_value="main"), \
+                mock.patch.object(wab, "gate_facts", return_value=facts), \
+                mock.patch.object(wab, "workdir_state", return_value=work):
+            return wab.gate_check(self.cfg, "W1", {"cwd": self.cwd})
+
+    def set_runs(self, doc):
+        (self.wave / "runs.json").write_text(doc if isinstance(doc, str) else json.dumps(doc), encoding="utf-8")
+
+    def runs_doc(self):
+        return json.loads(self.runs)
+
+    def std(self):
+        return self.wave / "superarmanda" / "manifest.json"
+
+    def assertRefused(self, why=None):
+        v = self.gate()
+        self.assertEqual(v["verdict"], "fail", v)
+        self.assertTrue(v["reasons"] and v["reasons"][0].startswith("manifest: "), v["reasons"])
+        if why:
+            self.assertIn(why, v["reasons"][0])
+        return v
+
+    def assertBlockedR1(self, v):
+        self.assertEqual(v["verdict"], "fail")
+        self.assertTrue(any("blocked" in r for r in v["reasons"]), v["reasons"])
+
+    # ----- a) two runs: the gate judges r2 -----
+    def test_gate_judges_the_last_run(self):
+        v = self.gate()
+        self.assertEqual(v["verdict"], "pass", v)
+        self.assertFalse([r for r in v["reasons"] if r.startswith("manifest")], v)
+
+    def test_the_first_run_alone_is_blocked(self):  # what 1.1.0 saw for this wave
+        doc = self.runs_doc()
+        doc["runs"] = doc["runs"][:1]
+        self.set_runs(doc)
+        self.assertBlockedR1(self.gate(self.r1))
+
+    # ----- b) no runs.json, or one record: as in 1.1.0 -----
+    def test_without_runs_json_the_standard_path_is_read(self):
+        (self.wave / "runs.json").unlink()
+        self.assertBlockedR1(self.gate(self.r1))  # manifest.json is r1 here
+        self.std().write_text(json.dumps(self.r2), encoding="utf-8")
+        self.assertEqual(self.gate()["verdict"], "pass")
+        self.assertEqual(wab.current_manifest(self.cfg, "W1"), (self.std(), None))
+
+    def test_one_record_is_the_standard_path_of_that_record(self):
+        doc = self.runs_doc()
+        doc["runs"] = doc["runs"][:1]
+        self.set_runs(doc)
+        self.assertBlockedR1(self.gate(self.r1))
+        self.std().write_text(json.dumps(self.r2), encoding="utf-8")
+        self.assertEqual(self.gate()["verdict"], "pass")
+
+    def test_empty_runs_list_is_the_standard_path(self):
+        doc = self.runs_doc()
+        doc["runs"] = []
+        self.set_runs(doc)
+        self.assertEqual(wab.current_manifest(self.cfg, "W1"), (self.std(), None))
+
+    def test_no_manifest_at_all_is_not_an_error_of_the_function(self):
+        (self.wave / "runs.json").unlink()
+        self.std().unlink()
+        self.assertEqual(wab.current_manifest(self.cfg, "W1"), (self.std(), None))
+        self.assertIsNone(wab.read_manifest(self.cfg, "W1"))
+
+    # ----- c) closed refusals, never a quiet fallback to manifest.json -----
+    def test_damaged_runs_json_is_refused(self):
+        for text in ("{not json", "[]", "null", json.dumps({"version": 2, "wave": "W1", "runs": []}),
+                     json.dumps({"version": 1, "wave": 1, "runs": []}),
+                     json.dumps({"version": 1, "wave": "W1", "runs": {}}),
+                     json.dumps({"version": 1, "wave": "W1", "runs": [1]})):
+            with self.subTest(text=text):
+                self.set_runs(text)
+                v = self.assertRefused()
+                self.assertNotIn("not json", v["reasons"][0])  # a reason, not the file's content
+
+    def test_runs_json_that_is_not_utf8_is_refused(self):
+        (self.wave / "runs.json").write_bytes(b"\xff\xfe\x00")
+        self.assertRefused()
+
+    def test_runs_json_fifo_without_writer_is_refused_and_does_not_hang(self):
+        import signal
+        (self.wave / "runs.json").unlink()
+        os.mkfifo(self.wave / "runs.json")
+
+        def boom(*a):
+            raise AssertionError("current_manifest hangs on a FIFO runs.json")
+        old = signal.signal(signal.SIGALRM, boom)
+        signal.alarm(20)
+        try:
+            path, why = wab.current_manifest(self.cfg, "W1")
+            self.assertIsNone(path)
+            self.assertIn("не обычный файл", why)
+            self.assertRefused()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_runs_json_symlink_is_refused(self):
+        real = self.wave / "real-runs.json"
+        (self.wave / "runs.json").rename(real)
+        (self.wave / "runs.json").symlink_to(real)
+        self.assertRefused()
+
+    def test_huge_runs_json_is_refused(self):
+        (self.wave / "runs.json").write_bytes(b" " * (2 * 1024 * 1024 + 10))
+        self.assertRefused("слишком большой")
+
+    def test_a_refusal_keeps_the_other_reasons_even_on_an_early_wait(self):
+        self.set_runs("{not json")
+        head = self.r2["head"]
+        facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": head, "base": "main"},
+                            check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+        pr = {"number": 7, "headRefOid": head, "isDraft": False, "state": "OPEN"}
+        with mock.patch.object(wab, "find_pr", return_value=pr), \
+                mock.patch.object(wab, "base_branch_of", return_value="main"), \
+                mock.patch.object(wab, "gate_facts", return_value=facts), \
+                mock.patch.object(wab, "workdir_state", return_value={"clean": True, "head": head, "fingerprint": "x"}):
+            v = wab.gate_check(self.cfg, "W1", {"cwd": self.cwd})
+        self.assertEqual(v["verdict"], "fail", v)
+        self.assertTrue(v["reasons"][0].startswith("manifest: "), v["reasons"])
+        self.assertTrue(any("проверки не завершены" in r for r in v["reasons"]), v["reasons"])
+        self.assertNotIn(gate.MANIFEST_MISSING, v["reasons"])
+
+    def test_a_refusal_keeps_merged_outside(self):
+        self.set_runs("{not json")
+        head = self.r2["head"]
+        facts = green_facts(pr={"state": "closed", "merged": True, "draft": False, "head": head, "base": "main"})
+        pr = {"number": 7, "headRefOid": head, "isDraft": False, "state": "OPEN"}
+        with mock.patch.object(wab, "find_pr", return_value=pr), \
+                mock.patch.object(wab, "base_branch_of", return_value="main"), \
+                mock.patch.object(wab, "gate_facts", return_value=facts), \
+                mock.patch.object(wab, "workdir_state", return_value={"clean": True, "head": head, "fingerprint": "x"}):
+            v = wab.gate_check(self.cfg, "W1", {"cwd": self.cwd})
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn(gate.MERGED_OUTSIDE, v["reasons"])
+
+    def test_a_directory_instead_of_runs_json_is_refused(self):
+        (self.wave / "runs.json").unlink()
+        (self.wave / "runs.json").mkdir()
+        self.assertRefused()
+
+    def test_runs_json_of_another_wave_is_refused(self):
+        doc = self.runs_doc()
+        doc["wave"] = "W2"
+        self.set_runs(doc)
+        self.assertRefused()
+
+    def test_a_record_pointing_to_a_missing_file_is_refused(self):
+        (self.wave / "superarmanda" / "manifest-run2.json").unlink()
+        self.assertRefused("прогона 2")
+
+    def test_a_record_without_a_usable_manifest_field_is_refused(self):
+        for bad in (None, "", 5, ["x"], "manifest-run2.json", "superarmanda/manifest-run2.json"):
+            with self.subTest(manifest=bad):
+                doc = self.runs_doc()
+                doc["runs"][-1]["manifest"] = bad
+                self.set_runs(doc)
+                self.assertRefused()
+
+    def test_a_path_with_nul_or_a_lone_surrogate_is_refused(self):
+        for bad in (f"{self.wave}/superarmanda/\u0000x", "/tmp/\udc80x", f"{self.wave}/\udc80"):
+            with self.subTest(manifest=bad):
+                doc = self.runs_doc()
+                doc["runs"][-1]["manifest"] = bad
+                self.set_runs(json.dumps(doc, ensure_ascii=True))
+                path, why = wab.current_manifest(self.cfg, "W1")  # must not raise
+                self.assertIsNone(path)
+                self.assertTrue(why)
+                self.assertRefused()
+                if "\u0000" in bad:
+                    self.assertIn("не разрешается", why)
+
+    def test_a_wave_name_with_nul_does_not_raise(self):
+        self.assertEqual(wab.current_manifest(self.cfg, "W1\u0000")[0].name, "manifest.json")
+
+    def test_deeply_nested_runs_json_is_refused_not_raised(self):
+        (self.wave / "runs.json").write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+        path, why = wab.current_manifest(self.cfg, "W1")
+        self.assertIsNone(path)
+        self.assertTrue(why)
+        self.assertRefused()
+
+    def test_deeply_nested_runs_json_in_a_valid_envelope_is_refused(self):
+        text = '{"version": 1, "wave": "W1", "runs": [{"x": ' + "[" * 100000 + "]" * 100000 + "}]}"
+        self.set_runs(text)
+        self.assertRefused()
+
+    def test_broken_utf8_in_runs_json_is_refused(self):
+        (self.wave / "runs.json").write_bytes(b'{"version": 1, "wave": "W1", "runs": ["\xc3\x28"]}')
+        self.assertRefused()
+
+    def test_oversized_runs_json_is_refused_in_the_gate(self):
+        (self.wave / "runs.json").write_bytes(b" " * (wab.RUNS_LIMIT + 1))
+        self.assertRefused("слишком большой")
+
+    def test_current_manifest_never_raises(self):  # the invariant: any failure of a step is a refusal
+        steps = ((wab.json, "loads", KeyError("x")), (wab.os, "open", RuntimeError("x")),
+                 (wab.os, "fstat", MemoryError("x")), (wab.os, "read", ValueError("x")),
+                 (wab.pathlib.Path, "resolve", AttributeError("x")), (wab.os.path, "isabs", TypeError("x")))
+        for mod, name, exc in steps:
+            with self.subTest(step=name):
+                with mock.patch.object(mod, name, side_effect=exc):
+                    path, why = wab.current_manifest(self.cfg, "W1")
+                self.assertIsNone(path)
+                self.assertTrue(why)
+                self.assertNotIn("Error", why)  # a reason, not the text of the exception
+
+    def test_a_last_record_that_is_not_an_object_is_refused(self):
+        doc = self.runs_doc()
+        doc["runs"][-1] = "x"
+        self.set_runs(doc)
+        self.assertRefused()
+
+    def test_a_path_outside_the_wave_directory_is_refused(self):
+        outside = self.tmp / "outside.json"
+        outside.write_text(json.dumps(self.r2), encoding="utf-8")
+        doc = self.runs_doc()
+        doc["runs"][-1]["manifest"] = str(outside)
+        self.set_runs(doc)
+        self.assertRefused("вне каталога волны")
+        other = self.cfg["run_dir"] / "W2" / "superarmanda"  # a neighbour wave is outside too
+        other.mkdir(parents=True)
+        (other / "manifest.json").write_text(json.dumps(self.r2), encoding="utf-8")
+        doc["runs"][-1]["manifest"] = str(other / "manifest.json")
+        self.set_runs(doc)
+        self.assertRefused("вне каталога волны")
+
+    def test_dotdot_out_of_the_wave_directory_is_refused(self):
+        outside = self.tmp / "outside.json"
+        outside.write_text(json.dumps(self.r2), encoding="utf-8")
+        doc = self.runs_doc()
+        doc["runs"][-1]["manifest"] = f"{self.wave}/superarmanda/../../../../{outside.name}"
+        self.set_runs(doc)
+        self.assertRefused()
+
+    def test_a_symlink_file_pointing_outside_is_refused(self):
+        outside = self.tmp / "outside.json"
+        outside.write_text(json.dumps(self.r2), encoding="utf-8")
+        link = self.wave / "superarmanda" / "manifest-run2.json"
+        link.unlink()
+        link.symlink_to(outside)
+        self.assertRefused("вне каталога волны")
+
+    def test_a_symlink_directory_pointing_outside_is_refused(self):
+        outside = self.tmp / "elsewhere"
+        outside.mkdir()
+        (outside / "manifest-run2.json").write_text(json.dumps(self.r2), encoding="utf-8")
+        shutil.rmtree(self.wave / "superarmanda")
+        (self.wave / "superarmanda").symlink_to(outside)
+        self.std().write_text(json.dumps(self.r1), encoding="utf-8")
+        self.assertRefused("вне каталога волны")
+
+    def test_a_directory_is_not_a_manifest(self):
+        target = self.wave / "superarmanda" / "manifest-run2.json"
+        target.unlink()
+        target.mkdir()
+        self.assertRefused()
+
+    def test_a_symlink_inside_the_wave_directory_is_fine(self):
+        real = self.wave / "superarmanda" / "real.json"
+        link = self.wave / "superarmanda" / "manifest-run2.json"
+        link.rename(real)
+        link.symlink_to(real)
+        self.assertEqual(self.gate()["verdict"], "pass")
+
+    def test_the_reason_is_short_and_has_no_file_content(self):
+        self.set_runs('{"secret-token-123": ')
+        v = self.assertRefused()
+        self.assertNotIn("secret-token-123", " ".join(v["reasons"]))
+        self.assertLess(len(v["reasons"][0]), 200)
+
+    # ----- d) the dashboard and `wab.py status` show r2 -----
+    def dash(self):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        dash.MANIFEST_CACHE.clear()
+        return dash
+
+    def test_dashboard_shows_the_last_run(self):
+        dash = self.dash()
+        where = dash.manifest_where(self.cfg, "W1")
+        self.assertEqual(where.get("run"), "2/2", where)
+        joined = "\n".join(t.plain for t in dash.manifest_lines(self.cfg, "W1", self.wave_rec()))
+        self.assertIn("прогон 2/2", joined)
+        self.assertNotIn("1/2", joined)
+
+    def test_dashboard_refusal_is_one_line_with_the_reason(self):
+        dash = self.dash()
+        self.set_runs("{not json")
+        self.assertIn("error", dash.manifest_where(self.cfg, "W1"))
+        joined = "\n".join(t.plain for t in dash.manifest_lines(self.cfg, "W1", self.wave_rec()))
+        self.assertIn("manifest: ", joined)
+        self.assertNotIn("прогон", joined)
+
+    def test_dashboard_without_any_manifest_is_none(self):
+        dash = self.dash()
+        (self.wave / "runs.json").unlink()
+        self.std().unlink()
+        self.assertIsNone(dash.manifest_where(self.cfg, "W1"))
+
+    def status_text(self):
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            wab.status_cmd(self.cfg)
+        return buf.getvalue()
+
+    def test_status_shows_the_last_run(self):
+        text = self.status_text()
+        self.assertIn("прогон 2/2", text)
+        self.assertNotIn("1/2", text)
+        self.assertIn("шаг", text)
+        self.assertIn("вердикты", text)
+
+    def live_cap_setup(self):
+        (self.wave / "max-runs").write_text("3\n", encoding="utf-8")
+        other = self.tmp / "other-wave"
+        other.mkdir()
+        (other / "max-runs").write_text("5\n", encoding="utf-8")
+        return other
+
+    def test_status_judges_the_run_by_the_cap_of_this_wave(self):
+        other = self.live_cap_setup()
+        for env in ({}, {"WAB_DIR": str(other)}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                if not env:
+                    os.environ.pop("WAB_DIR", None)
+                text = self.status_text()
+                self.assertIn("прогон 2/3 ", text)
+                self.assertNotIn("2/3!", text)
+
+    def test_dashboard_judges_the_run_by_the_cap_of_this_wave(self):
+        dash = self.dash()
+        other = self.live_cap_setup()
+        for env in ({}, {"WAB_DIR": str(other)}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                if not env:
+                    os.environ.pop("WAB_DIR", None)
+                dash.MANIFEST_CACHE.clear()
+                where = dash.manifest_where(self.cfg, "W1")
+                self.assertEqual((where.get("run"), where.get("last_run")), ("2/3", False), where)
+
+    def test_status_shows_the_refusal_and_survives_it(self):
+        self.set_runs("{not json")
+        text = self.status_text()
+        self.assertIn("manifest: ", text)
+        self.assertIn("W1: tmux=", text)
+
+    def test_status_survives_a_failing_where(self):
+        with mock.patch.object(subprocess, "run", side_effect=OSError("boom")):
+            text = self.status_text()
+        self.assertIn("W1: tmux=", text)
+        self.assertIn("manifest: ", text)
+
+    def test_status_of_a_wave_without_manifest_has_no_manifest_line(self):
+        (self.wave / "runs.json").unlink()
+        self.std().unlink()
+        self.assertNotIn("manifest", self.status_text())
+
+    # ----- e) no other reader of the standard path -----
+    def test_the_standard_path_literal_lives_only_in_the_shared_function(self):
+        hits = {}
+        for name in ("wab.py", "gate.py", "dash.py"):
+            src = (WAVES / name).read_text(encoding="utf-8")
+            hits[name] = len(re.findall(r"""["']manifest\.json["']""", src))
+        self.assertEqual(hits, {"wab.py": 1, "gate.py": 0, "dash.py": 0})
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        body = src[src.index("def _current_manifest("):]
+        body = body[:body.index("\ndef ", 10)]
+        self.assertRegex(body, r"""["']manifest\.json["']""")
+
+    def test_dash_does_not_build_the_manifest_path_itself(self):
+        src = (WAVES / "dash.py").read_text(encoding="utf-8")
+        self.assertNotRegex(src, r"""/\s*["']superarmanda["']""")
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
