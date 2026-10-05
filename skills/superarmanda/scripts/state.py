@@ -1522,18 +1522,19 @@ def result_model(args, risk):
     record "Fable was requested and is unavailable"; nothing weaker may take the role."""
     if args.model is not None and args.role not in MODEL_ROLES:
         fail(f"--model is only allowed for roles {', '.join(MODEL_ROLES)}")
-    model = None
-    if args.model is not None:
-        model = MODEL_ALIASES.get(args.model)
-        if model is None:
-            fail(
-                f"unknown --model {args.model!r}: must be exactly one of "
-                f"{', '.join(sorted(MODEL_ALIASES))}"
-            )
+    model = MODEL_ALIASES.get(args.model) if args.model is not None else None
     if risk == "high" and args.role in MODEL_ROLES and model != FABLE_MODEL:
+        given = "no --model" if args.model is None else repr(args.model)
         fail(
-            f"high-risk task requires --model {FABLE_MODEL} for {args.role} "
-            f"(got {model or 'no --model'}); no substitution by a weaker model"
+            f"high-risk task requires --model {FABLE_MODEL} for {args.role} (got {given}); "
+            "no substitution by a weaker or another model. If this host cannot run "
+            f"{args.role} on Fable, record --status unavailable --model fable: the task is "
+            "then not pass, as the policy intends"
+        )
+    if args.model is not None and model is None:
+        fail(
+            f"unknown --model {args.model!r}: must be exactly one of "
+            f"{', '.join(sorted(MODEL_ALIASES))}"
         )
     return model
 

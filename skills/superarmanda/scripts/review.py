@@ -1067,10 +1067,17 @@ def cli_error_category(output, error):
 
 
 # Error codes the Claude CLI puts on the assistant message it writes ITSELF when the provider
-# refuses a request (stream-json event `assistant`, top-level `error`; live journal rows:
-# tests/fixtures/transcripts/rate-limit-assistant.jsonl). The field sits beside `message`, not
-# inside it: neither the model's text nor a quote of the packet can set it.
+# refuses a request. Shape of the stream event, from a live run of Claude Code 2.1.289
+# (tests/fixtures/transcripts/stream-provider-error.jsonl): `type: assistant`, top-level `error`
+# and `is_api_error_message`, `message.model: "<synthetic>"`, then a `result` event with
+# `is_error: true` and `api_error_status`. The value `rate_limit` with HTTP 429 is live in session
+# journals (rate-limit-assistant.jsonl); a live STREAM of an exhausted subscription has not been
+# captured (#91), so a mistake here can only withhold `quota`, never grant it.
+# `error` sits beside `message`, not inside it: neither the model's text nor a quote of the
+# packet can set it, and the model does not write messages of the model "<synthetic>".
 PROVIDER_QUOTA_ERROR = "rate_limit"
+PROVIDER_QUOTA_STATUS = 429
+SYNTHETIC_MODEL = "<synthetic>"
 PROVIDER_AUTH_ERRORS = {
     "authentication_failed",
     "oauth_org_not_allowed",
@@ -1079,11 +1086,14 @@ PROVIDER_AUTH_ERRORS = {
 }
 
 
-def claude_provider_errors(stdout):
-    """Set of provider error codes on the assistant events of a Claude stream.
-    A line that is not one JSON object is not an event and carries no signal; an event line
-    with duplicate keys, or an `error` that is not a string, is recorded as `invalid`."""
-    codes = set()
+def claude_stream_facts(stdout):
+    """(provider error codes, api_error_status values) of a Claude stream.
+
+    A code counts only on an `assistant` event the CLI wrote itself (`message.model` is
+    "<synthetic>" and `is_api_error_message` is true) and only as a non-empty string; an `error` anywhere else on an assistant
+    event, a line with duplicate keys, a non-string code are recorded as `invalid`. A line that
+    is not one JSON object is not an event and carries no signal."""
+    codes, statuses = set(), []
     for line in stream_lines(stdout):
         line = line.strip()
         if not line.startswith("{"):
@@ -1094,26 +1104,46 @@ def claude_provider_errors(stdout):
             if '"error"' in line:
                 codes.add("invalid")
             continue
-        if isinstance(event, dict) and event.get("type") == "assistant" and "error" in event:
-            code = event["error"]
-            codes.add(code if isinstance(code, str) and code else "invalid")
-    return codes
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "result" and "api_error_status" in event:
+            statuses.append(event["api_error_status"])
+        if event.get("type") == "assistant" and "error" in event:
+            code, message = event["error"], event.get("message")
+            own = (
+                isinstance(message, dict)
+                and message.get("model") == SYNTHETIC_MODEL
+                and event.get("is_api_error_message") is True
+            )
+            codes.add(code if own and isinstance(code, str) and code else "invalid")
+    return codes, statuses
+
+
+def claude_provider_errors(stdout):
+    return claude_stream_facts(stdout)[0]
 
 
 def claude_failure_category(stdout, stderr):
     """Category of a failed Claude review run.
 
     `quota` only on the provider's own signal and only when nothing contradicts it: every
-    provider error code of the stream is `rate_limit`, and stderr (the CLI's own diagnostics)
-    names no more specific failure. An auth sign beside a quota sign is auth; any other
-    ambiguity falls back to the text heuristic, which cannot answer `quota`."""
-    codes = claude_provider_errors(stdout)
+    provider error code of the stream is `rate_limit`, every `api_error_status` the stream
+    reports is 429, and stderr (the CLI's own diagnostics) names no more specific failure.
+    An auth code is auth. Everything else is the text heuristic over STDERR alone: stdout is the
+    event stream, whose text belongs to the model and the packet and whose JSON keys (a live
+    `result` event has a `refused` counter) are not diagnostics; that heuristic cannot answer
+    `quota`."""
+    codes, statuses = claude_stream_facts(stdout)
     if codes & PROVIDER_AUTH_ERRORS:
         return "auth"
     from_stderr = cli_error_category("", stderr)
-    if codes == {PROVIDER_QUOTA_ERROR}:
-        return "quota" if from_stderr == "cli_exit" else from_stderr
-    return cli_error_category(stdout, stderr)
+    if (
+        codes == {PROVIDER_QUOTA_ERROR}
+        and from_stderr == "cli_exit"
+        and all(type(status) is int and status == PROVIDER_QUOTA_STATUS for status in statuses)
+    ):
+        return "quota"
+    return from_stderr
 
 
 def verify_packet_repo(repo, envelope):

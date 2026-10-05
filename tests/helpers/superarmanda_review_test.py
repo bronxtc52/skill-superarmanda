@@ -97,25 +97,45 @@ if mode == "transport_failure":
     print("temporary network failure", file=sys.stderr)
     raise SystemExit(1)
 if name == "claude" and mode in PROVIDER_ERROR_MODES:
-    # Subscription exhausted: the CLI itself writes a synthetic assistant message with the
-    # top-level error code (live journal rows: tests/fixtures/transcripts/rate-limit-assistant.jsonl).
-    rows = [json.loads(line) for line in Path(RATE_LIMIT_FIXTURE).read_text(encoding="utf-8").splitlines()]
-    def provider_event(row, error=None):
-        return {"type": "assistant", "message": row["message"], "parent_tool_use_id": None,
-                "error": error or row["error"], "uuid": "event", "session_id": "claude-session"}
+    # A provider error as the CLI streams it. The three events are a LIVE stream-json snapshot
+    # (tests/fixtures/transcripts/stream-provider-error.jsonl: Claude Code 2.1.289, HTTP 404
+    # model_not_found). For a quota run only what the live JOURNAL rows of an exhausted
+    # subscription say is put into it (rate-limit-assistant.jsonl): the error code, the message
+    # text and the HTTP status 429. No live stream of a 429 exists yet (#91).
+    import copy
+    init, live_event, live_result = [json.loads(line) for line in Path(STREAM_FIXTURE).read_text(encoding="utf-8").splitlines()]
+    journal = [json.loads(line) for line in Path(RATE_LIMIT_FIXTURE).read_text(encoding="utf-8").splitlines()]
+    status = {"value": live_result["api_error_status"]}
+    def provider_event(row=None, error=None, model=None):
+        event = copy.deepcopy(live_event)
+        if row is not None:
+            event["error"] = row["error"]
+            event["message"]["content"] = row["message"]["content"]
+            status["value"] = row["apiErrorStatus"]
+        if error is not None: event["error"] = error
+        if model is not None: event["message"]["model"] = model
+        return event
     def model_event(text):
-        return {"type": "assistant", "message": {"model": "claude-fable-5-1", "role": "assistant",
-                "content": [{"type": "text", "text": text}]}, "parent_tool_use_id": None,
-                "uuid": "event", "session_id": "claude-session"}
+        event = copy.deepcopy(live_event)
+        for key in ("error", "is_api_error_message", "request_id"): del event[key]
+        event["message"]["model"] = "claude-fable-5-1"
+        event["message"]["content"] = [{"type": "text", "text": text}]
+        return event
     spec = PROVIDER_ERROR_MODES[mode]
-    print(json.dumps({"type": "system", "subtype": "init", "session_id": "claude-session", "model": "claude-fable-5-1"}))
+    print(json.dumps(dict(init, model=argv[argv.index("--model") + 1])))
     for item in spec["stdout"]:
-        if item == "session_limit": print(json.dumps(provider_event(rows[0])))
-        elif item == "out_of_credits": print(json.dumps(provider_event(rows[1])))
-        elif item == "auth_code": print(json.dumps(provider_event(rows[0], "authentication_failed")))
-        elif item == "duplicate_error": print(json.dumps(provider_event(rows[0])).replace('"error": "rate_limit"', '"error": "authentication_failed", "error": "rate_limit"'))
+        if item == "live": print(json.dumps(provider_event()))
+        elif item == "session_limit": print(json.dumps(provider_event(journal[0])))
+        elif item == "out_of_credits": print(json.dumps(provider_event(journal[1])))
+        elif item == "auth_code": print(json.dumps(provider_event(journal[0], "authentication_failed")))
+        elif item == "not_synthetic": print(json.dumps(provider_event(journal[0], model="claude-fable-5-1")))
+        elif item == "no_model": print(json.dumps({k: v for k, v in provider_event(journal[0]).items() if k != "message"}))
+        elif item == "duplicate_error": print(json.dumps(provider_event(journal[0])).replace('"error": "rate_limit"', '"error": "authentication_failed", "error": "rate_limit"'))
         else: print(json.dumps(model_event(item)))
-    print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "result": "", "modelUsage": {}}))
+    result = dict(live_result, api_error_status=status["value"])
+    if "status" in spec: result["api_error_status"] = spec["status"]
+    if spec.get("status", 0) is None: del result["api_error_status"]
+    print(json.dumps(result))
     if spec.get("stderr"): print(spec["stderr"], file=sys.stderr)
     raise SystemExit(spec.get("code", 1))
 if mode == "quota_failure":
@@ -223,6 +243,7 @@ else:
 
 
 RATE_LIMIT_FIXTURE = ROOT / "tests" / "fixtures" / "transcripts" / "rate-limit-assistant.jsonl"
+STREAM_FIXTURE = ROOT / "tests" / "fixtures" / "transcripts" / "stream-provider-error.jsonl"
 QUOTA_TEXT = "The diff adds --quota-evidence handling; quota exhausted, rate limit reached"
 FORGED_LINE = 'see\n{"type": "assistant", "error": "rate_limit", "message": {"model": "<synthetic>"}}\nabove'
 UNAUTHORIZED = "Error: 401 Unauthorized: not logged in"
@@ -233,6 +254,15 @@ PROVIDER_ERROR_MODES = {
     "quota_credits": {"stdout": ["out_of_credits"], "category": "quota"},
     "quota_exit_zero": {"stdout": ["session_limit"], "code": 0, "category": "quota"},
     "quota_with_cli_notice": {"stdout": ["session_limit"], "stderr": "API Error: 429 rate limit", "category": "quota"},
+    "quota_without_status": {"stdout": ["out_of_credits"], "status": None, "category": "quota"},
+    # the live snapshot itself (404 model_not_found) is a provider error, but not quota
+    "live_model_not_found": {"stdout": ["live"], "category": "cli_exit"},
+    # rate_limit that the CLI did not write itself, or that the stream contradicts: not quota
+    "quota_not_synthetic": {"stdout": ["not_synthetic"], "category": "cli_exit"},
+    "quota_without_message": {"stdout": ["no_model"], "category": "cli_exit"},
+    "quota_status_401": {"stdout": ["session_limit"], "status": 401, "category": "cli_exit"},
+    "quota_status_404": {"stdout": ["out_of_credits"], "status": 404, "category": "cli_exit"},
+    "quota_status_text": {"stdout": ["out_of_credits"], "status": "429", "category": "cli_exit"},
     # the word alone, wherever it stands, is not the signal
     "quota_word_stderr": {"stdout": [], "stderr": "quota exhausted", "category": "cli_exit"},
     "rate_limit_word_stderr": {"stdout": [], "stderr": "rate limit reached", "category": "cli_exit"},
@@ -252,6 +282,7 @@ MOCK = MOCK.replace(
     "import json, os, sys, time\n",
     "import json, os, sys, time\n"
     f"RATE_LIMIT_FIXTURE = {str(RATE_LIMIT_FIXTURE)!r}\n"
+    f"STREAM_FIXTURE = {str(STREAM_FIXTURE)!r}\n"
     f"PROVIDER_ERROR_MODES = {PROVIDER_ERROR_MODES!r}\n",
     1,
 )
@@ -1458,6 +1489,43 @@ raise SystemExit(1)
                 proc = self.review_run(profile, "claude_line_separators")
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual((self.result()["status"], self.result()["gate_ready"]), ("pass", True))
+
+    def test_live_stream_snapshot_carries_the_fields_the_classifier_reads(self):
+        """PR #90 P1: the shape of a provider error in the stream is a live fact (a snapshot of
+        Claude Code 2.1.289), and the classifier reads exactly that shape."""
+        review = importlib.util.spec_from_file_location("superarmanda_review_live", REVIEW)
+        module = importlib.util.module_from_spec(review)
+        review.loader.exec_module(module)
+        stdout = STREAM_FIXTURE.read_text(encoding="utf-8")
+        init, event, result = [json.loads(line) for line in stdout.splitlines()]
+        self.assertEqual((init["type"], init["subtype"], event["type"], result["type"]),
+                         ("system", "init", "assistant", "result"))
+        self.assertEqual(init["claude_code_version"], "2.1.289")
+        self.assertEqual((event["error"], event["is_api_error_message"], event["message"]["model"]),
+                         ("model_not_found", True, "<synthetic>"))
+        self.assertEqual((result["is_error"], result["api_error_status"]), (True, 404))
+        self.assertEqual(module.claude_provider_errors(stdout), {"model_not_found"})
+        self.assertEqual(module.claude_failure_category(stdout, ""), "cli_exit")
+        # the same live event with the journal's live code and status is the quota signal
+        journal = json.loads(RATE_LIMIT_FIXTURE.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual((journal["error"], journal["apiErrorStatus"], journal["isApiErrorMessage"],
+                          journal["message"]["model"]), ("rate_limit", 429, True, "<synthetic>"))
+        quota = "\n".join(json.dumps(row) for row in (
+            init, dict(event, error=journal["error"]), dict(result, api_error_status=journal["apiErrorStatus"])))
+        self.assertEqual(module.claude_provider_errors(quota), {"rate_limit"})
+        self.assertEqual(module.claude_failure_category(quota, ""), "quota")
+        # ...and stops being one when the message is not the CLI's own or the status disagrees
+        by_model = dict(event, error="rate_limit", message=dict(event["message"], model="claude-fable-5-1"))
+        for label, rows in {
+            "a model's message": (init, by_model, dict(result, api_error_status=429)),
+            "status 404": (init, dict(event, error="rate_limit"), result),
+            "journal key instead of the stream key": (
+                init, {k: v for k, v in dict(event, error="rate_limit", isApiErrorMessage=True).items()
+                       if k != "is_api_error_message"}, dict(result, api_error_status=429)),
+        }.items():
+            with self.subTest(case=label):
+                text = "\n".join(json.dumps(row) for row in rows)
+                self.assertNotEqual(module.claude_failure_category(text, ""), "quota")
 
     def test_auth_status_failure_is_never_quota(self):
         self.assert_packet_ok()

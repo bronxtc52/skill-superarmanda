@@ -80,7 +80,10 @@ standalone skill не копирует policy и не создаёт обход.
    обязаны иметь `risk: high`. Модель записывается в metadata результата:
    `task-result --model <fable|sonnet|полный ID>`; для задачи high без `--model`, равной Fable,
    результат coder и tester не принимается при любом статусе. Fable недоступна — запиши
-   `--status unavailable --model fable` и остановись: подмены моделью слабее нет.
+   `--status unavailable --model fable` и остановись: подмены моделью слабее нет. Поэтому задачи
+   `risk: high` ведутся на Claude Code host; на хосте без Fable (Codex host) такая запись и
+   не-pass задачи — ожидаемое поведение политики, а не сбой (модель для него — решение владельца,
+   #92). Задачи medium и low на Codex-хосте идут как в 1.2.0, `--model` для них необязателен.
    Effort роли — параметр брифа: без указания tester `medium` (`high` при риске
    high), reader `low`; таблица — в [profiles.md](references/profiles.md).
 3. Инициализируй локальный manifest через `scripts/state.py`. Он привязан к

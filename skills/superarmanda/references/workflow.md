@@ -129,7 +129,10 @@ creates one manifest atomically.
   `tester`; в результат пишется полный ID в поле `model`. Для задачи high флаг обязателен при любом
   статусе и обязан означать Fable. Fable недоступна — `task-result --role <coder|tester> --status
   unavailable --model fable`: запись «Fable запрошена и недоступна», поле `model` результата,
-  `where` отдаёт `BLOCKED` без подмены моделью слабее.
+  `where` отдаёт `BLOCKED` без подмены моделью слабее. То же на хосте без Fable (Codex host):
+  задачи `risk: high` ведутся на Claude Code host, на Codex-хосте такая запись и не-pass задачи —
+  ожидаемое поведение, а не сбой (#92); отказ `task-result` с другой моделью сам называет этот
+  выход. Для medium и low `--model` необязателен, `role-model` — рекомендация для Claude-хоста.
 - роль `second_reviewer` — второе ревью задачи (шаг 5 после `cross_provider_reviewer`), источник
   для `fix-loop --outcome failed`, `--defer` и `--accept` по тем же правилам.
 - `task-result --quota-evidence <путь>` — только с отчётом профиля `codex-host-opus` у ревью

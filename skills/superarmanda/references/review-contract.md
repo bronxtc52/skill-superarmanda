@@ -133,8 +133,14 @@ python3 "$SUPERARMANDA_DIR/scripts/state.py" task-result --manifest <path> --tas
 результаты ревью попадают в историю в момент подъёма.
 
 Категорию `quota` у Claude-профилей `review.py` выводит только из сигнала провайдера: событие
-потока `assistant`, которое CLI пишет сам, с верхнеуровневым `error: "rate_limit"` (живые строки —
-`tests/fixtures/transcripts/rate-limit-assistant.jsonl`). Слова «quota» и «rate limit» в тексте
+потока `assistant`, которое CLI пишет сам (`message.model: "<synthetic>"`, `is_api_error_message:
+true`), с верхнеуровневым `error: "rate_limit"`; если событие `result` несёт `api_error_status`, он
+обязан быть 429. Маршрут проверен на живой форме события ошибки провайдера в потоке (снимок Claude
+Code 2.1.289, HTTP 404 — `tests/fixtures/transcripts/stream-provider-error.jsonl`) и на живом
+значении `rate_limit` со статусом 429 из журнала сессии (`rate-limit-assistant.jsonl`). Живого
+потока при исчерпанной подписке нет (#91): если он окажется другим, `quota` не будет и запасной
+Opus не откроется — ошибка возможна только в закрытую сторону. Stdout потока текстовой эвристикой
+не читается вовсе: прочие категории сбоя Claude-профиля берутся из stderr. Слова «quota» и «rate limit» в тексте
 модели, в цитатах пакета, в stderr и в выводе `claude auth status` категорию не дают: текстовая
 эвристика `quota` больше не возвращает. Неоднозначность закрывается в сторону «не evidence»:
 код авторизации в потоке (`authentication_failed` и родственные) или признак auth, таймаута,

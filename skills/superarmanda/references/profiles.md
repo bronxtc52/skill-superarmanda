@@ -8,8 +8,8 @@
 | Роль | Claude Code host (проверенный default) | Codex host (проверенный default) |
 |---|---|---|
 | coordinator / planner | доступная явная native-модель (Fable) | доступная явная native-модель (`gpt-6-astra`) |
-| coder | по риску задачи (раздел ниже): `coder@sonnet`, при high — Fable | fresh explicit native model (`coder@gpt-5.6-terra`) |
-| tester | по риску задачи (раздел ниже): `tester@sonnet`, при high — Fable | fresh explicit native model (`tester@gpt-5.6-terra`) |
+| coder | по риску задачи (раздел ниже): `coder@sonnet`, при high — Fable | fresh explicit native model (`coder@gpt-5.6-terra`); задачи high здесь не ведутся (#92) |
+| tester | по риску задачи (раздел ниже): `tester@sonnet`, при high — Fable | fresh explicit native model (`tester@gpt-5.6-terra`); задачи high здесь не ведутся (#92) |
 | task reviewer | Codex CLI / fixed adapter; при риске high — оба адаптера | Claude CLI / fixed adapter; при риске high — оба адаптера |
 | context / drafts | `reader`/`drafter@haiku` | `reader`/`drafter@gpt-5.6-luna` |
 | required PR review | GitHub Codex | GitHub Codex |
@@ -49,6 +49,16 @@
 - **Запасной Opus.** `codex-host-opus` заменяет `codex-host` только при подтверждённой квоте
   Fable: запись с `--quota-evidence <отчёт codex-host>`, где отчёт — ошибка `review.py` с
   `error_category: quota` для того же HEAD и пакета. Без него Opus-ревью не засчитывается.
+  Сигнал квоты проверен на живой форме события ошибки провайдера в потоке CLI и на живом значении
+  `rate_limit` из журнала сессии; живого потока при исчерпанной квоте нет (#91), поэтому ошибка
+  возможна только в закрытую сторону — маршрут не откроется.
+- **Где вести задачи high.** Задача `risk: high` ведётся там, где coder и tester можно запустить
+  на Fable, то есть на Claude Code host. На хосте без Fable (Codex host, где роли идут на
+  `gpt-5.6-terra`) роль записывается `task-result --status unavailable --model fable`: задача не
+  pass, `where` отдаёт `BLOCKED`. Это ожидаемое поведение политики 1.2.1, а не сбой; модель для
+  задач high на Codex-хосте — решение владельца (#92), до него подмены нет. Задачи medium и low на
+  Codex-хосте идут как в 1.2.0: `--model` необязателен, роли работают на моделях хоста;
+  `role-model` для них отдаёт рекомендацию для Claude-хоста (Sonnet) и Codex-хосту её не навязывает.
 
 Manifest `version: 1` (созданный до 1.2.1) оценивается по правилам 1.2.0: одна модель по таблице
 host-профилей ниже, одно ревью; `role-model`, `task-risk`, `--model`, `second_reviewer` и

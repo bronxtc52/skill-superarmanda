@@ -4458,6 +4458,22 @@ class HighRiskModels(PolicyBase):
         entry = self.record("coder", model=FABLE)
         self.assertEqual(entry["results"]["coder"]["model"], FABLE)
 
+    def test_refusal_of_another_model_names_the_way_out(self):
+        """PR #90 P1: a host without Fable (Codex host, #92) is told what to record, not left guessing."""
+        for role in ("coder", "tester"):
+            for model in (None, "sonnet", "gpt-5.6-terra", "gpt-6-astra", ""):
+                with self.subTest(role=role, model=model):
+                    message = self.record_refused(role, model=model).stderr
+                    for needle in ("claude-fable-5-1", "--status unavailable --model fable",
+                                   "no substitution", "not pass"):
+                        self.assertIn(needle, message)
+        entry = self.record("coder", "unavailable", model="fable")
+        self.assertEqual((entry["results"]["coder"]["status"], entry["status"]), ("unavailable", "in_progress"))
+        # below high a host is free to run its own models and to leave --model out, as in 1.2.0
+        self.init(risk="medium")
+        self.record("coder")
+        self.record("tester")
+
     def test_fable_alias_is_stored_canonically_and_lookalikes_are_rejected(self):
         for wrong in ("not-fable", "fable-lite", "Fable", "FABLE", "fable ", " fable", "fable\n",
                       FABLE + "-x", "x-" + FABLE, "claude-fable", "claude-fable-5", ""):
