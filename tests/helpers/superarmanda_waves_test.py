@@ -14581,6 +14581,20 @@ class CurrentRunManifest(Base):
         self.std().unlink()
         self.assertIsNone(dash.manifest_where(self.cfg, "W1"))
 
+    def test_dashboard_wave_name_with_nul_and_no_runs_json_does_not_raise(self):  # W1 remainder (a), #81
+        dash = self.dash()
+        (self.wave / "runs.json").unlink()
+        self.assertIsNone(dash.manifest_where(self.cfg, "W1\u0000"))
+
+    def test_the_gate_chooses_the_manifest_once(self):  # W1 remainder (c), #81
+        real = wab._current_manifest  # the reading of runs.json itself
+        for label, setup in (("a pass", lambda: None), ("a refusal", lambda: self.set_runs("{not json"))):
+            setup()
+            calls = []
+            with mock.patch.object(wab, "_current_manifest", side_effect=lambda *a: (calls.append(a), real(*a))[1]):
+                self.gate()
+            self.assertEqual(len(calls), 1, f"{label}: {calls}")
+
     def status_text(self):
         self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         buf = io.StringIO()
@@ -14655,6 +14669,318 @@ class CurrentRunManifest(Base):
     def test_dash_does_not_build_the_manifest_path_itself(self):
         src = (WAVES / "dash.py").read_text(encoding="utf-8")
         self.assertNotRegex(src, r"""/\s*["']superarmanda["']""")
+
+
+# ---------------------------------------------------------------- W2 (#81): one way to mask text for a human
+REDACT_FIXTURES = ROOT / "tests" / "fixtures" / "redact"
+INVISIBLE_CLASSES = {  # one family per class that must never glue or split a secret past the mask
+    "zero-width U+200B": "​", "zero-width U+200D": "‍", "zero-width U+2060": "⁠",
+    "zero-width U+FEFF": "﻿", "variation selector U+FE0F": "️",
+    "variation selector U+E0100": "\U000e0100", "lone CR": "\r",
+    "default-ignorable U+034F": "͏", "default-ignorable U+3164": "ㅤ",
+    "default-ignorable U+115F": "ᅟ", "default-ignorable U+2065": "⁥",
+    "default-ignorable U+00AD": "­",
+}
+HEX40 = "9f3a7c1e5b2d4086a1c7e93f5d20b84c6a17e9d3"
+B64 = "Zm9vYmFyU2VjcmV0S2V5VmFsdWUxMjM0NTY3ODkwYWJjZGVm"
+
+
+def secret_shapes(i):
+    """name -> (the secret as written, the visible values: no 4 characters of them may reach the output)."""
+    half = len(HEX40) // 2
+    return {
+        "key (password<i>=value)": (f"password{i}=Hunter2SecretValue99", ["Hunter2SecretValue99"]),
+        "key (pass<i>word=value)": (f"pass{i}word=Hunter2SecretValue99", ["Hunter2SecretValue99"]),
+        "value (password=sec<i>ret)": (f"password=Hunter2Sec{i}retValue99", ["Hunter2Sec", "retValue99"]),
+        "prefix sk-": (f"s{i}k-ant-api03-AbCdEfGhIjKl1234567890", ["AbCdEfGhIjKl1234567890"]),
+        "prefix sk-<i>": (f"sk-{i}ant-api03-AbCdEfGhIjKl1234567890", ["AbCdEfGhIjKl1234567890"]),
+        "prefix ghp_": (f"gh{i}p_AbCd1234EfGh5678IjKl9012MnOp3456", ["AbCd1234EfGh5678IjKl9012MnOp3456"]),
+        "prefix xoxb-": (f"xox{i}b-1234567890-AbCdEfGhIjKlMn", ["1234567890-AbCdEfGhIjKlMn"]),
+        "long hex": (HEX40[:half] + i + HEX40[half:], [HEX40[:half], HEX40[half:]]),
+        "base64": (B64[:24] + i + B64[24:], [B64[:24], B64[24:]]),
+    }
+
+
+def live_forms():
+    return [l for l in (REDACT_FIXTURES / "live-forms.txt").read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def leaked(out, values):
+    """The first 4-character piece of a secret value that is visible in `out`, else None."""
+    for v in values:
+        for k in range(len(v) - 3):
+            if v[k:k + 4] in out:
+                return v[k:k + 4]
+    return None
+
+
+def safe_text_fn():
+    """wab.safe_text; on a tree without it (the red run before the change) the old `_clean_redact`."""
+    return getattr(wab, "safe_text", None) or (lambda t, limit, owner_paths=False: wab._clean_redact(t, limit, owner_paths))
+
+
+def redact_uses_outside(waves_dir, allowed=("safe_text",)):
+    """[(file, line, function)]: every mention of redact / _clean_redact in scripts/waves/*.py that is not
+    inside one of the `allowed` functions. (The definition of redact is no mention: a FunctionDef has no Name.)"""
+    import ast
+    found = []
+    for path in sorted(Path(waves_dir).glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        def walk(node, func):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and func == "<module>":
+                func = node.name  # the outermost function: a helper inside safe_text is part of it
+            name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
+            if name in ("redact", "_clean_redact") and func not in allowed:
+                found.append((path.name, node.lineno, func))
+            for child in ast.iter_child_nodes(node):
+                walk(child, func)
+
+        walk(tree, "<module>")
+    return found
+
+
+class W2OutputPaths(Base):
+    """Every place that shows text to a human, in ONE registry (wab.OUTPUT_PATHS): the test goes by the
+    registry. A path that is not here is a path nobody checked for the invisible-character hole (#81)."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        self.dash = dash
+        dash.MANIFEST_CACHE.clear()
+
+    # ----- the adapters: raw outside text -> what a human gets to see on that path -----
+    def out_quote(self, raw):
+        return wab.quote(raw)
+
+    def out_render_notice(self, raw):
+        return wab.render_notice(raw)
+
+    def out_first_line(self, raw):
+        return wab._first_line(raw, 300)
+
+    def out_notify_telegram(self, raw):
+        cfg, _ = self.chain()
+        self.tg.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab.notify(cfg, raw)
+        return "\n".join(self.tg)
+
+    def out_notify_display(self, raw):
+        cfg, _ = self.chain(telegram=None)
+        shown = []
+        with mock.patch.object(wab, "display_all", side_effect=shown.append), \
+                contextlib.redirect_stdout(io.StringIO()):
+            wab.notify(cfg, raw)
+        return "\n".join(shown)
+
+    def out_attention(self, raw):
+        st = {"waves": {"W1": {"tmux": "wv-w1", "attention": {"blocked": {"at": 1.0, "line": raw}}}}}
+        w = {}
+        wab.note_attention(w, "blocked", raw, 1.0)
+        return wab.attention_text(st) + wab.attention_text({"waves": {"W1": {"tmux": "wv-w1", "attention": w["attention"]}}})
+
+    def out_event_line(self, raw):
+        cfg, _ = self.chain()
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            wab.event(cfg, raw)
+        return (cfg["run_dir"] / "events.log").read_text(encoding="utf-8") + printed.getvalue()
+
+    def out_short_command(self, raw):
+        return wab._short_command(f"bash -c eval '{raw}' < /dev/null", limit=1000)
+
+    def out_note_question(self, raw):
+        w = {}
+        wab.note_question(w, raw, 1.0)
+        return w["questions"][-1]["text"]
+
+    def out_chain_result(self, raw):
+        cfg, _ = self.chain()
+        w = self.wave_rec("W1", phase="done", questions=[{"at": 1.0, "text": raw}])
+        wab.write_chain_result(cfg, {"waves": {"W1": w}})
+        return (cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8")
+
+    def out_policy_question(self, raw):
+        fn = getattr(wab, "_policy_question", None)
+        if fn is None:  # before the change the line was cut out inline
+            return wab.redact((raw.splitlines() or [""])[0], 200)
+        return fn({"question": raw})
+
+    def out_say_echo(self, raw):
+        fn = getattr(wab, "_say_first", None)
+        if fn is None:
+            lines = [l for l in raw.splitlines() if l.strip()]
+            return wab.redact(lines[0] if lines else "", 120)
+        return fn(raw)
+
+    def out_blocked_notice(self, raw):
+        status = f"BLOCKED: [class=needs_decision rec=owner red=no] {raw}"
+        return wab.blocked_notice(self.chain()[0], "W1", status, "attach") + wab.blocked_notice(
+            self.chain()[0], "W1", f"BLOCKED: {raw}", "attach")
+
+    def out_status_cmd(self, raw):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", raw)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            wab.status_cmd(cfg)
+        return buf.getvalue()
+
+    def out_dash_event(self, raw):
+        phrase, details, _colour, _known = self.dash.humanize_event(raw)
+        return f"{phrase}\n{details or ''}"
+
+    def render_plain(self, renderable):
+        from rich.console import Console
+        con = Console(width=4000, record=True, file=io.StringIO(), force_terminal=False)
+        con.print(renderable)
+        return con.export_text()
+
+    def out_dash_current_panel(self, raw):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", raw)
+        self.pane = raw
+        with mock.patch.object(self.dash, "manifest_lines", return_value=[]):
+            return self.render_plain(self.dash.current_panel(cfg, self.get_state(cfg)))
+
+    def out_dash_manifest(self, raw):
+        cfg, _ = self.chain()
+        where = {"task": raw, "task_status": raw, "step": raw, "role": raw, "next_action": raw,
+                 "decision_required_for": raw, "run": raw, "error": None,
+                 "verdicts": {"tester": raw}, "open_findings": [{"role": raw, "status": raw}]}
+        with mock.patch.object(self.dash, "manifest_where", return_value=where):
+            lines = self.dash.manifest_lines(cfg, "W1", self.wave_rec())
+        err = {"error": raw}
+        with mock.patch.object(self.dash, "manifest_where", return_value=err):
+            lines += self.dash.manifest_lines(cfg, "W1", self.wave_rec())
+        return "\n".join(l.plain for l in lines)
+
+    def adapters(self):
+        return {name[4:]: getattr(self, name) for name in dir(self) if name.startswith("out_")}
+
+    # ----- the registry -----
+    def test_every_path_of_the_registry_has_a_test_and_the_other_way_round(self):
+        registry = getattr(wab, "OUTPUT_PATHS", None)
+        self.assertIsInstance(registry, dict, "wab.OUTPUT_PATHS: the registry of the paths that show text to a human")
+        self.assertEqual(set(registry), set(self.adapters()),
+                         "a path without a test (or a test of a path nobody registered)")
+        for name, what in registry.items():
+            self.assertTrue(isinstance(what, str) and what.strip(), f"{name}: no description")
+
+    def test_the_fixture_is_live_and_clean(self):
+        forms = live_forms()
+        self.assertGreaterEqual(len(forms), 6)
+        for line in forms:
+            self.assertEqual(line.count("@S@"), 1, line)
+
+    def test_every_path_hides_every_invisible_class_in_every_shape(self):
+        adapters = self.adapters()
+        for form in live_forms():
+            for cname, ch in INVISIBLE_CLASSES.items():
+                for sname, (secret, values) in secret_shapes(ch).items():
+                    raw = form.replace("@S@", secret)
+                    for path, fn in adapters.items():
+                        out = fn(raw)
+                        piece = leaked(out, values)
+                        if piece is not None:
+                            self.fail(f"{path}: «{piece}» of the secret [{sname}] with {cname} reached the output "
+                                      f"(form: {form[:50]}…)")
+
+    def test_a_clean_line_passes_through_every_path_not_masked_to_nothing(self):
+        # the sanity of the check above: the secret values are not in the fixture text itself
+        for form in live_forms():
+            for _name, (_secret, values) in secret_shapes("").items():
+                self.assertIsNone(leaked(form, values), form)
+
+    def test_the_whole_value_survives_neither_with_nor_without_the_invisible_character(self):
+        raw = live_forms()[0].replace("@S@", "password​=секретныйпароль123 конец")
+        for path, fn in self.adapters().items():
+            self.assertIsNone(leaked(fn(raw), ["секретныйпароль123"]), path)
+
+
+class W2SafeText(Base):
+    SAFE = staticmethod(lambda *a, **k: safe_text_fn()(*a, **k))
+    MASK = "[скрыто]"
+
+    def test_the_cut_never_leaves_a_part_of_a_secret_or_breaks_the_mask(self):
+        texts = ["ключ password=Hunter2SecretValue99 и ещё слова после",
+                 "x sk-ant-api03-AbCdEfGhIjKl1234567890 y zz",
+                 f"текст {HEX40} и конец строки",
+                 f"a​sk-ant-api03-AbCdEfGhIjKl1234567890 хвост",
+                 f"password​=Hunter2SecretValue99 хвост"]
+        values = ["Hunter2SecretValue99", "AbCdEfGhIjKl1234567890", HEX40]
+        for text in texts:
+            for limit in range(3, len(text) + 6):
+                with self.subTest(text=text[:20], limit=limit):
+                    out = self.SAFE(text, limit)
+                    self.assertLessEqual(len(out), limit)
+                    self.assertIsNone(leaked(out, values), out)
+                    rest = out.replace(self.MASK, "").removesuffix(" …")
+                    self.assertNotIn("[", rest, out)
+                    self.assertNotIn("скры", rest, out)
+                    self.assertNotIn("]", rest, out)
+
+    def test_a_lone_cr_inside_a_word_does_not_leak_the_tail_of_a_secret(self):
+        for raw in ("password=Hunter2\rSecretValue99", "x password=Hunter2Sec\rretValue99 y",
+                    "sk-ant-api03-AbCdEf\rGhIjKl1234567890", "token=AbCdEfGh1234\r5678IjKlMnOp"):
+            with self.subTest(raw=raw):
+                out = self.SAFE(raw, 10 ** 6)
+                self.assertIsNone(leaked(out, ["SecretValue99", "retValue99", "AbCdEfGhIjKl1234567890",
+                                               "GhIjKl", "5678IjKlMnOp"]), out)
+
+    def test_cr_between_innocent_words_stays_a_line_break(self):
+        self.assertEqual(self.SAFE("первая\r\nвторая\rтретья", 10 ** 6, False).splitlines(),
+                         ["первая", "вторая", "третья"])
+
+    def test_the_mask_is_made_before_the_cut_never_after(self):
+        out = self.SAFE("a" * 30 + " password=Hunter2SecretValue99", 45)
+        self.assertNotIn("Hunter2", out)
+        self.assertNotIn("password=Hun", out)
+
+    def test_redact_itself_does_not_break_the_mask_when_it_cuts(self):
+        text = "слово " * 4 + "password=Hunter2SecretValue99 хвост"
+        for limit in range(3, len(text)):
+            out = wab.redact(text, limit)
+            rest = out.replace(self.MASK, "").removesuffix(" …")
+            self.assertNotIn("скры", rest, (limit, out))
+            self.assertNotIn("[", rest, (limit, out))
+
+    def test_the_registry_and_the_static_check(self):
+        self.assertEqual(redact_uses_outside(WAVES), [])
+
+    def test_a_replaced_safe_text_is_caught_by_the_static_check_and_by_the_path_test(self):
+        tmp = self.tmp / "mut"
+        shutil.copytree(WAVES, tmp, ignore=shutil.ignore_patterns("__pycache__"))
+        src = (tmp / "wab.py").read_text(encoding="utf-8")
+        self.assertIn("safe_text(str(text), 300)", src)
+        (tmp / "wab.py").write_text(src.replace("safe_text(str(text), 300)", "redact(str(text), 300)"),
+                                    encoding="utf-8")
+        found = redact_uses_outside(tmp)
+        self.assertIn("note_question", [f[2] for f in found], found)
+        spec = importlib.util.spec_from_file_location("wab_mutant", tmp / "wab.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        w = {}
+        mod.note_question(w, "password​=Hunter2SecretValue99", 1.0)
+        self.assertIsNotNone(leaked(w["questions"][-1]["text"], ["Hunter2SecretValue99"]))
+        w = {}
+        wab.note_question(w, "password​=Hunter2SecretValue99", 1.0)  # the real one stays clean
+        self.assertIsNone(leaked(w["questions"][-1]["text"], ["Hunter2SecretValue99"]))
+
+    def test_a_replaced_safe_text_in_the_dashboard_is_caught_by_the_static_check(self):
+        tmp = self.tmp / "mut2"
+        shutil.copytree(WAVES, tmp, ignore=shutil.ignore_patterns("__pycache__"))
+        src = (tmp / "dash.py").read_text(encoding="utf-8")
+        self.assertIn("wab.safe_text(", src)
+        (tmp / "dash.py").write_text(src.replace("wab.safe_text(", "wab.redact(", 1), encoding="utf-8")
+        self.assertTrue([f for f in redact_uses_outside(tmp) if f[0] == "dash.py"])
+
 
 
 class Packaging(unittest.TestCase):

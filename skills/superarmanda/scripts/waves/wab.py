@@ -344,7 +344,10 @@ def save_state(cfg, st):
 
 
 def event(cfg, text):
-    text = " ⏎ ".join(l for l in text.splitlines() if l.strip())
+    # the WHOLE text of the event passes safe_text BEFORE it is cut into lines: events.log is read by a
+    # human (the watch window tails it, the dashboard shows it), and a line break (a lone CR, U+2028, NEL)
+    # inside a secret would otherwise cut it into two pieces that redact() does not recognise (#81)
+    text = " ⏎ ".join(l for l in safe_text(text, 10 ** 9).splitlines() if l.strip())
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}Z {text}"
     cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     with open(cfg["run_dir"] / "events.log", "a", encoding="utf-8") as f:
@@ -363,7 +366,14 @@ def read(p, on_error=""):
     cannot be read (a directory, no permission, removed between exists() and read_text())."""
     p = pathlib.Path(p)
     try:
-        return p.read_text(encoding="utf-8", errors="replace").strip() if p.exists() else ""
+        if not p.exists():
+            return ""
+        text = p.read_text(encoding="utf-8", errors="replace")
+        if "\n" in text:  # the universal-newline reading may have turned a lone CR into a line break
+            raw = p.read_bytes()
+            if b"\r" in raw:  # a lone CR stays a CR: `password=sec\rret` is one word for safe_text (#81)
+                text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+        return text.strip()
     except OSError:
         return on_error
 
@@ -936,7 +946,7 @@ def _short_command(args, limit=80):
     """What a background shell runs, for a one-line event: the part inside `eval '…'` of Claude
     Code's wrapper when there is one, else the whole command line; masked and shortened."""
     m = _EVAL_BODY.search(args)
-    return redact(m.group(1) if m else args, limit=limit)
+    return safe_text(m.group(1) if m else args, limit)
 
 
 def _age_text(secs):
@@ -1279,7 +1289,7 @@ def redact(text, limit=TG_LIMIT, owner_paths=True):
             return in_github or (rx is _OPAQUE and _readable_dashed(m))
 
         text = rx.sub(lambda m: m.group(0) if keep(m) else "[скрыто]", text)
-    return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
+    return _clip(text, limit)
 
 
 # The wave's own text (result.md, a status line, a reason from outside) is a QUOTE, never part of the
@@ -1343,34 +1353,90 @@ def _as_ranges(chars):
 # masked whole. Unicode spaces (Zs) are separators like a plain space, never part of a token.
 _INVISIBLE = ("\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f" + _chars_of({"Cf", "Zl", "Zp"})
               + _as_ranges(_default_ignorable()))
-_SPACES = " \\n\\t\\r" + _chars_of({"Zs"})
+# A word is a run between spaces, tabs and line breaks. A lone CR is NOT a break for the masking (it is one
+# for the line split): `password=sec\rret` is one word, else its tail `ret` would be left over the cut.
+_SPACES = " \\n\\t" + _chars_of({"Zs"})
 _CONTROL = re.compile(f"[{_INVISIBLE}]")
 _CTRL_WORD = re.compile(f"[^{_SPACES}]*[{_INVISIBLE}][^{_SPACES}]*")
+_CR_WORD = re.compile(f"[^{_SPACES}]*\r[^{_SPACES}]*")
+MASK = "[скрыто]"
 
 
-def _clean_redact(text, limit, owner_paths):
-    """redact() of text with control characters (quote markers included) neutralised WITHOUT a
-    choice heuristic: a token (a run between spaces, tabs and line breaks) that holds a control
-    character is masked whole, since a control character glues (`a\\x00sk-...`) or splits
-    (`sk-\\x00...`) a secret and no word of the wave holds one; the rest goes through redact()."""
-    text = _CTRL_WORD.sub("[скрыто]", text.replace("\r\n", "\n").replace("\r", "\n"))
+def safe_text(text, limit, owner_paths=False):
+    """THE one masking of text that is shown to a human (Telegram, display-message, ATTENTION, the
+    dashboard, chain-result.md, events.log, status): there is no other way to mask for output, and
+    OUTPUT_PATHS lists every path that uses it (#81). In this order, never another:
+    1. a word (a run between spaces, tabs and line breaks) that holds an invisible, control or
+       default-ignorable character is masked WHOLE, before any parsing or cutting: such a character
+       glues (`a\\x00sk-...`) or splits (`sk-\\x00...`) a secret past redact(), and no word of a wave holds one;
+       a lone CR inside a word is one of them: a word whose glued form is a secret is masked whole;
+    2. redact() over the whole text (no cut yet);
+    3. the cut to `limit` at a safe border: the mask is never torn (a border inside it cuts before it),
+       and the cut is never made BEFORE the masking."""
+    text = str(text).replace("\r\n", "\n")
+    text = _CTRL_WORD.sub(MASK, text)
+
+    def cr_word(m):  # a word with a lone CR: masked whole when its glued form (without the CR) holds a
+        word = m.group(0)  # secret, else the CR is a line break between two ordinary words
+        glued = word.replace("\r", "")
+        return MASK if redact(glued, 10 ** 9, owner_paths) != glued else word.replace("\r", "\n")
+
+    text = _CR_WORD.sub(cr_word, text)
     return _clip(redact(text, 10 ** 9, owner_paths), limit)
+
+
+# The registry of EVERY path that shows text to a human (#81). Each of them masks with safe_text() and
+# nothing else (no redact() / safe_text-less cut in a path of output: tests/…/superarmanda_waves_test.py
+# checks it statically by ast and goes through THIS registry with every class of invisible character).
+# A new path of output is added here in the same change as its test: the test compares the two sets.
+OUTPUT_PATHS = {
+    "quote": "quote(): the wave's text inside a notice",
+    "render_notice": "render_notice(): the text of a notice as it leaves (Telegram, display-message, ATTENTION)",
+    "first_line": "_first_line(): the first line of a rendered notice (display-message, ATTENTION, events)",
+    "notify_telegram": "notify(): the message to Telegram",
+    "notify_display": "notify() without Telegram: display-message in the tmux status line",
+    "attention": "attention_text()/note_attention(): the $RUN_DIR/ATTENTION file",
+    "event_line": "event(): a line of events.log and of the watch window",
+    "short_command": "_short_command(): a background command in an event",
+    "note_question": "note_question(): a question to the owner kept for chain-result.md",
+    "chain_result": "write_chain_result(): chain-result.md",
+    "policy_question": "_policy_question(): the question in policy-decisions.log",
+    "say_echo": "_say_first(): the text of `say` in its events",
+    "blocked_notice": "blocked_notice(): the BLOCKED notice that needs the owner",
+    "status_cmd": "status_cmd(): `wab.py status`",
+    "dash_event": "dash.humanize_event(): the events panel of the dashboard",
+    "dash_current_panel": "dash.current_panel(): the status and the screen of the current wave",
+    "dash_manifest": "dash.manifest_lines(): the superarmanda block of the current wave",
+}
 
 
 def quote(text, limit=TG_LIMIT):
     """The wave's (or any outside) text for a notice: control characters (and so the quote markers) are
     removed, secrets masked WITHOUT the owner-script exemption, the length capped at `limit`, the whole
     wrapped in the quote markers. See render_notice."""
-    return QUOTE_OPEN + _clean_redact(str(text).strip(), limit, False).strip() + QUOTE_CLOSE
+    return QUOTE_OPEN + safe_text(str(text).strip(), limit, False).strip() + QUOTE_CLOSE
+
+
+def _head(text, n):
+    """text[:n] that does not end inside the mask `[скрыто]`: a border inside it cuts before it."""
+    head = text[:n]
+    for k in range(min(len(MASK) - 1, n), 0, -1):
+        if head.endswith(MASK[:k]) and text.startswith(MASK[k:], n):
+            return head[:-k]
+    return head
 
 
 def _clip(text, limit):
-    return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
+    if len(text) <= limit:
+        return text
+    if limit < 3:
+        return "…"[:limit]
+    return _head(text, limit - 2).rstrip() + " …"
 
 
 def _render_quote(inner, before):
     """One quote as it is shown: a block when it holds lines or starts a line, else inline."""
-    inner = _clean_redact(inner, 10 ** 9, False)  # again, idempotent
+    inner = safe_text(inner, 10 ** 9, False)  # again, idempotent
     lines = inner.splitlines() or [""]
     if len(lines) == 1 and before and not before.endswith("\n"):
         return f"«цитата волны: {lines[0]}»"
@@ -1395,10 +1461,10 @@ def render_notice(text, limit=TG_MESSAGE_LIMIT):
     without markers (an older entry of the outbox) is redacted as a whole, as before."""
     out, pos = [], 0
     for m in _QUOTE_SPAN.finditer(text):
-        out.append(_clean_redact(text[pos:m.start()], 10 ** 9, True))
+        out.append(safe_text(text[pos:m.start()], 10 ** 9, True))
         out.append(_render_quote(m.group(1), "".join(out)))
         pos = m.end()
-    out.append(_clean_redact(text[pos:], 10 ** 9, True))
+    out.append(safe_text(text[pos:], 10 ** 9, True))
     return _clip("".join(out), limit)
 
 
@@ -1830,7 +1896,7 @@ def attention_text(st):
     if latest is None:
         return None
     wave, w, item = latest
-    text = (f"time: {_utc(item.get('at'))}\nwave: {wave}\nsignal: {item.get('line', '')}\n"
+    text = (f"time: {_utc(item.get('at'))}\nwave: {wave}\nsignal: {safe_text(item.get('line', ''), 300)}\n"
             f"attach: {attach_cmd(str(w.get('tmux') or ''))}\n")
     if total > 1:
         text += f"open signals: {total} (wab.py status, events.log)\n"
@@ -3393,14 +3459,25 @@ def _current_manifest(cfg, wave):
     return found, None
 
 
+_choice_memo = None  # {(run_dir, wave): result} while gate_check runs: ONE choice of the manifest per verdict
+
+
 def current_manifest(cfg, wave):
     """The invariant of the choice of the run: it never raises. Any failure of reading or parsing
     runs.json or of checking its record (RecursionError of a deeply nested file, an encoding error,
-    anything unexpected; not BaseException) is a closed refusal (None, reason), never the standard path."""
+    anything unexpected; not BaseException) is a closed refusal (None, reason), never the standard path.
+    Inside one gate_check the choice is made once (_choice_memo): the manifest and the reason of a
+    refusal come from the same reading of runs.json, even if it changes between the two questions."""
+    key = (str(cfg.get("run_dir")), wave)
+    if _choice_memo is not None and key in _choice_memo:
+        return _choice_memo[key]
     try:
-        return _current_manifest(cfg, wave)
+        result = _current_manifest(cfg, wave)
     except Exception:  # noqa: BLE001 - fail closed; the reason quotes nothing from the files
-        return None, "runs.json не разбирается или запись прогона не проверяется"
+        result = (None, "runs.json не разбирается или запись прогона не проверяется")
+    if _choice_memo is not None:
+        _choice_memo[key] = result
+    return result
 
 
 def read_manifest(cfg, wave):
@@ -3441,7 +3518,16 @@ def manifest_where_of(path, wave_dir, timeout=WHERE_TIMEOUT):
 
 def gate_check(cfg, wave, w):
     """The verdict of the merge gate for the wave's PR. Never raises: whatever goes wrong is a
-    `wait` (and never a `pass`)."""
+    `wait` (and never a `pass`). The manifest of the current run is chosen ONCE for the whole verdict."""
+    global _choice_memo
+    outer, _choice_memo = _choice_memo, {} if _choice_memo is None else _choice_memo
+    try:
+        return _gate_check(cfg, wave, w)
+    finally:
+        _choice_memo = outer
+
+
+def _gate_check(cfg, wave, w):
     base = {"pr": {}, "head": None, "unresolved": [], "draft": False, "number": None}
     try:
         pr = find_pr(cfg, w["cwd"])
@@ -3453,7 +3539,7 @@ def gate_check(cfg, wave, w):
         v = gate.evaluate(facts, pr["headRefOid"], manifest, workdir_state(w["cwd"]),
                           base_branch_of(cfg, w["cwd"]))
         if manifest is None:  # a refused choice of the run says why, instead of "manifest missing"
-            why = current_manifest(cfg, wave)[1]
+            why = current_manifest(cfg, wave)[1]  # the same choice as above: gate_check keeps it (_choice_memo)
             if why:  # fail closed, the reason first; the other reasons (MERGED_OUTSIDE ...) stay
                 v = dict(v, verdict="fail", reasons=[f"manifest: {why}"] + [r for r in v["reasons"]
                                                                           if r != gate.MANIFEST_MISSING])
@@ -4342,11 +4428,23 @@ def wave_restarts(w):
 QUESTIONS_CAP = 50  # BLOCKED questions kept per wave
 
 
+def _policy_question(label):
+    """The first line of a BLOCKED question as policy-decisions.log keeps it: masked as a whole first, then cut."""
+    lines = safe_text(label["question"], 10 ** 9).splitlines() or [""]
+    return _clip(lines[0], 200)
+
+
+def _say_first(text):
+    """The first non-empty line of the coordinator's text for the `say` events: masked as a whole, then cut."""
+    lines = [l for l in safe_text(text, 10 ** 9).splitlines() if l.strip()]
+    return _clip(lines[0], 120) if lines else ""
+
+
 def note_question(w, text, now):
     """Record a question to the owner (an owner-facing BLOCKED line) for the chain result: redacted,
     the same text twice in a row once, capped. In memory only: the caller saves it with its change."""
     qs = w.setdefault("questions", [])
-    text = redact(str(text), 300)
+    text = safe_text(str(text), 300)
     if not qs or qs[-1].get("text") != text:
         qs.append({"at": now, "text": text})
         del qs[:-QUESTIONS_CAP]
@@ -4426,7 +4524,7 @@ def write_chain_result(cfg, st):
              f"- волн: {len(cfg['waves'])}, PR: {prs}, перезапусков голов: {restarts_heads}, "
              f"перезапусков волн: {restarts_waves}, вопросов: {len(questions)}\n", "## Волны\n", *rows,
              "## Вопросы к владельцу\n"]
-    lines += ([f"- {_utc(q.get('at'))} {wave}: {redact(str(q.get('text') or ''), 300)}"
+    lines += ([f"- {_utc(q.get('at'))} {wave}: {safe_text(str(q.get('text') or ''), 300)}"
                for wave, q in questions] or ["нет"])
     path = cfg["run_dir"] / "chain-result.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4615,7 +4713,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
     drop_notice(w, "blocked")  # a usual BLOCKED signal of a failed first try asks nothing any more
     w.setdefault("notified", {})["blocked"] = status  # ...and is not raised again in this episode
-    question = redact((label["question"].splitlines() or [""])[0], 200)
+    question = _policy_question(label)
     try:
         with open(wave_dir(cfg, wave) / "policy-decisions.log", "a", encoding="utf-8") as f:
             f.write(f"{_utc(now)} class={label['class']} rec={label['rec']} {question}\n")
@@ -4645,12 +4743,12 @@ def blocked_notice(cfg, wave, status, attach):
     label = parse_blocked_label(status)
     if label is None or label["class"] == "merge_gate":
         return plain
-    # the WHOLE question takes the quote's own path (_clean_redact, the W3 invariant) before any split:
+    # the WHOLE question takes the quote's own path (safe_text, the W3 invariant) before any split:
     # a separator inside a secret's value (`password=variants:…`) would cut the value away from its key,
     # an invisible character inside the key (`password<U+200B>=…`) hides the key from redact(), and a
     # line separator (U+2028, NEL) would cut a token in two for splitlines(); a token that holds an
     # invisible character is masked whole first. quote() below masks each part again (idempotent).
-    question, options = _clean_redact(label["question"], 10 ** 9, False), ""
+    question, options = safe_text(label["question"], 10 ** 9, False), ""
     m = _OPTIONS.search(question)
     if m:
         question, options = question[:m.start()], question[m.end():]
@@ -5642,7 +5740,7 @@ def say_cmd(cfg, wave, text_file):
         raise SystemExit(f"wab: say: wave {wave} has no launched session in state.json of this run; nothing sent")
     name = rec["tmux"]
     lines = [l for l in text.splitlines() if l.strip()]
-    first = redact(lines[0] if lines else "", 120)
+    first = _say_first(text)
     if not tmux_alive(name):
         event(cfg, f"{wave}: say FAILED (no window {name}): {first}")
         return False
@@ -5697,14 +5795,14 @@ def manifest_status_line(cfg, wave):
 
 def status_cmd(cfg):
     st = load_state(cfg)
-    print("current:", st.get("current"))
-    for wave, w in st["waves"].items():
-        print(f"{wave}: tmux={w.get('tmux')} phase={w.get('phase')} ctx={w.get('tokens', 0) // 1000}k "
-              f"restarts={w.get('restarts', 0)} sessions={len(w.get('sessions') or [])} "
-              f"status={read(cfg['run_dir'] / wave / 'status')}")
+    print("current:", safe_text(st.get("current"), 200))
+    for wave, w in st["waves"].items():  # every line is shown to a human: it passes safe_text as a whole
+        print(safe_text(f"{wave}: tmux={w.get('tmux')} phase={w.get('phase')} ctx={w.get('tokens', 0) // 1000}k "
+                        f"restarts={w.get('restarts', 0)} sessions={len(w.get('sessions') or [])} "
+                        f"status={read(cfg['run_dir'] / wave / 'status')}", 10 ** 6))
         line = manifest_status_line(cfg, wave)
         if line:
-            print(line)
+            print(safe_text(line, 10 ** 6))
 
 
 def main(argv):
