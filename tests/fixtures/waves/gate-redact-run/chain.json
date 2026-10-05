@@ -1,0 +1,34 @@
+{
+ "chain": "waves-gate-redact",
+ "run_id": "2026-10-05-gr",
+ "repo": "bronxtc52/skill-superarmanda",
+ "base_branch": "main",
+ "waves": [
+  "W1",
+  "W2"
+ ],
+ "titles": {
+  "W1": "Гейт видит текущий прогон",
+  "W2": "Один путь маскировки, релиз 1.2.0"
+ },
+ "tmux_prefix": "gr-",
+ "merge_gate": "auto",
+ "mandate_sha256": "993ec95ca0399bcf0ab4e40aa7c28cb2eb966492b595b4e5cfadb6cf8e6f0fad",
+ "plan_sha256": "8fb532f5698799f5d13f25c54877771f20117351cfb8cb75069aa06ca08f0295",
+ "ctx_limit": 300000,
+ "idle_minutes": 15,
+ "handoff_timeout_minutes": 25,
+ "tick_seconds": 60,
+ "decision_policy": [
+  {
+   "class": "needs_decision"
+  }
+ ],
+ "max_auto_answers": 3,
+ "max_runs": 2,
+ "telegram": {
+  "keyvault": "kv-stub",
+  "token_secret": "stub-token",
+  "chat_secret": "stub-chat"
+ }
+}

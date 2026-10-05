@@ -98,13 +98,11 @@ class ReleasePolicyDocs(unittest.TestCase):
 
     RULE = "задачи про безопасность и маскировку обязаны иметь `risk: high`"
 
-    def test_release_1_2_1_is_versioned_and_names_the_compatibility_boundary(self):
-        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.1"?$')
+    def test_release_1_2_1_names_the_compatibility_boundary(self):
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         sections = re.split(r"(?m)^## ", changelog)
         section = next((s for s in sections if s.startswith("1.2.1 — 2026-10-05")), None)
         self.assertIsNotNone(section, "CHANGELOG has no section 1.2.1")
-        self.assertEqual(sections.index(section), 1, "1.2.1 must be the newest section")
         self.assertIn("#86", section)
         boundary = next((l for l in flat(section).split(" - ") if "Граница совместимости" in l), "")
         for needle in ("`version: 1`", "1.2.0", "`version: 2`", "двух ревью", "Fable", "metadata"):
@@ -163,6 +161,90 @@ class ReleasePolicyDocs(unittest.TestCase):
                        "--quota-evidence", "unavailable"):
             with self.subTest(doc="references/workflow.md", needle=needle):
                 self.assertIn(needle, workflow)
+
+
+class ReleaseWaveGateDocs(unittest.TestCase):
+    """1.2.2 (W2, #86): the merge gate by the risk of the wave, the coordinator's model, the two reviews of
+    the plan checked by `launch`, the skill updated only between waves."""
+
+    def test_release_1_2_2_is_versioned_and_names_the_compatibility_boundaries(self):
+        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.2"?$')
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        sections = re.split(r"(?m)^## ", changelog)
+        section = next((s for s in sections if s.startswith("1.2.2 — 2026-10-05")), None)
+        self.assertIsNotNone(section, "CHANGELOG has no section 1.2.2")
+        self.assertEqual(sections.index(section), 1, "1.2.2 must be the newest section")
+        for issue in ("#86", "#91", "#92"):
+            self.assertIn(issue, section)
+        boundaries = [l for l in flat(section).split(" - ") if "Граница совместимости" in l]
+        self.assertGreaterEqual(len(boundaries), 3, "each change of a default is its own boundary line")
+        joined = " ".join(boundaries)
+        for needle in ("`model`", "предупрежд", "`launch`", "ревью плана", "`plan_sha256`", "high-волн",
+                       "`version: 1`", "новый прогон волны", "watch"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, joined)
+        self.assertIn("только между волнами", flat(section))
+
+    def test_waves_doc_describes_the_gate_by_the_risk_of_the_wave(self):
+        text = doc("references/waves.md")
+        gate = flat(text.split("### Гейт мерджа: `merge_gate: auto`", 1)[1].split("\n### ", 1)[0])
+        for needle in ("Риск волны", "`<run_dir>/waves.json`", "`plan_sha256`", "каждая задача", "`second_reviewer`",
+                       "`version: 1`", "новый прогон волны", "`review_policy.level`", "`review_history`",
+                       "не верит сохранённому", "закрытый отказ",
+                       # fix round 1: the highest known risk, the traces of the high policy, the honest border
+                       "`wave.risk`", "наибольший", "`plan.wave_sha256`", "Записи политики high",
+                       "Известная граница", "manifest не подписан"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, gate)
+
+    def test_waves_doc_describes_the_coordinator_model_and_the_plan_review(self):
+        text = doc("references/waves.md")
+        whole = flat(text)
+        phase_a = flat(text.split("## Фаза A — текущая сессия", 1)[1].split("### Схема `waves.json` v1", 1)[0])
+        checklist = flat(text.split("### Предполётный чек-лист", 1)[1].split("### Мандат", 1)[0])
+        mandate = flat(text.split("### Мандат", 1)[1].split("### Политика решений", 1)[0])
+        fields = text.split("Поля `chain.json`:", 1)[1].split("**Admission.**", 1)[0]
+        model_row = next((l for l in fields.splitlines() if l.startswith("| `model`")), "")
+        self.assertIn("claude-fable-5-1", model_row)
+        self.assertIn("предупрежд", model_row)
+        self.assertIn('"model": "claude-fable-5-1"', text)
+        self.assertIn("модель координатора", checklist)
+        # the plan review: both reviewers, kept in the run directory, checked by launch
+        for part, name in ((phase_a, "phase A"), (checklist, "checklist")):
+            for needle in ("claude-host", "codex-host", "plan-review/"):
+                with self.subTest(part=name, needle=needle):
+                    self.assertIn(needle, part)
+        for needle in ("`plan.sha256`", "`packet.json`", "`result-claude-host.json`", "`result-codex-host.json`",
+                       "`result-codex-host-opus.json`", "`state_packet_hash`", "`wab.py launch`", "прошлых кругов",
+                       "`sha256sum waves.json`", "не симлинк"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, whole)
+        # the installed skill is updated only between waves
+        for part, name in ((checklist, "checklist"), (mandate, "mandate")):
+            with self.subTest(part=name):
+                self.assertIn("только между волнами", part)
+        table = text.split("## Что реализовано", 1)[1].split("## Фаза A", 1)[0]
+        row = next((l for l in table.splitlines() if "1.2.2; #86" in l), "")
+        for needle in ("риск", "plan-review", "`model`"):
+            with self.subTest(row=needle):
+                self.assertIn(needle, row)
+
+    def test_workflow_and_protocol_no_longer_promise_the_gate_for_later(self):
+        workflow = flat(doc("references/workflow.md"))
+        self.assertNotIn("собственная проверка двух ревью в гейте — следующая волна", workflow)
+        self.assertIn("по риску волны", workflow)
+        self.assertNotIn("Требование двух ревью в гейте мерджа диспетчера — следующая волна",
+                         flat(doc("references/waves.md")))
+        protocol = flat(doc("scripts/waves/PROTOCOL.md"))
+        self.assertIn("риск волны", protocol)
+        self.assertIn("новый прогон", protocol)
+
+    def test_opus_fallback_is_marked_as_not_proven_by_a_live_quota_event(self):
+        for relative in ("references/profiles.md", "references/review-contract.md"):
+            with self.subTest(doc=relative):
+                text = flat(doc(relative))
+                self.assertIn("#91", text)
+                self.assertIn("не проверен живым событием квоты", text)
 
 
 if __name__ == "__main__":

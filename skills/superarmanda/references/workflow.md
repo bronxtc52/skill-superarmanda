@@ -149,8 +149,13 @@ creates one manifest atomically.
   (не та модель, не та пара профилей, разные пакеты, Opus без подтверждения квоты), стоит в
   `next_action`.
 
-Гейт мерджа диспетчера волн в 1.2.1 читает manifest `version: 2` и статус задачи, который ставит
-`state.py`; собственная проверка двух ревью в гейте — следующая волна (#86).
+Гейт мерджа диспетчера волн с 1.2.2 судит по риску волны из одобренного `waves.json` (пин
+`plan_sha256`): в high-волне каждой задаче нужны оба ревью текущего HEAD, в любой волне — задаче
+с политикой `high`. Сохранённому статусу задачи гейт не верит и пересчитывает готовность теми же
+функциями `state.py`; manifest `version: 1` в high-волне — отказ с действием «новый прогон волны».
+Ниже `high` не-pass результат `second_reviewer` без находок (`unavailable`, `error`, `incomplete`)
+не блокирует ни `where`, ни гейт: второе ревью там необязательно. Подробно —
+[waves.md](waves.md), «Гейт мерджа».
 
 Before any result after a code or working-tree change, run
 `resume` with the same `--repo --base` and current `--head`; it removes stale results but keeps

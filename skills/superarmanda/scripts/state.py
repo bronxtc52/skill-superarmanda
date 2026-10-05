@@ -873,6 +873,22 @@ def open_review_findings(entry, head, role=None):
     ]
 
 
+def fable_review_of(entry, head):
+    """The first `review_history` item that is a codex-host (Fable) pass or findings of this
+    HEAD, or None. Such an item proves Fable was available for this HEAD: the codex-host-opus
+    fallback stands in for a Fable that gave NO review, so it neither replaces nor outlives one.
+    The single rule behind task-result (verified_review), readiness (high_risk_gaps) and the
+    advice of `where`."""
+    for item in (entry or {}).get("review_history") or ():
+        if (
+            item.get("profile") == FABLE_PROFILE
+            and item["status"] in ("pass", "findings")
+            and item["head"] == head
+        ):
+            return item
+    return None
+
+
 OPEN_FINDINGS = "open findings"
 
 
@@ -942,6 +958,15 @@ def high_risk_gaps(entry, results, head):
             gaps[role] = (
                 f"{role} is a {OPUS_PROFILE} review without quota evidence; the fallback counts "
                 f"only with --quota-evidence <{FABLE_PROFILE} quota error report>"
+            )
+        elif profile == OPUS_PROFILE and fable_review_of(entry, head) is not None:
+            # recorded before Fable answered (Opus -> Fable -> Astra on one HEAD): the history
+            # says Fable reviewed this HEAD, so the earlier fallback counts no more
+            gaps[role] = (
+                f"{role} is a {OPUS_PROFILE} fallback, but {FABLE_PROFILE} reviewed this HEAD "
+                f"({fable_review_of(entry, head)['status']} in review_history): the fallback "
+                f"counts only when {FABLE_PROFILE} gave no review; record the {FABLE_PROFILE} "
+                f"review as {role}"
             )
         else:
             reviews[role] = result
@@ -1582,6 +1607,67 @@ def review_profile_models():
     return table
 
 
+def is_quota_report(evidence):
+    """A review.py error report of codex-host (Fable) whose failure is the provider quota."""
+    return (
+        isinstance(evidence, dict)
+        and evidence.get("profile") == FABLE_PROFILE
+        and evidence.get("status") == "error"
+        and evidence.get("error_category") == "quota"
+        and evidence.get("gate_ready") is False
+    )
+
+
+def quota_evidence_problem(evidence, head, packet_hash):
+    """Why `evidence` does not open the codex-host-opus fallback for this HEAD and packet
+    (None: it does). `head` None skips the HEAD (a plan review has no manifest HEAD: the packet
+    binds it). The single rule for task-result --quota-evidence and the plan review of
+    `wab.py launch`."""
+    if not is_quota_report(evidence):
+        return (
+            f"must be a {FABLE_PROFILE} review.py report with status error, "
+            "error_category quota and gate_ready false"
+        )
+    if (head is not None and evidence.get("reviewed_head") != head) or evidence.get(
+        "state_packet_hash"
+    ) != packet_hash:
+        return "is not for this HEAD and packet (or predates review.py 1.2.1)"
+    return None
+
+
+def report_models_problem(report, profile):
+    """Why a review.py report does not agree with the profile it names (None: it does): the
+    model review.py requests for the profile and the model it observed running. One edited
+    `profile` field does not make another review.
+
+    review.py writes `observed_models` as the adapter's list for Astra (exactly the one model)
+    and as the CLI's modelUsage object for the Claude profiles, where entries of ancillary
+    CLI calls beside the primary model are legitimate. So the object is not compared as a
+    whole; the primary model must be there (and `primary_model_verified` is checked by the
+    caller)."""
+    cli, requested, observed = review_profile_models()[profile]
+    models = report.get("observed_models")
+    if cli == "claude":
+        models_fit = isinstance(models, dict) and isinstance(models.get(observed), dict)
+    else:
+        models_fit = models == [observed]
+    if report.get("requested_model") != requested or not models_fit:
+        return f"review report models do not belong to profile {profile}"
+    return None
+
+
+def report_verified(report):
+    """The report says its primary model was verified and its tools were isolated."""
+    capabilities = report.get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    isolation = capabilities.get("tool_isolation")
+    return (
+        capabilities.get("primary_model_verified") is True
+        and isinstance(isolation, str)
+        and isolation != "unverified"
+    )
+
+
 def verified_review(args, risk, packet_hash, entry):
     """Policy fields of a task-review result, taken from its review.py report.
 
@@ -1612,20 +1698,10 @@ def verified_review(args, risk, packet_hash, entry):
         fail(f"review report profile must be one of {sorted(REVIEW_PROFILES)}")
     if report.get("status") != args.status:
         fail(f"review report status {report.get('status')!r} differs from --status {args.status}")
-    # The report must agree with itself: the model review.py requests for this profile and
-    # the model it observed running. One edited `profile` field does not make another review.
-    # review.py writes `observed_models` as the adapter's list for Astra (exactly the one model)
-    # and as the CLI's modelUsage object for the Claude profiles, where entries of ancillary
-    # CLI calls beside the primary model are legitimate. So the object is not compared as a
-    # whole; the primary model must be there and `primary_model_verified` must be true.
-    cli, requested, observed = review_profile_models()[profile]
-    models = report.get("observed_models")
-    if cli == "claude":
-        models_fit = isinstance(models, dict) and isinstance(models.get(observed), dict)
-    else:
-        models_fit = models == [observed]
-    if report.get("requested_model") != requested or not models_fit:
-        fail(f"review report models do not belong to profile {profile}")
+    # The report must agree with itself (report_models_problem).
+    problem = report_models_problem(report, profile)
+    if problem:
+        fail(problem)
     session = report.get("session_id")
     if not isinstance(session, str) or not session:
         fail("review report has no review session_id")
@@ -1639,16 +1715,9 @@ def verified_review(args, risk, packet_hash, entry):
                 f"this report is the review already recorded as {other}: one review cannot "
                 "fill both review roles"
             )
-    capabilities = report.get("capabilities")
-    capabilities = capabilities if isinstance(capabilities, dict) else {}
-    isolation = capabilities.get("tool_isolation")
     if args.status == "pass" and report.get("gate_ready") is not True:
         fail("review report is not gate_ready: it cannot be recorded as pass")
-    if not (
-        capabilities.get("primary_model_verified") is True
-        and isinstance(isolation, str)
-        and isolation != "unverified"
-    ):
+    if not report_verified(report):
         fail(
             f"review report has no verified model and tool isolation: {args.status} is not recorded"
         )
@@ -1665,34 +1734,21 @@ def verified_review(args, risk, packet_hash, entry):
     # The fallback stands in for a Fable that gave NO review of this HEAD. A Fable pass or
     # findings in the history (either role, covered or not, overwritten since or not) proves
     # Fable was available: an older quota report must not let Opus replace or outvote it.
-    for item in entry.get("review_history") or ():
-        if (
-            item.get("profile") == FABLE_PROFILE
-            and item["status"] in ("pass", "findings")
-            and item["head"] == args.head
-        ):
-            fail(
-                f"{item['role']} recorded a {FABLE_PROFILE} review ({item['status']}) of this "
-                f"HEAD: {OPUS_PROFILE} is a fallback only when {FABLE_PROFILE} gave no review"
-            )
+    item = fable_review_of(entry, args.head)
+    if item is not None:
+        fail(
+            f"{item['role']} recorded a {FABLE_PROFILE} review ({item['status']}) of this "
+            f"HEAD: {OPUS_PROFILE} is a fallback only when {FABLE_PROFILE} gave no review"
+        )
     if args.quota_evidence is None:
         fail(
             f"a {OPUS_PROFILE} review is accepted only with --quota-evidence "
             f"<{FABLE_PROFILE} quota error report for this HEAD and packet>"
         )
     evidence, evidence_digest = read_report(args.quota_evidence, "--quota-evidence")
-    if not (
-        evidence.get("profile") == FABLE_PROFILE
-        and evidence.get("status") == "error"
-        and evidence.get("error_category") == "quota"
-        and evidence.get("gate_ready") is False
-    ):
-        fail(
-            f"--quota-evidence must be a {FABLE_PROFILE} review.py report with status error, "
-            "error_category quota and gate_ready false"
-        )
-    if evidence.get("reviewed_head") != args.head or evidence.get("state_packet_hash") != packet_hash:
-        fail("--quota-evidence is not for this HEAD and packet (or predates review.py 1.2.1)")
+    problem = quota_evidence_problem(evidence, args.head, packet_hash)
+    if problem:
+        fail(f"--quota-evidence {problem}")
     fields["fallback_for"] = FABLE_PROFILE
     fields["quota_evidence"] = {"artifact": args.quota_evidence, "sha256": evidence_digest}
     return fields
@@ -2047,11 +2103,58 @@ SECOND_REVIEW_FALLBACK = (
 )
 
 
-def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None):
+NO_SECOND_REVIEW_FALLBACK = (
+    f"; no fallback: {OPUS_PROFILE} stands in only for a {FABLE_PROFILE} that gave no review of "
+    "this HEAD because of the provider quota"
+)
+
+
+def second_review_fallback(entry, head):
+    """The tail of the `BLOCKED: second_reviewer error|unavailable` advice of a high-risk task:
+    the codex-host-opus fallback is offered only where task-result would accept it. Not when
+    Fable already reviewed this HEAD (fable_review_of), and not when the report behind the
+    recorded result fails the acceptance rule of the quota evidence (quota_evidence_problem:
+    this HEAD and the packet of the other review): the advice must not send the coordinator
+    into a refusal. A report that cannot be read is said to be unchecked, not absent."""
+    reviewed = fable_review_of(entry, head)
+    if reviewed is not None:
+        return (
+            f"{NO_SECOND_REVIEW_FALLBACK} ({FABLE_PROFILE} already reviewed it: "
+            f"{reviewed['status']} recorded as {reviewed['role']})"
+        )
+    results = (entry or {}).get("results") or {}
+    result = results.get("second_reviewer")
+    artifact = result.get("artifact") if isinstance(result, dict) else None
+    try:
+        evidence, _digest = read_report(artifact, "artifact")
+    except SystemExit:
+        # nothing readable behind the result (no --artifact, a relative path from another directory):
+        # the quota is neither proven nor disproven here, task-result will check the report it is given
+        return (
+            "; the quota report could not be checked (no readable review.py report behind the "
+            f"recorded result): {OPUS_PROFILE} counts only with --quota-evidence <{FABLE_PROFILE} "
+            "quota error report for this HEAD and packet>, no other model"
+        )
+    # The acceptance rule itself (quota_evidence_problem), against the packet the other review of this
+    # HEAD was recorded for; without one the report's own packet is all there is to compare.
+    other = results.get("cross_provider_reviewer")
+    packet_hash = other.get("packet_hash") if isinstance(other, dict) and other.get("head") == head else None
+    problem = quota_evidence_problem(
+        evidence, head, packet_hash if packet_hash is not None else evidence.get("state_packet_hash")
+    )
+    if problem is None:
+        return SECOND_REVIEW_FALLBACK
+    return f"{NO_SECOND_REVIEW_FALLBACK} (the recorded {FABLE_PROFILE} report {problem})"
+
+
+def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None, fallback=SECOND_REVIEW_FALLBACK):
     """Return (step, role, note); note overrides the default next_action.
     `risk` is the task's effective risk (None for manifest version 1) and `gaps` the
     high_risk_gaps of its current results: with risk high the second review is required and a
-    passed role named in `gaps` is not a pass.
+    passed role named in `gaps` is not a pass. Below high the second review is optional, like
+    CodeRabbit: only its findings need a disposition; error/unavailable/incomplete are
+    recorded and ignored. `fallback` is the tail of the advice for a failed second review of a
+    high-risk task (second_review_fallback; the default offers codex-host-opus).
     On the last permitted run of a wave there is no new `init --from-plan`, but fix rounds
     of the current run go on: findings that break the acceptance are a normal fix-loop
     --outcome failed; only findings outside the acceptance are deferred/accepted."""
@@ -2095,7 +2198,9 @@ def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None):
             return 6, "coordinator", gaps[role]
     if high and verdicts.get("coder") in ("error", "unavailable"):
         return 4, "coder", f"BLOCKED: coder {verdicts['coder']}; {NO_WEAKER_MODEL}"
-    for role, step in REVIEW_ORDER:
+    # the roles whose failure to give a verdict stops the task
+    order = [(role, step) for role, step in REVIEW_ORDER if high or role != "second_reviewer"]
+    for role, step in order:
         if verdicts.get(role) in ("error", "unavailable"):
             if high and role == "tester":
                 return step, role, f"BLOCKED: tester {verdicts[role]}; {NO_WEAKER_MODEL}"
@@ -2104,9 +2209,9 @@ def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None):
                 role,
                 f"BLOCKED: {role} {verdicts[role]}; retry once explicitly "
                 "or escalate to the owner (not a fix-loop)"
-                + (SECOND_REVIEW_FALLBACK if role == "second_reviewer" else ""),
+                + (fallback if role == "second_reviewer" else ""),
             )
-    for role, step in REVIEW_ORDER:
+    for role, step in order:
         if verdicts.get(role) == "incomplete":
             # incomplete = missing context, not a finding: no fix cycle
             return (
@@ -2201,6 +2306,7 @@ def where(args):
         last_run,
         risk=risk,
         gaps=current_gaps(entry, current_head, current_tree, risk),
+        fallback=second_review_fallback(entry, current_head) if risk == "high" else "",
     )
     position = data.get("position")
     precode = (
