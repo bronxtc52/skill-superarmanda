@@ -1187,7 +1187,7 @@ _STRUCTURED = [
     re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
+    "jwt",                                                              # JWT: _JWT below
     re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"),                      # Telegram bot token
     re.compile(r"(?i)\b(set-cookie|cookie)(\s*:\s*)[^\r\n]*"),                 # whole header value
     # the same matches as `(?<![\w-])(["']?<_SECRET_KEY>["']?)...`, in linear time (Codex, #85): that one starts after
@@ -1223,6 +1223,35 @@ class _LinearEmail:
 
 _EMAIL = _LinearEmail()
 _STRUCTURED[_STRUCTURED.index(None)] = _EMAIL
+
+
+class _LinearJwt:
+    """The rule `\\beyJ<seg>.<seg>.<seg>` (JWT) with the matches of re.sub over it, in linear time. re.sub tries every
+    `eyJ` of a long run of [A-Za-z0-9_-] (`eyJ...-eyJ...-`), and each try runs to the end of the run looking for the
+    `.` (quadratic, Astra on #85). A segment ends where its run ends (no `.` inside a run), so a try that fails fails
+    for every later `eyJ` of the same run as well: they are skipped up to the run's end."""
+    RX = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}")
+    START = re.compile(r"\beyJ")
+    RUN = re.compile(r"[A-Za-z0-9_-]*")
+
+    def sub(self, repl, text):
+        out, pos, at, failed_to = [], 0, 0, -1
+        while (c := self.START.search(text, at)) is not None:
+            if c.start() < failed_to:  # a later `eyJ` of a run whose first try failed
+                at = failed_to
+                continue
+            m = self.RX.match(text, c.start())
+            if m is None:
+                failed_to = self.RUN.match(text, c.start()).end()
+                at = c.start() + 1
+                continue
+            out += [text[pos:m.start()], repl(m)]
+            pos = at = m.end()
+        return "".join(out + [text[pos:]])
+
+
+_JWT = _LinearJwt()
+_STRUCTURED[_STRUCTURED.index("jwt")] = _JWT
 _HEURISTIC = [
     re.compile(r"\+\d[\d ()-]{8,}\d"),                                  # phone numbers (+7 ...)
     re.compile(r"(?<![\w+])(?:\+?7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)"),  # RU, no plus

@@ -16092,7 +16092,7 @@ class W2SafeText(Base):
              "строка\rс возвратом каретки", "user@example.com +7 912 345-67-89", "sha " + HEX40, B64]
 
     def test_safe_text_is_linear_on_a_long_word_and_on_a_megabyte(self):
-        for unit in ("a", "1", "a.", "Ab9-_.", "token.", ".sig", "x.token-", "a@", "a\r", "a\u200b"):
+        for unit in ("a", "1", "a.", "Ab9-_.", "token.", ".sig", "x.token-", "a@", "a\r", "a\u200b", "eyJ" + "A" * 12 + "-"):
             text = (unit * 16000)[:16000]
             with self.subTest(unit=unit):
                 start = time.monotonic()
@@ -16113,7 +16113,7 @@ class W2SafeText(Base):
         rnd = random.Random(85)
         toks = ["token", "sig", "SIG", ".", "=", ":", " ", "\"", "'", "@", "a", "1", "x@y.zz", "-", "_", "/", "+7", "\r", "\u200b",
                 "\n", "\u00a0", HEX40, "sha ", "reviewed_head:", "/commits/", "https://github.com/o/r/", "github.com/x/", B64, "ж",
-                ".cache/wab/", "ghp_" + "A" * 36, "[скрыто]", ",", "(", "#"]
+                ".cache/wab/", "ghp_" + "A" * 36, "[скрыто]", ",", "(", "#", "eyJ", "AAAAAAAAAA", "AAAAAAAAAA."]
         corpus += ["".join(rnd.choice(toks) for _ in range(rnd.randint(0, 16))) for _ in range(20000)]
         spaces = f"[^{wab._SPACES}]*"
         ctrl_word, soft_word = re.compile(spaces + f"[{wab._INVISIBLE}]" + spaces), re.compile(spaces + "\r" + spaces)
@@ -16130,7 +16130,9 @@ class W2SafeText(Base):
         old_key = re.compile(r"(?i)(?<![\w-])([\"']?" + wab._SECRET_KEY + r"[\"']?)(\s*[:=]\s*)"
                              r"(?!\[скрыто\])(?:\"(?:[^\"\\]|\\.)*\"?|'(?:[^'\\]|\\.)*'?|[^\s,;&}\]]+)")
         new_key = next(rx for rx in wab._STRUCTURED if getattr(rx, "pattern", "").startswith("(?i)(?:(?<![\\w.-])"))
-        structured = [old_email if rx is wab._EMAIL else old_key if rx is new_key else rx for rx in wab._STRUCTURED]
+        old_jwt = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}")
+        old_of = {id(wab._EMAIL): old_email, id(new_key): old_key, id(wab._JWT): old_jwt}
+        structured = [old_of.get(id(rx), rx) for rx in wab._STRUCTURED]
         old_rules = [mock.patch.object(wab, "_STRUCTURED", structured),
                      mock.patch.object(wab, "_labelled_sha", lambda m: bool(
                          re.fullmatch(r"[0-9a-fA-F]{40,64}", m.group(0)) and wab._SHA_LABEL.search(m.string[:m.start()]))),
