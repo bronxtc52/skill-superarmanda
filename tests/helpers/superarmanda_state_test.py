@@ -4906,6 +4906,142 @@ class HighRiskReviews(PolicyBase):
         entry = self.record("second_reviewer", **self.review_flags(ancillary))
         self.assertEqual(entry["status"], "ready_for_pr_review")
 
+    def opus_report(self):
+        # its own session: the CLI doubles give Fable and Opus one session id
+        return self.edited(self.report("codex-host-opus"), session_id="opus-review-session")
+
+    def test_opus_stays_refused_after_the_fable_result_is_overwritten(self):
+        """tester-3 T3-1: what Fable said about this HEAD cannot be unsaid by a later record."""
+        for status, mode, wipe in (("findings", "findings", "unavailable"), ("findings", "findings", "error"),
+                                   ("pass", "success", "error"), ("pass", "success", "unavailable"),
+                                   ("pass", "success", "incomplete")):
+            with self.subTest(fable=status, wipe=wipe):
+                self.init()
+                self.code_and_test()
+                quota = self.report("codex-host", "quota_failure")  # made before Fable answered
+                opus = self.opus_report()
+                self.review("cross_provider_reviewer", "claude-host")
+                self.review("second_reviewer", "codex-host", mode, status=status)
+                if status == "findings":
+                    self.ok("fix-loop", "--task", "t1", "--accept", "--source", "second_reviewer",
+                            "--severity", "high", "--note", "accepted")
+                flags = self.review_flags(opus, quota_evidence=str(quota))
+                self.record_refused("second_reviewer", needle="codex-host review", **flags)
+                self.record("second_reviewer", wipe)
+                self.record_refused("second_reviewer", needle="codex-host review", **flags)
+                self.record_refused("cross_provider_reviewer", needle="codex-host review", **flags)
+                self.assertEqual(self.entry()["status"], "in_progress")
+                where = self.where()
+                self.assertNotIn("done", where["next_action"])
+                if status == "findings":
+                    # the accepted limitation of this HEAD is still reported
+                    self.assertEqual(where["accepted"], 1)
+                    self.assertEqual([(a["source"], a["severity"], a["note"]) for a in where["accepted_limitations"]],
+                                     [("second_reviewer", "high", "accepted")])
+                # a new commit is another HEAD: there the fallback is open again
+                self.change(f"after {status} {wipe}\n")
+                self.resume()
+                self.code_and_test()
+                self.packet()
+                self.review("cross_provider_reviewer", "claude-host")
+                quota = self.report("codex-host", "quota_failure")
+                entry = self.record("second_reviewer",
+                                    **self.review_flags(self.opus_report(), quota_evidence=str(quota)))
+                self.assertEqual(entry["status"], "ready_for_pr_review")
+                self.assertEqual(self.where()["accepted_limitations"], [])
+
+    def test_open_findings_survive_resume_there_and_back(self):
+        """tester-3 T3-2: findings on a HEAD are not wiped by touching the tree and resuming twice."""
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        _, findings = self.review("second_reviewer", "codex-host", "findings", status="findings")
+        clean = self.edited(self.report("codex-host"), session_id="second-fable-run")
+        self.record_refused("second_reviewer", needle="open findings", **self.review_flags(clean))
+        head = self.head()
+        (self.repo / "junk.txt").write_text("x\n", encoding="utf-8")
+        self.assertEqual(self.resume()["invalidated_tasks"], ["t1"])
+        # the same HEAD over a touched tree is no way round either
+        self.record_refused("second_reviewer", "unavailable", needle="open findings")
+        (self.repo / "junk.txt").unlink()
+        self.resume()
+        self.assertEqual((self.head(), self.entry()["results"]), (head, {}))
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        for status, flags in (("pass", self.review_flags(clean)), ("unavailable", {}), ("incomplete", {})):
+            with self.subTest(status=status):
+                self.record_refused("second_reviewer", status, needle="open findings", **flags)
+        self.assertEqual(self.entry()["status"], "in_progress")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (6, "coordinator"))
+        self.assertIn("open findings", where["next_action"])
+        self.assertIn("second_reviewer", where["next_action"])
+        self.assertEqual([(f["role"], f["status"], f["artifact"]) for f in where["open_findings"]],
+                         [("second_reviewer", "findings", str(findings))])
+        # the way out on this HEAD is the same disposition as before, bound to that very result
+        accepted = self.ok("fix-loop", "--task", "t1", "--accept", "--source", "second_reviewer",
+                           "--severity", "medium", "--note", "known limitation")
+        self.assertEqual(accepted["status"], "in_progress")
+        entry = self.record("second_reviewer", **self.review_flags(clean))
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual((entry["fix_cycles"], len(entry["acceptances"])), (0, 1))
+        where = self.where()
+        self.assertEqual([(a["source"], a["severity"]) for a in where["accepted_limitations"]],
+                         [("second_reviewer", "medium")])
+        self.assertEqual(where["open_findings"], [])
+
+    def test_ordinary_cycle_and_reruns_without_a_verdict_stay_free(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        # incomplete and error before any verdict are repeated freely
+        for status in ("incomplete", "error", "unavailable", "incomplete"):
+            self.record("second_reviewer", status)
+        self.review("second_reviewer", "codex-host", "findings", status="findings")
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
+        self.change("fixed\n")
+        self.resume()
+        self.code_and_test()
+        self.packet()
+        self.review("cross_provider_reviewer", "claude-host")
+        entry, _ = self.review("second_reviewer", "codex-host")
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        history = entry["review_history"]
+        self.assertEqual([(h["role"], h["status"], h["profile"]) for h in history], [
+            ("cross_provider_reviewer", "pass", "claude-host"), ("second_reviewer", "incomplete", None),
+            ("second_reviewer", "error", None), ("second_reviewer", "unavailable", None),
+            ("second_reviewer", "incomplete", None), ("second_reviewer", "findings", "codex-host"),
+            ("cross_provider_reviewer", "pass", "claude-host"), ("second_reviewer", "pass", "codex-host"),
+        ])
+        self.assertEqual(set(history[-1]), {"role", "profile", "status", "head", "tree_fingerprint", "packet_hash",
+                                            "result_id", "result_sha256", "artifact", "recorded_at"})
+        self.assertEqual(len({h["head"] for h in history}), 2)
+        self.assertEqual(history[-1]["result_id"], entry["results"]["second_reviewer"]["result_id"])
+
+    def test_history_is_kept_only_for_high_risk_tasks_of_version_2(self):
+        self.assertIn("no task yet", self.where()["next_action"])  # a high run without a task
+        self.init(risk="medium")
+        self.record("coder")
+        self.record("tester")
+        self.record("cross_provider_reviewer", "findings")
+        self.record("cross_provider_reviewer", "findings", session="again")
+        self.assertNotIn("review_history", self.entry())
+        # raising the risk takes the current review results into the history: they cannot be wiped now
+        raised = self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.assertEqual([(h["role"], h["status"]) for h in raised["review_history"]],
+                         [("cross_provider_reviewer", "findings")])
+        self.record_refused("cross_provider_reviewer", "incomplete", needle="open findings")
+        # version 1: no key, and a manifest carrying it is refused
+        value = self.data()
+        value["version"] = 1
+        del value["review_policy"]
+        del value["tasks"]["t1"]["risk"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        self.refused("where", needle="version 2")
+        del value["tasks"]["t1"]["review_history"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertNotIn("review_history", entry)
+
     def test_quota_evidence_is_only_for_the_opus_profile(self):
         self.code_and_test()
         quota = self.report("codex-host", "quota_failure")
@@ -5025,6 +5161,7 @@ class HighRiskReviews(PolicyBase):
                     **self.review_flags(self.report("codex-host-opus"), quota_evidence=str(quota)))
         self.ok("mark", "--task", "t1", "--step", "7", "--safe-point", "true")
         value = self.data()
+        self.assertEqual(len(value["tasks"]["t1"]["review_history"]), 2)
         self.assertEqual(gate.manifest_problems(value, value["head"], value["tree_fingerprint"]), [])
         self.ok("task-risk", "--task", "t1", "--risk", "high")
         value = self.data()

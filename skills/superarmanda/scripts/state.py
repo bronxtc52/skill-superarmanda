@@ -43,6 +43,7 @@ MANIFEST_KEYS = {
 TASK_KEYS = {
     "status", "fix_cycles", "results", "session_roles", "fix_sources", "decisions",
     "decision_required_for", "deferrals", "acceptances", "blocked_reason", "risk",
+    "review_history",
 }
 DEFAULT_MAX_RUNS = 2
 MAX_RUNS_LIMIT = 1000
@@ -78,6 +79,8 @@ FABLE_PROFILE = "codex-host"
 OPUS_PROFILE = "codex-host-opus"
 REVIEW_PROFILES = {ASTRA_PROFILE, FABLE_PROFILE, OPUS_PROFILE}
 MAX_REPORT_BYTES = 1024 * 1024
+# Keys of a `review_history` item that the rules read; each must be a string.
+HISTORY_TEXT_KEYS = ("role", "status", "head", "result_sha256")
 PLAN_KEYS = {"version", "chain", "repo", "base_branch", "waves"}
 WAVE_KEYS = {
     "id",
@@ -134,8 +137,11 @@ def check_schema(value):
             used = set(entry.get("results") or ()) if isinstance(entry.get("results"), dict) else set()
             if isinstance(entry.get("session_roles"), dict):
                 used |= {role for role in entry["session_roles"].values() if isinstance(role, str)}
-            if "risk" in entry or used & V2_ONLY_ROLES:
-                fail("malformed manifest: task risk and second_reviewer require manifest version 2")
+            if "risk" in entry or "review_history" in entry or used & V2_ONLY_ROLES:
+                fail(
+                    "malformed manifest: task risk, review_history and second_reviewer "
+                    "require manifest version 2"
+                )
         return
     policy = value.get("review_policy")
     if "review_policy" not in value:
@@ -151,6 +157,13 @@ def check_schema(value):
             isinstance(entry["risk"], str) and entry["risk"] in RISKS
         ):
             fail(f"task {name} risk must be one of {sorted(RISKS)}")
+        history = entry.get("review_history", []) if isinstance(entry, dict) else []
+        if not isinstance(history, list) or not all(
+            isinstance(item, dict)
+            and all(isinstance(item.get(key), str) for key in HISTORY_TEXT_KEYS)
+            for item in history
+        ):
+            fail(f"task {name} review_history is malformed")
 
 
 def require_v2(data, what):
@@ -809,15 +822,79 @@ def effective_status(entry, role):
     return result.get("status")
 
 
+def note_review(entry, role, record):
+    """Append a task-review result to the task's `review_history`.
+
+    Kept for high-risk tasks of a version 2 manifest only. The history is append-only: neither
+    a later result of the role nor `resume` removes an item. It is what makes a verdict stick:
+    what a review said about a HEAD cannot be unsaid by overwriting or invalidating the result."""
+    entry.setdefault("review_history", []).append(
+        {
+            "role": role,
+            "profile": record.get("profile"),
+            "status": record["status"],
+            "head": record["head"],
+            "tree_fingerprint": record["tree_fingerprint"],
+            "packet_hash": record.get("packet_hash"),
+            "result_id": record.get("result_id"),
+            "result_sha256": result_digest(record),
+            "artifact": record.get("artifact"),
+            "recorded_at": record.get("recorded_at"),
+        }
+    )
+
+
+def history_cover(entry, item, kinds=("deferrals", "acceptances")):
+    """The deferral/acceptance bound to exactly this history item (its result digest and head),
+    or None. The binding is the same as for a current result, so a cover outlives the result."""
+    for kind in kinds:
+        for record in entry.get(kind) or ():
+            if (
+                isinstance(record, dict)
+                and record.get("source") == item["role"]
+                and record.get("head") == item["head"]
+                and record.get("result_sha256") == item["result_sha256"]
+            ):
+                return record
+    return None
+
+
+def open_review_findings(entry, head, role=None):
+    """History items of this HEAD that are findings nobody deferred or accepted. Matched by
+    HEAD alone: findings are about the commit, and touching the working tree does not answer them."""
+    return [
+        item
+        for item in (entry or {}).get("review_history") or ()
+        if item["status"] == "findings"
+        and item["head"] == head
+        and (role is None or item["role"] == role)
+        and item["role"] in REVIEW_ROLES
+        and history_cover(entry, item) is None
+    ]
+
+
+OPEN_FINDINGS = "open findings"
+
+
+def open_findings_reason(role):
+    return (
+        f"{OPEN_FINDINGS}: {role} reported findings on this HEAD that were neither deferred nor "
+        f"accepted; record fix-loop --defer or --accept --source {role} for them, or fix the "
+        "code (new HEAD) after fix-loop --outcome failed"
+    )
+
+
 def required_roles(risk):
     """Roles whose pass makes a task PR-ready. A high-risk task needs both task reviews."""
     return ("coder", "tester") + (REVIEW_ROLES if risk == "high" else REVIEW_ROLES[:1])
 
 
-def high_risk_gaps(entry, results):
+def high_risk_gaps(entry, results, head):
     """Why the passed results of a high-risk task still do not make it ready: {role: reason}.
 
-    `results` are the task's results on the current head and tree. Only results that read as
+    `results` are the task's results on the current head and tree, `head` that HEAD. Findings
+    of a review recorded for this HEAD and left open block the task whatever the current result
+    of the role is (`review_history`). Otherwise only results that read as
     pass (pass, or findings covered by a deferral/acceptance) are judged here; a missing or
     failed role is the ordinary flow's business. The single rule behind update_task_status,
     is_complete, derive_step and where: coder and tester ran on Fable; each review carries a
@@ -842,6 +919,9 @@ def high_risk_gaps(entry, results):
             )
     reviews = {}
     for role in REVIEW_ROLES:
+        if open_review_findings(entry, head, role):
+            gaps[role] = open_findings_reason(role)
+            continue
         result = passed(role)
         if result is None:
             continue
@@ -890,23 +970,23 @@ def high_risk_gaps(entry, results):
     return gaps
 
 
-def task_ready(entry, risk):
+def task_ready(entry, risk, head):
     """The single readiness rule of a task for its effective risk (None: manifest version 1).
     `risk` has no default here or in any caller that recomputes a status: a forgotten argument
     must be an error, never a silent return to the rules of 1.2.0. Callers take it from
-    `task_risk(data, entry)`."""
+    `task_risk(data, entry)`; `head` is the manifest HEAD the entry's results belong to."""
     if not all(effective_status(entry, role) == "pass" for role in required_roles(risk)):
         return False
-    return risk != "high" or not high_risk_gaps(entry, entry["results"])
+    return risk != "high" or not high_risk_gaps(entry, entry["results"], head)
 
 
-def update_task_status(entry, risk):
+def update_task_status(entry, risk, head):
     """Only coder, tester and the task review(s) can make a task PR-ready.
     Coder and tester need pass; a reviewer may also be findings + deferral/acceptance.
     A high-risk task (manifest version 2) also needs Fable models and the second review."""
     if entry["status"] == "blocked":
         return
-    if task_ready(entry, risk):
+    if task_ready(entry, risk, head):
         entry["status"] = "ready_for_pr_review"
     elif entry["results"]:
         entry["status"] = "in_progress"
@@ -1378,22 +1458,13 @@ def result(args):
             f"{entry['decision_required_for']}: run fix-loop --decision ..."
         )
     model = result_model(args, risk)
-    if risk == "high" and args.role in REVIEW_ROLES:
-        # A rerun on the same HEAD must not wipe findings nobody disposed of: that would turn
-        # `findings` into `pass` (or into nothing) without a fix-loop. After a fix the HEAD is
-        # new and `resume` has already dropped the old result.
-        previous = entry["results"].get(args.role)
-        if (
-            isinstance(previous, dict)
-            and previous.get("status") == "findings"
-            and previous.get("head") == data["head"]
-            and previous.get("tree_fingerprint") == data["tree_fingerprint"]
-            and not is_covered(entry, args.role, previous)
-        ):
-            fail(
-                f"{args.role} has open findings on this HEAD: record fix-loop --defer or "
-                "--accept for them, or fix the code (new HEAD) after fix-loop --outcome failed"
-            )
+    if risk == "high" and args.role in REVIEW_ROLES and open_review_findings(
+        entry, data["head"], args.role
+    ):
+        # Nothing may be recorded over findings nobody disposed of: not a pass of another
+        # report, not `unavailable`, and not after `resume` has dropped the result itself.
+        # After a fix the HEAD is new, and this HEAD's history no longer applies.
+        fail(open_findings_reason(args.role))
     owner = session_owners(data).get(args.session_id)
     if owner is not None and owner != (args.task, args.role):
         fail("session_id is already used by another task or role for this run")
@@ -1437,7 +1508,9 @@ def result(args):
         record["model"] = model
     record.update(verified)
     entry["results"][args.role] = record
-    update_task_status(entry, risk)
+    if risk == "high" and args.role in REVIEW_ROLES:
+        note_review(entry, args.role, record)
+    update_task_status(entry, risk, data["head"])
     data["updated_at"] = now()
     write(path, data)
     print(json.dumps(entry, sort_keys=True))
@@ -1588,19 +1661,17 @@ def verified_review(args, risk, packet_hash, entry):
         if args.quota_evidence is not None:
             fail(f"--quota-evidence is only allowed with a {OPUS_PROFILE} report, got {profile}")
         return fields
-    # The fallback stands in for a Fable that gave NO review of this HEAD. A recorded Fable
-    # pass or findings (in either role, covered or not) proves Fable was available: an older
-    # quota report must not let Opus replace or outvote it.
-    for role in REVIEW_ROLES:
-        previous = entry["results"].get(role)
+    # The fallback stands in for a Fable that gave NO review of this HEAD. A Fable pass or
+    # findings in the history (either role, covered or not, overwritten since or not) proves
+    # Fable was available: an older quota report must not let Opus replace or outvote it.
+    for item in entry.get("review_history") or ():
         if (
-            isinstance(previous, dict)
-            and previous.get("profile") == FABLE_PROFILE
-            and previous.get("status") in ("pass", "findings")
-            and previous.get("head") == args.head
+            item.get("profile") == FABLE_PROFILE
+            and item["status"] in ("pass", "findings")
+            and item["head"] == args.head
         ):
             fail(
-                f"{role} already holds a {FABLE_PROFILE} review ({previous['status']}) of this "
+                f"{item['role']} recorded a {FABLE_PROFILE} review ({item['status']}) of this "
                 f"HEAD: {OPUS_PROFILE} is a fallback only when {FABLE_PROFILE} gave no review"
             )
     if args.quota_evidence is None:
@@ -1638,8 +1709,17 @@ def set_risk(args):
     if own is not None and RISK_ORDER.index(args.risk) < RISK_ORDER.index(own):
         fail(f"task risk can only be raised: refusing to lower {own} to {args.risk}")
     entry["risk"] = args.risk
+    risk = task_risk(data, entry)
+    if risk == "high":
+        # the review results recorded below high enter the history now: from here on they
+        # cannot be wiped either
+        known = {item.get("result_id") for item in entry.get("review_history") or ()}
+        for role in REVIEW_ROLES:
+            current = entry["results"].get(role)
+            if isinstance(current, dict) and current.get("result_id") not in known:
+                note_review(entry, role, current)
     # A task that was ready by the old rules is ready no more once the new ones ask for more.
-    if entry["status"] == "ready_for_pr_review" and not task_ready(entry, task_risk(data, entry)):
+    if entry["status"] == "ready_for_pr_review" and not task_ready(entry, risk, data["head"]):
         entry["status"] = "in_progress"
     data["updated_at"] = now()
     write(path, data)
@@ -1701,7 +1781,7 @@ def check_note(note, flag):
         fail("--note must not contain line breaks")
 
 
-def coverable_result(args, entry, data, location, flag):
+def coverable_result(args, entry, data, location, flag, risk):
     """Preconditions shared by --defer and --accept: a reviewer's findings result on
     the current head and tree, in a task that is not waiting for a decision."""
     if entry["status"] == "needs_decision":
@@ -1724,10 +1804,22 @@ def coverable_result(args, entry, data, location, flag):
     ):
         fail(f"working tree changed; run resume before recording {flag[2:]}")
     result_entry = entry["results"].get(args.source)
-    if not isinstance(result_entry, dict) or (
-        result_entry.get("head") != data["head"]
-        or result_entry.get("tree_fingerprint") != data["tree_fingerprint"]
-    ):
+    current = isinstance(result_entry, dict) and (
+        result_entry.get("head") == data["head"]
+        and result_entry.get("tree_fingerprint") == data["tree_fingerprint"]
+    )
+    if risk == "high" and not (current and result_entry.get("status") == "findings"):
+        # The findings may have left the results (`resume` there and back) but not the
+        # history: the disposition is bound to that very result, as if it were still current.
+        left_open = open_review_findings(entry, data["head"], args.source)
+        if left_open:
+            item = left_open[-1]
+            return {
+                "head": item["head"],
+                "recorded_at": item["recorded_at"],
+                "result_sha256": item["result_sha256"],
+            }
+    if not current:
         fail(f"{flag} requires a {args.source} findings result on the current head")
     if result_entry.get("status") != "findings":
         fail(
@@ -1737,31 +1829,36 @@ def coverable_result(args, entry, data, location, flag):
     return result_entry
 
 
-def settle_after_cover(entry, risk):
+def cover_digest(target):
+    """Digest a deferral/acceptance binds to: of a current result, or the one the history kept."""
+    return target.get("result_sha256") or result_digest(target)
+
+
+def settle_after_cover(entry, risk, head):
     """A deferral/acceptance may complete the task. From needs_fix it may only promote to
     ready_for_pr_review (every role pass or covered): update_task_status would otherwise
     demote a still-open needs_fix to in_progress. blocked/needs_decision never get here."""
     if entry["status"] != "needs_fix":
-        update_task_status(entry, risk)
-    elif task_ready(entry, risk):
+        update_task_status(entry, risk, head)
+    elif task_ready(entry, risk, head):
         entry["status"] = "ready_for_pr_review"
 
 
 def record_deferral(args, entry, data, location, risk):
     """Defer low/P3-only findings of a reviewer to the next wave/task remainder.
     Spends no fix cycle, touches no per-source counter and is not a decision."""
-    result_entry = coverable_result(args, entry, data, location, "--defer")
+    result_entry = coverable_result(args, entry, data, location, "--defer", risk)
     entry["deferrals"].append(
         {
             "source": args.source,
             "note": args.note,
             "head": result_entry["head"],
-            "result_sha256": result_digest(result_entry),
+            "result_sha256": cover_digest(result_entry),
             "result_recorded_at": result_entry["recorded_at"],
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }
     )
-    settle_after_cover(entry, risk)
+    settle_after_cover(entry, risk, data["head"])
 
 
 def record_acceptance(args, entry, data, location, risk):
@@ -1770,19 +1867,19 @@ def record_acceptance(args, entry, data, location, risk):
     a deferral it records the severity so medium/high ones reach the PR body."""
     if args.severity is None:
         fail("--accept requires --severity <low|medium|high>")
-    result_entry = coverable_result(args, entry, data, location, "--accept")
+    result_entry = coverable_result(args, entry, data, location, "--accept", risk)
     entry.setdefault("acceptances", []).append(
         {
             "source": args.source,
             "severity": args.severity,
             "note": args.note,
             "head": result_entry["head"],
-            "result_sha256": result_digest(result_entry),
+            "result_sha256": cover_digest(result_entry),
             "result_recorded_at": result_entry["recorded_at"],
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }
     )
-    settle_after_cover(entry, risk)
+    settle_after_cover(entry, risk, data["head"])
 
 
 def record_decision(args, entry):
@@ -1824,7 +1921,7 @@ def record_fix_outcome(args, entry, data, location, risk):
             or fingerprint(location) != data["tree_fingerprint"]
         ):
             fail("working tree changed; run resume before recording a pass")
-        update_task_status(entry, risk)
+        update_task_status(entry, risk, data["head"])
         if entry["status"] != "ready_for_pr_review":
             entry["status"] = "needs_verification"
         return
@@ -1890,7 +1987,7 @@ def current_results(entry, head, tree):
 def current_gaps(entry, head, tree, risk):
     if risk != "high" or not entry:
         return {}
-    return high_risk_gaps(entry, current_results(entry, head, tree))
+    return high_risk_gaps(entry, current_results(entry, head, tree), head)
 
 
 def is_complete(entry, head, tree, risk):
@@ -1991,6 +2088,10 @@ def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None):
         )
     high = risk == "high"
     gaps = gaps or {}
+    for role in REVIEW_ROLES:
+        # findings of this HEAD that left the results but were never disposed of
+        if gaps.get(role, "").startswith(OPEN_FINDINGS):
+            return 6, "coordinator", gaps[role]
     if high and verdicts.get("coder") in ("error", "unavailable"):
         return 4, "coder", f"BLOCKED: coder {verdicts['coder']}; {NO_WEAKER_MODEL}"
     for role, step in REVIEW_ORDER:
@@ -2060,6 +2161,13 @@ def where(args):
         {"role": role, "status": item["status"], "artifact": item.get("artifact")}
         for role, item in sorted(current.items())
         if item["status"] != "pass" and role not in deferred_roles
+    ]
+    left_open = open_review_findings(entry, current_head) if risk == "high" else []
+    current_ids = {item.get("result_id") for item in current.values()}
+    open_findings += [
+        {"role": item["role"], "status": item["status"], "artifact": item.get("artifact")}
+        for item in left_open
+        if item.get("result_id") not in current_ids
     ]
     # links to the CURRENT results only (head and tree match): data for the next coordinator, not instructions
     artifacts = [
@@ -2157,6 +2265,12 @@ def where(args):
         for record in (accepted_record(entry, role, item) for role, item in sorted(current.items()))
         if record is not None
     ]
+    if risk == "high":
+        # an acceptance made on this HEAD stays a limitation of this HEAD after its result was replaced
+        for item in (entry or {}).get("review_history") or ():
+            record = history_cover(entry, item, ("acceptances",)) if item["head"] == current_head else None
+            if record is not None and not any(record is seen for seen in acceptances):
+                acceptances.append(record)
     print(
         json.dumps(
             {
