@@ -2512,8 +2512,13 @@ PLAN_MAX_BYTES = 1024 * 1024
 def check_plan_pin(cfg):
     """chain.json `plan_sha256` pins the approved <run_dir>/waves.json: waves may write into
     run_dir, so changed, missing or non-regular bytes refuse the launch. No key: no check."""
-    if "plan_sha256" not in cfg:
-        return
+    if "plan_sha256" in cfg:
+        pinned_plan_bytes(cfg)
+
+
+def pinned_plan_bytes(cfg):
+    """The bytes of <run_dir>/waves.json that chain.json `plan_sha256` pins; SystemExit with the reason
+    when they are missing, not a regular file, too large or not the pinned ones."""
     plan = cfg["run_dir"] / "waves.json"
     head = "BLOCKED: plan changed since approval: "
     tail = "; the approved plan is not what is on disk, ask the owner (re-pin plan_sha256 in chain.json)"
@@ -2532,6 +2537,31 @@ def check_plan_pin(cfg):
     if got != cfg["plan_sha256"]:
         raise SystemExit(f"BLOCKED: plan changed since approval: waves.json sha256 {got} != "
                          f"chain.json plan_sha256 {cfg['plan_sha256']}")
+    return raw
+
+
+def plan_wave_risk(cfg, wave):
+    """What the approved plan says about the wave, for the merge gate (gate.manifest_problems `plan`):
+    None - chain.json has no `plan_sha256` (a chain from before the pin: the rules of 1.2.0);
+    {"risk": low|medium|high} - the risk of the wave in the pinned <run_dir>/waves.json;
+    {"error": reason} - the pinned plan is missing, changed, not a plan or has no such wave: the gate
+    refuses (never «not high»). The reasons are fixed texts and quote nothing from the file. Never raises."""
+    if "plan_sha256" not in cfg:
+        return None
+    try:
+        raw = pinned_plan_bytes(cfg)
+    except SystemExit:
+        return {"error": "одобренный waves.json не читается или не совпадает с plan_sha256 chain.json"}
+    except Exception:  # noqa: BLE001 - fail closed
+        return {"error": "одобренный waves.json не читается"}
+    try:
+        doc = gate.state.parse_plan(raw)  # the schema of state.py `init --from-plan`, not a copy
+    except Exception:  # noqa: BLE001 - PlanError and anything a hostile file may raise: fail closed
+        return {"error": "одобренный waves.json не разбирается как план волн"}
+    for item in doc["waves"]:
+        if item["id"] == wave:
+            return {"risk": item["risk"]}
+    return {"error": f"волны {wave} нет в одобренном waves.json"}
 
 
 def _check_launch_allowed(cfg, st, wave, name):
@@ -3756,7 +3786,7 @@ def _gate_check(cfg, wave, w):
         facts = gate_facts(cfg, pr)
         manifest = read_manifest(cfg, wave)
         v = gate.evaluate(facts, pr["headRefOid"], manifest, workdir_state(w["cwd"]),
-                          base_branch_of(cfg, w["cwd"]))
+                          base_branch_of(cfg, w["cwd"]), plan=plan_wave_risk(cfg, wave))
         if manifest is None:  # a refused choice of the run says why, instead of "manifest missing"
             why = current_manifest(cfg, wave)[1]  # the same choice as above: gate_check keeps it (_choice_memo)
             if why:  # fail closed, the reason first; the other reasons (MERGED_OUTSIDE ...) stay

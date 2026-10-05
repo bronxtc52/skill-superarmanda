@@ -5305,6 +5305,262 @@ class W2StateRules(PolicyBase):
         self.assertEqual(entry["status"], "ready_for_pr_review")
 
 
+HIGH_WAVE = {"risk": "high"}
+MEDIUM_WAVE = {"risk": "medium"}
+
+
+class W2GateRules(PolicyBase):
+    """1.2.2 (W2, #86 п.1): the merge gate judges a manifest by the risk of the WAVE (from the approved
+    plan, given as `plan`) and recomputes readiness by the functions of state.py. The manifests are made
+    by state.py and review.py; a hand edit is a documented lowering of the rules."""
+
+    def setUp(self):
+        super().setUp()
+        self.gate = _load("superarmanda_gate_for_w2", GATE)
+
+    def problems(self, plan=None, value=None):
+        value = self.data() if value is None else value
+        args = (value, value["head"], value["tree_fingerprint"])
+        return self.gate.manifest_problems(*args) if plan is None else self.gate.manifest_problems(*args, plan=plan)
+
+    def assert_reason(self, problems, *needles):
+        self.assertTrue(any(all(n in p for n in needles) for p in problems), f"{needles} not in {problems}")
+
+    def opus_report(self):
+        return self.edited(self.report("codex-host-opus"), session_id="opus-review-session")
+
+    def two_reviews(self, task=None):
+        self.record("coder", model="fable", task=task)
+        self.record("tester", model="fable", task=task)
+        self.record("cross_provider_reviewer", task=task, **self.review_flags(self.report("claude-host")))
+        return self.record("second_reviewer", task=task, **self.review_flags(self.report("codex-host")))
+
+    def forge(self, edit):
+        """A hand edit of the manifest (what state.py would never write)."""
+        value = self.data()
+        edit(value)
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        return value
+
+    # ----- acceptance 2 -----
+    def test_high_wave_passes_with_astra_and_fable_on_head_for_every_task(self):
+        self.two_reviews()
+        entry = self.two_reviews(task="t2")
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(self.problems(HIGH_WAVE), [])
+        v = self.gate.evaluate(self.green_facts(), self.head(), self.data(), self.work(), "main", plan=HIGH_WAVE)
+        self.assertEqual((v["verdict"], v["reasons"]), ("pass", []))
+
+    def green_facts(self):
+        bot = {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+        return {"pr": {"state": "open", "merged": False, "draft": False, "head": self.head(), "base": "main"},
+                "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}],
+                "reviews": [{"user": bot, "commit_id": self.head(), "state": "COMMENTED"}],
+                "review_comments": [], "issue_comments": [], "resolved": {}, "threads": []}
+
+    def work(self):
+        return {"clean": True, "head": self.head(), "fingerprint": self.data()["tree_fingerprint"]}
+
+    def test_high_wave_passes_with_the_counted_opus_route(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        quota = self.report("codex-host", "quota_failure")
+        opus = self.opus_report()
+        entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(self.problems(HIGH_WAVE), [])
+        good = self.data()
+        # the same Opus without the evidence
+        bare = copy.deepcopy(good)
+        for key in ("quota_evidence", "fallback_for"):
+            del bare["tasks"]["t1"]["results"]["second_reviewer"][key]
+        self.assert_reason(self.problems(HIGH_WAVE, bare), "t1", "second_reviewer", "quota evidence")
+        # the same Opus on another HEAD: after a new commit its result is not a review of this HEAD
+        old = good["tasks"]["t1"]["results"]["second_reviewer"]
+        self.change("after opus\n")
+        self.resume()
+        self.packet()
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        stale = self.forge(lambda v: (v["tasks"]["t1"]["results"].__setitem__("second_reviewer", old),
+                                      v["tasks"]["t1"].__setitem__("status", "ready_for_pr_review")))
+        problems = self.problems(HIGH_WAVE, stale)
+        self.assert_reason(problems, "t1", "нет second_reviewer на HEAD PR")
+        v = self.gate.evaluate(self.green_facts(), self.head(), stale, self.work(), "main", plan=HIGH_WAVE)
+        self.assertEqual(v["verdict"], "fail")
+
+    # ----- acceptance 3 -----
+    def test_high_wave_refuses_a_version_1_manifest_and_names_the_new_run(self):
+        live = LiveVersion1Manifests.load_live(self, "v1-high-waves-gate-redact-W1.json")
+        self.assertEqual(live["version"], 1)
+        self.assertEqual(self.problems(None, live), [])  # a chain without the pin: the rules of 1.2.0
+        self.assertEqual(self.problems(MEDIUM_WAVE, live), [])
+        problems = self.problems(HIGH_WAVE, live)
+        self.assert_reason(problems, "manifest version 1", "новый прогон волны", "state.py init",
+                           "на текущей версии скилла")
+
+    def test_high_wave_refuses_one_astra_review_and_names_the_action(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        self.assertEqual(self.entry()["status"], "in_progress")
+        problems = self.problems(HIGH_WAVE)
+        self.assert_reason(problems, "t1", "нет second_reviewer на HEAD PR", "task-result --role second_reviewer",
+                           "codex-host")
+
+    def test_high_wave_judges_every_task_as_high_whatever_its_own_risk(self):
+        """Two tasks; the run's level was lowered to medium, t1 raised back to high with two reviews,
+        t2 left medium with one Astra: state.py calls both ready, the gate of a high wave does not."""
+        self.init(risk="medium")
+        self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.two_reviews()
+        self.record("coder", task="t2")
+        self.record("tester", task="t2")
+        entry = self.record("cross_provider_reviewer", task="t2", reviewed_head=self.head(),
+                            packet_hash=self.packet_hash, artifact="astra-report")
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual((self.data()["review_policy"]["level"], entry.get("risk", "medium")), ("medium", "medium"))
+        self.assertEqual(self.problems(MEDIUM_WAVE), [])  # by its own rules the manifest is fine
+        problems = self.problems(HIGH_WAVE)
+        self.assert_reason(problems, "review_policy.level", "medium", "занижен", "новый прогон волны")
+        self.assert_reason(problems, "t2", "нет second_reviewer на HEAD PR", "волна high")
+        self.assertFalse(any("t1" in p for p in problems), problems)
+
+    # ----- acceptance 5 -----
+    def test_medium_wave_refuses_a_high_task_with_one_astra_review(self):
+        self.init(risk="medium")
+        self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        # the saved status says ready (a hand edit): the gate recomputes
+        forged = self.forge(lambda v: v["tasks"]["t1"].__setitem__("status", "ready_for_pr_review"))
+        for plan in (MEDIUM_WAVE, None):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan, forged)
+                self.assert_reason(problems, "t1", "нет second_reviewer на HEAD PR", "задача high",
+                                   "task-result --role second_reviewer")
+                self.assert_reason(problems, "t1", "не подтверждён пересчётом")
+        # with the second review it passes
+        self.review("second_reviewer", "codex-host")
+        self.assertEqual(self.problems(MEDIUM_WAVE), [])
+
+    def test_medium_wave_refuses_a_version_1_manifest_with_a_high_task(self):
+        """The mandate: version 1 has no task risk; one that carries `risk: high` is a lowered version 2."""
+        live = LiveVersion1Manifests.load_live(self, "v1-medium-waves-tails-W2.json")
+        self.assertEqual(self.problems(MEDIUM_WAVE, live), [])
+        live["tasks"][self.TASK]["risk"] = "high"
+        for plan in (MEDIUM_WAVE, None):
+            with self.subTest(plan=plan):
+                self.assert_reason(self.problems(plan, live), "manifest version 1", "risk",
+                                   "новый прогон волны", "state.py init")
+
+    # ----- the remainder of W1 -----
+    def test_needs_fix_with_accept_limitation_does_not_skip_the_second_review(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "codex-host", "findings", status="findings")
+        for _ in range(2):
+            self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "cross_provider_reviewer")
+        decided = self.ok("fix-loop", "--task", "t1", "--decision", "accept_limitation", "--note", "accepted")
+        self.assertEqual(decided["status"], "needs_fix")
+        self.assertNotIn("second_reviewer", decided["results"])
+        for plan in (HIGH_WAVE, None):
+            with self.subTest(plan=plan):
+                self.assert_reason(self.problems(plan), "t1", "нет second_reviewer на HEAD PR")
+
+    def test_gate_does_not_trust_the_saved_status(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        forged = self.forge(lambda v: v["tasks"]["t1"].__setitem__("status", "ready_for_pr_review"))
+        for plan in (HIGH_WAVE, None):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan, forged)
+                self.assert_reason(problems, "t1", "не подтверждён пересчётом")
+                self.assert_reason(problems, "t1", "нет second_reviewer на HEAD PR")
+        # models: a coder that did not run on Fable is caught by the same rules of state.py
+        self.init()
+        self.two_reviews()
+        weak = self.forge(lambda v: v["tasks"]["t1"]["results"]["coder"].__setitem__("model", SONNET))
+        self.assert_reason(self.problems(HIGH_WAVE, weak), "t1", "coder", FABLE)
+
+    def test_gate_catches_a_manifest_lowered_from_version_2_to_1(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+
+        def lower(value):
+            value["version"] = 1
+            del value["review_policy"]
+            value["tasks"]["t1"]["status"] = "ready_for_pr_review"
+        lowered = self.forge(lower)
+        for plan in (HIGH_WAVE, MEDIUM_WAVE, None):
+            with self.subTest(plan=plan):
+                self.assert_reason(self.problems(plan, lowered), "manifest version 1 несёт записи версии 2",
+                                   "review_history", "новый прогон волны")
+        # the history removed too: the model and the report fields of the results still tell
+        def strip(value):
+            del value["tasks"]["t1"]["review_history"]
+        stripped = self.forge(strip)
+        self.assert_reason(self.problems(MEDIUM_WAVE, stripped), "manifest version 1 несёт записи версии 2",
+                           "t1.coder.model")
+        # a version the gate does not know is never judged
+        self.assert_reason(self.problems(MEDIUM_WAVE, dict(stripped, version=3)), "неизвестная версия")
+        # version 2 that lost its policy: the schema check of state.py refuses it
+        self.init()
+        self.two_reviews()
+        value = self.data()
+        del value["review_policy"]
+        self.assert_reason(self.problems(HIGH_WAVE, value), "manifest", "review_policy")
+
+    def test_gate_reads_review_history(self):
+        # Opus -> Fable -> Astra on one HEAD, the status forged to ready: the history says Fable reviewed it
+        self.code_and_test()
+        quota = self.report("codex-host", "quota_failure")
+        self.record("second_reviewer", **self.review_flags(self.opus_report(), quota_evidence=str(quota)))
+        self.review("cross_provider_reviewer", "codex-host")
+        self.review("cross_provider_reviewer", "claude-host")
+        forged = self.forge(lambda v: v["tasks"]["t1"].__setitem__("status", "ready_for_pr_review"))
+        self.assert_reason(self.problems(HIGH_WAVE, forged), "t1", "second_reviewer", "codex-host reviewed this HEAD")
+        # findings of Fable turned into a pass by hand: the history still holds them
+        self.init()
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        self.review("second_reviewer", "codex-host", "findings", status="findings")
+
+        def flip(value):
+            value["tasks"]["t1"]["results"]["second_reviewer"]["status"] = "pass"
+            value["tasks"]["t1"]["status"] = "ready_for_pr_review"
+        flipped = self.forge(flip)
+        problems = self.problems(HIGH_WAVE, flipped)
+        self.assert_reason(problems, "t1", "second_reviewer", "open findings")
+        self.assert_reason(problems, "t1", "second_reviewer", "review_history")
+
+    def test_unreadable_plan_is_a_closed_refusal_never_not_high(self):
+        self.two_reviews()
+        for plan in ({"error": "waves.json не совпадает с plan_sha256 chain.json"}, {"risk": "extreme"}, {}, "high"):
+            with self.subTest(plan=plan):
+                value = self.data()
+                problems = self.gate.manifest_problems(value, value["head"], value["tree_fingerprint"], plan=plan)
+                if plan == {}:
+                    self.assertEqual(problems, [])  # no pin: {} is the same as None
+                else:
+                    self.assert_reason(problems, "план волн")
+        v = self.gate.evaluate(self.green_facts(), self.head(), self.data(), self.work(), "main",
+                               plan={"error": "волны W9 нет в waves.json"})
+        self.assertEqual(v["verdict"], "fail")
+        self.assert_reason(v["reasons"], "план волн", "W9")
+
+    def test_medium_task_with_a_second_reviewer_that_gave_no_review_passes_the_gate(self):
+        """The same rule as state.py derive_step: below high the second review is optional."""
+        for status in ("unavailable", "error", "incomplete"):
+            with self.subTest(status=status):
+                self.init(risk="medium")
+                self.record("coder")
+                self.record("tester")
+                self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+                self.record("second_reviewer", status)
+                self.assertEqual(self.problems(MEDIUM_WAVE), [])
+        self.record("second_reviewer", "findings")
+        self.assert_reason(self.problems(MEDIUM_WAVE), "t1", "second_reviewer findings")
+
+
 class LiveVersion1Manifests(PolicyBase):
     """Manifests of finished chains (tests/fixtures/manifests/README.md) keep the rules of 1.2.0."""
 

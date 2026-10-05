@@ -16204,6 +16204,78 @@ class W2SafeText(Base):
 
 
 
+def plan_wave(wave_id, risk="medium", depends_on=()):
+    """One wave of a waves.json as state.py parse_plan accepts it (the schema of phase A)."""
+    return {"id": wave_id, "title": f"wave {wave_id}", "goal": "goal", "requirements": "requirements",
+            "acceptance": ["accepted"], "risk": risk, "checks": [{"name": "tests", "cmd": "true"}],
+            "depends_on": list(depends_on)}
+
+
+def plan_bytes(*waves):
+    doc = {"version": 1, "chain": CHAIN, "repo": "o/r", "base_branch": "main", "waves": list(waves)}
+    return (json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+class W2WaveRisk(GateBase):
+    """1.2.2 (W2, #86 п.1): the gate takes the risk of the wave from the approved waves.json pinned by
+    chain.json plan_sha256; a pinned plan that cannot be read is a closed refusal, never «not high»."""
+
+    def pinned(self, raw, write=True, pin=None, **chain):
+        cfg = self.start(plan_sha256=pin or hashlib.sha256(raw).hexdigest(), **chain)
+        if write:
+            (cfg["run_dir"] / "waves.json").write_bytes(raw)
+        return cfg
+
+    def test_chain_without_the_pin_has_no_plan_and_keeps_the_rules_of_1_2_0(self):
+        cfg = self.start()
+        self.assertIsNone(wab.plan_wave_risk(cfg, "W1"))
+        self.assertEqual(wab.gate_check(cfg, "W1", self.rec())["verdict"], "pass")
+
+    def test_risk_of_the_wave_comes_from_the_pinned_plan(self):
+        cfg = self.pinned(plan_bytes(plan_wave("W1", "high"), plan_wave("W2", "medium", ["W1"])))
+        self.assertEqual(wab.plan_wave_risk(cfg, "W1"), {"risk": "high"})
+        self.assertEqual(wab.plan_wave_risk(cfg, "W2"), {"risk": "medium"})
+
+    def test_gate_of_a_high_wave_refuses_the_manifest_of_the_old_rules_and_never_merges(self):
+        cfg = self.pinned(plan_bytes(plan_wave("W1", "high"), plan_wave("W2", "medium", ["W1"])))
+        v = wab.gate_check(cfg, "W1", self.rec())
+        self.assertEqual(v["verdict"], "fail")
+        self.assertTrue(any("волна high" in r and "новый прогон волны" in r and "state.py init" in r
+                            for r in v["reasons"]), v["reasons"])
+        self.assertTrue(self.tick())
+        self.assertEqual(self.merges(), [])
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate:"), self.status())
+        self.assertIn("новый прогон волны", self.status())
+
+    def test_gate_of_a_medium_wave_passes_the_same_manifest(self):
+        cfg = self.pinned(plan_bytes(plan_wave("W1", "medium"), plan_wave("W2", "high", ["W1"])))
+        self.assertEqual(wab.gate_check(cfg, "W1", self.rec())["verdict"], "pass")
+        self.merge_it()
+
+    def test_pinned_plan_that_cannot_be_read_is_a_closed_refusal(self):
+        good = plan_bytes(plan_wave("W1", "low"), plan_wave("W2", "low", ["W1"]))
+        secret = b'{"waves": [], "token": "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB"}\n'
+        cases = {
+            "missing": dict(raw=good, write=False),
+            "changed": dict(raw=good.replace(b'"low"', b'"medium"'), pin=hashlib.sha256(good).hexdigest()),
+            "not a plan": dict(raw=secret),
+            "wave absent": dict(raw=plan_bytes(plan_wave("W2", "low"))),
+        }
+        for label, kw in cases.items():
+            with self.subTest(case=label):
+                cfg = self.pinned(**kw)
+                self.addCleanup(lambda: None)
+                plan = wab.plan_wave_risk(cfg, "W1")
+                self.assertEqual(set(plan), {"error"}, plan)
+                self.assertNotIn("ghp_", plan["error"])
+                v = wab.gate_check(cfg, "W1", self.rec())
+                self.assertEqual(v["verdict"], "fail")
+                self.assertTrue(any(r.startswith("план волн:") for r in v["reasons"]), v["reasons"])
+                (cfg["run_dir"] / "waves.json").unlink(missing_ok=True)
+        cfg = self.pinned(raw=plan_bytes(plan_wave("W2", "low")))
+        self.assertIn("W1", wab.plan_wave_risk(cfg, "W1")["error"])
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
