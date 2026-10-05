@@ -881,9 +881,9 @@ def process_table():
     except subprocess.TimeoutExpired as e:
         raise ProcFactsError(f"ps: timeout after {PS_TIMEOUT} s") from e
     except (OSError, subprocess.SubprocessError) as e:
-        raise ProcFactsError(f"ps: {type(e).__name__}: {e}"[:150]) from e
+        raise ProcFactsError(_masked_line(f"ps: {type(e).__name__}: {e}", 150)) from e
     if r.returncode != 0:
-        raise ProcFactsError(f"ps: exit {r.returncode}: {(r.stderr or '').strip()[:100]}")
+        raise ProcFactsError(f"ps: exit {r.returncode}: {_masked_line(r.stderr or '', 100)}")
     table = {}
     for line in (r.stdout or "").splitlines():
         if not line.strip():
@@ -894,7 +894,7 @@ def process_table():
                 raise ValueError(line)
             pid, ppid, age = int(parts[0]), int(parts[1]), _etime_seconds(parts[2])
         except ValueError as e:
-            raise ProcFactsError(f"ps: unparsable line {line[:60]!r}") from e
+            raise ProcFactsError(f"ps: unparsable line {_masked_line(line, 60)!r}") from e
         first = parts[3].split(None, 1)[0]
         table[pid] = {"pid": pid, "ppid": ppid, "age": age, "args": parts[3],
                       "name": first.rsplit("/", 1)[-1]}
@@ -911,7 +911,7 @@ def claude_pid(w):
         raise ProcFactsError(f"tmux display-message: {type(e).__name__}") from e
     out = (r.stdout or "").strip()
     if r.returncode != 0 or not out.isdigit():
-        raise ProcFactsError(f"tmux display-message: no pane pid ({out[:30] or 'rc ' + str(r.returncode)})")
+        raise ProcFactsError(f"tmux display-message: no pane pid ({_masked_line(out, 30) or 'rc ' + str(r.returncode)})")
     return int(out)
 
 
@@ -3295,7 +3295,7 @@ def _gh(*args, timeout=GH_TIMEOUT):
     except (OSError, subprocess.SubprocessError) as e:
         raise gate.CollectError(f"gh {args[0]}: {type(e).__name__}")
     if r.returncode != 0:
-        why = (r.stderr or r.stdout or "").strip().replace("\n", " ")[:200] or f"rc={r.returncode}"
+        why = _masked_line(r.stderr or r.stdout or "", 200) or f"rc={r.returncode}"
         raise gate.CollectError(f"gh {' '.join(args[:2])}: {why}")
     return r.stdout
 
@@ -3510,7 +3510,7 @@ def manifest_where_of(path, wave_dir, timeout=WHERE_TIMEOUT):
     except subprocess.TimeoutExpired:
         return {"error": f"state.py where: таймаут {timeout} с"}
     except (OSError, ValueError) as e:
-        return {"error": str(e)[:150]}
+        return {"error": _masked_line(e, 150)}
     except RecursionError:
         return {"error": "state.py where: ответ не разбирается"}
     return result
@@ -3564,6 +3564,14 @@ def _one_line(text, limit=MAX_STATUS):
     if not text[cut].isspace():  # the border is inside a word: drop its beginning too
         cut = text.rfind(" ", 0, cut) if " " in text[:cut] else 0
     return text[:cut].rstrip() + " …"
+
+
+def _resolve_why(out):
+    """Why `resolveReviewThread` left the thread open: the errors of the answer (outside text: masked first,
+    then cut), else the plain fact."""
+    if isinstance(out, dict) and out.get("errors"):
+        return _masked_line(out.get("errors"), 200)
+    return "isResolved is not true"
 
 
 def _masked_line(text, limit):
@@ -3951,7 +3959,7 @@ def owner_merge(cfg, wave, run_id, sha):
         except (KeyError, TypeError):
             pass
         if resolved is not True:  # null, no field, false, errors: the thread is NOT closed
-            why = str(out.get("errors"))[:200] if isinstance(out, dict) and out.get("errors") else "isResolved is not true"
+            why = _resolve_why(out)
             raise SystemExit(f"wab: owner-merge: thread {thread} not resolved: {why}; nothing merged")
     if v["draft"]:  # ready may start new checks: stop here, the next run gates again on a non-draft PR
         argv = ["gh", "pr", "ready", str(number), "--repo", repo]

@@ -14791,6 +14791,210 @@ def cut_before_sink(waves_dir):
     return found
 
 
+# EVERY truncation by length in scripts/waves/*.py: a slice with an upper bound, _clip, _one_line, _head. A new one
+# is red until it is listed HERE with a reason, or rewritten as safe_text(text, limit) (the cut after the mask).
+# Key: (file, outermost function, the expression as ast.unparse prints it) -> why it is no cut of outside text.
+_SHA = "a git object id (12 hex characters): a name, no outside text"
+_MASKED = "the text is already masked (safe_text / _first_line / _safe) above: a cut AFTER the mask"
+_LIST = "a slice of a LIST (lines, arguments, records), not a cut of a text by length"
+_LOGIC = "parsing / comparison inside the code, nothing of it is shown"
+_DEDUP = "the key of once_per (dedup of an episode in state.json), it is never shown"
+_WORDCUT = "_one_line cuts at a WORD border: a token is never split, no prefix of it is left"
+CUT_ALLOWLIST = {}
+
+
+def _allow(file, func, why, *exprs):
+    for e in exprs:
+        CUT_ALLOWLIST[(file, func, e)] = why
+
+
+_allow("wab.py", "_text_head", _LOGIC, "s[:n]")
+_allow("wab.py", "unsent_reason", _LOGIC, "rest[:k]", "head[:k]")
+_allow("wab.py", "_undimmed", _LOGIC, "line[pos:m.start()]")
+_allow("wab.py", "input_empty_reason", _LOGIC, "raw[top:bottom]")
+_allow("wab.py", "input_text", _LOGIC, "raw[top:bottom]")
+_allow("wab.py", "_labelled_sha", _LOGIC, "m.string[:m.start()]")
+_allow("wab.py", "redact", _LOGIC, "m.string[:m.start()]")
+_allow("wab.py", "redact", _MASKED, "_clip(text, limit)")
+_allow("wab.py", "safe_text", _MASKED, "_clip(redact(text, 10 ** 9, owner_paths), limit)")
+_allow("wab.py", "_head", "the cut itself: it keeps the mask whole", "text[:n]", "MASK[:k]", "head[:-k]")
+_allow("wab.py", "_clip", "the cut itself, after the mask", "'…'[:limit]", "_head(text, limit - 2)")
+_allow("wab.py", "_render_quote", _MASKED, "_clip(row, room)")
+_allow("wab.py", "render_notice", "splits a notice at its quote markers; every part is masked whole afterwards",
+       "text[pos:m.start()]")
+_allow("wab.py", "render_notice", _MASKED, "_clip(''.join(out), limit)")
+_allow("wab.py", "_first_line", _MASKED, "_clip(f'{lines[0].strip()} {lines[1].lstrip('> ').strip()}', limit)",
+       "_clip(lines[0], limit)")
+_allow("wab.py", "chain_label", "the name of the chain is chain.json of the owner, controls are removed",
+       "_clip(name, SIGN_LIMIT)")
+_allow("wab.py", "notify", _MASKED, "_clip(first, 80)",
+       "_clip(f'{label}{(' ' + wave if wave else '')}: {_first_line(body, DISPLAY_LIMIT)}', DISPLAY_LIMIT)")
+_allow("wab.py", "pane_digest", _LIST, "[l for l in txt.splitlines() if l.strip()][:-2]")
+_allow("wab.py", "verify_previous_merge", _SHA, "oid[:12]")
+_allow("wab.py", "refresh_workdir", _SHA, "target.stdout.strip()[:12]")
+_allow("wab.py", "system_prompt", _LIST, "body.splitlines()[:1]")
+_allow("wab.py", "archive_attempt_files", "a random name", "uuid.uuid4().hex[:8]")
+_allow("wab.py", "_deliver", _DEDUP, "f'{what}: {e}'[:150]")
+_allow("wab.py", "_procs_unreadable", _DEDUP, "str(err)[:150]")
+_allow("wab.py", "exit_dialog", _LIST, "lines[-4:-1]")
+_allow("wab.py", "_gh", _LIST, "args[:2]")
+_allow("wab.py", "_one_line", _WORDCUT, "text[:cut]")
+_allow("wab.py", "_masked_line", _MASKED, "_clip(text, limit)")
+_allow("wab.py", "_write_status", _WORDCUT + " (the dispatcher's own status line)", "_one_line(text)")
+_allow("wab.py", "_gate_failed", _WORDCUT + " (typed into the wave, not shown to a human)", "_one_line(reasons, 1500)")
+_allow("wab.py", "owner_script_name", _SHA, "sha[:12]", "hashlib.sha256(ident.encode('utf-8')).hexdigest()[:16]")
+_allow("wab.py", "_note_done_head", _SHA, "old[:12]", "head[:12]")
+_allow("wab.py", "_gate_passed", _SHA, "sha[:12]")
+_allow("wab.py", "_regate", _SHA, "str(old)[:12]", "str(new)[:12]")
+_allow("wab.py", "owner_merge", _SHA, "sha[:12]", "w['gate_sha'][:12]", "str(v['head'])[:12]", "str(v2['head'])[:12]")
+_allow("wab.py", "owner_merge", _LIST, "merge[:3]")
+_allow("wab.py", "owner_handover", _SHA, "str(pr_head)[:12]", "str(head)[:12]", "merge[:12]", "head[:12]")
+_allow("wab.py", "_merging_tick", _DEDUP, "str(e)[:150]")
+_allow("wab.py", "_merging_tick", _SHA, "str(head)[:12]", "sha[:12]")
+_allow("wab.py", "_alarm_tick", _DEDUP, "str(e)[:150]", "str(facts['error'])[:150]")
+_allow("wab.py", "_alarm_tick", _SHA, "head[:12]")
+_allow("wab.py", "_pending_alarm_enter", _DEDUP, "str(e)[:150]")
+_allow("wab.py", "_policy_question", _MASKED, "_clip(lines[0], 200)")
+_allow("wab.py", "_say_first", _MASKED, "_clip(lines[0], 120)")
+_allow("wab.py", "note_question", _LIST, "qs[:-QUESTIONS_CAP]")
+_allow("wab.py", "write_chain_result", _SHA, "str(sha)[:12]")
+_allow("wab.py", "blocked_notice", "the question was masked by safe_text above; it is split at `Варианты:`", "question[:m.start()]")
+_allow("dash.py", "manifest_lines", _MASKED + " (`where` is masked by _masked)", "wab._head(nxt, 109)")
+_allow("dash.py", "current_panel", _MASKED + " (_safe_screen)", "wab._head(l, 150)")
+_allow("dash.py", "_clip", "the cut itself of the dashboard, over text masked by humanize_event", "wab._head(text, limit - 1)")
+_allow("dash.py", "_blocked_phrase", _MASKED + " (the whole line is masked first in humanize_event)",
+       "_clip(rest, 200)", "_clip(label['question'], 160)")
+_allow("dash.py", "_pulse_phrase", _MASKED + " (humanize_event)", "status[:40]")
+_allow("dash.py", "humanize_event", _MASKED, "wab._head(_safe(msg), 140)", "_clip(_safe(details), 160)")
+_allow("dash.py", "fold_events", "the time of an events.log line `HH:MM:SS`", "line[11:19]", "ts[:5]")
+_allow("gate.py", "_word_cut", _WORDCUT, "text[:cut]")
+_allow("gate.py", "manifest_problems", _SHA, "str(manifest.get('head'))[:12]", "head[:12]")
+_allow("gate.py", "evaluate", _SHA, "str(pr.get('head'))[:12]", "head[:12]", "str(work.get('head'))[:12]")
+_allow("gate.py", "owner_script", _SHA, "sha[:12]")
+_allow("gate.py", "alarm_text", _SHA, "head[:12]")
+
+
+def cut_sites(waves_dir):
+    """{(file, function, expression)}: every slice with an upper bound and every call of _clip / _one_line / _head."""
+    import ast
+    found = set()
+    for path in sorted(Path(waves_dir).glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        def walk(node, func):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and func == "<module>":
+                func = node.name
+            if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice) and node.slice.upper is not None:
+                found.add((path.name, func, ast.unparse(node)))
+            elif isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute)):
+                name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+                if name in ("_clip", "_one_line", "_head"):
+                    found.add((path.name, func, ast.unparse(node)))
+            for child in ast.iter_child_nodes(node):
+                walk(child, func)
+
+        walk(tree, "<module>")
+    return found
+
+
+def unlisted_cuts(waves_dir):
+    return sorted(c for c in cut_sites(waves_dir) if c not in CUT_ALLOWLIST)
+
+
+def stale_allowlist(waves_dir):
+    found = cut_sites(waves_dir)
+    return sorted(k for k in CUT_ALLOWLIST if k not in found)
+
+
+class W2EveryCut(Base):
+    """The invariant (#81): outside text is cut only by safe_text(text, limit) (or after it); every other cut by
+    length is listed in CUT_ALLOWLIST with its reason."""
+
+    def test_every_cut_in_the_scripts_is_listed_with_a_reason(self):
+        self.assertEqual(unlisted_cuts(WAVES), [])
+        self.assertEqual(stale_allowlist(WAVES), [], "an entry of the allowlist that matches nothing any more")
+
+    def mutate(self, name, old, new):
+        tmp = self.tmp / f"cut-{name}"
+        shutil.copytree(WAVES, tmp, ignore=shutil.ignore_patterns("__pycache__"))
+        src = (tmp / "wab.py").read_text(encoding="utf-8")
+        self.assertIn(old, src)
+        (tmp / "wab.py").write_text(src.replace(old, new, 1), encoding="utf-8")
+        return tmp
+
+    def test_gh_cut_through_a_variable_is_caught(self):
+        tmp = self.mutate("gh", '        why = _masked_line(r.stderr or r.stdout or "", 200) or f"rc={r.returncode}"',
+                          '        why = (r.stderr or r.stdout or "").strip().replace("\\n", " ")[:200] or f"rc={r.returncode}"')
+        self.assertTrue([c for c in unlisted_cuts(tmp) if c[1] == "_gh"], unlisted_cuts(tmp))
+
+    def test_a_new_cut_in_any_function_is_caught(self):
+        tmp = self.mutate("new", "def _say_first(text):\n", "def _say_first(text):\n    s = text[:120]\n    event({}, s)\n")
+        self.assertIn(("wab.py", "_say_first", "text[:120]"), unlisted_cuts(tmp))
+
+    def test_a_new_one_line_or_clip_is_caught(self):
+        tmp = self.mutate("clip", "def _say_first(text):\n", "def _say_first(text):\n    s = _one_line(text, 120)\n")
+        self.assertTrue([c for c in unlisted_cuts(tmp) if c[1] == "_say_first"])
+
+
+class W2CutOutside(Base):
+    """The three named sites of tester-2: the text of a gh error, of a failed `resolveReviewThread` and of a failed
+    `state.py where`, cut INSIDE a token."""
+
+    def text_for(self, token, visible, cut):
+        return "e" * (cut - 1 - visible) + " " + token
+
+    def test_a_gh_error_cut_inside_a_token_leaves_no_prefix(self):
+        for name, (token, part) in W2CutBeforeMask.TOKENS.items():
+            for visible in (len(token) // 2, len(token) // 2 + 3, 14):
+                with self.subTest(token=name, visible=visible):
+                    err = self.text_for(token, visible, 200)
+                    self.gh_handler = lambda args: subprocess.CompletedProcess(args, 1, "", err)
+                    with self.assertRaises(wab.gate.CollectError) as cm:
+                        wab._gh("api", "x")
+                    cfg, _ = self.chain()
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        wab.event(cfg, f"W1: {cm.exception}")
+                    seen = str(cm.exception) + (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+                    self.assertIsNone(leaked(seen, [part]), seen[-250:])
+
+    def test_a_failed_resolve_thread_cut_inside_a_token_leaves_no_prefix(self):
+        fn = getattr(wab, "_resolve_why", None)
+        self.assertIsNotNone(fn, "wab._resolve_why: the reason of a thread that is not resolved, masked, then cut")
+        for name, (token, part) in W2CutBeforeMask.TOKENS.items():
+            for visible in (len(token) // 2, len(token) // 2 + 3, 14):
+                with self.subTest(token=name, visible=visible):
+                    out = {"errors": [{"message": self.text_for(token, visible, 190)}]}
+                    self.assertIsNone(leaked(fn(out), [part]))
+        self.assertEqual(fn({}), "isResolved is not true")
+
+    def test_a_failed_where_cut_inside_a_token_leaves_no_prefix(self):
+        for name, (token, part) in W2CutBeforeMask.TOKENS.items():
+            for visible in (len(token) // 2, len(token) // 2 + 3, 14):
+                with self.subTest(token=name, visible=visible):
+                    err = OSError(self.text_for(token, visible, 150))
+                    with mock.patch.object(wab.subprocess, "run", side_effect=err):
+                        out = wab.manifest_where_of(self.tmp / "m.json", self.tmp)
+                    self.assertIsNone(leaked(out["error"], [part]), out)
+
+    def test_the_other_error_texts_cut_inside_a_token_leave_no_prefix(self):
+        for name, (token, part) in W2CutBeforeMask.TOKENS.items():
+            err = self.text_for(token, len(token) // 2, 100)
+            with self.subTest(token=name):
+                with mock.patch.object(wab, "sh", return_value=subprocess.CompletedProcess([], 1, "", err)):
+                    with self.assertRaises(wab.ProcFactsError) as cm:
+                        wab.process_table()
+                self.assertIsNone(leaked(str(cm.exception), [part]), str(cm.exception))
+
+    def test_gate_errors_are_cut_at_a_word_border(self):
+        import gate
+        for name, (token, part) in W2CutBeforeMask.TOKENS.items():
+            text = self.text_for(token, len(token) // 2, 200)
+            with self.subTest(token=name):
+                with self.assertRaises(gate.CollectError) as cm:
+                    gate._threads(lambda query, variables: {"errors": text}, "o/r", 1)
+                self.assertIsNone(leaked(str(cm.exception), [part]))
+
+
 class W2CutBeforeMask(Base):
     """A caller that cuts the outside text BEFORE it reaches safe_text leaves a token's prefix at the border
     (`ghp_abcde`: too short for any rule, so it is shown). Fixtures: the border falls INSIDE the token."""

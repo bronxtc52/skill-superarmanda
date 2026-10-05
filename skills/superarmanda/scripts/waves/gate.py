@@ -94,12 +94,24 @@ def _object(api, path):
     return data
 
 
+def _word_cut(text, limit):
+    """The text cut at a WORD border (gate.py is stdlib-only and cannot call wab.safe_text): a token is never split,
+    so no prefix of a secret (`ghp_abcde`) is left at the border; wab masks the whole message when it shows it."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = limit - 2
+    if not text[cut].isspace():
+        cut = text.rfind(" ", 0, cut) if " " in text[:cut] else 0
+    return text[:cut].rstrip() + " …"
+
+
 def _threads(graphql, repo, number):
     owner, name = repo.split("/", 1)
     data = graphql(THREADS_QUERY, {"owner": owner, "name": name, "number": number})
     try:
         if data.get("errors"):
-            raise CollectError(f"review threads: {str(data['errors'])[:200]}")
+            raise CollectError(f"review threads: {_word_cut(str(data['errors']), 200)}")
         box = data["data"]["repository"]["pullRequest"]["reviewThreads"]
         nodes, more = box["nodes"], box["pageInfo"]["hasNextPage"]
     except (AttributeError, KeyError, TypeError):
