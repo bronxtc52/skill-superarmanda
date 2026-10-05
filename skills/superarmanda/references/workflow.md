@@ -134,7 +134,8 @@ creates one manifest atomically.
   для `fix-loop --outcome failed`, `--defer` и `--accept` по тем же правилам.
 - `task-result --quota-evidence <путь>` — только с отчётом профиля `codex-host-opus` у ревью
   задачи high; правила — в [review-contract.md](review-contract.md). В результат ревью high
-  пишутся `profile`, `artifact_sha256`, а для запасного Opus — `fallback_for` и `quota_evidence`.
+  пишутся `profile`, `artifact_sha256`, `review_session_id`, а для запасного Opus — `fallback_for` и
+  `quota_evidence`. Один отчёт или одна сессия ревью не закрывает обе роли ревью задачи.
 - `where` дополнительно отдаёт `risk` (эффективный риск задачи), `review_policy`, а в `artifacts` —
   `model`, `profile`, `fallback_for`, `quota_evidence`. Причина, по которой задача high не готова
   (не та модель, не та пара профилей, разные пакеты, Opus без подтверждения квоты), стоит в

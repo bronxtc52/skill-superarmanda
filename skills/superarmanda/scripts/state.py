@@ -4,6 +4,7 @@
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import uuid
 import os
@@ -845,7 +846,11 @@ def high_risk_gaps(entry, results):
         if result is None:
             continue
         profile = result.get("profile")
-        if profile not in REVIEW_PROFILES or not isinstance(result.get("artifact_sha256"), str):
+        if (
+            profile not in REVIEW_PROFILES
+            or not isinstance(result.get("artifact_sha256"), str)
+            or not isinstance(result.get("review_session_id"), str)
+        ):
             gaps[role] = (
                 f"{role} result carries no verified review.py report; a high-risk task requires "
                 "task-result --artifact <report> --reviewed-head --packet-hash"
@@ -863,7 +868,15 @@ def high_risk_gaps(entry, results):
     if len(reviews) == len(REVIEW_ROLES) and not gaps.keys() & set(REVIEW_ROLES):
         last = REVIEW_ROLES[-1]
         profiles = sorted(result["profile"] for result in reviews.values())
-        if profiles not in ([ASTRA_PROFILE, FABLE_PROFILE], [ASTRA_PROFILE, OPUS_PROFILE]):
+        if any(
+            len({result[key] for result in reviews.values()}) != len(reviews)
+            for key in ("artifact_sha256", "review_session_id")
+        ):
+            gaps[last] = (
+                "the two results are the same review (one report or one review session); "
+                "a high-risk task requires two separate reviews"
+            )
+        elif profiles not in ([ASTRA_PROFILE, FABLE_PROFILE], [ASTRA_PROFILE, OPUS_PROFILE]):
             gaps[last] = (
                 f"the two reviews are {' + '.join(profiles)}; a high-risk task requires one "
                 f"{ASTRA_PROFILE} and one {FABLE_PROFILE} review "
@@ -1384,7 +1397,7 @@ def result(args):
             fail("GitHub Codex pass requires reviewed_head and HTTPS artifact URL")
         if packet_hash is not None:
             fail("GitHub Codex review does not accept packet_hash")
-    verified = verified_review(args, risk, packet_hash)
+    verified = verified_review(args, risk, packet_hash, entry)
     entry["session_roles"][args.session_id] = args.role
     record = {
         "status": args.status,
@@ -1459,8 +1472,29 @@ def read_report(location, label):
     return value, hashlib.sha256(raw).hexdigest()
 
 
-def verified_review(args, risk, packet_hash):
+def review_profile_models():
+    """`PROFILE_MODELS` of the sibling review.py: profile -> (CLI, requested model, observed
+    model). Read from the runner itself, so the two scripts cannot disagree; loaded only when a
+    report is verified. An unloadable runner is a refusal, not a skipped check."""
+    path = Path(__file__).resolve().parent / "review.py"
+    try:
+        spec = importlib.util.spec_from_file_location("superarmanda_review_profiles", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        table = module.PROFILE_MODELS
+    except Exception as exc:
+        fail(f"cannot read review profiles from {path.name}: {exc}")
+    if not isinstance(table, dict) or set(table) != REVIEW_PROFILES:
+        fail("review.py profiles differ from the profiles state.py knows")
+    return table
+
+
+def verified_review(args, risk, packet_hash, entry):
     """Policy fields of a task-review result, taken from its review.py report.
+
+    The report is checked for shape, for agreement with its own profile and for its binding to
+    this HEAD and packet. That stops a wrong or carelessly relabelled file; a report is not
+    signed, so its origin is not proven (the same trust as the manifest itself).
 
     For a high-risk task a `pass` or `findings` of either task review is recorded only with a
     report that state.py reads and checks itself: the coordinator's word is not enough. Other
@@ -1485,6 +1519,27 @@ def verified_review(args, risk, packet_hash):
         fail(f"review report profile must be one of {sorted(REVIEW_PROFILES)}")
     if report.get("status") != args.status:
         fail(f"review report status {report.get('status')!r} differs from --status {args.status}")
+    # The report must agree with itself: the model review.py requests for this profile and
+    # the model it observed running. One edited `profile` field does not make another review.
+    _cli, requested, observed = review_profile_models()[profile]
+    models = report.get("observed_models")
+    if report.get("requested_model") != requested or not (
+        isinstance(models, (list, dict)) and observed in models
+    ):
+        fail(f"review report models do not belong to profile {profile}")
+    session = report.get("session_id")
+    if not isinstance(session, str) or not session:
+        fail("review report has no review session_id")
+    for other in REVIEW_ROLES:
+        previous = entry["results"].get(other)
+        if other != args.role and isinstance(previous, dict) and (
+            previous.get("artifact_sha256") == digest
+            or previous.get("review_session_id") == session
+        ):
+            fail(
+                f"this report is the review already recorded as {other}: one review cannot "
+                "fill both review roles"
+            )
     capabilities = report.get("capabilities")
     capabilities = capabilities if isinstance(capabilities, dict) else {}
     isolation = capabilities.get("tool_isolation")
@@ -1501,7 +1556,7 @@ def verified_review(args, risk, packet_hash):
     response = report.get("response")
     if not isinstance(response, dict) or response.get("reviewed_head") != args.head:
         fail("review report reviewed_head differs from the result head")
-    fields = {"profile": profile, "artifact_sha256": digest}
+    fields = {"profile": profile, "artifact_sha256": digest, "review_session_id": session}
     if profile != OPUS_PROFILE:
         if args.quota_evidence is not None:
             fail(f"--quota-evidence is only allowed with a {OPUS_PROFILE} report, got {profile}")

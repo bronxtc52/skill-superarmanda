@@ -47,3 +47,25 @@
 самого Claude Code), числа (в том числе `usage`: тест перезаписывает их, чтобы задать размер контекста).
 
 Подстановка заглушек — `Journal` в `tests/helpers/superarmanda_waves_e2e_test.py`.
+
+## `rate-limit-assistant.jsonl` — исчерпанная подписка Claude (1.2.1, #86)
+
+Две живые строки журнала сессии Claude Code, которые CLI записал сам, когда провайдер ответил 429:
+
+1. лимит сессии подписки (Claude Code 2.1.259, 2026-09-06): текст «You've hit your session limit · resets …»,
+   поле `quotaLimits` со `status: rejected`;
+2. закончились кредиты (Claude Code 2.1.263, 2026-09-09): текст «You're out of usage credits…», поле `errorDetails`
+   с ответом API `rate_limit_error`.
+
+Обе строки — `type: assistant` с **верхнеуровневым** `error: "rate_limit"`, `isApiErrorMessage: true`,
+`apiErrorStatus: 429` и `message.model: "<synthetic>"`: сообщение сочинил CLI, а не модель. Именно поле `error`
+(а не слова в тексте) читает `review.py`, когда решает, что сбой Fable — квота.
+
+Заменено по таблице выше (`uuid`, `parentUuid`, `requestId`, `agentId`, `message.id` → `{UUID:n}`, `sessionId` →
+`{SESSION_ID}`, `timestamp` → `{TIMESTAMP}`), `req_…` внутри `errorDetails` → `{REQUEST_ID}`; `cwd`, `gitBranch`, `slug`
+удалены. Текст сообщения и `errorDetails` оставлены как есть: это служебные строки CLI и API без личных данных.
+
+Граница: это форма ЖУРНАЛА. Живого снимка stdout `claude -p --output-format stream-json` в момент квоты нет.
+Двойник CLI в `tests/helpers/superarmanda_review_test.py` строит событие потока из `message` и `error` этой
+фикстуры по схеме вывода установленного Claude Code 2.1.289 (событие `assistant`: `message`, `parent_tool_use_id`,
+`error`, `uuid`, `session_id`). Появится живой снимок потока — заменить им.

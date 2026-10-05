@@ -25,6 +25,15 @@
   (`quota_evidence`, `fallback_for`). Auth, таймаут и прочая недоступность Fable — не pass, без отката на Sonnet.
 - `review.py`: отчёт ошибки несёт `reviewed_head` и `state_packet_hash`, когда пакет загружен и сверен с
   репозиторием (нужно для quota evidence); при более ранней ошибке полей нет.
+- `review.py`: категория `quota` Claude-профилей выводится только из сигнала провайдера — события потока
+  `assistant` с верхнеуровневым `error: "rate_limit"`, которое CLI пишет сам. Слова «quota» и «rate limit» в
+  тексте модели, цитатах пакета, stderr и выводе `claude auth status` её больше не дают (раньше сбой
+  авторизации с таким словом в выводе получал `quota` и открывал запасной Opus). Признак auth, таймаута,
+  транспорта или отказа рядом с сигналом квоты — не `quota`. Изменение поведения: сбой, где о квоте говорит
+  только текст stderr, теперь `cli_exit`.
+- `state.py` сверяет отчёт ревью с его же профилем (`requested_model`, `observed_models` по таблице
+  `review.PROFILE_MODELS`) и требует `session_id` ревью; один отчёт или одна сессия ревью не закрывает обе роли
+  (`review_session_id` в результате). Подлинность неподписанного отчёта по-прежнему не доказывается.
 - `where` отдаёт `risk`, `review_policy`, а в `artifacts` — `model`, `profile`, `fallback_for`, `quota_evidence`.
 - Документация: таблица моделей по риску и шаблон брифа с `state.py role-model` (`profiles.md`), команда ревью
   задачи `high` и определение quota evidence (`review-contract.md`), шаблон тела PR со строкой о запасном

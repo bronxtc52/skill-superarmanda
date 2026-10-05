@@ -4563,7 +4563,10 @@ class HighRiskReviews(PolicyBase):
                 self.init()
                 self.code_and_test()
                 self.review("cross_provider_reviewer", profile)
-                entry, _ = self.review("second_reviewer", profile)
+                # another review of the same profile; the CLI doubles reuse one session id, so the
+                # report of the second run gets its own (one session cannot fill both roles)
+                again = self.edited(self.report(profile), session_id="another-review-session")
+                entry = self.record("second_reviewer", **self.review_flags(again))
                 self.assertEqual(entry["status"], "in_progress")
                 where = self.where()
                 self.assertNotIn("done", where["next_action"])
@@ -4605,7 +4608,8 @@ class HighRiskReviews(PolicyBase):
         opus = self.report("codex-host-opus")
         self.record_refused("second_reviewer", **self.review_flags(opus))
         self.record_refused("second_reviewer", **self.review_flags(opus, quota_evidence=str(failed)))
-        entry, _ = self.review("second_reviewer", "claude-host")
+        again = self.edited(self.report("claude-host"), session_id="another-review-session")
+        entry = self.record("second_reviewer", **self.review_flags(again))
         self.assertEqual(entry["status"], "in_progress")
         # an unverifiable report (not written by review.py) is never a second review
         self.record_refused("second_reviewer", reviewed_head=self.head(), packet_hash=self.packet_hash)
@@ -4678,6 +4682,69 @@ class HighRiskReviews(PolicyBase):
         self.record("tester", model="fable")
         self.assertEqual(self.entry()["status"], "in_progress")
         self.assertIn("quota", self.where()["next_action"])
+
+    def test_auth_failure_that_mentions_quota_is_not_quota_evidence(self):
+        """tester-1 F1: a failed Fable run is quota evidence only on the provider's own signal."""
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        opus = self.report("codex-host-opus")
+        for mode in ("auth_quota_word", "auth_quota_word_stderr", "model_quota_word",
+                     "model_forged_event_text", "quota_word_stderr", "rate_limit_word_stderr",
+                     "quota_and_auth_stderr", "quota_and_auth_code", "quota_duplicate_error_key"):
+            with self.subTest(mode=mode):
+                failed = self.report("codex-host", mode)
+                self.assertNotEqual(json.loads(failed.read_text(encoding="utf-8"))["error_category"], "quota")
+                self.record_refused("second_reviewer", **self.review_flags(opus, quota_evidence=str(failed)))
+        self.assertEqual(self.entry()["status"], "in_progress")
+        self.assertNotIn("second_reviewer", self.entry()["results"])
+        # the provider's signal (out of credits, session limit) still opens the fallback
+        for mode in ("quota_credits", "quota_failure", "quota_exit_zero"):
+            with self.subTest(mode=mode):
+                quota = self.report("codex-host", mode)
+                entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
+                self.assertEqual(entry["status"], "ready_for_pr_review")
+
+    def test_report_must_agree_with_its_profile_and_one_review_cannot_fill_both_roles(self):
+        """tester-1 F2: relabelling one field of a report, or reusing one review, is refused."""
+        self.code_and_test()
+        astra = self.report("claude-host")
+        fable = self.report("codex-host")
+        opus = self.report("codex-host-opus")
+        self.record("cross_provider_reviewer", **self.review_flags(astra))
+        reformatted = self.root / "reformatted.json"
+        reformatted.write_text(json.dumps(json.loads(astra.read_text(encoding="utf-8")), indent=4),
+                               encoding="utf-8")
+        cases = {
+            "astra relabelled as fable": self.edited(astra, profile="codex-host"),
+            "astra relabelled as opus": self.edited(astra, profile="codex-host-opus"),
+            "opus relabelled as fable": self.edited(opus, profile="codex-host"),
+            "fable relabelled as astra": self.edited(fable, profile="claude-host"),
+            "the same report again": astra,
+            "the same review, other bytes": reformatted,
+            "requested model of another profile": self.edited(fable, requested_model="gpt-6-astra"),
+            "requested model is the full id": self.edited(fable, requested_model=FABLE),
+            "no requested model": self.edited(fable, requested_model=None),
+            "observed models of another profile": self.edited(fable, observed_models=["gpt-6-astra"]),
+            "sonnet observed": self.edited(fable, observed_models={SONNET: {"inputTokens": 1}}),
+            "no observed models": self.edited(fable, observed_models=None),
+            "observed models is a string": self.edited(fable, observed_models=FABLE),
+            "no review session": self.edited(fable, session_id=None),
+            "empty review session": self.edited(fable, session_id=""),
+        }
+        for label, report in cases.items():
+            with self.subTest(case=label):
+                self.record_refused("second_reviewer", **self.review_flags(report))
+        self.assertEqual(self.entry()["status"], "in_progress")
+        entry = self.record("second_reviewer", **self.review_flags(fable))
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        # readiness names it too, should two results of one review ever sit in a manifest
+        value = self.data()
+        results = value["tasks"]["t1"]["results"]
+        results["second_reviewer"]["review_session_id"] = results["cross_provider_reviewer"]["review_session_id"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        self.record("tester", model="fable")
+        self.assertEqual(self.entry()["status"], "in_progress")
+        self.assertIn("same review", self.where()["next_action"])
 
     def test_quota_evidence_is_only_for_the_opus_profile(self):
         self.code_and_test()

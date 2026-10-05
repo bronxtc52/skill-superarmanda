@@ -72,8 +72,15 @@ python3 "$SUPERARMANDA_DIR/scripts/state.py" task-result --manifest <path> --tas
 `claude-host`, `codex-host`, `codex-host-opus`; `status` отчёта не равен записываемому; для `pass`
 нет `gate_ready: true`; для `findings` нет `capabilities.primary_model_verified: true` или
 `capabilities.tool_isolation` равен `unverified`; `state_packet_hash` не равен `--packet-hash`;
-`response.reviewed_head` не равен HEAD. В результат пишутся `profile` и `artifact_sha256`
-(SHA-256 байтов отчёта). `error`, `unavailable` и `incomplete` отчёта не требуют и pass не дают.
+`response.reviewed_head` не равен HEAD. Отчёт обязан быть согласован сам с собой: `requested_model`
+и `observed_models` должны принадлежать его профилю по таблице `PROFILE_MODELS` из `review.py`
+(`claude-host` → `gpt-6-astra`; `codex-host` → запрошена `fable`, наблюдается `claude-fable-5-1`;
+`codex-host-opus` → `claude-opus-5-5`), а `session_id` ревью — непустая строка. Один и тот же
+отчёт или одна сессия ревью не закрывает обе роли: вторая запись — отказ. В результат пишутся
+`profile`, `artifact_sha256` (SHA-256 байтов отчёта) и `review_session_id`. `error`, `unavailable`
+и `incomplete` отчёта не требуют и pass не дают. Известная граница: отчёт не подписан, поэтому
+`state.py` проверяет его форму, согласованность и привязку к HEAD и пакету, но не доказывает его
+подлинность.
 
 Задача high готова, когда coder и tester прошли на Fable (`--model`, поле `model` результата —
 `claude-fable-5-1`; при medium и low — `claude-sonnet-5-5` либо без модели), а оба ревью — `pass`
@@ -91,7 +98,17 @@ python3 "$SUPERARMANDA_DIR/scripts/state.py" task-result --manifest <path> --tas
 результата. Другого источника нет: текст диагностики, уведомление провайдера, отчёт другого HEAD
 или пакета, отчёт без этих двух полей (написанный до 1.2.1) не подходят. В результат пишутся
 `fallback_for: codex-host` и `quota_evidence: {artifact, sha256}`; оба пути видны в `where`.
-`--quota-evidence` с любым другим профилем — отказ. Auth, таймаут, отказ модели и любая другая
+`--quota-evidence` с любым другим профилем — отказ.
+
+Категорию `quota` у Claude-профилей `review.py` выводит только из сигнала провайдера: событие
+потока `assistant`, которое CLI пишет сам, с верхнеуровневым `error: "rate_limit"` (живые строки —
+`tests/fixtures/transcripts/rate-limit-assistant.jsonl`). Слова «quota» и «rate limit» в тексте
+модели, в цитатах пакета, в stderr и в выводе `claude auth status` категорию не дают: текстовая
+эвристика `quota` больше не возвращает. Неоднозначность закрывается в сторону «не evidence»:
+код авторизации в потоке (`authentication_failed` и родственные) или признак auth, таймаута,
+транспорта, отказа в stderr рядом с `rate_limit` — это соответствующая категория, а не `quota`;
+событие с повторным ключом — не сигнал. У Astra категория идёт из `codexErrorInfo:
+"usageLimitExceeded"` текущего thread/turn, то есть тоже из структуры, а не из текста. Auth, таймаут, отказ модели и любая другая
 недоступность Fable — `error`/`unavailable` роли `second_reviewer`: задача не pass, отката на
 Sonnet, Astra вторым разом или иную модель нет.
 
