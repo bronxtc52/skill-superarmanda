@@ -15772,8 +15772,11 @@ class W2OutputPaths(Base):
         cfg, _ = self.chain()
         where = {"task": raw, "task_status": raw, "step": raw, "role": raw, "next_action": raw,
                  "decision_required_for": raw, "run": raw, "error": None,
-                 "verdicts": {"tester": raw}, "open_findings": [{"role": raw, "status": raw}]}
-        for n, sev in enumerate(({raw: raw}, [raw], raw)):  # a malformed severity: never str() before the mask
+                 "verdicts": {"tester": raw, "reviewer": {"artifact": raw}}, "fix_round": {"artifact": raw},
+                 "open_findings": [{"role": raw, "status": raw, "x": {"artifact": raw}}]}
+        # tester on #85: only the `artifact` of an open finding is a path that is opened and not shown;
+        # an `artifact` key anywhere else is text like any other
+        for n, sev in enumerate(({raw: raw}, [raw], raw, "\x85" + raw + "\x1c")):  # never str()/strip() before the mask
             art = self.tmp / f"findings-{n}.json"
             art.write_text(json.dumps({"findings": [{"severity": sev}]}), encoding="utf-8")
             where["open_findings"].append({"role": "tester", "status": "failed", "artifact": str(art)})
@@ -15798,8 +15801,18 @@ class W2OutputPaths(Base):
                 with mock.patch.object(self.dash, "manifest_where", return_value=where):
                     lines = self.dash.manifest_lines(cfg, "W1", self.wave_rec())
                 self.assertNotIn("hunter2", "\n".join(l.plain for l in lines).lower())
-        art.write_text(json.dumps({"findings": [{"severity": "p1"}, {"priority": "HIGH"}, {}]}), encoding="utf-8")
+        art.write_text(json.dumps({"findings": [{"severity": "p1"}, {"priority": " HIGH\n"}, {}]}), encoding="utf-8")
         self.assertEqual(self.dash.finding_counts(str(art)), {"P1": 1, "high": 1, "None": 1})
+        # Astra on #85: strip() took the invisible character off the edge of an unknown value, and the mask,
+        # which hides the whole word for it, saw a plain short word: the unknown value stays as it was
+        for edge in ("\x85", "\x1c", "\u200b"):
+            with self.subTest(edge=edge):
+                self.dash.MANIFEST_CACHE.clear()
+                art.write_text(json.dumps({"findings": [{"severity": "Q7vZk2LmPx9Wt4Yb" + edge}]}), encoding="utf-8")
+                where = {"task": "W1", "open_findings": [{"role": "tester", "status": "failed", "artifact": str(art)}]}
+                with mock.patch.object(self.dash, "manifest_where", return_value=where):
+                    lines = self.dash.manifest_lines(self.chain()[0], "W1", self.wave_rec())
+                self.assertNotIn("q7vzk2lmpx9wt4yb", "\n".join(l.plain for l in lines).lower())
 
     def adapters(self):
         return {name[4:]: getattr(self, name) for name in dir(self) if name.startswith("out_")}

@@ -331,9 +331,10 @@ def finding_counts(artifact):
             sev = item.get("severity") or item.get("priority")
             if not isinstance(sev, (str, int, type(None))):  # str() of a nested value escapes an invisible
                 return None  # character of its key, and the mask would no longer see the hiding key (#85)
-            sev = str(sev).strip()
-            # only a known level changes its case: upper() of free text would hide `sk-…` from the mask (#85)
-            sev = next((k for k in SEVERITIES if k.lower() == sev.lower()), sev)
+            sev = str(sev)
+            # only a known level is trimmed and changes its case; anything else goes to the mask as it was:
+            # upper() hid `sk-…` from it, strip() took off the invisible character it hides a word for (#85)
+            sev = next((k for k in SEVERITIES if k.lower() == sev.strip().lower()), sev)
             counts[sev] = counts.get(sev, 0) + 1
         return counts
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -352,16 +353,23 @@ def _safe_mark():
     return wab.MASK
 
 
-def _masked(value, key=None):
+def _masked(value, finding=False, top=False):
     """`where` (what state.py printed) with every text in it masked by safe_text: the block shows names, tasks,
-    next actions and errors of the wave. The `artifact` path stays as it is: it is only OPENED (finding_counts),
-    never shown."""
+    next actions and errors of the wave. Only the `artifact` path of an open finding stays as it is: it is only
+    OPENED (finding_counts), never shown; an `artifact` key anywhere else is text like any other (#85)."""
     if isinstance(value, str):
-        return value if key == "artifact" else _safe(value)
+        return _safe(value)
     if isinstance(value, dict):
-        # a key that hides its value (invisible character, secret word) takes the value whole, like wab._masked_leaves
-        return {(_safe(k) if isinstance(k, str) else k): (_safe_mark() if wab._key_hides_value(k) else _masked(v, k))
-                for k, v in value.items()}
+        def leaf(k, v):
+            if wab._key_hides_value(k):
+                # a key that hides its value (invisible character, secret word) takes the value whole, like wab._masked_leaves
+                return _safe_mark()
+            if finding and k == "artifact" and isinstance(v, str):
+                return v
+            if top and k == "open_findings" and isinstance(v, list):
+                return [_masked(f, finding=True) for f in v]
+            return _masked(v)
+        return {(_safe(k) if isinstance(k, str) else k): leaf(k, v) for k, v in value.items()}
     if isinstance(value, list):
         return [_masked(v) for v in value]
     return value
@@ -371,7 +379,7 @@ def manifest_lines(cfg, wave, w):
     """The superarmanda block of the current panel; never raises on a manifest it cannot read."""
     where = manifest_where(cfg, wave)
     if isinstance(where, dict):
-        where = _masked(where)
+        where = _masked(where, top=True)
     head = Text("superarmanda  ", style="bold")
     if where is None:
         return [head.append("manifest ещё нет", style="grey50")]
