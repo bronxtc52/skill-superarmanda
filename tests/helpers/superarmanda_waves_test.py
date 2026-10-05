@@ -14358,6 +14358,63 @@ class CurrentRunManifest(Base):
         (self.wave / "runs.json").write_bytes(b"\xff\xfe\x00")
         self.assertRefused()
 
+    def test_runs_json_fifo_without_writer_is_refused_and_does_not_hang(self):
+        import signal
+        (self.wave / "runs.json").unlink()
+        os.mkfifo(self.wave / "runs.json")
+
+        def boom(*a):
+            raise AssertionError("current_manifest hangs on a FIFO runs.json")
+        old = signal.signal(signal.SIGALRM, boom)
+        signal.alarm(20)
+        try:
+            path, why = wab.current_manifest(self.cfg, "W1")
+            self.assertIsNone(path)
+            self.assertIn("не обычный файл", why)
+            self.assertRefused()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_runs_json_symlink_is_refused(self):
+        real = self.wave / "real-runs.json"
+        (self.wave / "runs.json").rename(real)
+        (self.wave / "runs.json").symlink_to(real)
+        self.assertRefused()
+
+    def test_huge_runs_json_is_refused(self):
+        (self.wave / "runs.json").write_bytes(b" " * (2 * 1024 * 1024 + 10))
+        self.assertRefused("слишком большой")
+
+    def test_a_refusal_keeps_the_other_reasons_even_on_an_early_wait(self):
+        self.set_runs("{not json")
+        head = self.r2["head"]
+        facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": head, "base": "main"},
+                            check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+        pr = {"number": 7, "headRefOid": head, "isDraft": False, "state": "OPEN"}
+        with mock.patch.object(wab, "find_pr", return_value=pr), \
+                mock.patch.object(wab, "base_branch_of", return_value="main"), \
+                mock.patch.object(wab, "gate_facts", return_value=facts), \
+                mock.patch.object(wab, "workdir_state", return_value={"clean": True, "head": head, "fingerprint": "x"}):
+            v = wab.gate_check(self.cfg, "W1", {"cwd": self.cwd})
+        self.assertEqual(v["verdict"], "fail", v)
+        self.assertTrue(v["reasons"][0].startswith("manifest: "), v["reasons"])
+        self.assertTrue(any("проверки не завершены" in r for r in v["reasons"]), v["reasons"])
+        self.assertNotIn(gate.MANIFEST_MISSING, v["reasons"])
+
+    def test_a_refusal_keeps_merged_outside(self):
+        self.set_runs("{not json")
+        head = self.r2["head"]
+        facts = green_facts(pr={"state": "closed", "merged": True, "draft": False, "head": head, "base": "main"})
+        pr = {"number": 7, "headRefOid": head, "isDraft": False, "state": "OPEN"}
+        with mock.patch.object(wab, "find_pr", return_value=pr), \
+                mock.patch.object(wab, "base_branch_of", return_value="main"), \
+                mock.patch.object(wab, "gate_facts", return_value=facts), \
+                mock.patch.object(wab, "workdir_state", return_value={"clean": True, "head": head, "fingerprint": "x"}):
+            v = wab.gate_check(self.cfg, "W1", {"cwd": self.cwd})
+        self.assertEqual(v["verdict"], "fail")
+        self.assertIn(gate.MERGED_OUTSIDE, v["reasons"])
+
     def test_a_directory_instead_of_runs_json_is_refused(self):
         (self.wave / "runs.json").unlink()
         (self.wave / "runs.json").mkdir()

@@ -3321,6 +3321,7 @@ def workdir_state(cwd):
 
 STATE_PY = pathlib.Path(__file__).resolve().parent.parent / "state.py"
 WHERE_TIMEOUT = 10
+RUNS_LIMIT = 2 * 1024 * 1024  # bytes of runs.json read by current_manifest
 
 
 def current_manifest(cfg, wave):
@@ -3336,9 +3337,28 @@ def current_manifest(cfg, wave):
     runs_file = wdir / "runs.json"
     if not os.path.lexists(runs_file):
         return standard, None
+    try:  # a FIFO without a writer or a symlink must not hang or redirect the gate
+        fd = os.open(runs_file, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)  # bytes, decoded below (encoding utf-8)
+    except OSError:
+        return None, "runs.json не обычный файл или нечитаем"
     try:
-        data = json.loads(runs_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "runs.json не обычный файл"
+        raw = b""
+        while len(raw) <= RUNS_LIMIT:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return None, "runs.json нечитаем или не JSON"
+    finally:
+        os.close(fd)
+    if len(raw) > RUNS_LIMIT:
+        return None, "runs.json слишком большой"
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:  # UnicodeDecodeError is a ValueError
         return None, "runs.json нечитаем или не JSON"
     if (not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("wave"), str)
             or not isinstance(data.get("runs"), list) or not all(isinstance(r, dict) for r in data["runs"])):
@@ -3416,9 +3436,9 @@ def gate_check(cfg, wave, w):
                           base_branch_of(cfg, w["cwd"]))
         if manifest is None:  # a refused choice of the run says why, instead of "manifest missing"
             why = current_manifest(cfg, wave)[1]
-            if why and gate.MANIFEST_MISSING in v["reasons"]:
-                v = dict(v, verdict="fail", reasons=[f"manifest: {why}" if r == gate.MANIFEST_MISSING else r
-                                                     for r in v["reasons"]])
+            if why:  # fail closed, the reason first; the other reasons (MERGED_OUTSIDE ...) stay
+                v = dict(v, verdict="fail", reasons=[f"manifest: {why}"] + [r for r in v["reasons"]
+                                                                          if r != gate.MANIFEST_MISSING])
         v["number"] = pr["number"]
         if v["verdict"] == "pass" and gate.critical(gate_facts(cfg, pr)) != gate.critical(facts):
             # a CI rerun or a new finding between the reads: the pass would rest on stale facts
