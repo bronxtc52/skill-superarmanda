@@ -5054,6 +5054,9 @@ class HighRiskReviews(PolicyBase):
         self.refused("where", needle="version 2")
         del value["tasks"]["t1"]["review_history"]
         self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        self.refused("where", needle="version 2")  # 1.2.3: the marker of the first external review is version 2 too
+        del value["tasks"]["t1"]["external_review"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
         entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
         self.assertEqual(entry["status"], "ready_for_pr_review")
         self.assertNotIn("review_history", entry)
@@ -6022,9 +6025,10 @@ class W3InternalReviewSource(PolicyBase):
     def test_malformed_internal_records_are_a_closed_refusal(self):
         self.internal()
         self.failed("internal_reviewer")
+        good = self.data()
         for key, bad in (("internal_rounds", 3), ("internal_rounds", ["x"]), ("external_review", "yes")):
             with self.subTest(key=key, bad=bad):
-                value = self.data()
+                value = copy.deepcopy(good)
                 value["tasks"]["t1"][key] = bad
                 self.manifest.write_text(json.dumps(value), encoding="utf-8")
                 self.refused("where", needle=key)
@@ -6057,11 +6061,11 @@ class W3Version1(PolicyBase):
                 forged = copy.deepcopy(live)
                 forged["tasks"][self.TASK][key] = value
                 self.manifest.write_text(json.dumps(forged), encoding="utf-8")
-                self.refused("where", needle=needle)
+                self.refused("where", needle="require manifest version 2")
         forged = copy.deepcopy(live)
         forged["tasks"][self.TASK]["session_roles"]["architect-1"] = "architect"
         self.manifest.write_text(json.dumps(forged), encoding="utf-8")
-        self.refused("where", needle=needle)
+        self.refused("where", needle="require manifest version 2")
 
 
 class W3RemainderOfW2(PolicyBase):

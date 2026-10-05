@@ -16,6 +16,12 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Fable subagent roles of the ordinary pipeline (1.2.3, #86 п.5-9): the architect of step 1, the
+# internal review before the external packet, the triage of external findings, the investigator of
+# a bug and the final check against the requirements. Manifest version 2 only; always Fable.
+# In 1.2.3 their results are records: they change neither the task status, nor readiness, nor the
+# merge gate (the machine obligation of internal_reviewer and final_check is 1.2.4).
+FABLE_ROLES = ("architect", "internal_reviewer", "triage", "investigator", "final_check")
 ROLES = {
     "coder",
     "tester",
@@ -23,16 +29,26 @@ ROLES = {
     "github_codex_review",
     "coderabbit",
     "second_reviewer",
+    *FABLE_ROLES,
 }
 STATUSES = {"pass", "findings", "incomplete", "error", "unavailable"}
+# The internal Fable review as a fix-loop source: its rounds spend no fix cycle and are counted
+# apart (`internal_rounds` of the task), at most MAX_INTERNAL_ROUNDS, and only before the first
+# external review of the task in this run.
+INTERNAL_SOURCE = "internal_reviewer"
+MAX_INTERNAL_ROUNDS = 3
 FIX_SOURCES = {
     "cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit", "tester",
+    INTERNAL_SOURCE,
 }
 DECISIONS = {"invariant", "cut_surface", "accept_limitation"}
 # Reviewer channels whose low/P3-only findings may be deferred to the remainder
 # of the next wave/task without spending the fix cap (#36). Tester is excluded:
 # a failed check is never a nit.
 DEFER_SOURCES = {"cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit"}
+# The roles of an external review: the first task-result of any of them (at any status) is the
+# first external packet of the task and closes the internal fix-loop source for the run.
+EXTERNAL_REVIEW_ROLES = DEFER_SOURCES
 MAX_DECISION_NOTE_LENGTH = 500
 # Every key state.py writes into a manifest. The merge gate refuses a manifest
 # carrying a key outside these sets: it cannot judge a record type it does not know.
@@ -43,8 +59,10 @@ MANIFEST_KEYS = {
 TASK_KEYS = {
     "status", "fix_cycles", "results", "session_roles", "fix_sources", "decisions",
     "decision_required_for", "deferrals", "acceptances", "blocked_reason", "risk",
-    "review_history",
+    "review_history", "internal_rounds", "external_review",
 }
+# Task keys only manifest version 2 carries.
+V2_TASK_KEYS = ("risk", "review_history", "internal_rounds", "external_review")
 DEFAULT_MAX_RUNS = 2
 MAX_RUNS_LIMIT = 1000
 RUNS_FILE_VERSION = 1
@@ -59,7 +77,7 @@ MANIFEST_VERSIONS = (1, 2)
 POLICY_VERSION = "1.2.1"
 POLICY_VERSIONS = {POLICY_VERSION}
 POLICY_KEYS = {"version", "level"}
-V2_ONLY_ROLES = {"second_reviewer"}
+V2_ONLY_ROLES = {"second_reviewer", *FABLE_ROLES}
 # Closed dictionary of coder/tester models. Matching is exact: no trim, no case folding, no prefix.
 FABLE_MODEL = "claude-fable-5-1"
 SONNET_MODEL = "claude-sonnet-5-5"
@@ -137,9 +155,10 @@ def check_schema(value):
             used = set(entry.get("results") or ()) if isinstance(entry.get("results"), dict) else set()
             if isinstance(entry.get("session_roles"), dict):
                 used |= {role for role in entry["session_roles"].values() if isinstance(role, str)}
-            if "risk" in entry or "review_history" in entry or used & V2_ONLY_ROLES:
+            if any(key in entry for key in V2_TASK_KEYS) or used & V2_ONLY_ROLES:
                 fail(
-                    "malformed manifest: task risk, review_history and second_reviewer "
+                    "malformed manifest: task risk, review_history, internal_rounds, "
+                    "external_review, second_reviewer and the Fable subagent roles "
                     "require manifest version 2"
                 )
         return
@@ -164,6 +183,18 @@ def check_schema(value):
             for item in history
         ):
             fail(f"task {name} review_history is malformed")
+        rounds = entry.get("internal_rounds", []) if isinstance(entry, dict) else []
+        if not isinstance(rounds, list) or not all(
+            isinstance(item, dict)
+            and all(isinstance(item.get(key), str) for key in ("head", "result_sha256"))
+            for item in rounds
+        ):
+            fail(f"task {name} internal_rounds is malformed")
+        marker = entry.get("external_review") if isinstance(entry, dict) else None
+        if marker is not None and not (
+            isinstance(marker, dict) and isinstance(marker.get("role"), str)
+        ):
+            fail(f"task {name} external_review is malformed")
 
 
 def require_v2(data, what):
@@ -1513,6 +1544,8 @@ def result(args):
         if packet_hash is not None:
             fail("GitHub Codex review does not accept packet_hash")
     verified = verified_review(args, risk, packet_hash, entry)
+    if args.role == INTERNAL_SOURCE:
+        refuse_external_report(args.artifact, "--artifact")
     entry["session_roles"][args.session_id] = args.role
     record = {
         "status": args.status,
@@ -1535,19 +1568,37 @@ def result(args):
     entry["results"][args.role] = record
     if risk == "high" and args.role in REVIEW_ROLES:
         note_review(entry, args.role, record)
-    update_task_status(entry, risk, data["head"])
+    if data["version"] == 2 and args.role in EXTERNAL_REVIEW_ROLES:
+        # the first external packet of the task in this run: kept through resume and new HEADs
+        entry.setdefault(
+            "external_review",
+            {"role": args.role, "head": args.head, "recorded_at": record["recorded_at"]},
+        )
+    if args.role not in FABLE_ROLES:
+        # a result of a Fable subagent role is a record: the task status is not its business
+        update_task_status(entry, risk, data["head"])
     data["updated_at"] = now()
     write(path, data)
     print(json.dumps(entry, sort_keys=True))
 
 
 def result_model(args, risk):
-    """Canonical model ID for the `model` field of a coder/tester result, or None.
-    A high-risk task requires Fable at ANY status: `unavailable` with `--model fable` is the
-    record "Fable was requested and is unavailable"; nothing weaker may take the role."""
-    if args.model is not None and args.role not in MODEL_ROLES:
-        fail(f"--model is only allowed for roles {', '.join(MODEL_ROLES)}")
+    """Canonical model ID for the `model` field of a result, or None.
+    A high-risk task requires Fable for coder and tester at ANY status: `unavailable` with
+    `--model fable` is the record "Fable was requested and is unavailable"; nothing weaker may
+    take the role. The Fable subagent roles require it at any status and any risk."""
+    if args.model is not None and args.role not in MODEL_ROLES + FABLE_ROLES:
+        fail(f"--model is only allowed for roles {', '.join(MODEL_ROLES + FABLE_ROLES)}")
     model = MODEL_ALIASES.get(args.model) if args.model is not None else None
+    if args.role in FABLE_ROLES and model != FABLE_MODEL:
+        given = "no --model" if args.model is None else repr(args.model)
+        fail(
+            f"role {args.role} runs only on Fable: --model {FABLE_MODEL} (or fable) is required "
+            f"at any status and any risk (got {given}); no substitution by a weaker or another "
+            f"model. If Fable is unavailable, record task-result --role {args.role} --status "
+            "unavailable --model fable: the field `model` then says Fable was requested and "
+            "did not answer"
+        )
     if risk == "high" and args.role in MODEL_ROLES and model != FABLE_MODEL:
         given = "no --model" if args.model is None else repr(args.model)
         fail(
@@ -1575,10 +1626,9 @@ def read_report(location, label):
         fd = os.open(location, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except (OSError, ValueError) as exc:
         fail(f"cannot open {label} (missing, symlink or unreadable): {exc}")
-    with os.fdopen(fd, "rb") as file:
-        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
-            fail(f"{label} must be a regular file")
-        raw = file.read(MAX_REPORT_BYTES + 1)
+    raw = read_regular(fd, label)
+    if raw is None:
+        fail(f"{label} must be a regular file")
     if len(raw) > MAX_REPORT_BYTES:
         fail(f"{label} exceeds {MAX_REPORT_BYTES} bytes")
     try:
@@ -1588,6 +1638,52 @@ def read_report(location, label):
     if not isinstance(value, dict):
         fail(f"{label} must be a JSON object")
     return value, hashlib.sha256(raw).hexdigest()
+
+
+def read_regular(fd, label):
+    """At most MAX_REPORT_BYTES + 1 bytes of the regular file behind `fd`, or None when it is
+    not a regular file (a directory, a FIFO). Always closes `fd`; a read error is a refusal,
+    never a traceback (a directory opens with O_RDONLY and fails only when read)."""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+        with os.fdopen(fd, "rb") as file:
+            return file.read(MAX_REPORT_BYTES + 1)
+    except OSError as exc:
+        fail(f"cannot read {label}: {exc}")
+
+
+def refuse_external_report(location, label):
+    """Refuse an artifact of the internal review that is a review.py report of an external
+    profile: an external finding cannot be recorded under the internal source, which spends no
+    fix cycle. Symlinks are followed (the question is what the path gives, not what it is).
+    Anything that is not a readable local JSON object (notes in Markdown, a URL, a missing
+    path, a directory) is not a report and is left alone; a file too large to check is refused.
+    A guard against a careless or convenient relabelling, not a proof of origin: like the
+    manifest, the artifact is not signed."""
+    if not isinstance(location, str) or not location:
+        return
+    try:
+        fd = os.open(location, os.O_RDONLY | os.O_NONBLOCK)
+    except (OSError, ValueError):
+        return
+    raw = read_regular(fd, label)
+    if raw is None:
+        return
+    if len(raw) > MAX_REPORT_BYTES:
+        fail(f"{label} exceeds {MAX_REPORT_BYTES} bytes: it cannot be checked for an external review report")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return
+    profile = value.get("profile") if isinstance(value, dict) else None
+    if isinstance(profile, str) and profile in REVIEW_PROFILES:
+        fail(
+            f"{label} is an external review report (review.py profile {profile}): its findings "
+            f"are not findings of {INTERNAL_SOURCE}; record them as task-result of the external "
+            "review role and fix-loop --outcome failed --source <that role>"
+        )
 
 
 def review_profile_models():
@@ -1984,6 +2080,9 @@ def record_fix_outcome(args, entry, data, location, risk):
         return
     if args.source is None:
         fail("--source is required with --outcome failed")
+    if args.source == INTERNAL_SOURCE:
+        record_internal_round(entry, data, location)
+        return
     entry["fix_cycles"] += 1
     sources = entry["fix_sources"]
     sources[args.source] = sources.get(args.source, 0) + 1
@@ -1995,6 +2094,79 @@ def record_fix_outcome(args, entry, data, location, risk):
     if sources[args.source] - decided >= 2:
         entry["status"] = "needs_decision"
         entry["decision_required_for"] = args.source
+
+
+def external_review_started(entry):
+    """The role of the first external review recorded for the task in this run, or None.
+    The marker `external_review` is written by task-result since 1.2.3; a manifest of 1.2.2 has
+    none, so the history that survives `resume` is read as well: the session ownership of the
+    task and its per-source fix counters."""
+    marker = entry.get("external_review")
+    if isinstance(marker, dict):
+        return marker.get("role") or "an external review"
+    used = [role for role in (entry.get("session_roles") or {}).values() if isinstance(role, str)]
+    used += list(entry.get("fix_sources") or {})
+    return next((role for role in sorted(used) if role in EXTERNAL_REVIEW_ROLES), None)
+
+
+def record_internal_round(entry, data, location):
+    """`fix-loop --outcome failed --source internal_reviewer`: a round of the internal Fable
+    review. It spends no fix cycle, touches no per-source counter and never asks for a
+    decision; it is counted in `internal_rounds` of the task (kept through `resume`), at most
+    MAX_INTERNAL_ROUNDS, and only before the first external review of the task in this run.
+    Each round is bound to one current `findings` result of the role."""
+    started = external_review_started(entry)
+    if started is not None:
+        fail(
+            f"--source {INTERNAL_SOURCE} is closed: the first external review of this task was "
+            f"already recorded ({started}); until the end of the run findings go under the "
+            "external source that raised them or under tester, which spends a fix cycle"
+        )
+    rounds = entry.setdefault("internal_rounds", [])
+    if len(rounds) >= MAX_INTERNAL_ROUNDS:
+        fail(
+            f"{MAX_INTERNAL_ROUNDS} internal rounds of this task are already recorded: no "
+            f"more rounds from {INTERNAL_SOURCE}; record this one under an ordinary source, "
+            "for example fix-loop --outcome failed --source tester (it spends a fix cycle)"
+        )
+    if (
+        data["repo"] != location
+        or commit(location, "HEAD") != data["head"]
+        or fingerprint(location) != data["tree_fingerprint"]
+    ):
+        fail("working tree changed; run resume before recording an internal round")
+    current = entry["results"].get(INTERNAL_SOURCE)
+    if not (
+        isinstance(current, dict)
+        and current.get("head") == data["head"]
+        and current.get("tree_fingerprint") == data["tree_fingerprint"]
+    ):
+        fail(
+            f"--source {INTERNAL_SOURCE} requires an {INTERNAL_SOURCE} findings result on the "
+            f"current head: record task-result --role {INTERNAL_SOURCE} --status findings "
+            "--model fable first"
+        )
+    if current.get("status") != "findings":
+        fail(
+            f"--source {INTERNAL_SOURCE} requires {INTERNAL_SOURCE} status findings, "
+            f"got {current.get('status')}"
+        )
+    refuse_external_report(current.get("artifact"), f"the artifact of the {INTERNAL_SOURCE} result")
+    digest = result_digest(current)
+    if any(item.get("result_sha256") == digest for item in rounds):
+        fail(
+            f"this {INTERNAL_SOURCE} result already has its round recorded; a new round needs "
+            f"a new {INTERNAL_SOURCE} findings result"
+        )
+    rounds.append(
+        {
+            "head": current["head"],
+            "result_sha256": digest,
+            "result_recorded_at": current.get("recorded_at"),
+            "recorded_at": now(),
+        }
+    )
+    entry["status"] = "needs_fix"
 
 
 def mark(args):
@@ -2241,7 +2413,9 @@ def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None, fallback=
 
 
 def results_any(entry, head, tree):
-    return bool(current_verdicts(entry, head, tree))
+    """Has the pipeline of the task produced a current result? The Fable subagent roles do not
+    count: an architect's result belongs to step 1 and must not end the pre-code steps."""
+    return any(role not in FABLE_ROLES for role in current_verdicts(entry, head, tree))
 
 
 def where(args):
@@ -2332,6 +2506,9 @@ def where(args):
         for source, count in sorted(entry.get("fix_sources", {}).items()):
             decided = sum(1 for item in decisions if item["source"] == source)
             fix_round[source] = f"{count - decided}/2"
+        if entry.get("internal_rounds"):
+            # rounds of the internal Fable review: their own counter, outside `total`
+            fix_round[INTERNAL_SOURCE] = f"{len(entry['internal_rounds'])}/{MAX_INTERNAL_ROUNDS}"
     fix_round["total"] = f"{(entry or {}).get('fix_cycles', 0)}/3"
     required = (entry or {}).get("decision_required_for")
     if check == "changed":

@@ -349,11 +349,11 @@ def _v2_traces(manifest, tasks):
     for name, entry in sorted(tasks.items()):
         if not isinstance(entry, dict):
             continue
-        traces += [f"{name}.{key}" for key in ("risk", "review_history") if key in entry]
+        traces += [f"{name}.{key}" for key in state.V2_TASK_KEYS if key in entry]
         results = entry.get("results") if isinstance(entry.get("results"), dict) else {}
         roles = entry.get("session_roles") if isinstance(entry.get("session_roles"), dict) else {}
-        if state.V2_ONLY_ROLES & (set(results) | {r for r in roles.values() if isinstance(r, str)}):
-            traces.append(f"{name}.second_reviewer")
+        used = set(results) | {r for r in roles.values() if isinstance(r, str)}
+        traces += [f"{name}.{role}" for role in sorted(state.V2_ONLY_ROLES & used)]
         for role, res in sorted(results.items()):
             if isinstance(res, dict):
                 traces += [f"{name}.{role}.{key}" for key in V2_RESULT_KEYS if key in res]
@@ -379,10 +379,15 @@ def _policy_problems(manifest, tasks, plan_risk):
             return [f"manifest: {_exc_str(e).removeprefix('state: ')}"], None, plan_risk
         level = manifest["review_policy"]["level"]
         wave = manifest.get("wave")
-        copied = wave.get("risk") if isinstance(wave, dict) and wave.get("risk") in state.RISKS else None
+        copied = wave.get("risk") if isinstance(wave, dict) else None
+        problems = [p for p in [_wave_copy_problem(manifest)] if p]
+        if not (isinstance(copied, str) and copied in state.RISKS):  # a list or an object is not hashable: no `in` first
+            if isinstance(wave, dict):
+                problems.append(f"manifest: `wave.risk` не строка из {'|'.join(state.RISK_ORDER)}: копию волны "
+                                f"правили вручную или manifest повреждён; нужен {NEW_RUN}")
+            copied = None
         known = {"одобренному waves.json": plan_risk, "копии волны в manifest (`wave.risk`)": copied}
         wave_risk = max((r for r in (plan_risk, copied, level) if r), key=state.RISK_ORDER.index)
-        problems = [p for p in [_wave_copy_problem(manifest)] if p]
         if wave_risk == "high" and level != "high":
             source = next(text for text, risk in known.items() if risk == "high")
             problems.append(f"волна high по {source}, а review_policy.level в manifest — {level}: уровень "
@@ -477,6 +482,8 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
                             f"state.py (риск {risk}); гейт не верит сохранённому статусу")
         for role, other in sorted(results.items()):  # github_codex_review, coderabbit, ...
             if (role not in ("coder", "tester", "cross_provider_reviewer") and isinstance(other, dict)
+                    # the Fable subagent roles are records in 1.2.3: no part of the gate (their obligation is 1.2.4)
+                    and role not in state.FABLE_ROLES
                     and other.get("head") == head and other.get("status") != "pass"
                     and not (role == "coderabbit" and other.get("status") == "unavailable")
                     # high: judged below with its own reasons; below high the second review is optional, like in
