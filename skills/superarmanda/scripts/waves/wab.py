@@ -1276,11 +1276,10 @@ _OWNER_SCRIPT = re.compile(r"\.cache/wab/([A-Za-z0-9_-]+\.[0-9a-f]{12}\.[0-9a-f]
 
 
 def _owner_script_spans(text):
-    folder = pathlib.Path.home() / ".cache" / "wab"
     spans = []
-    for m in _OWNER_SCRIPT.finditer(text):
+    for m in _OWNER_SCRIPT.finditer(text):  # the home folder is looked up only for a path of that shape (#85)
         try:
-            if (folder / m.group(1)).is_file():
+            if (pathlib.Path.home() / ".cache" / "wab" / m.group(1)).is_file():
                 spans.append(m.span())
         except OSError:
             pass
