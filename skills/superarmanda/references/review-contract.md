@@ -44,6 +44,66 @@ request как `session_id`; не приписывайте сервису кон
 State хранит эти значения как metadata. Coordinator подтверждает существование артефакта и
 `gate_ready: true` adapter report перед записью pass.
 
+## Ревью задачи с риском high (1.2.1, #86)
+
+Задача с эффективным риском high (см. [profiles.md](profiles.md), «Модель роли по риску») проходит
+только с двумя ревью ОДНОГО пакета на текущем HEAD: Astra и Fable. Документированная команда:
+
+```bash
+python3 "$SUPERARMANDA_DIR/scripts/review.py" run --repo /repo \
+  --packet /outside/packet.json --profile claude-host --output /outside/review-astra.json
+python3 "$SUPERARMANDA_DIR/scripts/review.py" run --repo /repo \
+  --packet /outside/packet.json --profile codex-host --output /outside/review-fable.json
+```
+
+Затем оба отчёта записываются в manifest; `--packet-hash` — поле `state_packet_hash` отчёта:
+
+```bash
+python3 "$SUPERARMANDA_DIR/scripts/state.py" task-result --manifest <path> --task <id> \
+  --role cross_provider_reviewer --status pass --session-id <id> --head <sha> \
+  --artifact /outside/review-astra.json --reviewed-head <sha> --packet-hash <sha256:...>
+python3 "$SUPERARMANDA_DIR/scripts/state.py" task-result --manifest <path> --task <id> \
+  --role second_reviewer --status pass --session-id <id> --head <sha> \
+  --artifact /outside/review-fable.json --reviewed-head <sha> --packet-hash <sha256:...>
+```
+
+Для такой задачи `state.py` не верит слову координатора, а сам читает отчёт из `--artifact`
+(обычный файл, не симлинк, не больше 1 MiB, один JSON-объект) и отказывает, если: `profile` не из
+`claude-host`, `codex-host`, `codex-host-opus`; `status` отчёта не равен записываемому; для `pass`
+нет `gate_ready: true`; для `findings` нет `capabilities.primary_model_verified: true` или
+`capabilities.tool_isolation` равен `unverified`; `state_packet_hash` не равен `--packet-hash`;
+`response.reviewed_head` не равен HEAD. В результат пишутся `profile` и `artifact_sha256`
+(SHA-256 байтов отчёта). `error`, `unavailable` и `incomplete` отчёта не требуют и pass не дают.
+
+Задача high готова, когда coder и tester прошли на Fable (`--model`, поле `model` результата —
+`claude-fable-5-1`; при medium и low — `claude-sonnet-5-5` либо без модели), а оба ревью — `pass`
+либо `findings`, покрытые `fix-loop --defer`/`--accept` ровно на этот результат, причём пара
+профилей — ровно один `claude-host` и ровно один `codex-host` с одним `packet_hash`. Один Astra,
+два Astra, Fable без Astra, ревью разных пакетов — не pass; причину называет `next_action`
+команды `where`. Какая роль (`cross_provider_reviewer` или `second_reviewer`) несёт какой профиль,
+не важно: важна пара. Находки второго ревьюера идут тем же `fix-loop`, что и у первого.
+
+**Запасной Opus и quota evidence.** Fable-ревью с ошибкой квоты не закрывает gate и не
+заменяется само. Единственный запасной маршрут — отдельный запуск `--profile codex-host-opus` на
+том же пакете и запись его отчёта с `--quota-evidence <путь>`. Quota evidence — это отчёт ошибки
+`review.py run --profile codex-host` с полями `status: error`, `error_category: quota`,
+`gate_ready: false`, чьи `reviewed_head` и `state_packet_hash` равны HEAD и пакету записываемого
+результата. Другого источника нет: текст диагностики, уведомление провайдера, отчёт другого HEAD
+или пакета, отчёт без этих двух полей (написанный до 1.2.1) не подходят. В результат пишутся
+`fallback_for: codex-host` и `quota_evidence: {artifact, sha256}`; оба пути видны в `where`.
+`--quota-evidence` с любым другим профилем — отказ. Auth, таймаут, отказ модели и любая другая
+недоступность Fable — `error`/`unavailable` роли `second_reviewer`: задача не pass, отката на
+Sonnet, Astra вторым разом или иную модель нет.
+
+**Поля отчёта ошибки.** Отчёт `status: error` несёт `profile`, `attempts`, `error`,
+`error_category`, `gate_ready: false`, а с 1.2.1 ещё `reviewed_head` (полный HEAD пакета) и
+`state_packet_hash` (`sha256:<hex>`) — только когда конверт пакета загружен и сверен с
+репозиторием. При ошибке раньше (нечитаемый или изменённый пакет, HEAD ушёл) этих полей нет.
+Сырых диагностик и содержимого пакета в отчёте по-прежнему нет.
+
+При риске medium и low, а также для manifest `version: 1`, действует прежнее правило: одно
+ревью `cross_provider_reviewer`, отчёт state не разыменовывает.
+
 Runner принимает только packet envelope v1. Его лимит измеряет весь сериализованный
 envelope вместе с завершающим newline, хотя `packet_hash` остаётся SHA-256
 канонического внутреннего payload. Ошибка packet или CLI event даёт nonzero

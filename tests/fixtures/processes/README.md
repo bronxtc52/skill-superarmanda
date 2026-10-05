@@ -1,6 +1,6 @@
 # Живые снимки дерева процессов окна волны
 
-Сняты 2026-10-04 координатором волны W1 цепочки `waves-tails` на mh-central (Linux, procps),
+Сняты 2026-10-04 координатором волны W1 цепочки `waves-tails` на сервере разработки (Linux, procps),
 командой диспетчера `ps -ww -A -o pid=,ppid=,etime=,args=`. Формат строки: `pid ppid etime args`.
 Из снимка оставлены только PID 1 и поддерево процесса `claude`; прочие процессы машины убраны.
 
@@ -12,7 +12,8 @@
 - `ps-claude-idle.txt` — свежий `claude` в приватном tmux (`-L wabfix-<pid>`) без единого запроса:
   дочерних процессов нет.
 
-Заменено: домашний каталог → `/home/user`, путь scratchpad сессии →
+Заменено: домашний каталог → `@HOME@` (1.2.1: раньше стояла заглушка-путь, теперь в фикстурах нет ни одного
+домашнего пути и имени хоста — это проверяет `tests/helpers/standalone_layout_test.py`), путь scratchpad сессии →
 `/tmp/claude-1000/<project>/<session>/scratchpad`, путь системной инструкции →
 `<run_dir>/system-prompt.md`, `--session-id` → нулевой UUID. Хвосты `args` (префикс shell-snapshot
 Claude Code, `eval '…'`, `pwd -P >| /tmp/claude-XXXX-cwd`) оставлены как есть: их читает код.

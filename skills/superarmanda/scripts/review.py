@@ -1112,19 +1112,24 @@ def failure_category(exc):
     return "validation"
 
 
-def write_error(output, profile, attempts, category):
+def write_error(output, profile, attempts, category, envelope=None):
+    """Write the error report. `envelope` is the packet envelope once it has been loaded AND
+    verified against the repository: only then does the report name the HEAD and the packet
+    the failed review was for (what `state.py --quota-evidence` checks). Nothing else of the
+    packet and no raw CLI diagnostics go into the report."""
+    value = {
+        "status": "error",
+        "profile": profile,
+        "attempts": attempts,
+        "error": "review failed",
+        "error_category": category,
+        "gate_ready": False,
+    }
+    if envelope is not None:
+        value["reviewed_head"] = envelope["packet"]["head"]
+        value["state_packet_hash"] = state_packet_hash(envelope)
     try:
-        write_result(
-            output,
-            {
-                "status": "error",
-                "profile": profile,
-                "attempts": attempts,
-                "error": "review failed",
-                "error_category": category,
-                "gate_ready": False,
-            },
-        )
+        write_result(output, value)
         return True
     except OSError:
         return False
@@ -1136,9 +1141,11 @@ def review(args):
     packet_path = absolute_lexical(args.packet)
     reject_output_aliases(output, packet_path)
     attempts = []
+    verified_envelope = None
     try:
         envelope, raw = load_packet(packet_path, args.max_bytes)
         verify_packet_repo(repo, envelope)
+        verified_envelope = envelope
         cli, requested, command = profiles(args.profile)
         env = scrubbed_environment()
         prompt = (
@@ -1267,7 +1274,9 @@ def review(args):
         AttributeError,
         RecursionError,
     ) as exc:
-        if not write_error(output, args.profile, attempts, failure_category(exc)):
+        if not write_error(
+            output, args.profile, attempts, failure_category(exc), verified_envelope
+        ):
             print("review: output unavailable", file=sys.stderr)
         else:
             print("review: validation failed", file=sys.stderr)

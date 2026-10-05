@@ -1,0 +1,141 @@
+{
+  "base": "@BASE@",
+  "created_at": "2026-10-05T04:02:15+00:00",
+  "head": "@HEAD@",
+  "plan": {
+    "approved_by": "plan@d0d35440f728081d2cad71b575ad143cf935dd380a452db37b7ba3019013ca9a",
+    "path": "@PATH@/waves-gate-redact/runs/waves-gate-redact/2026-10-05-gr/waves.json",
+    "sha256": "d0d35440f728081d2cad71b575ad143cf935dd380a452db37b7ba3019013ca9a",
+    "wave": "W1",
+    "wave_sha256": "a6074b8feee49bbd3c7f35743854d58d7bdf993eac1f16b09944198f441ce163"
+  },
+  "position": {
+    "head": "@HEAD@",
+    "recorded_at": "2026-10-05T04:39:27+00:00",
+    "safe_point": true,
+    "step": 7,
+    "task": "t1",
+    "tree_fingerprint": "@TREE@"
+  },
+  "repo": "@REPO@",
+  "run": {
+    "index": 2,
+    "max": 2
+  },
+  "run_id": null,
+  "tasks": {
+    "t1": {
+      "acceptances": [],
+      "decision_required_for": null,
+      "decisions": [],
+      "deferrals": [
+        {
+          "head": "@HEAD@",
+          "note": "<заметка убрана>",
+          "recorded_at": "2026-10-05T04:48:34+00:00",
+          "result_recorded_at": "2026-10-05T04:48:33+00:00",
+          "result_sha256": "f3ac8804cd5778343f8796414203537d5bacfa1e3a39e87c044f89be69fb0e4a",
+          "source": "coderabbit"
+        }
+      ],
+      "fix_cycles": 1,
+      "fix_sources": {
+        "github_codex_review": 1
+      },
+      "results": {
+        "coder": {
+          "artifact": "@PATH@/waves-gate-redact/runs/waves-gate-redact/2026-10-05-gr/W1/superarmanda/reports/coder-5.md",
+          "head": "@HEAD@",
+          "packet_hash": null,
+          "recorded_at": "2026-10-05T04:29:06+00:00",
+          "result_id": "eb52d3bab5d741879bf54991ea42047f",
+          "reviewed_head": null,
+          "session_id": "coder-t1-r2-a1f1c080",
+          "status": "pass",
+          "tree_fingerprint": "@TREE@"
+        },
+        "coderabbit": {
+          "artifact": "https://github.com/bronxtc52/skill-superarmanda/pull/82#pullrequestreview-5410102462",
+          "head": "@HEAD@",
+          "packet_hash": null,
+          "recorded_at": "2026-10-05T04:48:33+00:00",
+          "result_id": "16f594249e3548328abae605bb0725d0",
+          "reviewed_head": null,
+          "session_id": "coderabbit-pr82-review-5410102462",
+          "status": "findings",
+          "tree_fingerprint": "@TREE@"
+        },
+        "cross_provider_reviewer": {
+          "artifact": "@PATH@/waves-gate-redact/runs/waves-gate-redact/2026-10-05-gr/W1/superarmanda/review/result-6.json",
+          "head": "@HEAD@",
+          "packet_hash": "sha256:ae08a14d91c608828b48f3346813bc3f13b90a89c3a875b9bbb8633cabe34e00",
+          "recorded_at": "2026-10-05T04:39:26+00:00",
+          "result_id": "eca3f63743c246b6a1ecdbe87f626582",
+          "reviewed_head": "@HEAD@",
+          "session_id": "astra-t1-r2-review",
+          "status": "pass",
+          "tree_fingerprint": "@TREE@"
+        },
+        "github_codex_review": {
+          "artifact": "https://github.com/bronxtc52/skill-superarmanda/pull/82#issuecomment-5988241898",
+          "head": "@HEAD@",
+          "packet_hash": null,
+          "recorded_at": "2026-10-05T04:42:27+00:00",
+          "result_id": "c9d7a1b892a64e8f8a857deefc21315b",
+          "reviewed_head": "@HEAD@",
+          "session_id": "codex-pr82-issuecomment-5988241898",
+          "status": "pass",
+          "tree_fingerprint": "@TREE@"
+        },
+        "tester": {
+          "artifact": "@PATH@/waves-gate-redact/runs/waves-gate-redact/2026-10-05-gr/W1/superarmanda/reports/tester-5.md",
+          "head": "@HEAD@",
+          "packet_hash": null,
+          "recorded_at": "2026-10-05T04:34:23+00:00",
+          "result_id": "3528e9a8947a4c6895cacf8127ce03e2",
+          "reviewed_head": null,
+          "session_id": "tester-t1-r2-af4e236d",
+          "status": "pass",
+          "tree_fingerprint": "@TREE@"
+        }
+      },
+      "session_roles": {
+        "astra-t1-r2-review": "cross_provider_reviewer",
+        "coder-t1-r2-a1f1c080": "coder",
+        "coderabbit-pr82-review-5410102462": "coderabbit",
+        "codex-pr82-issuecomment-5988241898": "github_codex_review",
+        "codex-pr82-review-5409993960": "github_codex_review",
+        "tester-t1-r2-af4e236d": "tester"
+      },
+      "status": "ready_for_pr_review"
+    }
+  },
+  "tree_fingerprint": "@TREE@",
+  "updated_at": "2026-10-05T04:48:34+00:00",
+  "version": 1,
+  "wave": {
+    "acceptance": [
+      "<текст волны убран>",
+      "<текст волны убран>",
+      "<текст волны убран>",
+      "<текст волны убран>",
+      "<текст волны убран>"
+    ],
+    "checks": [
+      {
+        "cmd": "bash tests/superarmanda-waves.test.sh",
+        "name": "waves"
+      },
+      {
+        "cmd": "bash scripts/run-tests.sh",
+        "name": "all-tests"
+      }
+    ],
+    "depends_on": [],
+    "goal": "<текст волны убран>",
+    "id": "W1",
+    "requirements": "<текст волны убран>",
+    "risk": "high",
+    "title": "<текст волны убран>"
+  }
+}

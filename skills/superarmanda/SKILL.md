@@ -2,7 +2,7 @@
 name: superarmanda
 description: "По /superarmanda и на порученной реализации сложного или рискованного изменения поддерживаемого ПО, где риск оправдывает независимую проверку: связанные компоненты, совместимость, миграция данных, безопасность, платежи, сложная логика. Одна фича от требований до проверенного PR с независимыми coder, tester и подписочным ревью. НЕ для разведки, аудита, ревью готового diff, документов, аналитики, браузера, правок правил/skills и небольших исправлений."
 metadata:
-  version: "1.2.0"
+  version: "1.2.1"
   canon-version: "1.1"
 license: MIT
 ---
@@ -72,6 +72,15 @@ standalone skill не копирует policy и не создаёт обход.
    основную модель или подменить metadata.
    Каждому coder и tester назначай свежую native-сессию с явной моделью. Tester
    не получает самоотчёт coder как доказательство.
+   Модель coder и tester выбирается по риску задачи, её отдаёт
+   `state.py role-model --manifest <path> --task <id> --role <coder|tester>`: при риске high —
+   Fable (`claude-fable-5-1`), при medium и low — Sonnet (`claude-sonnet-5-5`). Риск волны —
+   нижняя граница для всех её задач; риск отдельной задачи поднимает
+   `state.py task-risk --task <id> --risk <low|medium|high>`. Задачи про безопасность и маскировку
+   обязаны иметь `risk: high`. Модель записывается в metadata результата:
+   `task-result --model <fable|sonnet|полный ID>`; для задачи high без `--model`, равной Fable,
+   результат coder и tester не принимается при любом статусе. Fable недоступна — запиши
+   `--status unavailable --model fable` и остановись: подмены моделью слабее нет.
    Effort роли — параметр брифа: без указания tester `medium` (`high` при риске
    high), reader `low`; таблица — в [profiles.md](references/profiles.md).
 3. Инициализируй локальный manifest через `scripts/state.py`. Он привязан к
@@ -83,8 +92,17 @@ standalone skill не копирует policy и не создаёт обход.
 5. Свежий tester проверяет приёмку, негативные случаи и интеграцию. Затем
    отдельный провайдер делает task review по [review-contract.md](references/review-contract.md).
    Неполный результат и недоступность обязательного reviewer не являются pass.
+   Задача с риском high требует ДВУХ ревью одного пакета: Astra (`review.py run --profile
+   claude-host`, роль `cross_provider_reviewer`) и Fable (`--profile codex-host`, роль
+   `second_reviewer`). Оба результата записываются с `--artifact <отчёт review.py>`,
+   `--reviewed-head` и `--packet-hash`: `state.py` сам читает отчёт и сверяет профиль, статус,
+   `gate_ready`, HEAD и пакет. Один Astra, два Astra, Fable без Astra или ревью разных пакетов —
+   не pass. Запасной маршрут один: при ошибке квоты Fable — `--profile codex-host-opus`, запись с
+   `--quota-evidence <отчёт codex-host с error_category: quota для того же HEAD и пакета>`.
+   Auth, таймаут и прочая недоступность Fable — `unavailable`/`error`, задача не pass, без отката
+   на Sonnet или другую модель. При риске medium и low — одно ревью, как раньше.
 6. После каждого изменения повтори tester и review, указывая источник находки в
-   `fix-loop --outcome failed --source <cross_provider_reviewer|github_codex_review|coderabbit|tester>`.
+   `fix-loop --outcome failed --source <cross_provider_reviewer|second_reviewer|github_codex_review|coderabbit|tester>`.
    `fix-loop` хранит максимум три неудачных цикла; после третьего status `blocked`,
    с воспроизведением и вариантами для пользователя. Правило двух кругов на источник:
    если один и тот же источник даёт вторую подряд находку (без учёта уже принятых по
@@ -97,7 +115,7 @@ standalone skill не копирует policy и не создаёт обход.
    задача возвращается в `needs_fix`, и цикл продолжается. Одно решение покупает ровно
    один дополнительный круг по этому источнику; общий кап в три неудачных цикла работает
    как прежде и имеет приоритет над повторным `needs_decision`. Если ВСЕ находки результата
-   ревьюера (`cross_provider_reviewer`, `github_codex_review`, `coderabbit`) — low/P3 (nit,
+   ревьюера (`cross_provider_reviewer`, `second_reviewer`, `github_codex_review`, `coderabbit`) — low/P3 (nit,
    minor), coordinator переносит их в остаток следующей волны/задачи через
    `fix-loop --defer --source <ревьюер> --note "<что отложено и куда>"`: кап и счётчик
    источника не тратятся, задача с отложенными находками ревьюера считается готовой. Для tester

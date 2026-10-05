@@ -1306,6 +1306,60 @@ raise SystemExit(1)
         self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "fable")
         self.assertEqual(len(self.logs()), 2)
 
+    def test_error_report_names_the_head_and_packet_once_the_packet_is_verified(self):
+        """#86: a quota error report is evidence for the Opus fallback only if it says which
+        HEAD and packet the failed review was for."""
+        self.assert_packet_ok()
+        envelope = json.loads(self.packet_path.read_text(encoding="utf-8"))
+        for profile, mode, category in (
+            ("codex-host", "quota_failure", "quota"),
+            ("claude-host", "limit", "quota"),
+            ("codex-host", "timeout", "timeout"),
+            ("codex-host-opus", "claude_auth_unauthorized", "auth"),
+        ):
+            with self.subTest(profile=profile, mode=mode):
+                self.result_path.unlink(missing_ok=True)
+                proc = self.review_run(profile, mode)
+                self.assertNotEqual(proc.returncode, 0)
+                result = self.result()
+                self.assertEqual(
+                    set(result),
+                    {"status", "profile", "attempts", "error", "error_category", "gate_ready",
+                     "reviewed_head", "state_packet_hash"},
+                )
+                self.assertEqual((result["status"], result["error_category"]), ("error", category))
+                self.assertIs(result["gate_ready"], False)
+                self.assertEqual(result["reviewed_head"], self.head_value)
+                self.assertEqual(result["reviewed_head"], envelope["packet"]["head"])
+                self.assertEqual(result["state_packet_hash"], "sha256:" + envelope["packet_hash"])
+                # nothing of the packet or of the CLI diagnostics leaks into the report
+                self.assertNotIn("quota exhausted", self.result_path.read_text(encoding="utf-8"))
+                self.assertNotIn("Must review the patch", self.result_path.read_text(encoding="utf-8"))
+
+    def test_error_before_the_packet_is_verified_has_no_head_or_packet_hash(self):
+        self.assert_packet_ok()
+        good = self.packet_path.read_text(encoding="utf-8")
+        tampered = self.root / "tampered.json"
+        tampered.write_text(good.replace(self.head_value, "0" * len(self.head_value)), encoding="utf-8")
+        missing = self.root / "no-packet.json"
+        for label, packet in (("unreadable packet", missing), ("packet fails validation", tampered)):
+            with self.subTest(case=label):
+                self.result_path.unlink(missing_ok=True)
+                proc = self.review_run("codex-host", "quota_failure", packet=packet)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(
+                    set(self.result()),
+                    {"status", "profile", "attempts", "error", "error_category", "gate_ready"},
+                )
+        # the packet is intact but the repository moved on: it was never verified against it
+        self.git("commit", "--allow-empty", "-qm", "moved on")
+        self.result_path.unlink(missing_ok=True)
+        proc = self.review_run("codex-host", "quota_failure")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("reviewed_head", self.result())
+        self.assertNotIn("state_packet_hash", self.result())
+        self.assertEqual(self.logs(), [], "no CLI may run for an unverified packet")
+
     def test_astra_usage_limit_is_reported_as_quota_in_run_result(self):
         # issue #17/#10: исчерпанная подписка Codex — это quota, а не protocol
         self.assert_packet_ok()

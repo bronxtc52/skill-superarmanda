@@ -2232,7 +2232,10 @@ class StateContract(unittest.TestCase):
         reviewer = info["artifacts"][1]
         self.assertEqual(reviewer, {"role": "cross_provider_reviewer", "status": "pass",
                                     "artifact": "evidence", "reviewed_head": self.head(),
-                                    "packet_hash": self.PACKET, "session_id": "reviewer-1"})
+                                    "packet_hash": self.PACKET, "session_id": "reviewer-1",
+                                    # 1.2.1 (#86): policy fields, empty below risk high
+                                    "model": None, "profile": None, "fallback_for": None,
+                                    "quota_evidence": None})
         coder = info["artifacts"][0]
         self.assertIsNone(coder["reviewed_head"])
         self.assertIsNone(coder["packet_hash"])
@@ -2625,7 +2628,9 @@ class WavesContract(unittest.TestCase):
                 "wave_sha256": canonical_sha(selected),
             },
         )
-        self.assertEqual(data["version"], 1)
+        # 1.2.1 (#86): new manifests are version 2; the wave's risk is the policy level
+        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["review_policy"], {"version": "1.2.1", "level": selected["risk"]})
         self.assertEqual(data["base"], self.base)
 
     # T1: init --expect-sha256 pins the approved plan bytes
@@ -2677,7 +2682,8 @@ class WavesContract(unittest.TestCase):
             "--run-id",
             "legacy",
         )
-        self.assertEqual(set(self.manifest_data()), V060_KEYS)
+        # 1.2.1 (#86): the only addition to the v0.6.0 keys is the review policy
+        self.assertEqual(set(self.manifest_data()), V060_KEYS | {"review_policy"})
 
     def assert_init_rejected(self, selector):
         proc = self.init_wave_raw(selector)
@@ -4135,6 +4141,758 @@ class Sha256RepositoryState(unittest.TestCase):
             "--session-id", "coder-1", "--head", self.head[:40], "--artifact", "evidence",
         )
         self.assertNotEqual(proc.returncode, 0)
+
+
+# ---------------------------------------------------------------- 1.2.1 (#86): model by risk, two reviews
+REVIEW = ROOT / "skills" / "superarmanda" / "scripts" / "review.py"
+GATE = ROOT / "skills" / "superarmanda" / "scripts" / "waves" / "gate.py"
+LIVE_MANIFESTS = ROOT / "tests" / "fixtures" / "manifests"
+FABLE = "claude-fable-5-1"
+SONNET = "claude-sonnet-5-5"
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def fake_review_clis():
+    """The subscription CLI doubles of the review suite (tests/helpers/superarmanda_review_test.py):
+    review reports in these tests are written by review.py itself, not by hand."""
+    suite = _load("superarmanda_review_suite", Path(__file__).with_name("superarmanda_review_test.py"))
+    return {"claude": suite.MOCK, "codex": suite.CODEX_MOCK}
+
+
+class PolicyBase(unittest.TestCase):
+    """A manifest version 2 made by state.py over a throwaway repository with one change."""
+
+    RISK = "high"
+    TASK = "t1"
+
+    def setUp(self):
+        for key in [k for k in os.environ if k.startswith("WAB_")] + ["SUPERARMANDA_TZ"]:
+            os.environ.pop(key, None)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q")
+        self.git("checkout", "-q", "-b", "main")
+        self.git("config", "user.email", "tester@example.invalid")
+        self.git("config", "user.name", "State Tester")
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        self.git("commit", "-qm", "base")
+        self.base = self.head()
+        self.change("changed\n")
+        self.manifest = self.root / "run.json"
+        self.serial = itertools.count(1)
+        self.init()
+
+    # ----- repository and state CLI -----
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *map(str, args)], text=True, capture_output=True, check=True
+        )
+
+    def head(self):
+        return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def change(self, text):
+        (self.repo / "tracked.txt").write_text(text, encoding="utf-8")
+        self.git("commit", "-qam", "change")
+        return self.head()
+
+    def state(self, command, *args):
+        return subprocess.run(
+            ["python3", str(STATE), command, "--manifest", str(self.manifest), *map(str, args)],
+            text=True, capture_output=True,
+        )
+
+    def ok(self, command, *args):
+        proc = self.state(command, *args)
+        self.assertEqual(proc.returncode, 0, f"{command}: {proc.stderr}")
+        return json.loads(proc.stdout)
+
+    def refused(self, command, *args, needle=None):
+        """A closed refusal: non-zero code and a byte-identical manifest."""
+        before = self.manifest.read_bytes()
+        proc = self.state(command, *args)
+        self.assertNotEqual(proc.returncode, 0, f"{command} {args} was accepted: {proc.stdout}")
+        self.assertEqual(self.manifest.read_bytes(), before, "a refusal must not change the manifest")
+        if needle is not None:
+            self.assertIn(needle, proc.stderr)
+        return proc
+
+    def init(self, *extra, risk=None):
+        self.manifest.unlink(missing_ok=True)
+        risk = self.RISK if risk is None else risk
+        flags = ["--risk", risk] if risk else []
+        return self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head(),
+                       "--run-id", "policy", *flags, *extra)
+
+    def resume(self):
+        return self.ok("resume", "--repo", self.repo, "--base", self.base, "--head", self.head())
+
+    def data(self):
+        return json.loads(self.manifest.read_text(encoding="utf-8"))
+
+    def entry(self, task=None):
+        return self.data()["tasks"][task or self.TASK]
+
+    def where(self):
+        return self.ok("where")
+
+    def result_args(self, role, status="pass", task=None, session=None, **flags):
+        args = ["--task", task or self.TASK, "--role", role, "--status", status,
+                "--session-id", session or f"{role}-{next(self.serial)}", "--head", self.head()]
+        flags.setdefault("artifact", "evidence")
+        for name, value in flags.items():
+            if value is not None:
+                args += ["--" + name.replace("_", "-"), value]
+        return args
+
+    def record(self, role, status="pass", **flags):
+        return self.ok("task-result", *self.result_args(role, status, **flags))
+
+    def record_refused(self, role, status="pass", needle=None, **flags):
+        return self.refused("task-result", *self.result_args(role, status, **flags), needle=needle)
+
+    # ----- review reports written by review.py over the subscription CLI doubles -----
+    def packet(self, requirements="Must review the patch.\n"):
+        number = next(self.serial)
+        if not hasattr(self, "bin"):
+            self.bin = self.root / "bin"
+            self.bin.mkdir()
+            for name, source in fake_review_clis().items():
+                (self.bin / name).write_text(source, encoding="utf-8")
+                (self.bin / name).chmod(0o755)
+        requirements_file = self.root / f"requirements-{number}.txt"
+        requirements_file.write_text(requirements, encoding="utf-8")
+        evidence = self.root / f"evidence-{number}.txt"
+        evidence.write_text("synthetic checks passed\n", encoding="utf-8")
+        path = self.root / f"packet-{number}.json"
+        proc = subprocess.run(
+            ["python3", str(REVIEW), "packet", "--repo", str(self.repo), "--base", self.base,
+             "--head", self.head(), "--requirements", str(requirements_file),
+             "--test-evidence", str(evidence), "--output", str(path)],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.packet_path = path
+        self.packet_hash = "sha256:" + json.loads(path.read_text(encoding="utf-8"))["packet_hash"]
+        return path
+
+    def report(self, profile, mode="success", packet=None):
+        """Run review.py for `profile`; return the path of the report it wrote."""
+        if packet is None and not hasattr(self, "packet_path"):
+            self.packet()
+        output = self.root / f"report-{profile}-{next(self.serial)}.json"
+        env = os.environ.copy()
+        env.update({"PATH": str(self.bin) + os.pathsep + env.get("PATH", ""), "SA_TEST_MODE": mode,
+                    "SA_TEST_LOG": str(self.root / "cli-log.jsonl")})
+        subprocess.run(
+            ["python3", str(REVIEW), "run", "--repo", str(self.repo), "--packet",
+             str(packet or self.packet_path), "--profile", profile, "--output", str(output),
+             "--timeout", "2" if mode == "timeout" else "20"],
+            text=True, capture_output=True, env=env,
+        )
+        self.assertTrue(output.exists(), f"review.py wrote no report for {profile}/{mode}")
+        return output
+
+    def review_flags(self, report, packet_hash=None, **flags):
+        return dict(artifact=str(report), reviewed_head=self.head(),
+                    packet_hash=packet_hash or self.packet_hash, **flags)
+
+    def review(self, role, profile, mode="success", status="pass", **flags):
+        report = self.report(profile, mode)
+        return self.record(role, status, **self.review_flags(report, **flags)), report
+
+    def code_and_test(self, model="fable"):
+        self.record("coder", model=model)
+        self.record("tester", model=model)
+
+    def edited(self, report, **changes):
+        """A copy of a review.py report with the named top-level fields replaced (None removes)."""
+        value = json.loads(Path(report).read_text(encoding="utf-8"))
+        for key, new in changes.items():
+            if new is None:
+                value.pop(key, None)
+            else:
+                value[key] = new
+        path = self.root / f"edited-{next(self.serial)}.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return path
+
+
+class RiskPolicyManifest(PolicyBase):
+    """Manifest version 2: the review policy field and its closed validation."""
+
+    def write_plan(self, risk):
+        plan = self.root / "waves.json"
+        plan.write_text(json.dumps(plan_doc([wave("w1", risk=risk)])), encoding="utf-8")
+        return f"{plan}#w1"
+
+    def test_init_writes_version_2_with_policy_level_and_version(self):
+        self.assertEqual(self.data()["version"], 2)
+        self.assertEqual(self.data()["review_policy"], {"version": "1.2.1", "level": "high"})
+        self.manifest.unlink()
+        printed = self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head())
+        self.assertEqual(printed["review_policy"], {"version": "1.2.1", "level": "low"})
+        self.assertEqual(self.data()["version"], 2)
+        for risk in ("low", "medium", "high"):
+            with self.subTest(wave_risk=risk):
+                self.manifest.unlink()
+                self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head(),
+                        "--from-plan", self.write_plan(risk))
+                self.assertEqual(self.data()["review_policy"], {"version": "1.2.1", "level": risk})
+                self.assertEqual(self.data()["version"], 2)
+
+    def test_init_refuses_risk_with_from_plan_and_unknown_risk(self):
+        self.manifest.unlink()
+        for flags in (["--risk", "high", "--from-plan", self.write_plan("low")], ["--risk", "urgent"],
+                      ["--risk", ""]):
+            with self.subTest(flags=flags):
+                proc = self.state("init", "--repo", self.repo, "--base", self.base, "--head", self.head(), *flags)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertFalse(self.manifest.exists())
+
+    def test_unknown_or_missing_policy_is_a_closed_refusal_for_every_command(self):
+        self.code_and_test()
+        good = self.data()
+
+        def broken(change):
+            value = copy.deepcopy(good)
+            change(value)
+            return value
+
+        cases = {
+            "version 3": broken(lambda v: v.update(version=3)),
+            "version string": broken(lambda v: v.update(version="2")),
+            "version missing": broken(lambda v: v.pop("version")),
+            "policy removed": broken(lambda v: v.pop("review_policy")),
+            "policy not an object": broken(lambda v: v.update(review_policy="1.2.1")),
+            "policy extra key": broken(lambda v: v["review_policy"].update(extra=1)),
+            "policy without level": broken(lambda v: v["review_policy"].pop("level")),
+            "policy without version": broken(lambda v: v["review_policy"].pop("version")),
+            "unknown policy version": broken(lambda v: v["review_policy"].update(version="9.9.9")),
+            "unknown level": broken(lambda v: v["review_policy"].update(level="urgent")),
+            "level not a string": broken(lambda v: v["review_policy"].update(level=["high"])),
+            "unknown task risk": broken(lambda v: v["tasks"]["t1"].update(risk="urgent")),
+            "v1 carrying a policy": broken(lambda v: v.update(version=1)),
+        }
+        commands = {
+            "status": [],
+            "where": [],
+            "resume": ["--repo", self.repo, "--base", self.base, "--head", self.head()],
+            "task-result": self.result_args("tester", model="fable"),
+            "fix-loop": ["--task", "t1", "--outcome", "failed", "--source", "tester"],
+            "mark": ["--task", "t1", "--step", "4", "--safe-point", "false"],
+            "role-model": ["--task", "t1", "--role", "coder"],
+            "task-risk": ["--task", "t1", "--risk", "high"],
+        }
+        for label, value in cases.items():
+            self.manifest.write_text(json.dumps(value), encoding="utf-8")
+            for command, args in commands.items():
+                with self.subTest(case=label, command=command):
+                    self.refused(command, *args)
+
+    def test_role_model_follows_the_effective_risk(self):
+        for level, model in (("high", FABLE), ("medium", SONNET), ("low", SONNET)):
+            self.init(risk=level)
+            before = self.manifest.read_bytes()
+            for role in ("coder", "tester"):
+                with self.subTest(level=level, role=role):
+                    answer = self.ok("role-model", "--task", "t1", "--role", role)
+                    self.assertEqual(answer, {"task": "t1", "role": role, "risk": level, "model": model,
+                                              "policy_version": "1.2.1"})
+            self.assertEqual(self.manifest.read_bytes(), before, "role-model is read-only")
+        # a task raised to high inside a low run gets Fable; its neighbour keeps Sonnet
+        self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "tester")["model"], FABLE)
+        self.assertEqual(self.ok("role-model", "--task", "t2", "--role", "coder")["model"], SONNET)
+        self.refused("role-model", "--task", "t1", "--role", "cross_provider_reviewer")
+
+    def test_task_risk_can_be_raised_or_repeated_never_lowered(self):
+        self.init(risk="low")
+        self.assertEqual(self.ok("task-risk", "--task", "t1", "--risk", "medium")["risk"], "medium")
+        self.assertEqual(self.ok("task-risk", "--task", "t1", "--risk", "medium")["risk"], "medium")
+        self.refused("task-risk", "--task", "t1", "--risk", "low", needle="lower")
+        self.assertEqual(self.ok("task-risk", "--task", "t1", "--risk", "high")["risk"], "high")
+        self.refused("task-risk", "--task", "t1", "--risk", "medium", needle="lower")
+        self.refused("task-risk", "--task", "t1", "--risk", "urgent")
+        self.assertEqual(self.entry()["risk"], "high")
+        self.assertEqual(self.where()["risk"], "high")
+
+    def test_high_wave_is_the_floor_for_a_medium_task(self):
+        """A medium task of a high wave: one Astra pass is not a pass, and its roles get Fable."""
+        self.manifest.unlink()
+        self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head(),
+                "--from-plan", self.write_plan("high"))
+        self.ok("task-risk", "--task", "t1", "--risk", "medium")
+        self.assertEqual(self.entry()["risk"], "medium")
+        for role in ("coder", "tester"):
+            self.assertEqual(self.ok("role-model", "--task", "t1", "--role", role)["model"], FABLE)
+        self.record_refused("coder", model="sonnet")
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        self.assertEqual(self.entry()["status"], "in_progress")
+        where = self.where()
+        self.assertEqual((where["risk"], where["role"]), ("high", "second_reviewer"))
+        self.assertNotIn("done", where["next_action"])
+
+
+class HighRiskModels(PolicyBase):
+    """Coder and tester of a high-risk task run on Fable, and the result says so."""
+
+    def test_high_coder_and_tester_require_the_fable_model(self):
+        for role in ("coder", "tester"):
+            for model in (None, "", "sonnet", SONNET, "claude-opus-5-5", "gpt-6-astra"):
+                with self.subTest(role=role, model=model):
+                    self.record_refused(role, model=model)
+        self.assertEqual(self.data()["tasks"], {})
+        self.record_refused("coder", needle=FABLE)
+        entry = self.record("coder", model=FABLE)
+        self.assertEqual(entry["results"]["coder"]["model"], FABLE)
+
+    def test_fable_alias_is_stored_canonically_and_lookalikes_are_rejected(self):
+        for wrong in ("not-fable", "fable-lite", "Fable", "FABLE", "fable ", " fable", "fable\n",
+                      FABLE + "-x", "x-" + FABLE, "claude-fable", "claude-fable-5", ""):
+            with self.subTest(model=wrong):
+                self.record_refused("coder", model=wrong)
+                self.record_refused("tester", status="unavailable", model=wrong)
+        self.assertEqual(self.record("coder", model="fable")["results"]["coder"]["model"], FABLE)
+        self.assertEqual(self.record("tester", model="fable")["results"]["tester"]["model"], FABLE)
+
+    def test_medium_task_model_is_optional_but_only_from_the_dictionary(self):
+        self.init(risk="medium")
+        self.assertNotIn("model", self.record("coder")["results"]["coder"])
+        self.assertEqual(self.record("coder", model="sonnet")["results"]["coder"]["model"], SONNET)
+        self.assertEqual(self.record("tester", model="fable")["results"]["tester"]["model"], FABLE)
+        for wrong in ("", "gpt-6-astra", "Sonnet", "sonnet-lite"):
+            self.record_refused("tester", model=wrong)
+        # the model of a reviewer comes from its verified report, never from a flag
+        for role in ("cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit"):
+            self.record_refused(role, status="incomplete", model="fable")
+
+    def test_unavailable_fable_is_recorded_and_never_replaced_by_a_weaker_model(self):
+        for role, others in (("coder", ()), ("tester", ("coder",))):
+            with self.subTest(role=role):
+                self.init()
+                for other in others:
+                    self.record(other, model="fable")
+                entry = self.record(role, "unavailable", model="fable")
+                self.assertEqual(
+                    (entry["results"][role]["status"], entry["results"][role]["model"]), ("unavailable", FABLE)
+                )
+                self.assertNotEqual(entry["status"], "ready_for_pr_review")
+                where = self.where()
+                self.assertEqual(where["role"], role)
+                self.assertTrue(where["next_action"].startswith("BLOCKED"), where["next_action"])
+                self.assertIn("weaker model", where["next_action"])
+                self.assertNotIn("must finish", where["next_action"])
+                self.assertEqual(
+                    next(a for a in where["artifacts"] if a["role"] == role)["model"], FABLE
+                )
+                # Sonnet cannot take the role over, whatever status it reports
+                for status in ("pass", "unavailable", "error"):
+                    self.record_refused(role, status, model="sonnet")
+                self.record_refused(role, "unavailable")
+                self.assertEqual(self.entry()["results"][role]["status"], "unavailable")
+
+    def test_risk_raised_after_results_takes_readiness_back(self):
+        self.init(risk="medium")
+        self.record("coder", model="sonnet")
+        self.record("tester")
+        self.review("cross_provider_reviewer", "claude-host")
+        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        raised = self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.assertEqual(raised["status"], "in_progress")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (4, "coder"))
+        self.assertIn(FABLE, where["next_action"])
+        self.assertIn(SONNET, where["next_action"])
+        # redoing the roles on Fable and adding both verified reviews makes it ready again
+        self.code_and_test()
+        self.assertEqual(self.where()["role"], "cross_provider_reviewer")  # recorded without a verified report
+        self.review("cross_provider_reviewer", "claude-host")
+        self.review("second_reviewer", "codex-host")
+        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+
+
+class HighRiskReviews(PolicyBase):
+    """A high-risk task passes only with two verified reviews: Astra (claude-host) and Fable (codex-host)."""
+
+    def test_one_astra_pass_is_not_enough_and_astra_plus_fable_passes(self):
+        self.code_and_test()
+        entry, astra = self.review("cross_provider_reviewer", "claude-host")
+        self.assertEqual(entry["status"], "in_progress")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (5, "second_reviewer"))
+        entry, fable = self.review("second_reviewer", "codex-host")
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        for role, profile, report in (("cross_provider_reviewer", "claude-host", astra),
+                                      ("second_reviewer", "codex-host", fable)):
+            stored = entry["results"][role]
+            self.assertTrue(json.loads(report.read_text(encoding="utf-8"))["gate_ready"])
+            self.assertEqual(stored["profile"], profile)
+            self.assertEqual(stored["artifact"], str(report))
+            self.assertEqual(stored["artifact_sha256"], hashlib.sha256(report.read_bytes()).hexdigest())
+            self.assertEqual(stored["packet_hash"], self.packet_hash)
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (7, "github_codex_review"))
+        self.assertEqual(where["review_policy"], {"version": "1.2.1", "level": "high"})
+        self.assertEqual({a["role"]: a["profile"] for a in where["artifacts"]},
+                         {"coder": None, "tester": None, "cross_provider_reviewer": "claude-host",
+                          "second_reviewer": "codex-host"})
+        self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
+        self.assertIn("done", self.where()["next_action"])
+
+    def test_roles_may_swap_profiles_but_the_pair_must_be_astra_and_fable(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "codex-host")
+        entry, _ = self.review("second_reviewer", "claude-host")
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+
+    def test_two_astra_reviews_or_fable_without_astra_do_not_pass(self):
+        for profile in ("claude-host", "codex-host"):
+            with self.subTest(profile=profile):
+                self.init()
+                self.code_and_test()
+                self.review("cross_provider_reviewer", profile)
+                entry, _ = self.review("second_reviewer", profile)
+                self.assertEqual(entry["status"], "in_progress")
+                where = self.where()
+                self.assertNotIn("done", where["next_action"])
+                self.assertEqual((where["step"], where["role"]), (5, "second_reviewer"))
+                self.assertIn("claude-host", where["next_action"])
+                self.assertIn("codex-host", where["next_action"])
+
+    def test_reviews_of_different_packets_do_not_pass(self):
+        self.code_and_test()
+        self.packet("First packet.\n")
+        self.review("cross_provider_reviewer", "claude-host")
+        self.packet("Another packet of the same head.\n")
+        entry, _ = self.review("second_reviewer", "codex-host")
+        self.assertEqual(entry["status"], "in_progress")
+        where = self.where()
+        self.assertEqual(where["role"], "second_reviewer")
+        self.assertIn("packet", where["next_action"])
+
+    def test_fable_review_failure_never_passes_and_never_falls_back(self):
+        """auth, timeout and an unavailable Fable: recorded, not a pass, no Sonnet/Astra stand-in."""
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        for mode, category in (("claude_auth_unauthorized", "auth"), ("timeout", "timeout")):
+            with self.subTest(mode=mode):
+                failed = self.report("codex-host", mode)
+                self.assertEqual(json.loads(failed.read_text(encoding="utf-8"))["error_category"], category)
+                # the failed report cannot be recorded as a pass or as findings
+                for status in ("pass", "findings"):
+                    self.record_refused("second_reviewer", status, **self.review_flags(failed))
+                for status in ("error", "unavailable"):
+                    entry = self.record("second_reviewer", status, artifact=str(failed))
+                    self.assertEqual(entry["status"], "in_progress")
+                    where = self.where()
+                    self.assertEqual((where["step"], where["role"]), (5, "second_reviewer"))
+                    self.assertTrue(where["next_action"].startswith("BLOCKED"), where["next_action"])
+                    self.assertIn("codex-host-opus", where["next_action"])
+                    self.assertIn("quota", where["next_action"])
+        # without a quota report the Opus route is closed, and Astra twice is not a pair
+        opus = self.report("codex-host-opus")
+        self.record_refused("second_reviewer", **self.review_flags(opus))
+        self.record_refused("second_reviewer", **self.review_flags(opus, quota_evidence=str(failed)))
+        entry, _ = self.review("second_reviewer", "claude-host")
+        self.assertEqual(entry["status"], "in_progress")
+        # an unverifiable report (not written by review.py) is never a second review
+        self.record_refused("second_reviewer", reviewed_head=self.head(), packet_hash=self.packet_hash)
+        self.record_refused("second_reviewer", artifact=str(self.root / "missing.json"),
+                            reviewed_head=self.head(), packet_hash=self.packet_hash)
+
+    def test_fable_quota_report_opens_the_opus_fallback_and_both_artifacts_are_recorded(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        quota = self.report("codex-host", "quota_failure")
+        evidence = json.loads(quota.read_text(encoding="utf-8"))
+        self.assertEqual((evidence["profile"], evidence["status"], evidence["error_category"]),
+                         ("codex-host", "error", "quota"))
+        opus = self.report("codex-host-opus")
+        entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        stored = entry["results"]["second_reviewer"]
+        self.assertEqual(stored["profile"], "codex-host-opus")
+        self.assertEqual(stored["fallback_for"], "codex-host")
+        self.assertEqual(stored["artifact"], str(opus))
+        self.assertEqual(stored["artifact_sha256"], hashlib.sha256(opus.read_bytes()).hexdigest())
+        self.assertEqual(stored["quota_evidence"],
+                         {"artifact": str(quota), "sha256": hashlib.sha256(quota.read_bytes()).hexdigest()})
+        shown = next(a for a in self.where()["artifacts"] if a["role"] == "second_reviewer")
+        self.assertEqual((shown["profile"], shown["fallback_for"]), ("codex-host-opus", "codex-host"))
+        self.assertEqual(shown["quota_evidence"], stored["quota_evidence"])
+
+    def test_opus_without_evidence_or_with_foreign_evidence_does_not_count(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        old_head_quota = self.report("codex-host", "quota_failure")
+        self.change("second change\n")
+        self.resume()
+        self.code_and_test()
+        self.packet()
+        self.review("cross_provider_reviewer", "claude-host")
+        opus = self.report("codex-host-opus")
+        quota = self.report("codex-host", "quota_failure")
+        packet_path, packet_hash = self.packet_path, self.packet_hash
+        foreign_quota = self.report("codex-host", "quota_failure",
+                                    packet=self.packet("Another packet of the new head.\n"))
+        self.assertNotEqual(self.packet_hash, packet_hash)
+        self.packet_path, self.packet_hash = packet_path, packet_hash
+        cases = {
+            "no evidence": None,
+            "evidence of another head": old_head_quota,
+            "evidence of another packet": foreign_quota,
+            "evidence without head and packet (old format)":
+                self.edited(quota, reviewed_head=None, state_packet_hash=None),
+            "evidence without packet": self.edited(quota, state_packet_hash=None),
+            "evidence is an auth error": self.edited(quota, error_category="auth"),
+            "evidence is not an error": self.edited(quota, status="incomplete"),
+            "evidence claims gate_ready": self.edited(quota, gate_ready=True),
+            "evidence of astra": self.edited(quota, profile="claude-host"),
+            "evidence of opus itself": self.edited(quota, profile="codex-host-opus"),
+            "evidence is the opus pass": opus,
+            "evidence is missing": self.root / "no-such-report.json",
+        }
+        for label, evidence in cases.items():
+            with self.subTest(case=label):
+                flags = self.review_flags(opus, quota_evidence=None if evidence is None else str(evidence))
+                self.record_refused("second_reviewer", **flags)
+        self.assertNotIn("second_reviewer", self.entry()["results"])
+        # a stored Opus result that lost its evidence is not a second review either
+        self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
+        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        value = self.data()
+        del value["tasks"]["t1"]["results"]["second_reviewer"]["quota_evidence"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        self.record("tester", model="fable")
+        self.assertEqual(self.entry()["status"], "in_progress")
+        self.assertIn("quota", self.where()["next_action"])
+
+    def test_quota_evidence_is_only_for_the_opus_profile(self):
+        self.code_and_test()
+        quota = self.report("codex-host", "quota_failure")
+        for role, profile in (("cross_provider_reviewer", "claude-host"), ("second_reviewer", "codex-host")):
+            with self.subTest(profile=profile):
+                report = self.report(profile)
+                self.record_refused(role, **self.review_flags(report, quota_evidence=str(quota)))
+        self.record_refused("coder", model="fable", quota_evidence=str(quota))
+        self.init(risk="medium")
+        self.record_refused("cross_provider_reviewer",
+                            **self.review_flags(self.report("codex-host-opus"), quota_evidence=str(quota)))
+
+    def test_report_must_be_a_verified_review_of_this_head_and_packet(self):
+        self.code_and_test()
+        good = self.report("claude-host")
+        good_hash = self.packet_hash
+        findings = self.report("codex-host", "findings")
+        body = json.loads(good.read_text(encoding="utf-8"))
+        link = self.root / "link.json"
+        link.symlink_to(good)
+        directory = self.root / "report-dir"
+        directory.mkdir()
+        not_json = self.root / "not-json.json"
+        not_json.write_text("not json", encoding="utf-8")
+        array = self.root / "array.json"
+        array.write_text("[]", encoding="utf-8")
+        huge = self.root / "huge.json"
+        huge.write_text(json.dumps(dict(body, padding="x" * (2 * 1024 * 1024))), encoding="utf-8")
+        cases = {
+            "gate_ready false as pass": self.edited(good, gate_ready=False),
+            "gate_ready missing": self.edited(good, gate_ready=None),
+            "gate_ready truthy string": self.edited(good, gate_ready="true"),
+            "report status differs": self.edited(good, status="findings"),
+            "unknown profile": self.edited(good, profile="sonnet-host"),
+            "profile missing": self.edited(good, profile=None),
+            "another packet": self.edited(good, state_packet_hash="sha256:" + "0" * 64),
+            "packet missing (old report)": self.edited(good, state_packet_hash=None),
+            "another head": self.edited(good, response=dict(body["response"], reviewed_head="0" * 40)),
+            "no response": self.edited(good, response=None),
+            "symlink": link,
+            "directory": directory,
+            "not json": not_json,
+            "not an object": array,
+            "oversized": huge,
+            "missing file": self.root / "absent.json",
+        }
+        for label, report in cases.items():
+            with self.subTest(case=label):
+                self.record_refused("cross_provider_reviewer", **self.review_flags(report))
+        # the flags must name the report's packet, and the three of them are mandatory
+        self.record_refused("cross_provider_reviewer", **self.review_flags(good, packet_hash="sha256:" + "1" * 64))
+        for missing in ("artifact", "reviewed_head", "packet_hash"):
+            flags = self.review_flags(good)
+            flags[missing] = None
+            for status in ("pass", "findings"):
+                with self.subTest(missing=missing, status=status):
+                    self.record_refused("cross_provider_reviewer", status, **flags)
+        # findings need a verified model and tool isolation as well
+        capabilities = json.loads(findings.read_text(encoding="utf-8"))["capabilities"]
+        for label, broken in {
+            "model not verified": dict(capabilities, primary_model_verified=False),
+            "tools unverified": dict(capabilities, tool_isolation="unverified"),
+            "tools missing": {k: v for k, v in capabilities.items() if k != "tool_isolation"},
+        }.items():
+            with self.subTest(case=label):
+                self.record_refused("second_reviewer", "findings",
+                                    **self.review_flags(self.edited(findings, capabilities=broken)))
+        self.record_refused("second_reviewer", "pass", **self.review_flags(findings))
+        self.assertEqual(self.packet_hash, good_hash)
+        self.assertNotIn("cross_provider_reviewer", self.entry()["results"])
+        self.record("cross_provider_reviewer", **self.review_flags(good))
+        self.record("second_reviewer", "findings", **self.review_flags(findings))
+        self.assertEqual(self.entry()["results"]["second_reviewer"]["profile"], "codex-host")
+
+    def test_second_reviewer_findings_go_through_the_same_fix_loop_rules(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        entry, _ = self.review("second_reviewer", "codex-host", "findings", status="findings")
+        self.assertEqual(entry["status"], "in_progress")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (6, "coordinator"))
+        self.assertIn("--source second_reviewer", where["next_action"])
+        deferred = self.ok("fix-loop", "--task", "t1", "--defer", "--source", "second_reviewer",
+                           "--note", "low: wording -> next wave")
+        self.assertEqual(deferred["status"], "ready_for_pr_review")
+        # a rerun is another result: the deferral does not cover it
+        entry, _ = self.review("second_reviewer", "codex-host", "findings", status="findings")
+        self.assertEqual(entry["status"], "in_progress")
+        accepted = self.ok("fix-loop", "--task", "t1", "--accept", "--source", "second_reviewer",
+                           "--severity", "medium", "--note", "accepted limitation")
+        self.assertEqual(accepted["status"], "ready_for_pr_review")
+        failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
+        self.assertEqual((failed["status"], failed["fix_sources"]), ("needs_fix", {"second_reviewer": 1}))
+        again = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
+        self.assertEqual((again["status"], again["decision_required_for"]), ("needs_decision", "second_reviewer"))
+
+    def test_medium_task_of_version_2_passes_with_one_astra_as_in_1_2_0(self):
+        for level in ("medium", "low"):
+            with self.subTest(level=level):
+                self.init(risk=level)
+                self.record("coder")
+                self.record("tester")
+                # the report is not dereferenced: any artifact string works, as before
+                entry = self.record("cross_provider_reviewer", reviewed_head=self.head(),
+                                    packet_hash="ab12" * 16, artifact="not-a-file")
+                self.assertEqual(entry["status"], "ready_for_pr_review")
+                self.assertNotIn("profile", entry["results"]["cross_provider_reviewer"])
+                where = self.where()
+                self.assertEqual((where["step"], where["role"], where["risk"]), (7, "github_codex_review", level))
+
+    def test_merge_gate_reads_a_version_2_manifest_without_unknown_records(self):
+        gate = _load("superarmanda_gate_for_policy", GATE)
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        quota = self.report("codex-host", "quota_failure")
+        self.record("second_reviewer",
+                    **self.review_flags(self.report("codex-host-opus"), quota_evidence=str(quota)))
+        self.ok("mark", "--task", "t1", "--step", "7", "--safe-point", "true")
+        value = self.data()
+        self.assertEqual(gate.manifest_problems(value, value["head"], value["tree_fingerprint"]), [])
+        self.ok("task-risk", "--task", "t1", "--risk", "high")
+        value = self.data()
+        self.assertEqual(gate.manifest_problems(value, value["head"], value["tree_fingerprint"]), [])
+        # the gate still refuses what it does not know
+        value["surprise"] = 1
+        self.assertTrue(any("unknown record type" in p for p in
+                            gate.manifest_problems(value, value["head"], value["tree_fingerprint"])))
+
+
+class LiveVersion1Manifests(PolicyBase):
+    """Manifests of finished chains (tests/fixtures/manifests/README.md) keep the rules of 1.2.0."""
+
+    RISK = "low"
+
+    def load_live(self, name):
+        raw = (LIVE_MANIFESTS / name).read_text(encoding="utf-8")
+        state_module = _load("superarmanda_state_for_fixture", STATE)
+        fixture = json.loads(raw)
+        bound = [
+            (task, kind, index)
+            for task, entry in fixture["tasks"].items()
+            for kind in ("deferrals", "acceptances")
+            for index, record in enumerate(entry.get(kind, []))
+            if record["result_sha256"] == state_module.result_digest(entry["results"].get(record["source"]))
+        ]
+        tree = self.data()["tree_fingerprint"]  # of the throwaway repository, from state.py init
+        for mark, value in (("@REPO@", str(self.repo.resolve())), ("@BASE@", self.base),
+                            ("@HEAD@", self.head()), ("@TREE@", tree), ("@PATH@", str(self.root / "live"))):
+            raw = raw.replace(mark, value)
+        value = json.loads(raw)
+        for task, kind, index in bound:  # the substitution changed the results the records name
+            record = value["tasks"][task][kind][index]
+            record["result_sha256"] = state_module.result_digest(value["tasks"][task]["results"][record["source"]])
+        self.manifest.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
+        (self.TASK,) = value["tasks"]
+        return value
+
+    def assert_rules_of_1_2_0(self, name, risk):
+        live = self.load_live(name)
+        self.assertEqual((live["version"], live["wave"]["risk"]), (1, risk))
+        self.assertNotIn("review_policy", live)
+        status = self.ok("status")
+        self.assertTrue(status["tree_matches"])
+        self.assertEqual(status["tasks"][self.TASK]["status"], "ready_for_pr_review")
+        where = self.where()
+        self.assertIn("done", where["next_action"])
+        self.assertEqual((where["risk"], where["review_policy"]), (None, None))
+        # recomputed by today's state.py: no model, one Astra result, still ready
+        for role in ("coder", "tester"):
+            entry = self.record(role)
+            self.assertNotIn("model", entry["results"][role])
+        entry = self.record("cross_provider_reviewer", reviewed_head=self.head(),
+                            packet_hash="ab12" * 16, artifact="not-a-file")
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(set(entry["results"]["cross_provider_reviewer"]),
+                         {"status", "head", "session_id", "artifact", "reviewed_head", "packet_hash",
+                          "tree_fingerprint", "recorded_at", "result_id"})
+        self.assertNotIn("second_reviewer", self.where()["next_action"])
+        self.assertEqual(self.data()["version"], 1)
+        self.assertNotIn("review_policy", self.data())
+
+    def test_live_high_wave_manifest_of_version_1_keeps_the_rules_of_1_2_0(self):
+        self.assert_rules_of_1_2_0("v1-high-waves-gate-redact-W1.json", "high")
+
+    def test_live_medium_wave_manifest_passes_with_one_astra_review(self):
+        self.assert_rules_of_1_2_0("v1-medium-waves-tails-W2.json", "medium")
+
+    def test_new_flags_and_commands_are_refused_on_version_1(self):
+        self.load_live("v1-high-waves-gate-redact-W1.json")
+        quota = self.root / "quota.json"
+        quota.write_text("{}", encoding="utf-8")
+        needle = "requires manifest version 2"
+        self.record_refused("coder", model="fable", needle=needle)
+        self.record_refused("tester", model="sonnet", needle=needle)
+        self.record_refused("second_reviewer", needle=needle)
+        self.record_refused("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16,
+                            quota_evidence=str(quota), needle=needle)
+        self.refused("task-risk", "--task", self.TASK, "--risk", "high", needle=needle)
+        self.refused("role-model", "--task", self.TASK, "--role", "coder", needle=needle)
+        self.refused("fix-loop", "--task", self.TASK, "--outcome", "failed", "--source", "second_reviewer",
+                     needle=needle)
+        self.refused("fix-loop", "--task", self.TASK, "--defer", "--source", "second_reviewer",
+                     "--note", "n", needle=needle)
+
+    def test_version_2_high_manifest_without_the_policy_field_is_refused(self):
+        self.init(risk="high")
+        self.code_and_test()
+        value = self.data()
+        del value["review_policy"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        for command, args in (("status", []), ("where", []),
+                              ("task-result", self.result_args("tester", model="fable"))):
+            with self.subTest(command=command):
+                self.refused(command, *args, needle="review_policy")
 
 
 if __name__ == "__main__":

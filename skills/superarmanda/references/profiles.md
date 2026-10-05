@@ -8,12 +8,71 @@
 | Роль | Claude Code host (проверенный default) | Codex host (проверенный default) |
 |---|---|---|
 | coordinator / planner | доступная явная native-модель (Fable) | доступная явная native-модель (`gpt-6-astra`) |
-| coder | fresh explicit native model (`coder@sonnet`) | fresh explicit native model (`coder@gpt-5.6-terra`) |
-| tester | fresh explicit native model (`tester@sonnet`) | fresh explicit native model (`tester@gpt-5.6-terra`) |
-| task reviewer | Codex CLI / fixed adapter | Claude CLI / fixed adapter |
+| coder | по риску задачи (раздел ниже): `coder@sonnet`, при high — Fable | fresh explicit native model (`coder@gpt-5.6-terra`) |
+| tester | по риску задачи (раздел ниже): `tester@sonnet`, при high — Fable | fresh explicit native model (`tester@gpt-5.6-terra`) |
+| task reviewer | Codex CLI / fixed adapter; при риске high — оба адаптера | Claude CLI / fixed adapter; при риске high — оба адаптера |
 | context / drafts | `reader`/`drafter@haiku` | `reader`/`drafter@gpt-5.6-luna` |
 | required PR review | GitHub Codex | GitHub Codex |
 | optional PR review | CodeRabbit | CodeRabbit |
+
+## Модель роли по риску (1.2.1, #86)
+
+Модель coder и tester задаёт риск задачи, а не привычка координатора. Источник истины —
+`state.py`: он считает эффективный риск задачи и отдаёт модель командой `role-model`.
+
+| Риск задачи | coder | tester | Ревью задачи |
+|---|---|---|---|
+| high | Fable (`claude-fable-5-1`) | Fable (`claude-fable-5-1`) | два: Astra (`claude-host`) и Fable (`codex-host`) |
+| medium | Sonnet (`claude-sonnet-5-5`) | Sonnet (`claude-sonnet-5-5`) | одно (`cross_provider_reviewer`) |
+| low | Sonnet (`claude-sonnet-5-5`) | Sonnet (`claude-sonnet-5-5`) | одно (`cross_provider_reviewer`) |
+
+- **Эффективный риск задачи** — больший из риска прогона (`review_policy.level` manifest:
+  риск волны при `init --from-plan`, иначе `init --risk`, по умолчанию `low`) и собственного риска
+  задачи (`state.py task-risk --task <id> --risk <low|medium|high>`). Риск волны — нижняя граница
+  для всех её задач, в том числе для модели: задача medium в волне high идёт на Fable и требует
+  двух ревью. Риск задачи можно только поднять.
+- **Задачи про безопасность и маскировку обязаны иметь `risk: high`**: маскировка секретов,
+  границы данных, авторизация, гейты и проверки, которые что-то запрещают. Сомневаешься — high.
+- **Модель обязательна в metadata результата.** `task-result --model <значение>` принимает только
+  закрытый словарь: `claude-fable-5-1`, `claude-sonnet-5-5` и алиасы `fable`, `sonnet`
+  (совпадение точное, без обрезки пробелов и смены регистра); в manifest пишется полный ID.
+  Для задачи с риском high результат coder и tester без `--model`, равной Fable, отклоняется при
+  любом статусе, а готовность задачи дополнительно требует `model: claude-fable-5-1` у обоих
+  результатов (если риск подняли уже после записи — роли переделываются на Fable).
+- **Fable недоступна** (лимит, авторизация, модель не отвечает) — координатор записывает
+  `task-result --role <coder|tester> --status unavailable --model fable` и останавливается:
+  `where` отдаёт `BLOCKED`, задача не pass. Подмены Sonnet или другой моделью слабее нет.
+- **Второй ревьюер.** Для задачи high роль `second_reviewer` обязательна наравне с
+  `cross_provider_reviewer`: пара отчётов `review.py` — ровно один `claude-host` (Astra) и ровно
+  один `codex-host` (Fable) по одному пакету и текущему HEAD. Порядок и команда — в
+  [review-contract.md](review-contract.md).
+- **Запасной Opus.** `codex-host-opus` заменяет `codex-host` только при подтверждённой квоте
+  Fable: запись с `--quota-evidence <отчёт codex-host>`, где отчёт — ошибка `review.py` с
+  `error_category: quota` для того же HEAD и пакета. Без него Opus-ревью не засчитывается.
+
+Manifest `version: 1` (созданный до 1.2.1) оценивается по правилам 1.2.0: одна модель по таблице
+host-профилей ниже, одно ревью; `role-model`, `task-risk`, `--model`, `second_reviewer` и
+`--quota-evidence` на нём — отказ.
+
+### Шаблон брифа coder и tester
+
+Модель в бриф не пишется по памяти: её отдаёт `state.py`, и она же уходит в `--model` результата.
+
+```text
+Роль: <coder|tester>, задача <id>, свежая сессия.
+Модель: значение поля "model" из вывода
+  python3 "$SUPERARMANDA_DIR/scripts/state.py" role-model --manifest <path> --task <id> --role <coder|tester>
+  (риск high -> claude-fable-5-1; medium и low -> claude-sonnet-5-5). Другая модель не подходит;
+  недоступна -> сообщи координатору, не подменяй.
+Риск задачи: <low|medium|high> (поле "risk" того же вывода). Effort: <по таблице ниже>.
+Требования, приёмка, разрешённые файлы, запреты, команды проверок: <...>
+Отчёт: <путь>. В отчёте назови фактическую модель сессии.
+
+Для задачи с риском high в брифе стоит: Модель: claude-fable-5-1
+Запись результата координатором:
+  state.py task-result --manifest <path> --task <id> --role <coder|tester> --status <status> \
+    --session-id <id> --head <sha> --artifact <отчёт> --model <model из role-model>
+```
 
 ## Effort ролей
 
@@ -26,7 +85,7 @@ Effort субагента — параметр брифа координатор
 | reader | `low` | — (извлекает факты и ссылки `file:line`, не рассуждает) |
 | coder | по выбору координатора | — |
 
-Модели ролей это не меняет (`tester@sonnet`, `reader@haiku`). Повод (#15): субагенты coder/tester
+Модель роли effort не меняет: её задаёт риск (раздел выше; `reader@haiku` — всегда). Повод (#15): субагенты coder/tester
 съедали больше половины суточного лимита, перечитывая репозиторий целиком. Поэтому бриф tester по
 умолчанию — дифф и команды проверки, а чтение репозитория идёт через `reader`: выжимка и ссылки
 `file:line`, а не файлы целиком. Если host не умеет задавать effort субагента, координатор
@@ -46,7 +105,8 @@ Fable quota attempt.
 
 `session_id` закреплён за парой task/role на всём run и не может перейти в
 другую задачу или роль даже после resume. Это разделяет сессии, но не доказывает, какая модель
-фактически отвечала. Для task review используй другой провайдер, чем host coder.
+фактически отвечала. Для task review используй другой провайдер, чем host coder; при риске
+high — оба провайдера (раздел «Модель роли по риску»).
 
 `scripts/review.py` реализует фиксированные подписочные adapters. `codex-host`
 остаётся Fable. После подтверждённого provider quota event/notice Fable (либо
@@ -115,7 +175,9 @@ python3 "$SUPERARMANDA_DIR/scripts/review.py" run --repo /repo \
   --output /outside/opus-result.json
 ```
 
-Он сохраняет исходный Fable failure artifact вместе с Opus result artifact.
+Он сохраняет исходный Fable failure artifact вместе с Opus result artifact. Для задачи с
+риском high оба пути уходят в manifest: `task-result --role second_reviewer --artifact
+/outside/opus-result.json --quota-evidence /outside/fable-quota-result.json`.
 Нода без нужного CLI, подписки или подтверждённой capability даёт review
 unavailable → BLOCKED, PR остаётся draft. Mock-тесты не подтверждают доступ к
 внешнему аккаунту.

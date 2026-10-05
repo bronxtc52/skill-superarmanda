@@ -124,6 +124,35 @@ bound; run `check` later or resume from saved state. Keep the PR draft until the
 is ready. Manual Codex review on draft PR #426 has been proven; there is still no ready-PR/API
 fallback or automatic draft transition.
 
+## Шаблон тела PR
+
+Тело PR собирает координатор по manifest (`state.py where`: `risk`, `artifacts`,
+`accepted_limitations`). Секции обязательны, пустая — словом «Нет».
+
+```markdown
+## Что и зачем
+
+<изменение и причина; Closes/Refs #N>
+
+## Проверки (HEAD <sha>)
+
+- `<команда>` — <итог>
+- Риск задачи: <low|medium|high>. Модель coder и tester: <claude-fable-5-1 | claude-sonnet-5-5> (из manifest).
+- Ревью задачи: Astra (`claude-host`) — <pass | findings: решение>; для риска high также Fable (`codex-host`) — <pass | findings: решение>.
+- Запасное Opus-ревью (`codex-host-opus`): <нет | да — вместо Fable; подтверждение квоты Fable: отчёт `codex-host` с `error_category: quota` на этом HEAD и пакете, `<путь из quota_evidence>`>.
+
+## Принятые ограничения
+
+<Нет. | по строке на каждую запись `fix-loop --accept` с severity medium/high: источник, что принято и почему>
+
+## Остаток (вне приёмки)
+
+<Нет. | отложенные находки `fix-loop --defer` и куда они перенесены>
+```
+
+Строка о запасном Opus-ревью пишется всегда: читатель PR должен видеть, что второе ревью делала
+не Fable, и чем подтверждена её квота.
+
 `--worktree` names the local checkout solely for the output boundary; `--output` must be outside
 that checkout before the script makes any GitHub request. When the current directory is outside a
 Git checkout, `--worktree LOCAL_CHECKOUT` is required; otherwise it defaults to the current

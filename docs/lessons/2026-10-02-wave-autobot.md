@@ -115,3 +115,4 @@ W1 после пройденного гейта продолжала комми�
 | 1.1.0 | W4 | панель событий для человека (#69), e2e толчка, CodeRabbit и cleanup, точный итог закрытия сессий, релиз |
 | 1.1.1 | W1 waves-gate-redact | гейт мерджа, дашборд и `wab.py status` берут manifest текущего прогона по `runs.json` (#76) |
 | 1.2.0 | W2 waves-gate-redact | один путь маскировки `safe_text` и реестр путей вывода `OUTPUT_PATHS` (#81) |
+| 1.2.1 | W1 waves-fable-policy | модель роли по риску, два ревью для `high`, manifest `version: 2` (#86) |

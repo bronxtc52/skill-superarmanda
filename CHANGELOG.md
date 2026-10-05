@@ -3,6 +3,45 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 1.2.1 — 2026-10-05
+
+### Добавлено
+
+- Модель роли по риску (#86): `state.py role-model --task <id> --role <coder|tester>` отдаёт модель по эффективному
+  риску задачи: `high` → Fable (`claude-fable-5-1`), `medium` и `low` → Sonnet (`claude-sonnet-5-5`). Эффективный риск —
+  больший из риска прогона (`review_policy.level`: риск волны при `init --from-plan`, иначе `init --risk`) и риска
+  задачи (`state.py task-risk`, только поднять). Риск волны — нижняя граница и для модели.
+- Модель в metadata результата: `task-result --model` для `coder` и `tester` принимает закрытый словарь
+  (`claude-fable-5-1`, `claude-sonnet-5-5`, алиасы `fable`, `sonnet`; совпадение точное) и пишет полный ID в поле
+  `model`. Для задачи `high` результат без модели Fable отклоняется при любом статусе; `unavailable` с
+  `--model fable` — запись «Fable запрошена и недоступна», `where` отдаёт `BLOCKED` без подмены моделью слабее.
+- Два ревью для задачи `high`: новая роль `second_reviewer`. Задача готова, только когда оба ревью — отчёты
+  `review.py` одного пакета на текущем HEAD, ровно один `claude-host` (Astra) и ровно один `codex-host` (Fable).
+  `state.py` сам читает отчёт из `--artifact` и сверяет профиль, статус, `gate_ready`, HEAD и пакет; в результат
+  пишутся `profile` и `artifact_sha256`. Один Astra, два Astra, Fable без Astra, разные пакеты — не pass, причина
+  стоит в `next_action`.
+- Запасной Opus только с подтверждением квоты: отчёт `codex-host-opus` принимается с `--quota-evidence <отчёт
+  codex-host с error_category: quota для того же HEAD и пакета>`; в manifest остаются оба артефакта
+  (`quota_evidence`, `fallback_for`). Auth, таймаут и прочая недоступность Fable — не pass, без отката на Sonnet.
+- `review.py`: отчёт ошибки несёт `reviewed_head` и `state_packet_hash`, когда пакет загружен и сверен с
+  репозиторием (нужно для quota evidence); при более ранней ошибке полей нет.
+- `where` отдаёт `risk`, `review_policy`, а в `artifacts` — `model`, `profile`, `fallback_for`, `quota_evidence`.
+- Документация: таблица моделей по риску и шаблон брифа с `state.py role-model` (`profiles.md`), команда ревью
+  задачи `high` и определение quota evidence (`review-contract.md`), шаблон тела PR со строкой о запасном
+  Opus-ревью (`pr-review.md`), правило «задачи про безопасность и маскировку обязаны иметь `risk: high`»
+  (`profiles.md`, `waves.md`).
+
+### Изменено
+
+- **Граница совместимости:** manifest `version: 1` оценивается по правилам 1.2.0 (одно ревью, модель не
+  требуется; `role-model`, `task-risk`, `--model`, `second_reviewer`, `--quota-evidence` на нём — отказ); новые
+  manifest — `version: 2` с полем `review_policy`; pass задачи `high` требует двух ревью и модели Fable в metadata
+  результатов coder и tester. Manifest `version: 2` без `review_policy`, с неизвестной версией политики или
+  уровнем — закрытый отказ любой команды.
+- Гейт мерджа диспетчера волн читает manifest `version: 2` без изменений правил; собственная проверка двух ревью
+  в гейте — следующая волна цепочки (#86).
+- Фикстуры тестов не содержат домашних путей и имён хоста: заглушки `@HOME@`/`@PATH@`, проверка — тест.
+
 ## 1.2.0 — 2026-10-05
 
 ### Исправлено
