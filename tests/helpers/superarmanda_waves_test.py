@@ -14867,10 +14867,10 @@ def _allow(file, func, why, *exprs):
 _allow("wab.py", "_text_head", _LOGIC, "s[:n]")
 _allow("wab.py", "unsent_reason", _LOGIC, "rest[:k]", "head[:k]")
 _allow("wab.py", "_undimmed", _LOGIC, "line[pos:m.start()]")
+_allow("wab.py", "sub", "_LinearEmail.sub() is re.sub of the e-mail rule: it joins the text between its matches back whole, "
+       "inside redact() (#85)", "text[pos:m.start()]")
 _allow("wab.py", "input_empty_reason", _LOGIC, "raw[top:bottom]")
 _allow("wab.py", "input_text", _LOGIC, "raw[top:bottom]")
-_allow("wab.py", "_labelled_sha", _LOGIC, "m.string[:m.start()]")
-_allow("wab.py", "redact", _LOGIC, "m.string[:m.start()]")
 _allow("wab.py", "_head", "the cut itself: it keeps the mask whole", "text[:n]", "MASK[:k]", "head[:-k]")
 _allow("wab.py", "_clip", "the cut itself, after the mask (_require_masked)", "'…'[:limit]")
 _allow("wab.py", "render_notice", "splits a notice at its quote markers; every part is masked whole afterwards",
