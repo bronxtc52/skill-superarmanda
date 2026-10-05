@@ -14740,6 +14740,124 @@ def redact_uses_outside(waves_dir, allowed=("safe_text",)):
     return found
 
 
+SINK_CALLS = {"safe_text", "_safe", "_safe_screen", "_masked_line", "event", "notify", "quote", "put_notice",
+              "blocked_notice", "render_notice", "_first_line"}
+CUTTERS = {"_clip", "_one_line"}
+# a slice of THESE is no outside text: git object ids (12 hex of a sha) and `first`, which is the already masked
+# first line of a notice (_first_line). Anything else cut before it reaches a sink is the #81 hole.
+ALLOWED_CUT_BASE = re.compile(r"^(?:str\()?(?:first|\w*(?:sha|head|oid|merge|old|new)\w*|\w+\['head'\]|"
+                              r"target\.stdout\.strip\(\))\)?$")
+
+
+# (function, sliced text): render_notice splits the text of a notice at its quote markers, every part is masked
+# whole afterwards, nothing is dropped; main() passes `argv[3:]`, the list of arguments, not a text.
+ALLOWED_CUT_IN = {("render_notice", "text"), ("main", "argv")}
+
+
+def cut_before_sink(waves_dir):
+    """[(file, line, function, source)]: a slice, _clip(...) or _one_line(...) INSIDE the arguments of a call that
+    shows text to a human (SINK_CALLS): the text is cut BEFORE it is masked, and the border may fall inside a
+    token (`ghp_abcde`). The cut belongs to the limit of safe_text or after it."""
+    import ast
+    found = []
+    for path in sorted(Path(waves_dir).glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        def walk(node, func):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and func == "<module>":
+                func = node.name
+            if isinstance(node, ast.Call):
+                f = node.func
+                name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+                if name in SINK_CALLS:
+                    for arg in [*node.args, *(k.value for k in node.keywords)]:
+                        for sub in ast.walk(arg):
+                            src = None
+                            if isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Slice):
+                                src = ast.unparse(sub.value)
+                                if ALLOWED_CUT_BASE.match(src) or (func, src) in ALLOWED_CUT_IN:
+                                    continue
+                            elif isinstance(sub, ast.Call) and (
+                                    (isinstance(sub.func, ast.Name) and sub.func.id in CUTTERS)):
+                                src = ast.unparse(sub)
+                                if sub.args and ALLOWED_CUT_BASE.match(ast.unparse(sub.args[0])):
+                                    continue
+                            if src is not None:
+                                found.append((path.name, sub.lineno, func, src))
+            for child in ast.iter_child_nodes(node):
+                walk(child, func)
+
+        walk(tree, "<module>")
+    return found
+
+
+class W2CutBeforeMask(Base):
+    """A caller that cuts the outside text BEFORE it reaches safe_text leaves a token's prefix at the border
+    (`ghp_abcde`: too short for any rule, so it is shown). Fixtures: the border falls INSIDE the token."""
+    TOKENS = {  # token, the visible part of the value that must not appear
+        "ghp_": ("ghp_AbCd1234EfGh5678IjKl9012MnOp3456", "AbCd1234EfGh"),
+        "sk-": ("sk-ant-api03-AbCdEfGhIjKl1234567890", "AbCdEfGhIjKl"),
+        "password=": ("password=Hunter2SecretValue99", "Hunter2Secret"),
+        "hex": (HEX40, HEX40[:12]),
+        "base64": (B64, B64[:12]),
+    }
+
+    def status_for(self, token, visible, cut=200):
+        head = "BLOCKED: "
+        pad = "y" * (cut - len(head) - 1 - visible)
+        return f"{head}{pad} {token}"
+
+    def test_a_blocked_status_cut_inside_a_token_does_not_show_its_prefix_in_events_and_notices(self):
+        for name, (token, part) in self.TOKENS.items():
+            for visible in (len(token) // 2, len(token) // 2 + 3, 14):
+                with self.subTest(token=name, visible=visible):
+                    self.tg.clear()
+                    cfg, _ = self.chain()
+                    self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(last_status="RUNNING")}})
+                    self.set_status(cfg, "W1", self.status_for(token, visible))
+                    with contextlib.redirect_stdout(io.StringIO()) as printed:
+                        wab.tick(cfg, wab.load_state(cfg))
+                    seen = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8") + printed.getvalue() \
+                        + "\n".join(self.tg)
+                    att = cfg["run_dir"] / "ATTENTION"
+                    seen += att.read_text(encoding="utf-8") if att.exists() else ""
+                    self.assertIn("BLOCKED", seen)
+                    self.assertIsNone(leaked(seen, [part]), seen[-300:])
+
+    def test_one_line_does_not_cut_inside_a_word(self):
+        for name, (token, part) in self.TOKENS.items():
+            text = "y " * 100 + token
+            for limit in range(150, len(text) - 1):
+                out = wab._one_line(text, limit)
+                self.assertIsNone(leaked(out, [token]), (name, limit, out))
+                self.assertLessEqual(len(out), limit)
+
+    def test_the_masked_line_is_masked_before_it_is_cut(self):
+        fn = getattr(wab, "_masked_line", None)
+        self.assertIsNotNone(fn, "wab._masked_line: mask first, then collapse and cut")
+        for name, (token, part) in self.TOKENS.items():
+            for limit in range(150, 230):
+                self.assertIsNone(leaked(fn(("y " * 100) + token, limit), [part]), (name, limit))
+        self.assertIsNone(leaked(fn("password=Hunter2\rSecretValue99", 100), ["SecretValue99"]))
+
+    def test_the_static_check_finds_no_cut_before_a_sink(self):
+        self.assertEqual(cut_before_sink(WAVES), [])
+
+    def test_a_cut_before_a_sink_is_caught_by_the_static_check(self):
+        tmp = self.tmp / "mut3"
+        shutil.copytree(WAVES, tmp, ignore=shutil.ignore_patterns("__pycache__"))
+        src = (tmp / "wab.py").read_text(encoding="utf-8")
+        good = 'event(cfg, f"{wave}: {safe_text(status, 200)}")'
+        self.assertIn(good, src)
+        (tmp / "wab.py").write_text(src.replace(good, 'event(cfg, f"{wave}: {status[:200]}")'), encoding="utf-8")
+        found = cut_before_sink(tmp)
+        self.assertEqual([f[3] for f in found], ["status"], found)
+        mutant = (tmp / "wab.py").read_text(encoding="utf-8").replace(
+            '{status[:200]}', "{_one_line(status, 200)}")
+        (tmp / "wab.py").write_text(mutant, encoding="utf-8")
+        self.assertEqual([f[3] for f in cut_before_sink(tmp)], ["_one_line(status, 200)"])
+
+
 class W2OutputPaths(Base):
     """Every place that shows text to a human, in ONE registry (wab.OUTPUT_PATHS): the test goes by the
     registry. A path that is not here is a path nobody checked for the invisible-character hole (#81)."""

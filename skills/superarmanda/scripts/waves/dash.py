@@ -611,9 +611,9 @@ def humanize_event(msg):
                     result = build(m)
                     break
     if result is None:
-        return (_safe(wab._head(msg, 140)), None, INFO_GREY, False)
+        return (wab._head(_safe(msg), 140), None, INFO_GREY, False)
     phrase, details, colour = result
-    return (_safe(phrase), _safe(_clip(details, 160)) if details else None, colour, True)
+    return (_safe(phrase), _clip(_safe(details), 160) if details else None, colour, True)
 
 
 def _pulse_key(msg):

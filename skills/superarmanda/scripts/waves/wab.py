@@ -1568,14 +1568,14 @@ def notify(cfg, text, wave=None):
         try:
             display_all(short)
         except (subprocess.CalledProcessError, OSError) as e:
-            event(cfg, f"display-message failed ({type(e).__name__}): {first[:80]}")
+            event(cfg, f"display-message failed ({type(e).__name__}): {_clip(first, 80)}")
         return True  # Telegram is not configured: there is nothing to repeat
     try:
         _send_telegram(cfg, render_notice(text, TG_MESSAGE_LIMIT))
         event(cfg, f"telegram: {first}")
         return True
     except Exception as e:  # notification must never stop supervision
-        event(cfg, f"telegram FAILED ({type(e).__name__}): {first[:80]}")
+        event(cfg, f"telegram FAILED ({type(e).__name__}): {_clip(first, 80)}")
         return False
 
 
@@ -3555,8 +3555,23 @@ def _gate_check(cfg, wave, w):
 
 
 def _one_line(text, limit=MAX_STATUS):
+    """The text in one line, cut at a WORD border: a border inside a token would leave its prefix (`ghp_abcde`),
+    too short for any masking rule. The text is the dispatcher's own; text of outside goes through _masked_line."""
     text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[:limit - 2].rstrip() + " …"
+    if len(text) <= limit:
+        return text
+    cut = limit - 2
+    if not text[cut].isspace():  # the border is inside a word: drop its beginning too
+        cut = text.rfind(" ", 0, cut) if " " in text[:cut] else 0
+    return text[:cut].rstrip() + " …"
+
+
+def _masked_line(text, limit):
+    """Text from outside as ONE line for an event or a notice: masked as a whole first (safe_text), then
+    collapsed to one line, then cut. Never a cut or a collapse before the mask: str.split() also splits at a
+    lone CR, U+2028 and the like, i.e. inside a secret."""
+    text = " ".join(safe_text(text, 10 ** 9).split())
+    return _clip(text, limit)
 
 
 def _write_status(wdir, text):
@@ -3643,7 +3658,7 @@ def handoff_gate_line(cfg, wave, w):
     try:
         v = gate_check(cfg, wave, w)
         _note_pr(w, v.get("number"))  # whatever the verdict: the hand-off carries the PR number (#34)
-        reasons = _one_line("; ".join(v["reasons"]), 300)
+        reasons = _masked_line("; ".join(v["reasons"]), 300)
         if v["verdict"] == "wait" and reasons.startswith("сбор фактов"):
             return f"Гейт мерджа не проверен: {quote(reasons)}"
         if v["verdict"] != "pass":
@@ -3659,7 +3674,7 @@ def handoff_gate_line(cfg, wave, w):
         path = write_owner_script(cfg, wave, sha)  # never the raw `gh pr merge`: the script gates again
         return f"Гейт мерджа пройден. Выполни: {home_form(path)} (заново проверит гейт на этом HEAD; draft PR сперва переведёт в ready и остановится, потом запусти ещё раз, чтобы смержить)"
     except Exception as e:  # noqa: BLE001
-        return f"Гейт мерджа не проверен: {type(e).__name__}: {quote(_one_line(e, 200))}"
+        return f"Гейт мерджа не проверен: {type(e).__name__}: {quote(e, 200)}"
 
 
 def _gate_tick(cfg, st, wave, w, wdir, now):
@@ -3713,7 +3728,7 @@ def _still_done(cfg, st, wave, w, wdir, what):
         w["last_status"], w["phase"] = again, "running"
         w.pop("done_head", None)  # its next DONE starts afresh
     save_state(cfg, st)
-    event(cfg, f"{wave}: {what}, but the status is «{_one_line(again or '', 80)}» now: nothing done")
+    event(cfg, f"{wave}: {what}, but the status is «{safe_text(again or '', 80)}» now: nothing done")
     return False
 
 
@@ -3769,7 +3784,7 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
     w["gate_sha"], w["gate_pr"] = sha, number
     unresolved = v["unresolved"]
     if v["reasons"]:  # a pass carries only the accepted limitations (`accepted <sev> <source>: <note>`)
-        event(cfg, f"{wave}: merge gate passed with accepted limitations: {_one_line('; '.join(v['reasons']), 600)}")
+        event(cfg, f"{wave}: merge gate passed with accepted limitations: {safe_text('; '.join(v['reasons']), 600)}")
     if v["draft"] and not unresolved:
         return _gate_ready(cfg, st, wave, w, wdir, number, sha)
     w["phase"] = "merging"
@@ -3812,7 +3827,7 @@ def _run_gh_step(argv):
     except (OSError, subprocess.SubprocessError) as e:
         return type(e).__name__
     if r.returncode != 0:
-        return _one_line(r.stderr or r.stdout or f"rc={r.returncode}", 200)
+        return _masked_line(r.stderr or r.stdout or f"rc={r.returncode}", 200)
     return None
 
 
@@ -3844,7 +3859,7 @@ def _hand_to_owner(cfg, st, wave, w, wdir, number, sha, text, log_text):
     try:  # the owner gets the script (it gates again, readies a draft and stops, then merges pinned to the sha), not the raw command
         command = home_form(write_owner_script(cfg, wave, sha))
     except (OSError, ValueError) as e:
-        command = f"(скрипт владельца не записан: {_one_line(e, 100)}; проверь PR #{number} вручную)"
+        command = f"(скрипт владельца не записан: {_masked_line(e, 100)}; проверь PR #{number} вручную)"
     w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate passed; {log_text}")
     note_question(w, w["last_status"], time.time())
     put_notice(w, "merge_refused", sha, f"{SIGN}волна {wave}: {text}. Выполни: {command}")
@@ -3943,7 +3958,7 @@ def owner_merge(cfg, wave, run_id, sha):
         r = sh(*argv, check=False, timeout=120)
         if r.returncode != 0:
             raise SystemExit(f"wab: owner-merge: `gh pr ready` failed: "
-                             f"{_one_line(r.stderr or r.stdout or r.returncode, 200)}")
+                             f"{_masked_line(r.stderr or r.stdout or r.returncode, 200)}")
         print(f"wab: owner-merge: PR #{number} переведён в ready; дождись завершения проверок "
               f"и запусти скрипт ещё раз ({len(v['unresolved'])} threads resolved)", flush=True)
         return
@@ -3964,7 +3979,7 @@ def owner_merge(cfg, wave, run_id, sha):
     r = sh(*merge, check=False, timeout=120)
     if r.returncode != 0:
         raise SystemExit(f"wab: owner-merge: `{' '.join(merge[:3])}` failed: "
-                         f"{_one_line(r.stderr or r.stdout or r.returncode, 200)}")
+                         f"{_masked_line(r.stderr or r.stdout or r.returncode, 200)}")
     print(f"wab: owner-merge: PR #{number} merge requested at {sha[:12]} "
           f"({len(v['unresolved'])} threads resolved)", flush=True)
 
@@ -4033,14 +4048,14 @@ def owner_handover(cfg, wave, run_id):
         # the hand-off, not after (the same check as refresh_workdir)
         dirty = git("status", "--porcelain", "--untracked-files=all")
         if dirty.returncode != 0:
-            raise SystemExit(f"wab: {what}: git status failed in {cwd}: {_one_line(dirty.stderr, 200)}; nothing done")
+            raise SystemExit(f"wab: {what}: git status failed in {cwd}: {_masked_line(dirty.stderr, 200)}; nothing done")
         if dirty.stdout.strip():
             raise SystemExit(f"wab: {what}: the wave's working copy {cwd} is not clean (uncommitted or untracked "
                              f"changes: not what was merged); commit or remove them; nothing done")
         fetch = git("fetch", "origin", base)
         if fetch.returncode != 0:
             raise SystemExit(f"wab: {what}: git fetch origin {base} failed: "
-                             f"{_one_line(fetch.stderr, 200)}; nothing done")
+                             f"{_masked_line(fetch.stderr, 200)}; nothing done")
         if git("merge-base", "--is-ancestor", merge, f"refs/remotes/origin/{base}").returncode != 0:
             raise SystemExit(f"wab: {what}: merge commit {merge[:12]} of PR #{number} is not an ancestor of "
                              f"origin/{base}; nothing done")
@@ -4121,7 +4136,7 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         try:
             command = home_form(write_owner_script(cfg, wave, sha))
         except (OSError, ValueError) as e:
-            command = f"(скрипт владельца не записан: {_one_line(e, 100)}; проверь PR #{number} вручную)"
+            command = f"(скрипт владельца не записан: {_masked_line(e, 100)}; проверь PR #{number} вручную)"
         w["merge_rc"] = None  # marker: handed to the owner
         w["last_status"] = _write_status(
             wdir, f"BLOCKED: merge gate passed; merge result unknown; owner runs {command}")
@@ -4550,7 +4565,7 @@ def chain_done_text(cfg, st):
     try:
         path, summary = write_chain_result(cfg, st)
     except Exception as e:  # noqa: BLE001 - the end of the chain is always reported and saved
-        return f"{SIGN}цепочка завершена, все волны готовы (chain-result.md не записан: {_one_line(e, 100)})."
+        return f"{SIGN}цепочка завершена, все волны готовы (chain-result.md не записан: {_masked_line(e, 100)})."
     return (f"{SIGN}цепочка завершена, все волны готовы.\n{summary}\n"
             f"Итог: chain-result.md в каталоге прогона {home_form(path.parent)}")
 
@@ -4919,7 +4934,7 @@ def _tick(cfg, st):
             put_notice(w, "blocked", status, blocked_notice(cfg, wave, status, attach))
         save_state(cfg, st)
         if fresh:
-            event(cfg, f"{wave}: {status[:200]}")
+            event(cfg, f"{wave}: {safe_text(status, 200)}")
         flush_notices(cfg, st, w)
         return True
 
