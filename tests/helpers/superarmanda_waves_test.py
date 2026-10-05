@@ -14681,6 +14681,9 @@ INVISIBLE_CLASSES = {  # one family per class that must never glue or split a se
     "default-ignorable U+115F": "ᅟ", "default-ignorable U+2065": "⁥",
     "default-ignorable U+00AD": "­",
 }
+# what str.split() / splitlines() cut at besides ASCII whitespace: a secret torn by them was shown by its tail (tester-3)
+SPLIT_CLASSES = {f"split U+{ord(c):04X}": c for c in ["\x1c", "\x1d", "\x1e", "\x1f", "\x85", "\u2028", "\u2029"]}
+# the Unicode spaces (Zs) are separators like a plain space (W3Quote pins it): not here
 HEX40 = "9f3a7c1e5b2d4086a1c7e93f5d20b84c6a17e9d3"
 B64 = "Zm9vYmFyU2VjcmV0S2V5VmFsdWUxMjM0NTY3ODkwYWJjZGVm"
 
@@ -14815,20 +14818,17 @@ _allow("wab.py", "input_empty_reason", _LOGIC, "raw[top:bottom]")
 _allow("wab.py", "input_text", _LOGIC, "raw[top:bottom]")
 _allow("wab.py", "_labelled_sha", _LOGIC, "m.string[:m.start()]")
 _allow("wab.py", "redact", _LOGIC, "m.string[:m.start()]")
-_allow("wab.py", "redact", _MASKED, "_clip(text, limit)")
-_allow("wab.py", "safe_text", _MASKED, "_clip(redact(text, 10 ** 9, owner_paths), limit)")
 _allow("wab.py", "_head", "the cut itself: it keeps the mask whole", "text[:n]", "MASK[:k]", "head[:-k]")
-_allow("wab.py", "_clip", "the cut itself, after the mask", "'…'[:limit]", "_head(text, limit - 2)")
-_allow("wab.py", "_render_quote", _MASKED, "_clip(row, room)")
+_allow("wab.py", "_clip", "the cut itself, after the mask (_require_masked)", "'…'[:limit]")
 _allow("wab.py", "render_notice", "splits a notice at its quote markers; every part is masked whole afterwards",
        "text[pos:m.start()]")
-_allow("wab.py", "render_notice", _MASKED, "_clip(''.join(out), limit)")
-_allow("wab.py", "_first_line", _MASKED, "_clip(f'{lines[0].strip()} {lines[1].lstrip('> ').strip()}', limit)",
-       "_clip(lines[0], limit)")
-_allow("wab.py", "chain_label", "the name of the chain is chain.json of the owner, controls are removed",
-       "_clip(name, SIGN_LIMIT)")
-_allow("wab.py", "notify", _MASKED, "_clip(first, 80)",
-       "_clip(f'{label}{(' ' + wave if wave else '')}: {_first_line(body, DISPLAY_LIMIT)}', DISPLAY_LIMIT)")
+_allow("wab.py", "_tick", _LIST, "(w.get('ctx_hist', []) + [tokens])[-120:]")
+_allow("wab.py", "auto_mode_off", _LIST + " (lines of the pane, read by the code)", "[l for l in text.splitlines() if l.strip()][-6:]")
+_allow("dash.py", "current_panel", _LIST + " (lines of the masked screen)",
+       "[l for l in _safe_screen(wab.pane_text(w['tmux'])).splitlines() if l.strip()][-14:]")
+_allow("dash.py", "spark", _LIST, "values[-width:]")
+_allow("dash.py", "tail_items", _LIST, "items[-n:]")
+_allow("dash.py", "ktok", "a number with a precision, not a text", "{n / 1000000:.2f}")
 _allow("wab.py", "pane_digest", _LIST, "[l for l in txt.splitlines() if l.strip()][:-2]")
 _allow("wab.py", "verify_previous_merge", _SHA, "oid[:12]")
 _allow("wab.py", "refresh_workdir", _SHA, "target.stdout.strip()[:12]")
@@ -14838,10 +14838,7 @@ _allow("wab.py", "_deliver", _DEDUP, "f'{what}: {e}'[:150]")
 _allow("wab.py", "_procs_unreadable", _DEDUP, "str(err)[:150]")
 _allow("wab.py", "exit_dialog", _LIST, "lines[-4:-1]")
 _allow("wab.py", "_gh", _LIST, "args[:2]")
-_allow("wab.py", "_one_line", _WORDCUT, "text[:cut]")
-_allow("wab.py", "_masked_line", _MASKED, "_clip(text, limit)")
-_allow("wab.py", "_write_status", _WORDCUT + " (the dispatcher's own status line)", "_one_line(text)")
-_allow("wab.py", "_gate_failed", _WORDCUT + " (typed into the wave, not shown to a human)", "_one_line(reasons, 1500)")
+_allow("wab.py", "_one_line", _WORDCUT + " (over text masked by _require_masked)", "text[:cut]")
 _allow("wab.py", "owner_script_name", _SHA, "sha[:12]", "hashlib.sha256(ident.encode('utf-8')).hexdigest()[:16]")
 _allow("wab.py", "_note_done_head", _SHA, "old[:12]", "head[:12]")
 _allow("wab.py", "_gate_passed", _SHA, "sha[:12]")
@@ -14854,28 +14851,32 @@ _allow("wab.py", "_merging_tick", _SHA, "str(head)[:12]", "sha[:12]")
 _allow("wab.py", "_alarm_tick", _DEDUP, "str(e)[:150]", "str(facts['error'])[:150]")
 _allow("wab.py", "_alarm_tick", _SHA, "head[:12]")
 _allow("wab.py", "_pending_alarm_enter", _DEDUP, "str(e)[:150]")
-_allow("wab.py", "_policy_question", _MASKED, "_clip(lines[0], 200)")
-_allow("wab.py", "_say_first", _MASKED, "_clip(lines[0], 120)")
 _allow("wab.py", "note_question", _LIST, "qs[:-QUESTIONS_CAP]")
 _allow("wab.py", "write_chain_result", _SHA, "str(sha)[:12]")
 _allow("wab.py", "blocked_notice", "the question was masked by safe_text above; it is split at `Варианты:`", "question[:m.start()]")
-_allow("dash.py", "manifest_lines", _MASKED + " (`where` is masked by _masked)", "wab._head(nxt, 109)")
-_allow("dash.py", "current_panel", _MASKED + " (_safe_screen)", "wab._head(l, 150)")
-_allow("dash.py", "_clip", "the cut itself of the dashboard, over text masked by humanize_event", "wab._head(text, limit - 1)")
-_allow("dash.py", "_blocked_phrase", _MASKED + " (the whole line is masked first in humanize_event)",
-       "_clip(rest, 200)", "_clip(label['question'], 160)")
 _allow("dash.py", "_pulse_phrase", _MASKED + " (humanize_event)", "status[:40]")
-_allow("dash.py", "humanize_event", _MASKED, "wab._head(_safe(msg), 140)", "_clip(_safe(details), 160)")
 _allow("dash.py", "fold_events", "the time of an events.log line `HH:MM:SS`", "line[11:19]", "ts[:5]")
-_allow("gate.py", "_word_cut", _WORDCUT, "text[:cut]")
 _allow("gate.py", "manifest_problems", _SHA, "str(manifest.get('head'))[:12]", "head[:12]")
 _allow("gate.py", "evaluate", _SHA, "str(pr.get('head'))[:12]", "head[:12]", "str(work.get('head'))[:12]")
 _allow("gate.py", "owner_script", _SHA, "sha[:12]")
 _allow("gate.py", "alarm_text", _SHA, "head[:12]")
 
 
+def _is_cut_slice(node):
+    """A slice that cuts by length: an upper bound, or a lower bound counted from the END (`text[-50:]`)."""
+    import ast
+    if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)):
+        return False
+    lo = node.slice.lower
+    negative = isinstance(lo, ast.UnaryOp) and isinstance(lo.op, ast.USub) or (
+        isinstance(lo, ast.Constant) and isinstance(lo.value, int) and lo.value < 0)
+    return node.slice.upper is not None or negative
+
+
 def cut_sites(waves_dir):
-    """{(file, function, expression)}: every slice with an upper bound and every call of _clip / _one_line / _head."""
+    """{(file, function, expression)}: every way to cut a text by length that is not a helper call: a slice with an
+    upper bound or from the end, textwrap / shorten, a precision in a format (`f"{t:.50}"`, `"%.50s" % t`).
+    The helpers (_clip, _one_line, _head, _masked_line) are no sites: each of them masks FIRST by itself (rule A)."""
     import ast
     found = set()
     for path in sorted(Path(waves_dir).glob("*.py")):
@@ -14884,17 +14885,128 @@ def cut_sites(waves_dir):
         def walk(node, func):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and func == "<module>":
                 func = node.name
-            if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice) and node.slice.upper is not None:
+            if _is_cut_slice(node):
                 found.add((path.name, func, ast.unparse(node)))
             elif isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute)):
                 name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr
-                if name in ("_clip", "_one_line", "_head"):
+                if name in ("shorten", "wrap", "fill", "truncate"):
                     found.add((path.name, func, ast.unparse(node)))
+            elif isinstance(node, ast.FormattedValue) and node.format_spec is not None:
+                spec = ast.unparse(node.format_spec)
+                if re.search(r"\.\d", spec):
+                    found.add((path.name, func, ast.unparse(node)))
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod) \
+                    and isinstance(node.left, ast.Constant) and isinstance(node.left.value, str) \
+                    and re.search(r"%\.\d", node.left.value):
+                found.add((path.name, func, ast.unparse(node)))
             for child in ast.iter_child_nodes(node):
                 walk(child, func)
 
         walk(tree, "<module>")
     return found
+
+
+# the helpers that cut or join text: each must ask for the mask FIRST (_require_masked), and only they (and
+# safe_text / redact, which make the mask) may construct Masked
+MASKING_HELPERS = {("wab.py", "_clip"), ("wab.py", "_head"), ("wab.py", "_one_line"), ("wab.py", "_masked_line"),
+                   ("dash.py", "_clip")}
+MASKED_MAKERS = MASKING_HELPERS | {("wab.py", "safe_text"), ("wab.py", "redact")}
+
+
+def helper_violations(waves_dir):
+    """Rule A: a helper of MASKING_HELPERS that does not call _require_masked; rule D: Masked(...) built anywhere
+    but in MASKED_MAKERS."""
+    import ast
+    bad = []
+    for path in sorted(Path(waves_dir).glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        for (f, name) in MASKING_HELPERS:
+            if f == path.name:
+                calls = {ast.unparse(c.func) for c in ast.walk(funcs[name]) if isinstance(c, ast.Call)} if name in funcs else set()
+                if not calls & {"_require_masked", "wab._require_masked"}:
+                    bad.append((path.name, name, "does not call _require_masked"))
+
+        def walk(node, func):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and func == "<module>":
+                func = node.name
+            if isinstance(node, ast.Call):
+                fn = ast.unparse(node.func)
+                if fn in ("Masked", "wab.Masked") and (path.name, func) not in MASKED_MAKERS:
+                    bad.append((path.name, func, "builds Masked: " + ast.unparse(node)[:60]))
+            for child in ast.iter_child_nodes(node):
+                walk(child, func)
+
+        walk(tree, "<module>")
+    return bad
+
+
+# Rule C. Functions that show text to a human: in them str.split / splitlines / partition run ONLY on a masked
+# value (the result of safe_text & co., or a name assigned from one): split on raw text cuts a secret in two.
+OUTPUT_FUNCS = {
+    "wab.py": {"quote", "_render_quote", "render_notice", "_first_line", "notify", "note_attention", "attention_text",
+               "event", "_short_command", "note_question", "write_chain_result", "_policy_question", "_say_first",
+               "blocked_notice", "status_cmd", "manifest_status_line", "_write_status", "_gate_failed",
+               "handoff_gate_line", "manifest_where_of", "_resolve_why", "say_cmd", "_masked_line", "_one_line",
+               "_gh", "chain_label", "owner_merge", "owner_handover", "_hand_to_owner"},
+    "dash.py": {"humanize_event", "current_panel", "manifest_lines", "_blocked_phrase", "_pulse_phrase", "_masked",
+                "_safe", "_safe_screen", "_clip", "fold_events", "events_panel", "waves_table", "pipeline"},
+}
+MASKERS = {"safe_text", "_masked_line", "_one_line", "_first_line", "render_notice", "quote", "_safe", "_safe_screen",
+           "_require_masked", "_clip", "_head", "_policy_question", "_say_first", "_resolve_why"}
+SPLITTERS = {"split", "rsplit", "splitlines", "partition", "rpartition"}
+SPLIT_ALLOWED = {  # (file, function, receiver) -> why
+    ("wab.py", "blocked_notice", "question.strip()"): "the question is masked by safe_text at the top of the function",
+    ("wab.py", "blocked_notice", "options.strip()"): "a part of that masked question, cut at `Варианты:`",
+}
+
+
+def _masked_expr(node, names):
+    import ast
+    if isinstance(node, ast.Call):
+        f = node.func
+        name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+        if name in MASKERS:
+            return True
+        if isinstance(f, ast.Attribute):  # masked.strip() / masked.lower() / masked.replace(...)
+            return _masked_expr(f.value, names)
+    if isinstance(node, ast.Name):
+        return node.id in names
+    if isinstance(node, ast.Subscript):
+        return _masked_expr(node.value, names)
+    if isinstance(node, (ast.ListComp, ast.GeneratorExp)):
+        return _masked_expr(node.elt, names) or any(_masked_expr(g.iter, names) for g in node.generators)
+    if isinstance(node, ast.IfExp):
+        return _masked_expr(node.body, names) and _masked_expr(node.orelse, names)
+    return False
+
+
+def unmasked_splits(waves_dir):
+    import ast
+    found = []
+    for path in sorted(Path(waves_dir).glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in OUTPUT_FUNCS.get(path.name, ())):
+            names = set()
+            for _ in range(3):  # a name assigned from a masked expression is masked (a few passes: chains)
+                for node in ast.walk(fn):
+                    targets = []
+                    if isinstance(node, ast.Assign):
+                        targets, value = node.targets, node.value
+                    elif isinstance(node, ast.NamedExpr):
+                        targets, value = [node.target], node.value
+                    elif isinstance(node, (ast.For, ast.comprehension)):
+                        targets, value = [node.target], node.iter
+                    else:
+                        continue
+                    if _masked_expr(value, names):
+                        for t in targets:
+                            names |= {n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in SPLITTERS:
+                    if not _masked_expr(node.func.value, names):
+                        found.append((path.name, fn.name, ast.unparse(node.func.value)))
+    return sorted(c for c in set(found) if c not in SPLIT_ALLOWED)
 
 
 def unlisted_cuts(waves_dir):
@@ -14914,12 +15026,21 @@ class W2EveryCut(Base):
         self.assertEqual(unlisted_cuts(WAVES), [])
         self.assertEqual(stale_allowlist(WAVES), [], "an entry of the allowlist that matches nothing any more")
 
-    def mutate(self, name, old, new):
+    def test_every_helper_masks_first_and_only_the_makers_build_masked(self):
+        self.assertEqual(helper_violations(WAVES), [])
+
+    def test_no_output_function_splits_a_value_that_is_not_masked(self):
+        self.assertEqual(unmasked_splits(WAVES), [])
+        self.assertEqual([k for k in SPLIT_ALLOWED if k not in {
+            (f, fn, r) for f, fn, r in [("wab.py", "blocked_notice", "question.strip()"),
+                                        ("wab.py", "blocked_notice", "options.strip()")]}], [])
+
+    def mutate(self, name, old, new, file="wab.py"):
         tmp = self.tmp / f"cut-{name}"
         shutil.copytree(WAVES, tmp, ignore=shutil.ignore_patterns("__pycache__"))
-        src = (tmp / "wab.py").read_text(encoding="utf-8")
+        src = (tmp / file).read_text(encoding="utf-8")
         self.assertIn(old, src)
-        (tmp / "wab.py").write_text(src.replace(old, new, 1), encoding="utf-8")
+        (tmp / file).write_text(src.replace(old, new, 1), encoding="utf-8")
         return tmp
 
     def test_gh_cut_through_a_variable_is_caught(self):
@@ -14928,12 +15049,50 @@ class W2EveryCut(Base):
         self.assertTrue([c for c in unlisted_cuts(tmp) if c[1] == "_gh"], unlisted_cuts(tmp))
 
     def test_a_new_cut_in_any_function_is_caught(self):
-        tmp = self.mutate("new", "def _say_first(text):\n", "def _say_first(text):\n    s = text[:120]\n    event({}, s)\n")
-        self.assertIn(("wab.py", "_say_first", "text[:120]"), unlisted_cuts(tmp))
+        for n, expr in enumerate(("text[:120]", "text[-50:]", "textwrap.shorten(text, 50)", "f'{text:.50}'", "'%.50s' % text")):
+            with self.subTest(expr=expr):
+                tmp = self.mutate(f"new{n}", "def _say_first(text):\n", f"def _say_first(text):\n    s = {expr}\n    event({{}}, s)\n")
+                self.assertTrue([c for c in unlisted_cuts(tmp) if c[1] == "_say_first"], unlisted_cuts(tmp))
 
-    def test_a_new_one_line_or_clip_is_caught(self):
-        tmp = self.mutate("clip", "def _say_first(text):\n", "def _say_first(text):\n    s = _one_line(text, 120)\n")
-        self.assertTrue([c for c in unlisted_cuts(tmp) if c[1] == "_say_first"])
+    def test_a_raw_split_before_the_mask_is_caught(self):
+        tmp = self.mutate("rawsplit", "def _gate_failed(cfg, st, wave, w, wdir, reasons):\n",
+                          "def _gate_failed(cfg, st, wave, w, wdir, reasons):\n    reasons = ' '.join(reasons.split())\n")
+        self.assertIn(("wab.py", "_gate_failed", "reasons"), unmasked_splits(tmp))
+        tmp = self.mutate("rawsplit2", "safe_text(text, 10 ** 9).splitlines() if l.strip()]\n    return _clip(lines[0], 120)",
+                          "text.splitlines() if l.strip()]\n    return _clip(lines[0], 120)")
+        self.assertIn(("wab.py", "_say_first", "text"), unmasked_splits(tmp))
+
+    def test_a_helper_that_does_not_mask_first_is_caught(self):
+        tmp = self.mutate("nomask", 'text = Masked(" ".join(_require_masked(text).split()))\n    if len(text) <= limit:\n        return text\n    cut',
+                          'text = Masked(" ".join(str(text).split()))\n    if len(text) <= limit:\n        return text\n    cut')
+        self.assertIn(("wab.py", "_one_line", "does not call _require_masked"), helper_violations(tmp))
+        self.assertTrue([u for u in unmasked_splits(tmp) if u[1] == "_one_line"])
+
+    def test_masked_built_outside_the_makers_is_caught(self):
+        tmp = self.mutate("masked", "def _say_first(text):\n", "def _say_first(text):\n    text = Masked(text)\n")
+        self.assertTrue([b for b in helper_violations(tmp) if b[1] == "_say_first"])
+
+    def test_masked_is_a_str_that_json_and_files_take(self):
+        m = wab.safe_text("a b", 10)
+        self.assertIsInstance(m, wab.Masked)
+        self.assertIsInstance(m, str)
+        self.assertEqual(json.dumps({"s": m}), '{"s": "a b"}')
+        self.assertIsInstance(wab._one_line("a  b"), wab.Masked)
+        self.assertIsInstance(wab._clip("x" * 50, 10), wab.Masked)
+        self.assertIsInstance(wab._masked_line("x\u2028y", 10), wab.Masked)
+
+    def test_a_helper_asked_with_raw_text_masks_it(self):
+        raw = "password=Hunter2\x1cSecretValue99"
+        for fn in (lambda t: wab._one_line(t), lambda t: wab._clip(t, 100), lambda t: wab._head(t, 100),
+                   lambda t: wab._masked_line(t, 100), lambda t: self.dash_clip(t)):
+            self.assertIsNone(leaked(fn(raw), ["SecretValue99"]))
+
+    def dash_clip(self, t):
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        return dash._clip(t, 100)
 
 
 class W2CutOutside(Base):
@@ -14985,14 +15144,15 @@ class W2CutOutside(Base):
                         wab.process_table()
                 self.assertIsNone(leaked(str(cm.exception), [part]), str(cm.exception))
 
-    def test_gate_errors_are_cut_at_a_word_border(self):
+    def test_gate_errors_are_not_cut_by_gate_and_masked_where_they_are_shown(self):
         import gate
         for name, (token, part) in W2CutBeforeMask.TOKENS.items():
             text = self.text_for(token, len(token) // 2, 200)
             with self.subTest(token=name):
                 with self.assertRaises(gate.CollectError) as cm:
                     gate._threads(lambda query, variables: {"errors": text}, "o/r", 1)
-                self.assertIsNone(leaked(str(cm.exception), [part]))
+                self.assertIn(token, str(cm.exception))  # gate.py (stdlib-only) does not touch the text at all
+                self.assertIsNone(leaked(wab._masked_line(cm.exception, 200), [part]))
 
 
 class W2CutBeforeMask(Base):
@@ -15033,7 +15193,7 @@ class W2CutBeforeMask(Base):
             text = "y " * 100 + token
             for limit in range(150, len(text) - 1):
                 out = wab._one_line(text, limit)
-                self.assertIsNone(leaked(out, [token]), (name, limit, out))
+                self.assertIsNone(leaked(out, [part]), (name, limit, out))
                 self.assertLessEqual(len(out), limit)
 
     def test_the_masked_line_is_masked_before_it_is_cut(self):
@@ -15144,6 +15304,29 @@ class W2OutputPaths(Base):
         return wab.blocked_notice(self.chain()[0], "W1", status, "attach") + wab.blocked_notice(
             self.chain()[0], "W1", f"BLOCKED: {raw}", "attach")
 
+    def out_status_file(self, raw):
+        cfg, _ = self.chain()
+        wdir = wab.wave_dir(cfg, "W1")
+        returned = wab._write_status(wdir, raw)
+        return returned + "\n" + (wdir / "status").read_text(encoding="utf-8")
+
+    def out_gate_failed(self, raw):
+        cfg, _ = self.chain()
+        w = self.wave_rec("W1", phase="gate")
+        st = {"current": "W1", "waves": {"W1": w}}
+        self.put_state(cfg, st)
+        self.tg.clear()
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            wab._gate_failed(cfg, st, "W1", w, wab.wave_dir(cfg, "W1"), f"проверки неуспешны: {raw} (failure)")
+        seen = [w.get("last_status", ""), w["gate_fail_msg"]["text"], (wab.wave_dir(cfg, "W1") / "status").read_text(encoding="utf-8"),
+                (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"), printed.getvalue(), "\n".join(self.tg),
+                self.dash.wave_status(cfg, "W1", w), str(self.get_state(cfg)["waves"]["W1"].get("last_status"))]
+        self.put_state(cfg, st)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            wab.status_cmd(cfg)
+        return "\n".join(map(str, seen)) + "\n" + buf.getvalue()
+
     def out_status_cmd(self, raw):
         cfg, _ = self.chain()
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
@@ -15194,6 +15377,30 @@ class W2OutputPaths(Base):
                          "a path without a test (or a test of a path nobody registered)")
         for name, what in registry.items():
             self.assertTrue(isinstance(what, str) and what.strip(), f"{name}: no description")
+
+    def test_every_path_hides_a_secret_torn_by_a_separator_of_str_split(self):
+        adapters = self.adapters()
+        for form in live_forms()[:2]:
+            for cname, ch in SPLIT_CLASSES.items():
+                for sname, (secret, values) in secret_shapes(ch).items():
+                    raw = form.replace("@S@", secret)
+                    for path, fn in adapters.items():
+                        piece = leaked(fn(raw), values)
+                        if piece is not None:
+                            self.fail(f"{path}: «{piece}» of the secret [{sname}] torn by {cname} reached the output")
+
+    def test_safe_text_masks_the_whole_word_when_a_secret_is_torn_by_a_control_separator(self):
+        for cname, ch in SPLIT_CLASSES.items():
+            for sname, (secret, values) in secret_shapes(ch).items():
+                out = wab.safe_text(f"x {secret} y", 10 ** 6)
+                self.assertIsNone(leaked(out, values), (cname, sname, out))
+                self.assertIn("x ", out)
+        self.assertEqual(wab.safe_text("5\u00a0мин и 3\u2009с", 100), "5\u00a0мин и 3\u2009с")  # an innocent text stays
+
+    def test_one_line_masks_before_it_collapses(self):
+        for cname, ch in SPLIT_CLASSES.items():
+            out = wab._one_line(f"r password=sec{ch}retvalue99")
+            self.assertIsNone(leaked(out, ["retvalue99"]), (cname, out))
 
     def test_the_fixture_is_live_and_clean(self):
         forms = live_forms()

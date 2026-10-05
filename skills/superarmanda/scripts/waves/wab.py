@@ -1289,7 +1289,7 @@ def redact(text, limit=TG_LIMIT, owner_paths=True):
             return in_github or (rx is _OPAQUE and _readable_dashed(m))
 
         text = rx.sub(lambda m: m.group(0) if keep(m) else "[скрыто]", text)
-    return _clip(text, limit)
+    return _clip(Masked(text), limit)
 
 
 # The wave's own text (result.md, a status line, a reason from outside) is a QUOTE, never part of the
@@ -1353,36 +1353,55 @@ def _as_ranges(chars):
 # masked whole. Unicode spaces (Zs) are separators like a plain space, never part of a token.
 _INVISIBLE = ("\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f" + _chars_of({"Cf", "Zl", "Zp"})
               + _as_ranges(_default_ignorable()))
-# A word is a run between spaces, tabs and line breaks. A lone CR is NOT a break for the masking (it is one
-# for the line split): `password=sec\rret` is one word, else its tail `ret` would be left over the cut.
+# A word is a run between spaces, tabs and line breaks. A lone CR is NOT a break for the masking (it is one for
+# the line split): `password=sec\rret` is one word, else its tail `ret` would be left over the cut (#81).
+# The Unicode spaces (Zs: NBSP, U+2000-U+200A, U+3000...) ARE separators, like a plain space: a secret torn by
+# any space leaves its parts visible, plain or not (an existing test pins it, W3Quote); the characters of
+# str.split() that are no space to the eye (\x1c-\x1f, NEL, U+2028/9) are in _INVISIBLE: the word is masked whole.
 _SPACES = " \\n\\t" + _chars_of({"Zs"})
 _CONTROL = re.compile(f"[{_INVISIBLE}]")
 _CTRL_WORD = re.compile(f"[^{_SPACES}]*[{_INVISIBLE}][^{_SPACES}]*")
-_CR_WORD = re.compile(f"[^{_SPACES}]*\r[^{_SPACES}]*")
+_SOFT_WORD = re.compile(f"[^{_SPACES}]*\r[^{_SPACES}]*")
 MASK = "[скрыто]"
+
+
+class Masked(str):
+    """Text that has passed safe_text(): the mark that every cutting or joining helper (_clip, _head, _one_line,
+    _masked_line) asks for FIRST (_require_masked). A str subclass: json, state.json and files take it as a str;
+    an operation on it (a slice, join) gives a plain str again, so a helper wraps its result itself. Made only
+    by safe_text and those helpers (tests/…: the static check)."""
+    __slots__ = ()
+
+
+def _require_masked(text, owner_paths=False):
+    """THE one place of the rule «mask first, then anything else»: a Masked text goes on as it is, any other
+    text (a str, an exception, None) is masked first by safe_text. Chosen over a TypeError: a caller cannot
+    forget the mask (no helper ever touches raw outside text), and the mask is idempotent, so a text that is
+    masked twice costs only time. A caller that needs the owner-script exemption masks itself (owner_paths=True)."""
+    return text if isinstance(text, Masked) else safe_text(text, 10 ** 9, owner_paths)
 
 
 def safe_text(text, limit, owner_paths=False):
     """THE one masking of text that is shown to a human (Telegram, display-message, ATTENTION, the
     dashboard, chain-result.md, events.log, status): there is no other way to mask for output, and
-    OUTPUT_PATHS lists every path that uses it (#81). In this order, never another:
-    1. a word (a run between spaces, tabs and line breaks) that holds an invisible, control or
+    OUTPUT_PATHS lists every path that uses it (#81). The result is Masked. In this order, never another:
+    1. a word (a run between ASCII spaces, tabs and line breaks) that holds an invisible, control or
        default-ignorable character is masked WHOLE, before any parsing or cutting: such a character
        glues (`a\\x00sk-...`) or splits (`sk-\\x00...`) a secret past redact(), and no word of a wave holds one;
-       a lone CR inside a word is one of them: a word whose glued form is a secret is masked whole;
+       a lone CR inside a word is one of them: a word whose glued form (without the CR) is a secret is masked whole;
     2. redact() over the whole text (no cut yet);
     3. the cut to `limit` at a safe border: the mask is never torn (a border inside it cuts before it),
        and the cut is never made BEFORE the masking."""
     text = str(text).replace("\r\n", "\n")
     text = _CTRL_WORD.sub(MASK, text)
 
-    def cr_word(m):  # a word with a lone CR: masked whole when its glued form (without the CR) holds a
-        word = m.group(0)  # secret, else the CR is a line break between two ordinary words
+    def soft_word(m):  # masked whole when its glued form holds a secret, else the CR is a line break
+        word = m.group(0)  # between two ordinary words and a Zs stays what it is
         glued = word.replace("\r", "")
         return MASK if redact(glued, 10 ** 9, owner_paths) != glued else word.replace("\r", "\n")
 
-    text = _CR_WORD.sub(cr_word, text)
-    return _clip(redact(text, 10 ** 9, owner_paths), limit)
+    text = _SOFT_WORD.sub(soft_word, text)
+    return _clip(Masked(redact(text, 10 ** 9, owner_paths)), limit)
 
 
 # The registry of EVERY path that shows text to a human (#81). Each of them masks with safe_text() and
@@ -1404,6 +1423,8 @@ OUTPUT_PATHS = {
     "say_echo": "_say_first(): the text of `say` in its events",
     "blocked_notice": "blocked_notice(): the BLOCKED notice that needs the owner",
     "status_cmd": "status_cmd(): `wab.py status`",
+    "status_file": "_write_status(): the dispatcher's own `status` file and its return value (last_status)",
+    "gate_failed": "_gate_failed(): status, last_status, the message to the window, events, notice of a failed merge gate",
     "dash_event": "dash.humanize_event(): the events panel of the dashboard",
     "dash_current_panel": "dash.current_panel(): the status and the screen of the current wave",
     "dash_manifest": "dash.manifest_lines(): the superarmanda block of the current wave",
@@ -1419,19 +1440,21 @@ def quote(text, limit=TG_LIMIT):
 
 def _head(text, n):
     """text[:n] that does not end inside the mask `[скрыто]`: a border inside it cuts before it."""
+    text = _require_masked(text)
     head = text[:n]
     for k in range(min(len(MASK) - 1, n), 0, -1):
         if head.endswith(MASK[:k]) and text.startswith(MASK[k:], n):
-            return head[:-k]
-    return head
+            return Masked(head[:-k])
+    return Masked(head)
 
 
 def _clip(text, limit):
+    text = _require_masked(text)
     if len(text) <= limit:
         return text
     if limit < 3:
-        return "…"[:limit]
-    return _head(text, limit - 2).rstrip() + " …"
+        return Masked("…"[:limit])
+    return Masked(_head(text, limit - 2).rstrip() + " …")
 
 
 def _render_quote(inner, before):
@@ -3502,7 +3525,7 @@ def manifest_where_of(path, wave_dir, timeout=WHERE_TIMEOUT):
         proc = subprocess.run([sys.executable, str(STATE_PY), "where", "--manifest", str(path)],
                               capture_output=True, text=True, encoding="utf-8", timeout=timeout, env=env)
         if proc.returncode != 0:
-            lines = [l.strip() for l in (proc.stderr or proc.stdout).splitlines() if l.strip()]
+            lines = [l.strip() for l in safe_text(proc.stderr or proc.stdout, 10 ** 9).splitlines() if l.strip()]
             raise ValueError(lines[-1] if lines else f"rc {proc.returncode}")
         result = json.loads(proc.stdout)
         if not isinstance(result, dict):
@@ -3556,14 +3579,15 @@ def _gate_check(cfg, wave, w):
 
 def _one_line(text, limit=MAX_STATUS):
     """The text in one line, cut at a WORD border: a border inside a token would leave its prefix (`ghp_abcde`),
-    too short for any masking rule. The text is the dispatcher's own; text of outside goes through _masked_line."""
-    text = " ".join(str(text).split())
+    too short for any masking rule. MASKED FIRST (_require_masked), then collapsed: str.split() also cuts at
+    \\x1c-\\x1f, NEL, U+2028/9 and the Zs spaces, i.e. inside a secret, if it runs on raw text."""
+    text = Masked(" ".join(_require_masked(text).split()))
     if len(text) <= limit:
         return text
     cut = limit - 2
     if not text[cut].isspace():  # the border is inside a word: drop its beginning too
         cut = text.rfind(" ", 0, cut) if " " in text[:cut] else 0
-    return text[:cut].rstrip() + " …"
+    return Masked(text[:cut].rstrip() + " …")
 
 
 def _resolve_why(out):
@@ -3578,23 +3602,23 @@ def _masked_line(text, limit):
     """Text from outside as ONE line for an event or a notice: masked as a whole first (safe_text), then
     collapsed to one line, then cut. Never a cut or a collapse before the mask: str.split() also splits at a
     lone CR, U+2028 and the like, i.e. inside a secret."""
-    text = " ".join(safe_text(text, 10 ** 9).split())
-    return _clip(text, limit)
+    return _clip(Masked(" ".join(_require_masked(text).split())), limit)
 
 
 def _write_status(wdir, text):
     """The dispatcher's own status line, atomically (the wave may read the file at any moment)."""
+    text = _one_line(safe_text(text, 10 ** 9, owner_paths=True))  # the file is read by a human too: masked FIRST
     fd, tmp = tempfile.mkstemp(dir=wdir, prefix=".status.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(_one_line(text) + "\n")
+            f.write(text + "\n")
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, wdir / "status")
     except BaseException:
         pathlib.Path(tmp).unlink(missing_ok=True)
         raise
-    return _one_line(text)
+    return text
 
 
 def home_form(path):
@@ -5762,7 +5786,6 @@ def say_cmd(cfg, wave, text_file):
         # never guess the session name: with a shared tmux_prefix it may belong to another chain
         raise SystemExit(f"wab: say: wave {wave} has no launched session in state.json of this run; nothing sent")
     name = rec["tmux"]
-    lines = [l for l in text.splitlines() if l.strip()]
     first = _say_first(text)
     if not tmux_alive(name):
         event(cfg, f"{wave}: say FAILED (no window {name}): {first}")
@@ -5819,10 +5842,12 @@ def manifest_status_line(cfg, wave):
 def status_cmd(cfg):
     st = load_state(cfg)
     print("current:", safe_text(st.get("current"), 200))
-    for wave, w in st["waves"].items():  # every line is shown to a human: it passes safe_text as a whole
-        print(safe_text(f"{wave}: tmux={w.get('tmux')} phase={w.get('phase')} ctx={w.get('tokens', 0) // 1000}k "
-                        f"restarts={w.get('restarts', 0)} sessions={len(w.get('sessions') or [])} "
-                        f"status={read(cfg['run_dir'] / wave / 'status')}", 10 ** 6))
+    for wave, w in st["waves"].items():  # the texts of the state and of the status file pass safe_text, the numbers stay numbers
+        tokens = w.get("tokens", 0)
+        ctx = tokens // 1000 if isinstance(tokens, int) and not isinstance(tokens, bool) else "?"
+        print(f"{safe_text(wave, 200)}: tmux={safe_text(w.get('tmux'), 200)} phase={safe_text(w.get('phase'), 200)} ctx={ctx}k "
+              f"restarts={safe_text(w.get('restarts', 0), 50)} sessions={len(w.get('sessions') or [])} "
+              f"status={safe_text(read(cfg['run_dir'] / wave / 'status'), 10 ** 6)}")
         line = manifest_status_line(cfg, wave)
         if line:
             print(safe_text(line, 10 ** 6))

@@ -465,8 +465,8 @@ _NEEDS_OWNER_CLASSES = ("plan_mismatch", "merge_gate")
 
 
 def _clip(text, limit):
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else wab._head(text, limit - 1).rstrip() + "…"
+    text = wab.Masked(" ".join(wab._require_masked(text).split()))  # masked FIRST, then collapsed and cut
+    return text if len(text) <= limit else wab.Masked(wab._head(text, limit - 1).rstrip() + "…")
 
 
 def _blocked_phrase(wave, rest):
