@@ -2630,7 +2630,7 @@ class WavesContract(unittest.TestCase):
         )
         # 1.2.1 (#86): new manifests are version 2; the wave's risk is the policy level
         self.assertEqual(data["version"], 2)
-        self.assertEqual(data["review_policy"], {"version": "1.2.1", "level": selected["risk"]})
+        self.assertEqual(data["review_policy"], {"version": "1.2.4", "level": selected["risk"]})
         self.assertEqual(data["base"], self.base)
 
     # T1: init --expect-sha256 pins the approved plan bytes
@@ -4311,9 +4311,29 @@ class PolicyBase(unittest.TestCase):
         report = self.report(profile, mode)
         return self.record(role, status, **self.review_flags(report, **flags)), report
 
-    def code_and_test(self, model="fable"):
+    def code_and_test(self, model="fable", internal=True):
+        """Everything of a task before its external review packet. Since the review policy 1.2.4 that
+        includes the internal Fable review of this HEAD (mandatory for a high-risk task, a mere record
+        below high)."""
         self.record("coder", model=model)
         self.record("tester", model=model)
+        if internal:
+            self.record("internal_reviewer", model="fable")
+
+    def ready_after_final_check(self):
+        """Review policy 1.2.4: with everything else counted a high-risk task is not ready yet and waits
+        for the final check alone (`where` names it); the final check makes it ready. Returns the entry."""
+        self.assertEqual(self.entry()["status"], "in_progress")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (7, "final_check"), where["next_action"])
+        entry = self.final_check()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        return entry
+
+    def final_check(self, status="pass", task=None):
+        """The final Fable check after the task reviews: the last step of readiness of a high-risk task
+        under the review policy 1.2.4."""
+        return self.record("final_check", status, model="fable", task=task)
 
     def edited(self, report, **changes):
         """A copy of a review.py report with the named top-level fields replaced (None removes)."""
@@ -4338,17 +4358,17 @@ class RiskPolicyManifest(PolicyBase):
 
     def test_init_writes_version_2_with_policy_level_and_version(self):
         self.assertEqual(self.data()["version"], 2)
-        self.assertEqual(self.data()["review_policy"], {"version": "1.2.1", "level": "high"})
+        self.assertEqual(self.data()["review_policy"], {"version": "1.2.4", "level": "high"})
         self.manifest.unlink()
         printed = self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head())
-        self.assertEqual(printed["review_policy"], {"version": "1.2.1", "level": "low"})
+        self.assertEqual(printed["review_policy"], {"version": "1.2.4", "level": "low"})
         self.assertEqual(self.data()["version"], 2)
         for risk in ("low", "medium", "high"):
             with self.subTest(wave_risk=risk):
                 self.manifest.unlink()
                 self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head(),
                         "--from-plan", self.write_plan(risk))
-                self.assertEqual(self.data()["review_policy"], {"version": "1.2.1", "level": risk})
+                self.assertEqual(self.data()["review_policy"], {"version": "1.2.4", "level": risk})
                 self.assertEqual(self.data()["version"], 2)
 
     def test_init_refuses_risk_with_from_plan_and_unknown_risk(self):
@@ -4408,7 +4428,7 @@ class RiskPolicyManifest(PolicyBase):
                 with self.subTest(level=level, role=role):
                     answer = self.ok("role-model", "--task", "t1", "--role", role)
                     self.assertEqual(answer, {"task": "t1", "role": role, "risk": level, "model": model,
-                                              "policy_version": "1.2.1"})
+                                              "policy_version": "1.2.4"})
             self.assertEqual(self.manifest.read_bytes(), before, "role-model is read-only")
         # a task raised to high inside a low run gets Fable; its neighbour keeps Sonnet
         self.ok("task-risk", "--task", "t1", "--risk", "high")
@@ -4523,6 +4543,8 @@ class HighRiskModels(PolicyBase):
         self.init(risk="medium")
         self.record("coder", model="sonnet")
         self.record("tester")
+        # 1.2.4: the internal review counts only before the first external packet, at any risk
+        self.record("internal_reviewer", model="fable")
         self.review("cross_provider_reviewer", "claude-host")
         self.assertEqual(self.entry()["status"], "ready_for_pr_review")
         raised = self.ok("task-risk", "--task", "t1", "--risk", "high")
@@ -4531,12 +4553,12 @@ class HighRiskModels(PolicyBase):
         self.assertEqual((where["step"], where["role"]), (4, "coder"))
         self.assertIn(FABLE, where["next_action"])
         self.assertIn(SONNET, where["next_action"])
-        # redoing the roles on Fable and adding both verified reviews makes it ready again
+        # redoing the roles on Fable and adding both verified reviews and the final check makes it ready again
         self.code_and_test()
         self.assertEqual(self.where()["role"], "cross_provider_reviewer")  # recorded without a verified report
         self.review("cross_provider_reviewer", "claude-host")
         self.review("second_reviewer", "codex-host")
-        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.ready_after_final_check()
 
 
 class HighRiskReviews(PolicyBase):
@@ -4549,7 +4571,7 @@ class HighRiskReviews(PolicyBase):
         where = self.where()
         self.assertEqual((where["step"], where["role"]), (5, "second_reviewer"))
         entry, fable = self.review("second_reviewer", "codex-host")
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         for role, profile, report in (("cross_provider_reviewer", "claude-host", astra),
                                       ("second_reviewer", "codex-host", fable)):
             stored = entry["results"][role]
@@ -4560,10 +4582,11 @@ class HighRiskReviews(PolicyBase):
             self.assertEqual(stored["packet_hash"], self.packet_hash)
         where = self.where()
         self.assertEqual((where["step"], where["role"]), (7, "github_codex_review"))
-        self.assertEqual(where["review_policy"], {"version": "1.2.1", "level": "high"})
+        self.assertEqual(where["review_policy"], {"version": "1.2.4", "level": "high"})
         self.assertEqual({a["role"]: a["profile"] for a in where["artifacts"]},
-                         {"coder": None, "tester": None, "cross_provider_reviewer": "claude-host",
-                          "second_reviewer": "codex-host"})
+                         {"coder": None, "tester": None, "internal_reviewer": None,
+                          "cross_provider_reviewer": "claude-host", "second_reviewer": "codex-host",
+                          "final_check": None})
         self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
         self.assertIn("done", self.where()["next_action"])
 
@@ -4571,7 +4594,7 @@ class HighRiskReviews(PolicyBase):
         self.code_and_test()
         self.review("cross_provider_reviewer", "codex-host")
         entry, _ = self.review("second_reviewer", "claude-host")
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
 
     def test_two_astra_reviews_or_fable_without_astra_do_not_pass(self):
         for profile in ("claude-host", "codex-host"):
@@ -4641,7 +4664,7 @@ class HighRiskReviews(PolicyBase):
                          ("codex-host", "error", "quota"))
         opus = self.report("codex-host-opus")
         entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         stored = entry["results"]["second_reviewer"]
         self.assertEqual(stored["profile"], "codex-host-opus")
         self.assertEqual(stored["fallback_for"], "codex-host")
@@ -4691,7 +4714,7 @@ class HighRiskReviews(PolicyBase):
         self.assertNotIn("second_reviewer", self.entry()["results"])
         # a stored Opus result that lost its evidence is not a second review either
         self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
-        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.ready_after_final_check()
         value = self.data()
         del value["tasks"]["t1"]["results"]["second_reviewer"]["quota_evidence"]
         self.manifest.write_text(json.dumps(value), encoding="utf-8")
@@ -4718,7 +4741,7 @@ class HighRiskReviews(PolicyBase):
             with self.subTest(mode=mode):
                 quota = self.report("codex-host", mode)
                 entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
-                self.assertEqual(entry["status"], "ready_for_pr_review")
+                entry = self.ready_after_final_check()
 
     def test_report_must_agree_with_its_profile_and_one_review_cannot_fill_both_roles(self):
         """tester-1 F2: relabelling one field of a report, or reusing one review, is refused."""
@@ -4752,7 +4775,7 @@ class HighRiskReviews(PolicyBase):
                 self.record_refused("second_reviewer", **self.review_flags(report))
         self.assertEqual(self.entry()["status"], "in_progress")
         entry = self.record("second_reviewer", **self.review_flags(fable))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         # readiness names it too, should two results of one review ever sit in a manifest
         value = self.data()
         results = value["tasks"]["t1"]["results"]
@@ -4796,7 +4819,7 @@ class HighRiskReviews(PolicyBase):
         self.review("cross_provider_reviewer", "claude-host")
         self.record("second_reviewer", "error", artifact=str(quota))
         entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
 
     def test_open_findings_of_a_review_are_not_replaced_without_a_disposition(self):
         """A second run of the same profile on the same HEAD cannot wipe findings of a high-risk task."""
@@ -4816,7 +4839,7 @@ class HighRiskReviews(PolicyBase):
         self.ok("fix-loop", "--task", "t1", "--accept", "--source", "second_reviewer",
                 "--severity", "low", "--note", "false positive: context was missing")
         entry = self.record("second_reviewer", **self.review_flags(clean))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         # after a fix the HEAD is new: resume drops the findings and the cycle goes on
         self.review("second_reviewer", "codex-host", "findings", status="findings")
         self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
@@ -4825,8 +4848,8 @@ class HighRiskReviews(PolicyBase):
         self.code_and_test()
         self.packet()
         self.review("cross_provider_reviewer", "claude-host")
-        entry, _ = self.review("second_reviewer", "codex-host")
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.review("second_reviewer", "codex-host")
+        entry = self.ready_after_final_check()
         # below high, and so for 1.2.0 manifests, a rerun replaces findings as before
         self.init(risk="medium")
         self.record("coder")
@@ -4920,7 +4943,7 @@ class HighRiskReviews(PolicyBase):
                                                              **{"claude-haiku-4-5-20251001": {"inputTokens": 1}}))
         self.record("cross_provider_reviewer", **self.review_flags(astra))
         entry = self.record("second_reviewer", **self.review_flags(ancillary))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
 
     def opus_report(self):
         # its own session: the CLI doubles give Fable and Opus one session id
@@ -4963,7 +4986,7 @@ class HighRiskReviews(PolicyBase):
                 quota = self.report("codex-host", "quota_failure")
                 entry = self.record("second_reviewer",
                                     **self.review_flags(self.opus_report(), quota_evidence=str(quota)))
-                self.assertEqual(entry["status"], "ready_for_pr_review")
+                entry = self.ready_after_final_check()
                 self.assertEqual(self.where()["accepted_limitations"], [])
 
     def test_open_findings_survive_resume_there_and_back(self):
@@ -4998,7 +5021,7 @@ class HighRiskReviews(PolicyBase):
                            "--severity", "medium", "--note", "known limitation")
         self.assertEqual(accepted["status"], "in_progress")
         entry = self.record("second_reviewer", **self.review_flags(clean))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         self.assertEqual((entry["fix_cycles"], len(entry["acceptances"])), (0, 1))
         where = self.where()
         self.assertEqual([(a["source"], a["severity"]) for a in where["accepted_limitations"]],
@@ -5019,7 +5042,7 @@ class HighRiskReviews(PolicyBase):
         self.packet()
         self.review("cross_provider_reviewer", "claude-host")
         entry, _ = self.review("second_reviewer", "codex-host")
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         history = entry["review_history"]
         self.assertEqual([(h["role"], h["status"], h["profile"]) for h in history], [
             ("cross_provider_reviewer", "pass", "claude-host"), ("second_reviewer", "incomplete", None),
@@ -5145,13 +5168,15 @@ class HighRiskReviews(PolicyBase):
         self.assertIn("--source second_reviewer", where["next_action"])
         deferred = self.ok("fix-loop", "--task", "t1", "--defer", "--source", "second_reviewer",
                            "--note", "low: wording -> next wave")
-        self.assertEqual(deferred["status"], "ready_for_pr_review")
+        self.assertEqual(deferred["status"], "in_progress")  # 1.2.4: the final check is still owed
+        self.ready_after_final_check()
         # a rerun is another result: the deferral does not cover it
         entry, _ = self.review("second_reviewer", "codex-host", "findings", status="findings")
         self.assertEqual(entry["status"], "in_progress")
         accepted = self.ok("fix-loop", "--task", "t1", "--accept", "--source", "second_reviewer",
                            "--severity", "medium", "--note", "accepted limitation")
-        self.assertEqual(accepted["status"], "ready_for_pr_review")
+        self.assertEqual(accepted["status"], "in_progress")  # the review was recorded again: a new final check
+        self.ready_after_final_check()
         failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
         self.assertEqual((failed["status"], failed["fix_sources"]), ("needs_fix", {"second_reviewer": 1}))
         again = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
@@ -5178,6 +5203,7 @@ class HighRiskReviews(PolicyBase):
         quota = self.report("codex-host", "quota_failure")
         self.record("second_reviewer",
                     **self.review_flags(self.report("codex-host-opus"), quota_evidence=str(quota)))
+        self.final_check()
         self.ok("mark", "--task", "t1", "--step", "7", "--safe-point", "true")
         value = self.data()
         self.assertEqual(len(value["tasks"]["t1"]["review_history"]), 2)
@@ -5258,7 +5284,7 @@ class W2StateRules(PolicyBase):
                 self.assertNotIn("done", where["next_action"])
                 # the way out: the Fable review itself as the second review
                 entry, _ = self.review("second_reviewer", "codex-host")
-                self.assertEqual(entry["status"], "ready_for_pr_review")
+                entry = self.ready_after_final_check()
 
     def test_where_does_not_offer_the_opus_fallback_where_task_result_refuses_it(self):
         offer = "the only fallback is profile codex-host-opus"
@@ -5309,7 +5335,7 @@ class W2StateRules(PolicyBase):
         self.assertIn(offer, where["next_action"])
         entry = self.record("second_reviewer",
                             **self.review_flags(self.opus_report(), quota_evidence=str(quota)))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
 
 
 HIGH_WAVE = {"risk": "high"}
@@ -5337,10 +5363,14 @@ class W2GateRules(PolicyBase):
         return self.edited(self.report("codex-host-opus"), session_id="opus-review-session")
 
     def two_reviews(self, task=None):
+        """A complete high-risk task: since the review policy 1.2.4 the two reviews stand between the
+        internal Fable review and the final check."""
         self.record("coder", model="fable", task=task)
         self.record("tester", model="fable", task=task)
+        self.record("internal_reviewer", model="fable", task=task)
         self.record("cross_provider_reviewer", task=task, **self.review_flags(self.report("claude-host")))
-        return self.record("second_reviewer", task=task, **self.review_flags(self.report("codex-host")))
+        self.record("second_reviewer", task=task, **self.review_flags(self.report("codex-host")))
+        return self.final_check(task=task)
 
     def forge(self, edit):
         """A hand edit of the manifest (what state.py would never write)."""
@@ -5374,7 +5404,7 @@ class W2GateRules(PolicyBase):
         quota = self.report("codex-host", "quota_failure")
         opus = self.opus_report()
         entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         self.assertEqual(self.problems(HIGH_WAVE), [])
         good = self.data()
         # the same Opus without the evidence
@@ -5448,6 +5478,7 @@ class W2GateRules(PolicyBase):
                 self.assert_reason(problems, "t1", "не подтверждён пересчётом")
         # with the second review it passes
         self.review("second_reviewer", "codex-host")
+        self.final_check()  # 1.2.4: and with the final check after it
         self.assertEqual(self.problems(MEDIUM_WAVE), [])
 
     def test_medium_wave_refuses_a_version_1_manifest_with_a_high_task(self):
@@ -5677,7 +5708,7 @@ class W2FixRound1State(PolicyBase):
         self.record("second_reviewer", "error", artifact=str(fresh))
         self.assertIn(offer, self.where()["next_action"])
         entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(fresh)))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
 
 
 class LiveVersion1Manifests(PolicyBase):
@@ -5773,8 +5804,9 @@ EXTERNAL_REVIEW_ROLES = ("cross_provider_reviewer", "second_reviewer", "github_c
 
 
 class W3FableRoles(PolicyBase):
-    """The five Fable subagent roles: recorded only with the Fable model, and (in W3) without any
-    effect on readiness, `where` or the merge gate."""
+    """The five Fable subagent roles: recorded only with the Fable model. Their records have no effect on
+    readiness, `where` or the merge gate, except `internal_reviewer` and `final_check` of a high-risk task
+    since the review policy 1.2.4 (W4MandatoryFableRoles, W4GateRoles)."""
 
     def way_out(self, role):
         return f"task-result --role {role} --status unavailable --model fable"
@@ -5814,10 +5846,14 @@ class W3FableRoles(PolicyBase):
 
         for risk, plan in (("high", HIGH_WAVE), ("medium", MEDIUM_WAVE)):
             self.init(risk=risk)
+            # 1.2.4: the two mandatory roles of a high-risk task are part of its readiness; the other
+            # three stay records there, and all five stay records below high
+            roles = FABLE_ROLES if risk != "high" else ("architect", "triage", "investigator")
             if risk == "high":
                 self.code_and_test()
                 self.review("cross_provider_reviewer", "claude-host")
                 self.review("second_reviewer", "codex-host")
+                self.final_check()
             else:
                 self.record("coder")
                 self.record("tester")
@@ -5826,7 +5862,7 @@ class W3FableRoles(PolicyBase):
             self.assertEqual(before[0], "ready_for_pr_review")
             self.assertEqual(problems(plan), [])
             for status in ("pass", "findings", "unavailable", "error", "incomplete"):
-                for role in FABLE_ROLES:
+                for role in roles:
                     with self.subTest(risk=risk, role=role, status=status):
                         entry = self.record(role, status, model="fable")
                         self.assertEqual(entry["status"], "ready_for_pr_review")
@@ -6095,6 +6131,7 @@ class W3RemainderOfW2(PolicyBase):
         self.code_and_test()
         self.review("cross_provider_reviewer", "claude-host")
         self.review("second_reviewer", "codex-host")
+        self.final_check()
         value = self.data()
         self.assertEqual(gate.manifest_problems(value, value["head"], value["tree_fingerprint"], plan=HIGH_WAVE), [])
         bot = {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}
@@ -6312,7 +6349,7 @@ class W4MandatoryFableRoles(W4Base):
         # a record of the old HEAD put back by hand is not a result of this HEAD
         value = self.data()
         old = dict(value["tasks"]["t1"]["results"]["second_reviewer"], status="pass", head=self.base,
-                   reviewed_head=None, packet_hash=None, model=FABLE)
+                   reviewed_head=None, packet_hash=None, model=FABLE, session_id="final-check-of-the-old-head")
         value["tasks"]["t1"]["results"]["final_check"] = old
         self.manifest.write_text(json.dumps(value), encoding="utf-8")
         self.assert_not_ready("final_check")
@@ -6389,9 +6426,9 @@ class W4MandatoryFableRoles(W4Base):
         self.internal("findings")
         reviewed = self.head()
         self.record("cross_provider_reviewer", "findings",
-                    **self.review_flags(self.report("claude-host", "findings")))
+                    **self.review_flags(self.report("codex-host", "findings")))
         self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "cross_provider_reviewer")
-        self.assertEqual(self.next_head()["invalidated_tasks"], [])  # needs_fix is kept by resume
+        self.assertEqual(self.next_head()["invalidated_tasks"], ["t1"])
         entry = self.entry()
         self.assertEqual(entry["results"], {})
         self.assertEqual((entry["internal_review"]["status"], entry["internal_review"]["head"]),
@@ -6529,7 +6566,7 @@ class W4GateRoles(W4Base):
         self.built()
         self.internal("findings")
         self.record("cross_provider_reviewer", "findings",
-                    **self.review_flags(self.report("claude-host", "findings")))
+                    **self.review_flags(self.report("codex-host", "findings")))
         self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "cross_provider_reviewer")
         self.next_head()
         self.built()
@@ -6588,7 +6625,10 @@ class W4GateRoles(W4Base):
                 with self.subTest(case=label, plan=plan):
                     problems = self.problems(plan, value)
                     self.assert_reason(problems, "t1", role, action)
-                    self.assert_reason(problems, "t1", "не подтверждён пересчётом")
+                    if "another" not in label:
+                        # (a record of another head or tree is not a result of this HEAD for the gate at
+                        # all; state.task_ready reads the results `resume` left, which are all current)
+                        self.assert_reason(problems, "t1", "не подтверждён пересчётом")
                     self.assertEqual(self.verdict(plan, value)["verdict"], "fail")
 
     def test_recorded_non_pass_final_check_fails_the_gate(self):

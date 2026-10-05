@@ -19,8 +19,10 @@ from pathlib import Path
 # Fable subagent roles of the ordinary pipeline (1.2.3, #86 п.5-9): the architect of step 1, the
 # internal review before the external packet, the triage of external findings, the investigator of
 # a bug and the final check against the requirements. Manifest version 2 only; always Fable.
-# In 1.2.3 their results are records: they change neither the task status, nor readiness, nor the
-# merge gate (the machine obligation of internal_reviewer and final_check is 1.2.4).
+# The results of architect, triage and investigator are records: they change neither the task
+# status, nor readiness, nor the merge gate. Under the review policy 1.2.4 internal_reviewer and
+# final_check are part of the readiness of a high-risk task (fable_role_gaps); under the policy
+# 1.2.1 they are records too.
 FABLE_ROLES = ("architect", "internal_reviewer", "triage", "investigator", "final_check")
 ROLES = {
     "coder",
@@ -59,10 +61,10 @@ MANIFEST_KEYS = {
 TASK_KEYS = {
     "status", "fix_cycles", "results", "session_roles", "fix_sources", "decisions",
     "decision_required_for", "deferrals", "acceptances", "blocked_reason", "risk",
-    "review_history", "internal_rounds", "external_review",
+    "review_history", "internal_rounds", "external_review", "internal_review",
 }
 # Task keys only manifest version 2 carries.
-V2_TASK_KEYS = ("risk", "review_history", "internal_rounds", "external_review")
+V2_TASK_KEYS = ("risk", "review_history", "internal_rounds", "external_review", "internal_review")
 DEFAULT_MAX_RUNS = 2
 MAX_RUNS_LIMIT = 1000
 RUNS_FILE_VERSION = 1
@@ -74,8 +76,14 @@ RISK_ORDER = ("low", "medium", "high")
 # Manifest version 1 is judged by the rules of 1.2.0 (one cross-provider review, no model in
 # the result). Version 2 carries `review_policy` and is judged by the policy below (#86).
 MANIFEST_VERSIONS = (1, 2)
-POLICY_VERSION = "1.2.1"
-POLICY_VERSIONS = {POLICY_VERSION}
+# The version of the review policy is the compatibility boundary of the rules (not of the shape):
+# `init` writes POLICY_VERSION, and every rule takes the version from the manifest it judges.
+# 1.2.1: the model by risk and two reviews for high (1.2.1-1.2.3). 1.2.4: for a high-risk task
+# internal_reviewer and final_check are mandatory as well (MANDATORY_ROLES_POLICIES).
+POLICY_VERSION = "1.2.4"
+POLICY_VERSIONS = {"1.2.1", POLICY_VERSION}
+MANDATORY_ROLES_POLICIES = {"1.2.4"}
+MANDATORY_FABLE_ROLES = ("internal_reviewer", "final_check")
 POLICY_KEYS = {"version", "level"}
 V2_ONLY_ROLES = {"second_reviewer", *FABLE_ROLES}
 # Closed dictionary of coder/tester models. Matching is exact: no trim, no case folding, no prefix.
@@ -158,7 +166,7 @@ def check_schema(value):
             if any(key in entry for key in V2_TASK_KEYS) or used & V2_ONLY_ROLES:
                 fail(
                     "malformed manifest: task risk, review_history, internal_rounds, "
-                    "external_review, second_reviewer and the Fable subagent roles "
+                    "external_review, internal_review, second_reviewer and the Fable subagent roles "
                     "require manifest version 2"
                 )
         return
@@ -195,6 +203,12 @@ def check_schema(value):
             isinstance(marker, dict) and isinstance(marker.get("role"), str)
         ):
             fail(f"task {name} external_review is malformed")
+        credit = entry.get("internal_review") if isinstance(entry, dict) else None
+        if isinstance(entry, dict) and "internal_review" in entry and not (
+            isinstance(credit, dict)
+            and all(isinstance(credit.get(key), str) for key in ("status", "head"))
+        ):
+            fail(f"task {name} internal_review is malformed")
 
 
 def require_v2(data, what):
@@ -210,6 +224,11 @@ def task_risk(data, entry):
     level = data["review_policy"]["level"]
     own = (entry or {}).get("risk", level)
     return max(level, own, key=RISK_ORDER.index)
+
+
+def policy_version(data):
+    """The version of the review policy the manifest is judged by; None for manifest version 1."""
+    return data["review_policy"]["version"] if data["version"] == 2 else None
 
 
 def role_model(risk):
@@ -1026,25 +1045,161 @@ def high_risk_gaps(entry, results, head):
     return gaps
 
 
-def task_ready(entry, risk, head):
+NEW_RUN_REQUIRED = "new run required"
+INTERNAL_COUNTED = ("pass", "findings")
+
+
+def internal_review_gap(entry, head):
+    """Why the internal Fable review of a high-risk task is not counted, or None (policy 1.2.4).
+
+    The credit is the durable task record `internal_review`: the LAST task-result of
+    internal_reviewer recorded before the first external packet of the task in this run
+    (`external_review`); `resume` keeps both. Counted: status pass or findings, and its HEAD is the
+    HEAD of the first external packet, so the internal review read exactly the diff that went
+    out. Before the packet the requirement is open: the record must be of the current `head`,
+    the one the packet will be built from. After the packet a missing credit cannot be earned in
+    this run: the reason starts with NEW_RUN_REQUIRED."""
+    record = entry.get("internal_review")
+    marker = entry.get("external_review")
+    status = record.get("status") if isinstance(record, dict) else None
+    recorded = f"task-result --role {INTERNAL_SOURCE} --status <pass|findings> --model fable"
+    if not isinstance(marker, dict):
+        if status in INTERNAL_COUNTED and record.get("head") == head:
+            return None
+        if status is None:
+            what = f"no {INTERNAL_SOURCE} result is recorded"
+        elif record.get("head") != head:
+            what = f"the {INTERNAL_SOURCE} result is of another HEAD ({str(record.get('head'))[:12]})"
+        else:
+            what = f"the last {INTERNAL_SOURCE} result is {status}"
+        return (
+            f"{what}; a high-risk task requires the internal Fable review of this HEAD before "
+            f"the first external review packet: record {recorded} (Fable unavailable: retry or "
+            "escalate to the owner, no weaker model, and do not start the external review)"
+        )
+    if status in INTERNAL_COUNTED and record.get("head") == marker.get("head"):
+        return None
+    packet = str(marker.get("head"))[:12]
+    if status is None:
+        what = f"no {INTERNAL_SOURCE} result was recorded before the first external packet"
+    elif status not in INTERNAL_COUNTED:
+        what = f"the last {INTERNAL_SOURCE} result before the first external packet is {status}"
+    else:
+        what = (
+            f"the {INTERNAL_SOURCE} result is of HEAD {str(record.get('head'))[:12]}, the first "
+            f"external packet of HEAD {packet}"
+        )
+    return (
+        f"{NEW_RUN_REQUIRED}: {what} ({marker.get('role')}); the internal review counts only "
+        "before the first external packet of the task and on its HEAD, so this run cannot make "
+        "the task ready: start a new run of the task (state.py init on a new manifest path; in "
+        "a wave: state.py init --from-plan, a new run of the wave)"
+    )
+
+
+def final_check_gap(entry, results):
+    """Why the final check of a high-risk task is not counted, or None (policy 1.2.4).
+
+    `results` are the task's results on the current head and tree. Counted: a current
+    final_check with status pass recorded after the current results of both task reviews:
+    `after_reviews` of the record names the result_id of each review it was recorded after, so
+    a review recorded later (or again) asks for a new final check. The PR reviews
+    (github_codex_review, coderabbit) are no part of the comparison."""
+    recorded = "task-result --role final_check --status pass --model fable"
+    result = results.get("final_check")
+    if not isinstance(result, dict):
+        return (
+            "no final_check result on this HEAD; a high-risk task requires the final Fable "
+            f"check after the last task review: record {recorded}"
+        )
+    status = result.get("status")
+    if status != "pass":
+        if status == "findings":
+            advice = (
+                "return the gaps to work (fix-loop --outcome failed under an ordinary source, "
+                f"new HEAD), then record {recorded}"
+            )
+        elif status == "incomplete":
+            advice = f"re-run the final check with the missing context and record {recorded}"
+        else:
+            advice = (
+                "retry once explicitly or escalate to the owner, no substitution by a weaker "
+                f"model; then record {recorded}"
+            )
+        return f"final_check is {status} on this HEAD, a high-risk task requires pass: {advice}"
+    seen = result.get("after_reviews")
+    seen = seen if isinstance(seen, dict) else {}
+    late = [
+        role
+        for role in REVIEW_ROLES
+        if not isinstance(results.get(role), dict)
+        or results[role].get("result_id") is None
+        or seen.get(role) != results[role].get("result_id")
+    ]
+    if late:
+        return (
+            f"final_check was recorded before the current {' and '.join(late)} result of this "
+            "HEAD; it counts only after the last task review: run the final check again and "
+            f"record {recorded}"
+        )
+    return None
+
+
+def fable_role_gaps(entry, results, head, policy):
+    """{role: reason} for the mandatory Fable roles of a HIGH-risk task that are not counted.
+
+    Empty under a policy that does not make them mandatory (1.2.1) and for manifest version 1
+    (policy None). The single rule behind task_ready, derive_step, where and the merge gate;
+    the caller decides that the task is judged as high."""
+    if policy not in MANDATORY_ROLES_POLICIES:
+        return {}
+    gaps = {}
+    reason = internal_review_gap(entry, head)
+    if reason is not None:
+        gaps["internal_reviewer"] = reason
+    reason = final_check_gap(entry, results)
+    if reason is not None:
+        gaps["final_check"] = reason
+    return gaps
+
+
+def task_ready(entry, risk, head, policy):
     """The single readiness rule of a task for its effective risk (None: manifest version 1).
-    `risk` has no default here or in any caller that recomputes a status: a forgotten argument
-    must be an error, never a silent return to the rules of 1.2.0. Callers take it from
-    `task_risk(data, entry)`; `head` is the manifest HEAD the entry's results belong to."""
+    `risk` and `policy` have no default here or in any caller that recomputes a status: a
+    forgotten argument must be an error, never a silent return to older rules. Callers take them
+    from `task_risk(data, entry)` and `policy_version(data)`; `head` is the manifest HEAD the
+    entry's results belong to."""
     if not all(effective_status(entry, role) == "pass" for role in required_roles(risk)):
         return False
-    return risk != "high" or not high_risk_gaps(entry, entry["results"], head)
+    if risk != "high":
+        return True
+    return not high_risk_gaps(entry, entry["results"], head) and not fable_role_gaps(
+        entry, entry["results"], head, policy
+    )
 
 
-def update_task_status(entry, risk, head):
+def update_task_status(entry, risk, head, policy):
     """Only coder, tester and the task review(s) can make a task PR-ready.
     Coder and tester need pass; a reviewer may also be findings + deferral/acceptance.
-    A high-risk task (manifest version 2) also needs Fable models and the second review."""
+    A high-risk task (manifest version 2) also needs Fable models and the second review, and
+    under the policy 1.2.4 the internal review and the final check (fable_role_gaps)."""
     if entry["status"] == "blocked":
         return
-    if task_ready(entry, risk, head):
+    if task_ready(entry, risk, head, policy):
         entry["status"] = "ready_for_pr_review"
     elif entry["results"]:
+        entry["status"] = "in_progress"
+
+
+def settle_mandatory_role(entry, risk, head, policy):
+    """After a result of internal_reviewer or final_check under the policy 1.2.4: it may complete
+    the task or take its readiness away; any other status (needs_fix, needs_verification,
+    pending) is not its business."""
+    if entry["status"] in ("blocked", "needs_decision"):
+        return
+    if task_ready(entry, risk, head, policy):
+        entry["status"] = "ready_for_pr_review"
+    elif entry["status"] == "ready_for_pr_review":
         entry["status"] = "in_progress"
 
 
@@ -1506,6 +1661,7 @@ def result(args):
         require_v2(data, "--quota-evidence")
     entry = task(data, args.task)
     risk = task_risk(data, entry)
+    policy = policy_version(data)
     if entry["status"] == "blocked":
         fail("task is blocked after three fix cycles; explicit human reset is required")
     if entry["status"] == "needs_decision":
@@ -1565,7 +1721,27 @@ def result(args):
     if model is not None:
         record["model"] = model
     record.update(verified)
+    mandatory = policy in MANDATORY_ROLES_POLICIES and args.role in MANDATORY_FABLE_ROLES
+    if mandatory and args.role == "final_check":
+        # which results of the task reviews this check was recorded after (final_check_gap)
+        record["after_reviews"] = {
+            role: entry["results"][role]["result_id"]
+            for role in REVIEW_ROLES
+            if isinstance(entry["results"].get(role), dict)
+            and entry["results"][role].get("result_id") is not None
+        }
     entry["results"][args.role] = record
+    if mandatory and args.role == INTERNAL_SOURCE and not isinstance(
+        entry.get("external_review"), dict
+    ):
+        # the credit of the internal review (internal_review_gap): the last record before the
+        # first external packet; kept through resume, at any risk (a task may be raised to high)
+        entry["internal_review"] = {
+            "status": args.status,
+            "head": args.head,
+            "result_sha256": result_digest(record),
+            "recorded_at": record["recorded_at"],
+        }
     if risk == "high" and args.role in REVIEW_ROLES:
         note_review(entry, args.role, record)
     if data["version"] == 2 and args.role in EXTERNAL_REVIEW_ROLES:
@@ -1575,8 +1751,10 @@ def result(args):
             {"role": args.role, "head": args.head, "recorded_at": record["recorded_at"]},
         )
     if args.role not in FABLE_ROLES:
-        # a result of a Fable subagent role is a record: the task status is not its business
-        update_task_status(entry, risk, data["head"])
+        update_task_status(entry, risk, data["head"], policy)
+    elif mandatory:
+        settle_mandatory_role(entry, risk, data["head"], policy)
+    # else: a result of a Fable subagent role is a record: the task status is not its business
     data["updated_at"] = now()
     write(path, data)
     print(json.dumps(entry, sort_keys=True))
@@ -1872,7 +2050,9 @@ def set_risk(args):
             if isinstance(current, dict) and current.get("result_id") not in known:
                 note_review(entry, role, current)
     # A task that was ready by the old rules is ready no more once the new ones ask for more.
-    if entry["status"] == "ready_for_pr_review" and not task_ready(entry, risk, data["head"]):
+    if entry["status"] == "ready_for_pr_review" and not task_ready(
+        entry, risk, data["head"], policy_version(data)
+    ):
         entry["status"] = "in_progress"
     data["updated_at"] = now()
     write(path, data)
@@ -1912,14 +2092,15 @@ def fix_loop(args):
         fail("task is blocked after three fix cycles; explicit human reset is required")
     if args.severity is not None and not args.accept:
         fail("--severity is only allowed with --accept")
+    policy = policy_version(data)
     if args.accept:
-        record_acceptance(args, entry, data, location, risk)
+        record_acceptance(args, entry, data, location, risk, policy)
     elif args.defer:
-        record_deferral(args, entry, data, location, risk)
+        record_deferral(args, entry, data, location, risk, policy)
     elif args.decision is not None:
         record_decision(args, entry)
     else:
-        record_fix_outcome(args, entry, data, location, risk)
+        record_fix_outcome(args, entry, data, location, risk, policy)
     data["updated_at"] = now()
     write(path, data)
     print(json.dumps(entry, sort_keys=True))
@@ -1987,17 +2168,17 @@ def cover_digest(target):
     return target.get("result_sha256") or result_digest(target)
 
 
-def settle_after_cover(entry, risk, head):
+def settle_after_cover(entry, risk, head, policy):
     """A deferral/acceptance may complete the task. From needs_fix it may only promote to
     ready_for_pr_review (every role pass or covered): update_task_status would otherwise
     demote a still-open needs_fix to in_progress. blocked/needs_decision never get here."""
     if entry["status"] != "needs_fix":
-        update_task_status(entry, risk, head)
-    elif task_ready(entry, risk, head):
+        update_task_status(entry, risk, head, policy)
+    elif task_ready(entry, risk, head, policy):
         entry["status"] = "ready_for_pr_review"
 
 
-def record_deferral(args, entry, data, location, risk):
+def record_deferral(args, entry, data, location, risk, policy):
     """Defer low/P3-only findings of a reviewer to the next wave/task remainder.
     Spends no fix cycle, touches no per-source counter and is not a decision."""
     result_entry = coverable_result(args, entry, data, location, "--defer", risk)
@@ -2011,10 +2192,10 @@ def record_deferral(args, entry, data, location, risk):
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }
     )
-    settle_after_cover(entry, risk, data["head"])
+    settle_after_cover(entry, risk, data["head"], policy)
 
 
-def record_acceptance(args, entry, data, location, risk):
+def record_acceptance(args, entry, data, location, risk, policy):
     """Accept a reviewer's findings of any severity as a known limitation (#54).
     Like a deferral it spends no fix cycle and is bound to the exact result; unlike
     a deferral it records the severity so medium/high ones reach the PR body."""
@@ -2032,7 +2213,7 @@ def record_acceptance(args, entry, data, location, risk):
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }
     )
-    settle_after_cover(entry, risk, data["head"])
+    settle_after_cover(entry, risk, data["head"], policy)
 
 
 def record_decision(args, entry):
@@ -2059,7 +2240,7 @@ def record_decision(args, entry):
     entry["status"] = "needs_fix"
 
 
-def record_fix_outcome(args, entry, data, location, risk):
+def record_fix_outcome(args, entry, data, location, risk, policy):
     if entry["status"] == "needs_decision":
         fail(
             "decision required for source "
@@ -2074,7 +2255,7 @@ def record_fix_outcome(args, entry, data, location, risk):
             or fingerprint(location) != data["tree_fingerprint"]
         ):
             fail("working tree changed; run resume before recording a pass")
-        update_task_status(entry, risk, data["head"])
+        update_task_status(entry, risk, data["head"], policy)
         if entry["status"] != "ready_for_pr_review":
             entry["status"] = "needs_verification"
         return
@@ -2213,18 +2394,21 @@ def current_results(entry, head, tree):
     }
 
 
-def current_gaps(entry, head, tree, risk):
+def current_gaps(entry, head, tree, risk, policy):
+    """Everything that keeps the passed results of a high-risk task from making it ready:
+    high_risk_gaps plus, under the policy 1.2.4, the gaps of the mandatory Fable roles."""
     if risk != "high" or not entry:
         return {}
-    return high_risk_gaps(entry, current_results(entry, head, tree), head)
+    results = current_results(entry, head, tree)
+    return {**high_risk_gaps(entry, results, head), **fable_role_gaps(entry, results, head, policy)}
 
 
-def is_complete(entry, head, tree, risk):
+def is_complete(entry, head, tree, risk, policy):
     step, role, _note = derive_step(
         entry,
         current_verdicts(entry, head, tree),
         risk=risk,
-        gaps=current_gaps(entry, head, tree, risk),
+        gaps=current_gaps(entry, head, tree, risk, policy),
     )
     return step == 7 and role is None
 
@@ -2236,7 +2420,7 @@ def pick_task(data, head, tree):
     marked = position["task"] if position is not None else None
 
     def done(entry):
-        return is_complete(entry, head, tree, task_risk(data, entry))
+        return is_complete(entry, head, tree, task_risk(data, entry), policy_version(data))
 
     if marked in tasks and not done(tasks[marked]):
         return marked
@@ -2322,9 +2506,10 @@ def second_review_fallback(entry, head):
 def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None, fallback=SECOND_REVIEW_FALLBACK):
     """Return (step, role, note); note overrides the default next_action.
     `risk` is the task's effective risk (None for manifest version 1) and `gaps` the
-    high_risk_gaps of its current results: with risk high the second review is required and a
-    passed role named in `gaps` is not a pass. Below high the second review is optional, like
-    CodeRabbit: only its findings need a disposition; error/unavailable/incomplete are
+    current_gaps of its current results: with risk high the second review is required and a
+    passed role named in `gaps` is not a pass; under the policy 1.2.4 `gaps` also names the
+    mandatory Fable roles (internal_reviewer after tester, final_check after the two reviews).
+    Below high the second review is optional, like CodeRabbit: only its findings need a disposition; error/unavailable/incomplete are
     recorded and ignored. `fallback` is the tail of the advice for a failed second review of a
     high-risk task (second_review_fallback; the default offers codex-host-opus).
     On the last permitted run of a wave there is no new `init --from-plan`, but fix rounds
@@ -2333,6 +2518,11 @@ def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None, fallback=
     status = entry.get("status") if entry else None
     if status == "blocked":
         return None, None, None
+    gaps = gaps or {}
+    if gaps.get(INTERNAL_SOURCE, "").startswith(NEW_RUN_REQUIRED):
+        # the internal review was missed before the first external packet: nothing done in this
+        # run makes the task ready, so say it before any more work is spent on it
+        return 5, INTERNAL_SOURCE, f"BLOCKED: {INTERNAL_SOURCE}: {gaps[INTERNAL_SOURCE]}"
     if status == "needs_decision":
         return 6, "coordinator", None
     if status == "needs_fix":
@@ -2363,7 +2553,6 @@ def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None, fallback=
             "after disposing the findings",
         )
     high = risk == "high"
-    gaps = gaps or {}
     for role in REVIEW_ROLES:
         # findings of this HEAD that left the results but were never disposed of
         if gaps.get(role, "").startswith(OPEN_FINDINGS):
@@ -2402,11 +2591,21 @@ def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None, fallback=
         return 5, "tester", None
     if "tester" in gaps:
         return 5, "tester", f"step 5 tester: {gaps['tester']}"
+    if INTERNAL_SOURCE in gaps:
+        # policy 1.2.4, high: the internal Fable review of this HEAD before the external packet
+        if verdicts.get(INTERNAL_SOURCE) in ("error", "unavailable"):
+            return 5, INTERNAL_SOURCE, f"BLOCKED: {INTERNAL_SOURCE}: {gaps[INTERNAL_SOURCE]}"
+        return 5, INTERNAL_SOURCE, f"step 5 {INTERNAL_SOURCE}: {gaps[INTERNAL_SOURCE]}"
     for role in required_roles(risk)[2:]:
         if verdicts.get(role) != "pass":
             return 5, role, None
         if role in gaps:
             return 5, role, f"step 5 {role}: {gaps[role]}"
+    if "final_check" in gaps:
+        # policy 1.2.4, high: the final Fable check after the last task review
+        if verdicts.get("final_check") in ("error", "unavailable"):
+            return 7, "final_check", f"BLOCKED: final_check: {gaps['final_check']}"
+        return 7, "final_check", f"step 7 final_check: {gaps['final_check']}"
     if verdicts.get("github_codex_review") != "pass":
         return 7, "github_codex_review", None
     return 7, None, None
@@ -2479,7 +2678,7 @@ def where(args):
         effective,
         last_run,
         risk=risk,
-        gaps=current_gaps(entry, current_head, current_tree, risk),
+        gaps=current_gaps(entry, current_head, current_tree, risk, policy_version(data)),
         fallback=second_review_fallback(entry, current_head) if risk == "high" else "",
     )
     position = data.get("position")
