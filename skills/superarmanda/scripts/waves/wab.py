@@ -125,7 +125,7 @@ def load_chain(path, create=True):
     try:
         cfg = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        raise SystemExit(f"chain.json: cannot read {path}: {e}")
+        raise SystemExit(f"chain.json: cannot read {path}: {_exc_text(e)}")
     if not isinstance(cfg, dict):
         raise SystemExit("chain.json: must be a JSON object")
     for key in OPTIONAL_STRINGS + ("tmux_prefix",):
@@ -226,7 +226,7 @@ def load_chain(path, create=True):
         if create:
             cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     except (OSError, RuntimeError, ValueError) as e:  # symlink loop, no permission, a file in the way
-        raise SystemExit(f"chain.json: run_dir/workdir cannot be used: {e}")
+        raise SystemExit(f"chain.json: run_dir/workdir cannot be used: {_exc_text(e)}")
     return cfg
 
 
@@ -281,7 +281,7 @@ def load_state(cfg):
         if st.get("current") is not None and not isinstance(st["current"], str):
             raise ValueError("`current` must be a wave name or null")
     except (OSError, ValueError) as e:
-        raise SystemExit(f"wab: cannot read state.json: {e}")
+        raise SystemExit(f"wab: cannot read state.json: {_exc_text(e)}")
     st.setdefault("waves", {})
     return st
 
@@ -393,7 +393,7 @@ def require_tmux():
     try:
         r = tmux("-V", check=False)
     except OSError as e:
-        raise SystemExit(f"tmux is required (>= 3.2) but could not be run: {e}")
+        raise SystemExit(f"tmux is required (>= 3.2) but could not be run: {_exc_text(e)}")
     version = parse_tmux_version(r.stdout) if r.returncode == 0 else None
     if version is None:
         raise SystemExit(f"cannot determine the tmux version (tmux -V gave rc={r.returncode} "
@@ -881,7 +881,7 @@ def process_table():
     except subprocess.TimeoutExpired as e:
         raise ProcFactsError(f"ps: timeout after {PS_TIMEOUT} s") from e
     except (OSError, subprocess.SubprocessError) as e:
-        raise ProcFactsError(_masked_line(f"ps: {type(e).__name__}: {e}", 150)) from e
+        raise ProcFactsError(_masked_line(f"ps: {type(e).__name__}: {_exc_text(e)}", 150)) from e
     if r.returncode != 0:
         raise ProcFactsError(f"ps: exit {r.returncode}: {_masked_line(r.stderr or '', 100)}")
     table = {}
@@ -975,8 +975,8 @@ def bg_tails(children, w, now):
 
 def _procs_unreadable(cfg, w, wave, err):
     """One event per episode of an unreadable process tree (shared by the tails watch and the nudge)."""
-    if once_per(w, "procfacts", str(err)[:150]):
-        event(cfg, f"{wave}: дерево процессов недоступно: {err}")
+    if once_per(w, "procfacts", _exc_text(err)[:150]):
+        event(cfg, f"{wave}: дерево процессов недоступно: {_exc_text(err)}")
 
 
 def _watch_bg_tails(cfg, st, wave, w, children, now):
@@ -1405,7 +1405,7 @@ def _require_masked(text, owner_paths=False):
     return text if isinstance(text, Masked) else safe_text(text, 10 ** 9, owner_paths)
 
 
-_CONTAINERS = (dict, list, tuple, set, frozenset)
+DEPTH_MARK = "[скрыто: глубина]"
 
 
 def _masked_leaves(obj, owner_paths, depth=0):
@@ -1415,7 +1415,7 @@ def _masked_leaves(obj, owner_paths, depth=0):
     if isinstance(obj, str):
         return safe_text(obj, 10 ** 9, owner_paths)
     if depth > 20:
-        return "…"
+        return DEPTH_MARK  # never str()/repr() of what is left: it would write an invisible character as `\\u200b`
     nxt = depth + 1
     if isinstance(obj, dict):
         return {_masked_leaves(k, owner_paths, nxt): _masked_leaves(v, owner_paths, nxt) for k, v in obj.items()}
@@ -1425,8 +1425,15 @@ def _masked_leaves(obj, owner_paths, depth=0):
     if isinstance(obj, (set, frozenset)):
         return [_masked_leaves(v, owner_paths, nxt) for v in obj]
     if isinstance(obj, BaseException):
-        args = [_masked_leaves(a, owner_paths, nxt) for a in obj.args]
-        return args[0] if len(args) == 1 else tuple(args)
+        # the args, masked like any container, NEVER str(e): str(KeyError("password<ZWSP>=x")) is the repr of the
+        # string and several args give str(tuple): the invisible character becomes a literal `\\u200b` first
+        args = list(obj.args)
+        if isinstance(obj, OSError):  # what str() adds to the args: the file names
+            args += [f for f in (obj.filename, obj.filename2) if f is not None and f not in args]
+        parts = [_masked_leaves(a, owner_paths, nxt) for a in args]
+        if len(parts) == 1:
+            return parts[0]
+        return _join_masked([p if isinstance(p, str) else str(p) for p in parts], " ", owner_paths)
     if isinstance(obj, (bytes, bytearray)):
         return safe_text(bytes(obj).decode("utf-8", errors="replace"), 10 ** 9, owner_paths)
     if obj is None or isinstance(obj, (bool, int, float)):
@@ -1438,10 +1445,13 @@ def _text_of(obj, owner_paths):
     """The str that safe_text masks: a str as it is; a container (or an exception holding one) by its masked leaves."""
     if isinstance(obj, str):
         return obj
-    if isinstance(obj, BaseException) and not any(isinstance(a, _CONTAINERS) for a in obj.args):
-        return str(obj)  # the usual message: its args are plain text, str() keeps them as they are
     masked = _masked_leaves(obj, owner_paths)
     return masked if isinstance(masked, str) else str(masked)
+
+
+def _exc_text(e, owner_paths=False):
+    """An exception as text for an event, a notice or an error: its args masked as leaves (safe_text), never str(e)."""
+    return safe_text(e, 10 ** 9, owner_paths)
 
 
 def safe_text(text, limit, owner_paths=False):
@@ -2106,7 +2116,7 @@ def isolated_workdir(path):
         if pathlib.Path(path).stat().st_uid != os.getuid():
             return f"{path} is not owned by the current user"
     except OSError as e:
-        return f"{path}: {e}"
+        return f"{path}: {_exc_text(e)}"
     return None
 
 
@@ -2455,7 +2465,7 @@ def read_prompt(path):
         why = "is a broken symlink" if path.is_symlink() else "not found"
         raise SystemExit(f"wab: prompt file {path} {why}; launch refused")
     except (OSError, RuntimeError) as e:  # a symlink loop, no permission on a parent
-        raise SystemExit(f"wab: prompt file {path}: cannot resolve the path ({e}); launch refused")
+        raise SystemExit(f"wab: prompt file {path}: cannot resolve the path ({_exc_text(e)}); launch refused")
     if not target.is_file():
         raise SystemExit(f"wab: prompt file {path} is not a regular file; launch refused")
     try:
@@ -2634,7 +2644,7 @@ def sync_max_runs(cfg, wave):
         tmp.write_text(want, encoding="utf-8")
         os.replace(tmp, target)
     except OSError as e:
-        event(cfg, f"{wave}: max-runs file not written: {e}")
+        event(cfg, f"{wave}: max-runs file not written: {_exc_text(e)}")
 
 
 def start_session(cfg, st, wave):
@@ -2661,7 +2671,7 @@ def _plan_pin_refused(cfg, st, wave, drop_pending=False):
     try:
         check_plan_pin(cfg)
     except SystemExit as e:
-        why = str(e)
+        why = _exc_text(e)
         w = st["waves"][wave]
         # a live session holds a typed or pending stale prompt: Enter in it would start the
         # unapproved plan, and a corrected `launch` is refused while the session exists
@@ -2827,7 +2837,7 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None):
     try:
         lock = _InputLock(cfg, wave).__enter__()
     except NotSubmitted as e:  # `say` is typing right now: nothing sent, the next tick retries
-        event(cfg, f"{wave}: {what} postponed: {e}")
+        event(cfg, f"{wave}: {what} postponed: {_exc_text(e)}")
         return False
     try:
         if w.get("pending_enter") == IDLE_NUDGE_WHAT and what != IDLE_NUDGE_WHAT:
@@ -2850,8 +2860,8 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None):
         try:
             fresh = precheck() if precheck is not None else True
         except gate.CollectError as e:  # the facts could not be read: neither typed, nor Enter, nor clearing
-            if once_per(w, "precheck_error", f"{what}: {e}"[:150]):
-                event(cfg, f"{wave}: {what} postponed: facts not collected under the input lock: {e}")
+            if once_per(w, "precheck_error", f"{what}: {_exc_text(e)}"[:150]):
+                event(cfg, f"{wave}: {what} postponed: facts not collected under the input lock: {_exc_text(e)}")
             return False
         w.get("notified", {}).pop("precheck_error", None)
         if not fresh:
@@ -2926,7 +2936,7 @@ def _settle_clear(cfg, st, wave, w, locked=False, target=None):
             with _InputLock(cfg, wave):
                 left = clear_input(target or name)
     except NotSubmitted as e:
-        left = str(e)
+        left = _exc_text(e)
     except (subprocess.SubprocessError, OSError) as e:
         left = type(e).__name__
     if left is None:
@@ -3119,7 +3129,7 @@ def close_window(cfg, st, w):
                 tmux("send-keys", "-t", pane_target(target), "-l", "/exit", check=False)
                 tmux("send-keys", "-t", pane_target(target), "Enter", check=False)
         except (NotSubmitted, subprocess.SubprocessError, OSError) as e:  # a vanished pane, a busy input
-            why = str(e) if isinstance(e, NotSubmitted) else type(e).__name__
+            why = _exc_text(e) if isinstance(e, NotSubmitted) else type(e).__name__
             if once_per(w, "exit_blocked", why):
                 event(cfg, f"{wave}: /exit not sent: {why}; retried next tick")
             return False
@@ -3313,7 +3323,7 @@ def next_prompt_problem(path):
     try:
         read_prompt(path)
     except SystemExit as e:
-        return str(e)
+        return _exc_text(e)
     return None
 
 
@@ -3640,9 +3650,9 @@ def _gate_check(cfg, wave, w):
             return dict(v, verdict="wait", reasons=["факты изменились во время сбора"])
         return v
     except gate.CollectError as e:
-        return dict(base, verdict="wait", reasons=[f"сбор фактов: {e}"])
+        return dict(base, verdict="wait", reasons=[f"сбор фактов: {_exc_text(e)}"])
     except Exception as e:  # noqa: BLE001 - fail closed: an unexpected error is a wait, never a pass
-        return dict(base, verdict="wait", reasons=[f"гейт: {type(e).__name__}: {e}"])
+        return dict(base, verdict="wait", reasons=[f"гейт: {type(e).__name__}: {_exc_text(e)}"])
 
 
 def _one_line(text, limit=MAX_STATUS):
@@ -3880,7 +3890,7 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
     try:
         gate.merge_argv(repo, number, sha)  # validates repo/PR/sha
     except ValueError as e:
-        return _gate_failed(cfg, st, wave, w, wdir, f"недопустимые repo/PR/sha: {e}")
+        return _gate_failed(cfg, st, wave, w, wdir, f"недопустимые repo/PR/sha: {_exc_text(e)}")
     w["gate_sha"], w["gate_pr"] = sha, number
     unresolved = v["unresolved"]
     if v["reasons"]:  # a pass carries only the accepted limitations (`accepted <sev> <source>: <note>`)
@@ -3893,7 +3903,7 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
         try:
             path = write_owner_script(cfg, wave, sha)
         except (OSError, ValueError) as e:
-            return _gate_failed(cfg, st, wave, w, wdir, f"скрипт владельца не записан: {e}")
+            return _gate_failed(cfg, st, wave, w, wdir, f"скрипт владельца не записан: {_exc_text(e)}")
         w["last_status"] = _write_status(
             wdir, f"BLOCKED: merge gate passed; {len(unresolved)} unresolved review threads; owner runs {home_form(path)}")
         note_question(w, w["last_status"], time.time())
@@ -4031,7 +4041,7 @@ def owner_merge(cfg, wave, run_id, sha):
                          f"(external) with a passed gate; nothing done")
     v = gate_check(cfg, wave, w)
     if v["verdict"] != "pass":
-        raise SystemExit(f"wab: owner-merge: the gate is {v['verdict']}: {'; '.join(v['reasons'])}; nothing done")
+        raise SystemExit(f"wab: owner-merge: the gate is {v['verdict']}: {_masked_line('; '.join(v['reasons']), 600)}; nothing done")
     if v["head"] != w["gate_sha"] or v["number"] != w.get("gate_pr"):
         raise SystemExit(f"wab: owner-merge: PR head {str(v['head'])[:12]} is not the gated {w['gate_sha'][:12]}; "
                          f"nothing done (the dispatcher gates the new head again)")
@@ -4044,7 +4054,7 @@ def owner_merge(cfg, wave, run_id, sha):
         try:
             out = gh_graphql(gate.RESOLVE_MUTATION, {"id": thread})
         except gate.CollectError as e:
-            raise SystemExit(f"wab: owner-merge: thread {thread} not resolved: {e}")
+            raise SystemExit(f"wab: owner-merge: thread {thread} not resolved: {_exc_text(e)}")
         resolved = None
         try:
             resolved = out["data"]["resolveReviewThread"]["thread"]["isResolved"]
@@ -4122,7 +4132,7 @@ def owner_handover(cfg, wave, run_id):
             info = _json(_gh("pr", "view", str(pr["number"]), "--repo", repo, "--json",
                              "state,mergeCommit,headRefOid,baseRefName"), "gh pr view")
         except gate.CollectError as e:
-            raise SystemExit(f"wab: {what}: PR not read: {e}; nothing done")
+            raise SystemExit(f"wab: {what}: PR not read: {_exc_text(e)}; nothing done")
         number = pr["number"]
         if not isinstance(info, dict) or info.get("state") != "MERGED":
             got = info.get("state") if isinstance(info, dict) else None
@@ -4196,8 +4206,8 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         if not isinstance(info, dict):
             raise gate.CollectError("gh pr view: unexpected response")
     except gate.CollectError as e:
-        if once_per(w, "merge_view_error", str(e)[:150]):
-            event(cfg, f"{wave}: PR #{number} state not read: {e}")
+        if once_per(w, "merge_view_error", _exc_text(e)[:150]):
+            event(cfg, f"{wave}: PR #{number} state not read: {_exc_text(e)}")
         save_state(cfg, st)
         return True
     w.get("notified", {}).pop("merge_view_error", None)
@@ -4324,7 +4334,7 @@ def _nudge_precheck(cfg, st, wave, w, digest, minutes):
         try:
             return not wave_children(cfg, w)
         except ProcFactsError as e:
-            raise gate.CollectError(f"process tree: {e}") from e
+            raise gate.CollectError(f"process tree: {_exc_text(e)}") from e
     return fresh
 
 
@@ -4411,8 +4421,8 @@ def _alarm_tick(cfg, st, wave, w, now):
             w["pr"] = pr["number"]
         facts = gate_facts(cfg, pr)
     except gate.CollectError as e:
-        if once_per(w, "alarm_error", str(e)[:150]):
-            event(cfg, f"{wave}: alarm: PR facts not collected: {e}")
+        if once_per(w, "alarm_error", _exc_text(e)[:150]):
+            event(cfg, f"{wave}: alarm: PR facts not collected: {_exc_text(e)}")
         return  # the intent is kept, nothing is delivered
     if facts.get("error"):
         if once_per(w, "alarm_error", str(facts["error"])[:150]):
@@ -4452,8 +4462,8 @@ def _pending_alarm_enter(cfg, st, wave, w):
     try:
         pr = find_pr(cfg, w["cwd"])
     except gate.CollectError as e:
-        if once_per(w, "alarm_error", str(e)[:150]):
-            event(cfg, f"{wave}: alarm: PR facts not collected: {e}")
+        if once_per(w, "alarm_error", _exc_text(e)[:150]):
+            event(cfg, f"{wave}: alarm: PR facts not collected: {_exc_text(e)}")
         return False
     if not pr or pr.get("state") != "OPEN":
         _drop_stale_alarm(cfg, st, wave, w, "the PR is not open")
@@ -4711,7 +4721,7 @@ def _complete_wave(cfg, st, wave, w, wdir, now):
     try:
         started = launch(cfg, waves[idx + 1], nxt, by_dispatcher=True)
     except SystemExit as e:  # refused before its intent (previous window alive, admission...)
-        _launch_refused(cfg, st, wave, waves[idx + 1], str(e))
+        _launch_refused(cfg, st, wave, waves[idx + 1], _exc_text(e))
         return False
     fresh_st = load_state(cfg)  # launch saved a newer snapshot (new current, new record):
     st.clear()                  # the caller's dict must not be written back over it
@@ -5228,8 +5238,8 @@ def register_dash(cfg, path, session, sock="", pane=None):
     try:
         value = wab_open_value(path)
     except ValueError as e:
-        event(cfg, f"Ctrl+\\ binding refused: {e}")
-        print(f"wab: Ctrl+\\ binding refused: {e}", file=sys.stderr)
+        event(cfg, f"Ctrl+\\ binding refused: {_exc_text(e)}")
+        print(f"wab: Ctrl+\\ binding refused: {_exc_text(e)}", file=sys.stderr)
         return False
     marks = (("@wab_open", value), ("@wab_run", run_tag(cfg)), ("@wab_run_dir", str(cfg["run_dir"])))
     for opt, val in marks:  # @wab_run / @wab_run_dir: whose pane it is (close_chain_sessions, stale_chains)
@@ -5515,7 +5525,7 @@ def close_chain_sessions(cfg, st):
         if res["sessions"] or res["panes"]:
             event(cfg, f"chain sessions closed: sessions {res['sessions']}, panes {res['panes']}")
     except (OSError, subprocess.SubprocessError) as e:
-        event(cfg, f"closing the chain's tmux sessions failed: {type(e).__name__}: {e}")
+        event(cfg, f"closing the chain's tmux sessions failed: {type(e).__name__}: {_exc_text(e)}")
     return res
 
 
@@ -5527,7 +5537,7 @@ def close_finished_chain(cfg, st):
     try:
         return close_chain_sessions(cfg, st)
     except Exception as e:  # noqa: BLE001
-        event(cfg, f"closing the chain's tmux sessions failed: {type(e).__name__}: {e}")
+        event(cfg, f"closing the chain's tmux sessions failed: {type(e).__name__}: {_exc_text(e)}")
         return None
 
 
@@ -5632,7 +5642,7 @@ def _state_or_event(cfg):
     try:
         return load_state(cfg)
     except SystemExit as e:
-        event(cfg, str(e))
+        event(cfg, _exc_text(e))
         raise
 
 
@@ -5750,10 +5760,10 @@ def _watch(cfg, path, max_ticks=None):
         try:
             fresh = load_chain(path)  # thresholds can be tuned live
         except SystemExit as e:
-            event(cfg, f"chain.json not re-read, keeping the previous settings: {e}")
+            event(cfg, f"chain.json not re-read, keeping the previous settings: {_exc_text(e)}")
         except Exception as e:  # noqa: BLE001 - load_chain refuses with SystemExit; anything else is a
             # bug, and a live edit must still never kill the supervision
-            event(cfg, f"chain.json not re-read, keeping the previous settings: {type(e).__name__}: {e}")
+            event(cfg, f"chain.json not re-read, keeping the previous settings: {type(e).__name__}: {_exc_text(e)}")
         else:
             changed = sorted(k for k in set(pinned) | set(_identity(fresh)) if pinned.get(k) != _identity(fresh).get(k))
             if changed:
@@ -5876,7 +5886,7 @@ def say_cmd(cfg, wave, text_file):
                     event(cfg, f"{wave}: say: owner-answered marker not written ({e.strerror or e})")
             send_text(name, text, on_typed=typed)
     except (subprocess.CalledProcessError, OSError, NotSubmitted) as e:
-        why = str(e) if isinstance(e, NotSubmitted) else type(e).__name__
+        why = _exc_text(e) if isinstance(e, NotSubmitted) else type(e).__name__
         event(cfg, f"{wave}: say FAILED ({why}): {first}")
         print(f"wab: say: the text did not leave the input line of {name}: {why}; "
               f"look: {attach_cmd(name)}", file=sys.stderr)

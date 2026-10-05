@@ -94,20 +94,31 @@ def _object(api, path):
     return data
 
 
+DEPTH_MARK = "[скрыто: глубина]"
+
+
 def _leaves(obj, depth=0):
     """Every str leaf (and dict key) of a nested answer, AS IT IS: str()/repr() of a list writes an invisible
     character as a literal `\\u200b`, which wab's mask cannot find; wab masks the whole message where it shows it."""
     if isinstance(obj, str):
         yield obj
-    elif depth < 20 and isinstance(obj, dict):
+    elif isinstance(obj, (dict, list, tuple, set, frozenset)) and depth >= 20:
+        yield DEPTH_MARK  # never str()/repr() of what is left: it would write an invisible character as `\\u200b`
+    elif isinstance(obj, dict):
         for k, v in obj.items():
             yield from _leaves(k, depth + 1)
             yield from _leaves(v, depth + 1)
-    elif depth < 20 and isinstance(obj, (list, tuple)):
+    elif isinstance(obj, (list, tuple, set, frozenset)):
         for v in obj:
             yield from _leaves(v, depth + 1)
     elif obj is not None:
         yield str(obj)
+
+
+def _exc_str(e):
+    """An exception as text WITHOUT str(e) (str(KeyError("password<ZWSP>=x")) is the repr of the string): the leaves
+    of its args as they are, joined; wab masks the whole message where it shows it."""
+    return " ".join(x for a in e.args for x in _leaves(a))
 
 
 def _threads(graphql, repo, number):
@@ -200,7 +211,7 @@ def gather(repo, number, head, api, graphql):
     try:
         return collect(repo, number, head, api, graphql)
     except CollectError as e:
-        return {"error": str(e)}
+        return {"error": _exc_str(e)}
 
 
 # ---------- Codex and checks ----------

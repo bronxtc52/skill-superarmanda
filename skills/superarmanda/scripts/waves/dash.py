@@ -440,7 +440,7 @@ def current_panel(cfg, st):
     try:
         block = manifest_lines(cfg, wave, w)
     except Exception as e:  # noqa: BLE001 - a block of the frame, not the frame
-        block = [Text(_safe(f"manifest: {type(e).__name__}: {e}"), style="yellow")]
+        block = [Text(_safe(f"manifest: {type(e).__name__}: {wab._exc_text(e)}"), style="yellow")]
     return Panel(Group(head, Text(), ctx, Text(), *block, Text(), Panel(screen, title="экран волны (live)",
                                                          border_style="grey35", box=box.ROUNDED)),
                  title=f"⚙ Текущая волна {wave}", border_style="magenta")
