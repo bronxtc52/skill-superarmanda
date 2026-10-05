@@ -1496,7 +1496,17 @@ def _require_masked(text, owner_paths=False):
 DEPTH_MARK = "[скрыто: глубина]"
 
 
-_SECRET_KEY_RE = re.compile(r"(?i)(?:" + _SECRET_KEY + r"|(?:proxy-)?authorization)")
+# A dict key that looks secret: the matches of `(?i)(?:<_SECRET_KEY>|(?:proxy-)?authorization)` taken whole (fullmatch),
+# in linear time (Astra on #85): there `[\w.-]*WORD[\w.-]*` retried the tail after every secret word of a long key
+# (`token`*N + `!`). The same test in two parts: the key is made of [\w.-] only and holds a secret word somewhere
+# (every word is made of [\w.-] too), or it is `sig` / `authorization` / `proxy-authorization` itself.
+_KEY_ALPHABET = re.compile(r"[\w.-]*")
+_SECRET_WORD_RE = re.compile(r"(?i)" + _SECRET_WORDS)
+_BARE_SECRET_KEY = re.compile(r"(?i)sig|(?:proxy-)?authorization")
+
+
+def _secret_key(k):
+    return bool(_KEY_ALPHABET.fullmatch(k) and _SECRET_WORD_RE.search(k) or _BARE_SECRET_KEY.fullmatch(k))
 
 
 def _key_hides_value(key):
@@ -1507,7 +1517,7 @@ def _key_hides_value(key):
     if not isinstance(key, str):
         return False
     k = key.replace("\r\n", "\n")
-    return bool(_CONTROL.search(k) or "\r" in k or _SECRET_KEY_RE.fullmatch(k.strip().strip("\"'")))
+    return bool(_CONTROL.search(k) or "\r" in k or _secret_key(k.strip().strip("\"'")))
 
 
 gate.key_hides_value = _key_hides_value  # the one predicate: gate._leaves hides by it (its own default hides every value)

@@ -16105,6 +16105,28 @@ class W2SafeText(Base):
         self.assertLess(time.monotonic() - start, 2.0)
         self.assertIsNone(leaked(out, ["Hunter2SecretValue99", "A" * 36, "AbCdEfGhIjKl1234567890", B64]))
 
+    def test_a_long_key_of_a_structure_is_checked_in_linear_time(self):
+        # Astra on #85: _key_hides_value took `(?i)[\w.-]*WORD[\w.-]*` whole, and a key `token`*N + `!` retried the tail
+        # after every `token` (quadratic: 100 000 characters took seconds)
+        for n in (2000, 20000):
+            key = "token" * n + "!"
+            for obj in ({key: "Hunter2SecretValue99"}, [{"errors": [{key: 1}]}], ValueError({key: "v"})):
+                with self.subTest(n=n, obj=type(obj).__name__):
+                    start = time.monotonic()
+                    self.SAFE(obj, 10 ** 9)
+                    list(gate._leaves(obj))  # the gate asks the same predicate (gate.key_hides_value)
+                    self.assertLess(time.monotonic() - start, 0.5)
+
+    def test_the_split_key_check_gives_the_results_of_the_old_one(self):
+        old = re.compile(r"(?i)(?:" + wab._SECRET_KEY + r"|(?:proxy-)?authorization)")
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        keys = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) < 200}
+        rnd = random.Random(84)
+        toks = ["token", "TOKEN", "sig", "SIG", "authorization", "proxy-", "Proxy-Authorization", "api", "_", "-", "key",
+                "secret", ".", "!", " ", "a", "1", "ж", "\u212a", "\"", "=", "private-key", "connection_string", "dsn"]
+        keys |= {"".join(rnd.choice(toks) for _ in range(rnd.randint(0, 8))) for _ in range(20000)}
+        self.assertEqual([k for k in sorted(keys) if bool(old.fullmatch(k)) != wab._secret_key(k)], [])
+
     def test_the_linear_rules_give_the_results_of_the_old_ones(self):
         tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         corpus = sorted({n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
