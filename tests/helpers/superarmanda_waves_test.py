@@ -21,6 +21,7 @@ and live sessions are lost (incident W4, 2026-10-01):
     default server.
 """
 
+import ast
 import atexit
 import contextlib
 import fcntl
@@ -28,6 +29,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import random
 import os
 import re
 import shlex
@@ -40,6 +42,15 @@ import unittest
 import uuid
 from pathlib import Path
 from unittest import mock
+
+# macOS: the default temporary directory (/var/folders/<xx>/<opaque blob>/T) holds a segment that redact() masks as an
+# opaque token (_OPAQUE), so the test chain's path inside the dispatcher's own hint (`launch <chain.json> ...`) would be
+# masked and the tests that read the hint fail. The tests live in /tmp there, as on Linux; the limit itself (a chain
+# under such a path is masked in the hints) is an accepted limitation of 1.2.0 (PR #85).
+if sys.platform == "darwin":
+    tempfile.tempdir = "/tmp"
+    os.environ["TMPDIR"] = "/tmp"
+
 
 # ---------- TMUX_GUARD: no test may touch a tmux server it did not create ----------
 def _install_tmux_guard():
@@ -16070,6 +16081,68 @@ class W2SafeText(Base):
         self.assertIn("wab.safe_text(", src)
         (tmp / "dash.py").write_text(src.replace("wab.safe_text(", "wab.redact(", 1), encoding="utf-8")
         self.assertTrue([f for f in redact_uses_outside(tmp) if f[0] == "dash.py"])
+
+    # Codex on #85: safe_text() went quadratic on a long word (`[^ ]*X[^ ]*` retried from every character), and so did
+    # redact() of 1.1.0 (the e-mail rule, the `key=value` rule after every `.`, the label of a sha looked for in the
+    # whole text before every match). 16 000 characters took 18 s, 1 MB of mixed text did not end in minutes.
+    LINES = ["2026-10-05 09:22:38Z W1: DONE, awaiting merge by the coordinator",
+             "ошибка: не удалось выполнить gh pr view 85 (exit 1)", "password=Hunter2SecretValue99 и токен ghp_" + "A" * 36,
+             "см. https://github.com/o/r/pull/85#issuecomment-5991616185 и /o/r/commit/" + HEX40,
+             "путь /home/user/projects/x/runs/demo/W1/next-prompt.md", "a\u200bsk-ant-api03-AbCdEfGhIjKl1234567890 хвост",
+             "строка\rс возвратом каретки", "user@example.com +7 912 345-67-89", "sha " + HEX40, B64]
+
+    def test_safe_text_is_linear_on_a_long_word_and_on_a_megabyte(self):
+        for unit in ("a", "1", "a.", "Ab9-_.", "token.", ".sig", "x.token-", "a@", "a\r", "a\u200b"):
+            text = (unit * 16000)[:16000]
+            with self.subTest(unit=unit):
+                start = time.monotonic()
+                self.SAFE(text, 10 ** 9)
+                self.assertLess(time.monotonic() - start, 0.5, unit)
+        text = "\n".join(self.LINES[i % len(self.LINES)] for i in range(40000))[:1_000_000]
+        start = time.monotonic()
+        out = self.SAFE(text, 10 ** 9)
+        # linear, it takes ~0.5 s here (19 rules over 1 MB); quadratic, it took minutes: 2 s keeps CI runners apart
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertIsNone(leaked(out, ["Hunter2SecretValue99", "A" * 36, "AbCdEfGhIjKl1234567890", B64]))
+
+    def test_the_linear_rules_give_the_results_of_the_old_ones(self):
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        corpus = sorted({n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                         and len(n.value) < 5000})
+        corpus += [p.read_text(encoding="utf-8") for p in sorted(REDACT_FIXTURES.iterdir()) if p.suffix == ".txt"]
+        rnd = random.Random(85)
+        toks = ["token", "sig", "SIG", ".", "=", ":", " ", "\"", "'", "@", "a", "1", "x@y.zz", "-", "_", "/", "+7", "\r", "\u200b",
+                "\n", "\u00a0", HEX40, "sha ", "reviewed_head:", "/commits/", "https://github.com/o/r/", "github.com/x/", B64, "ж",
+                ".cache/wab/", "ghp_" + "A" * 36, "[скрыто]", ",", "(", "#"]
+        corpus += ["".join(rnd.choice(toks) for _ in range(rnd.randint(0, 16))) for _ in range(20000)]
+        spaces = f"[^{wab._SPACES}]*"
+        ctrl_word, soft_word = re.compile(spaces + f"[{wab._INVISIBLE}]" + spaces), re.compile(spaces + "\r" + spaces)
+
+        def old_safe_text(text, owner_paths):  # the two word rules of the old safe_text, then the same redact()
+            text = ctrl_word.sub(self.MASK, wab._text_of(text, owner_paths).replace("\r\n", "\n"))
+
+            def soft(m):
+                glued = m.group(0).replace("\r", "")
+                return self.MASK if wab.redact(glued, 10 ** 9, owner_paths) != glued else m.group(0).replace("\r", "\n")
+            return wab._clip(wab.Masked(wab.redact(soft_word.sub(soft, text), 10 ** 9, owner_paths)), 10 ** 9)
+
+        old_email = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+        old_key = re.compile(r"(?i)(?<![\w-])([\"']?" + wab._SECRET_KEY + r"[\"']?)(\s*[:=]\s*)"
+                             r"(?!\[скрыто\])(?:\"(?:[^\"\\]|\\.)*\"?|'(?:[^'\\]|\\.)*'?|[^\s,;&}\]]+)")
+        new_key = next(rx for rx in wab._STRUCTURED if getattr(rx, "pattern", "").startswith("(?i)(?:(?<![\\w.-])"))
+        structured = [old_email if rx is wab._EMAIL else old_key if rx is new_key else rx for rx in wab._STRUCTURED]
+        old_rules = [mock.patch.object(wab, "_STRUCTURED", structured),
+                     mock.patch.object(wab, "_labelled_sha", lambda m: bool(
+                         re.fullmatch(r"[0-9a-fA-F]{40,64}", m.group(0)) and wab._SHA_LABEL.search(m.string[:m.start()]))),
+                     mock.patch.object(wab, "_after_commit_path", lambda m: bool(wab._GITHUB_SHA.search(m.string[:m.start()]))),
+                     mock.patch.object(wab, "_within", lambda spans, m: any(a <= m.start() and m.end() <= b for a, b in spans))]
+        new = [(wab.redact(t, 10 ** 9, op), self.SAFE(t, 10 ** 9, op)) for t in corpus for op in (False, True)]
+        with contextlib.ExitStack() as stack:
+            for patch in old_rules:
+                stack.enter_context(patch)
+            old = [(wab.redact(t, 10 ** 9, op), old_safe_text(t, op)) for t in corpus for op in (False, True)]
+        diff = [(t, op) for (t, op), a, b in zip([(t, op) for t in corpus for op in (False, True)], new, old) if a != b]
+        self.assertEqual(diff, [])
 
 
 

@@ -24,6 +24,7 @@ Every contact with tmux, claude, Telegram and az goes through the module-level f
 `_send_telegram`, so tests can replace them. Paths that depend on $HOME are computed at call
 time, not at import.
 """
+import bisect
 import fcntl
 import hashlib
 import json
@@ -1177,8 +1178,9 @@ _OPAQUE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}")
 _HEX_KEY = re.compile(r"(?=(?:-?[0-9A-Fa-f]){32})[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*")
 # The words of a key that hides its value: ONE source for the `key=value` rule below and for _key_hides_value (the
 # dict keys of a structure that is masked by its leaves).
-_SECRET_KEY = (r"(?:[\w.-]*(?:secret|token|password|passwd|pwd|api[_-]?key|private[_-]?key|dsn|cookie|session|"
-               r"credential|connection[_-]?string|accountkey|sharedaccesskey|signature)[\w.-]*|sig)")
+_SECRET_WORDS = (r"(?:secret|token|password|passwd|pwd|api[_-]?key|private[_-]?key|dsn|cookie|session|"
+                 r"credential|connection[_-]?string|accountkey|sharedaccesskey|signature)")
+_SECRET_KEY = r"(?:[\w.-]*" + _SECRET_WORDS + r"[\w.-]*|sig)"
 _STRUCTURED = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
     re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"),
@@ -1188,13 +1190,39 @@ _STRUCTURED = [
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
     re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"),                      # Telegram bot token
     re.compile(r"(?i)\b(set-cookie|cookie)(\s*:\s*)[^\r\n]*"),                 # whole header value
-    re.compile(r"(?i)(?<![\w-])([\"']?" + _SECRET_KEY + r"[\"']?)(\s*[:=]\s*)"
+    # the same matches as `(?<![\w-])(["']?<_SECRET_KEY>["']?)...`, in linear time (Codex, #85): that one starts after
+    # every `.` of a run and backtracks `[\w.-]*KEY[\w.-]*` over the rest of it. A key ends where its run of [\w.-] ends
+    # (`:`/`=`/a quote follow it), so it is the WHOLE run that holds a secret word, and its leftmost start is the start
+    # of the run or a quote after a `.` (a start inside the run that matches means the run's start matches too); only
+    # the bare `sig` may also start after a `.` of the run (`.sig=`), and there the run-wide branch is not tried.
+    re.compile(r"(?i)(?:(?<![\w.-])|(?<=\.)(?=[\"']|sig))"
+               r"([\"']?(?:(?:(?<![\w.-])|(?<=[\"']))(?=[\w.-]*" + _SECRET_WORDS + r")[\w.-]+|sig)[\"']?)"
+               r"(\s*[:=]\s*)"
                r"(?!\[скрыто\])(?:\"(?:[^\"\\]|\\.)*\"?|'(?:[^'\\]|\\.)*'?|[^\s,;&}\]]+)"),             # key as a word, value as a whole
     re.compile(r"(?i)\b((?:proxy-)?authorization)(\s*:\s*)(?:(?:bearer|basic|token|digest)\s+)?\S+"),
     re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(r"(?<=://)[^/\s@]+(?=@)"),                           # userinfo in URLs, with or without password
-    re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),                      # e-mail addresses
+    None,                                                               # e-mail addresses: _EMAIL below
 ]
+class _LinearEmail:
+    """The rule `[\\w.+-]+@domain` (e-mail addresses) with the matches of re.sub over it, in linear time. re.sub
+    retries the pattern from EVERY character of a long run of `[\\w.+-]` without an `@` and is quadratic (Codex, #85).
+    Its leftmost match starts either where the scan goes on (right after the last match) or at the start of a run:
+    a start inside a run that matches means the run's earlier character matches too. So: one anchored try where
+    the scan goes on, else a search that only starts a run (lookbehind); the match itself is the same pattern's."""
+    RX = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+    RUN_START = re.compile(r"(?<![\w.+-])" + RX.pattern)
+
+    def sub(self, repl, text):
+        out, pos = [], 0
+        while (m := self.RX.match(text, pos) or self.RUN_START.search(text, pos)) is not None:
+            out += [text[pos:m.start()], repl(m)]
+            pos = m.end()
+        return "".join(out + [text[pos:]])
+
+
+_EMAIL = _LinearEmail()
+_STRUCTURED[_STRUCTURED.index(None)] = _EMAIL
 _HEURISTIC = [
     re.compile(r"\+\d[\d ()-]{8,}\d"),                                  # phone numbers (+7 ...)
     re.compile(r"(?<![\w+])(?:\+?7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)"),  # RU, no plus
@@ -1248,10 +1276,40 @@ def _readable_dashed(m):
     return "-" in t and all(_WORDISH.fullmatch(part) for part in re.split(r"[-/_+=]", t))
 
 
+_SPACE = re.compile(r"\s")
+
+
+def _label_window(text, end):
+    """Where a label that ends the text at `end` (_SHA_LABEL: a word of 13 characters at most, then spaces, `=`/`:`,
+    spaces) can start: the search runs over this window and not over the whole text before `end`, which made redact()
+    quadratic in the number of its matches (Codex, #85). `\\b` at the window's start still sees the character before it."""
+    i = end
+    while i and _SPACE.match(text, i - 1):
+        i -= 1
+    if i and text[i - 1] in "=:":
+        i -= 1
+        while i and _SPACE.match(text, i - 1):
+            i -= 1
+    return max(0, i - 13)
+
+
 def _labelled_sha(m):
     """A bare 40-64 hex string is a key; only one right after an explicit SHA/hash label is a commit id."""
     return bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", m.group(0))
-                and _SHA_LABEL.search(m.string[:m.start()]))
+                and _SHA_LABEL.search(m.string, _label_window(m.string, m.start()), m.start()))
+
+
+def _after_commit_path(m):
+    """The match follows `/commit/`, `/commits/` or `/tree/`: looked for in the 9 characters before it (`/commits/`),
+    not in the whole text before it (quadratic, Codex #85)."""
+    return bool(_GITHUB_SHA.search(m.string, max(0, m.start() - 9), m.start()))
+
+
+def _within(spans, m):
+    """The match lies inside one of `spans` (sorted, not overlapping: from finditer): by bisection, not by a walk over
+    all of them for every match (quadratic in the number of URLs and matches, Codex #85)."""
+    i = bisect.bisect_right(spans, (m.start(), float("inf"))) - 1
+    return i >= 0 and m.end() <= spans[i][1]
 
 
 def _github_host(url):
@@ -1282,12 +1340,11 @@ def redact(text, limit=TG_LIMIT, owner_paths=True):
         own = _owner_script_spans(text) if owner_paths else []
 
         def keep(m, rx=rx, spans=spans, own=own):
-            if _labelled_sha(m) or any(a <= m.start() and m.end() <= b for a, b in own):
+            if _labelled_sha(m) or _within(own, m):
                 return True
-            in_github = any(a <= m.start() and m.end() <= b for a, b in spans)
+            in_github = _within(spans, m)
             if rx is _HEX_KEY:
-                return bool(in_github and re.fullmatch(r"[0-9a-fA-F]{40}", m.group(0))
-                            and _GITHUB_SHA.search(m.string[:m.start()]))
+                return bool(in_github and re.fullmatch(r"[0-9a-fA-F]{40}", m.group(0)) and _after_commit_path(m))
             return in_github or (rx is _OPAQUE and _readable_dashed(m))
 
         text = rx.sub(lambda m: m.group(0) if keep(m) else "[скрыто]", text)
@@ -1362,8 +1419,9 @@ _INVISIBLE = ("\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f" + _chars_of({"Cf", "Zl", "Zp
 # str.split() that are no space to the eye (\x1c-\x1f, NEL, U+2028/9) are in _INVISIBLE: the word is masked whole.
 _SPACES = " \\n\\t" + _chars_of({"Zs"})
 _CONTROL = re.compile(f"[{_INVISIBLE}]")
-_CTRL_WORD = re.compile(f"[^{_SPACES}]*[{_INVISIBLE}][^{_SPACES}]*")
-_SOFT_WORD = re.compile(f"[^{_SPACES}]*\r[^{_SPACES}]*")
+# The text split into words and separators in ONE pass (the separators are kept: odd items): a regex that looks for a
+# word around a character (`[^ ]*X[^ ]*`) retries from every character of a long word and is quadratic (Codex, #85).
+_WORD_SPLIT = re.compile(f"([{_SPACES}]+)")
 MASK = "[скрыто]"
 
 
@@ -1421,7 +1479,7 @@ def _key_hides_value(key):
     if not isinstance(key, str):
         return False
     k = key.replace("\r\n", "\n")
-    return bool(_CTRL_WORD.search(k) or "\r" in k or _SECRET_KEY_RE.fullmatch(k.strip().strip("\"'")))
+    return bool(_CONTROL.search(k) or "\r" in k or _SECRET_KEY_RE.fullmatch(k.strip().strip("\"'")))
 
 
 gate.key_hides_value = _key_hides_value  # the one predicate: gate._leaves hides by it (its own default hides every value)
@@ -1487,16 +1545,15 @@ def safe_text(text, limit, owner_paths=False):
     2. redact() over the whole text (no cut yet);
     3. the cut to `limit` at a safe border: the mask is never torn (a border inside it cuts before it),
        and the cut is never made BEFORE the masking."""
-    text = _text_of(text, owner_paths).replace("\r\n", "\n")
-    text = _CTRL_WORD.sub(MASK, text)
-
-    def soft_word(m):  # masked whole when its glued form holds a secret, else the CR is a line break
-        word = m.group(0)  # between two ordinary words and a Zs stays what it is
-        glued = word.replace("\r", "")
-        return MASK if redact(glued, 10 ** 9, owner_paths) != glued else word.replace("\r", "\n")
-
-    text = _SOFT_WORD.sub(soft_word, text)
-    return _clip(Masked(redact(text, 10 ** 9, owner_paths)), limit)
+    parts = _WORD_SPLIT.split(_text_of(text, owner_paths).replace("\r\n", "\n"))
+    for i in range(0, len(parts), 2):  # the words; a separator stays what it is (a Zs too)
+        word = parts[i]
+        if _CONTROL.search(word):
+            parts[i] = MASK
+        elif "\r" in word:  # masked whole when its glued form holds a secret, else the CR is a line break
+            glued = word.replace("\r", "")
+            parts[i] = MASK if redact(glued, 10 ** 9, owner_paths) != glued else word.replace("\r", "\n")
+    return _clip(Masked(redact("".join(parts), 10 ** 9, owner_paths)), limit)
 
 
 # The registry of EVERY path that shows text to a human (#81). Each of them masks with safe_text() and
