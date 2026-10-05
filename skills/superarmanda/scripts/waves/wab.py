@@ -1518,6 +1518,7 @@ OUTPUT_PATHS = {
     "say_echo": "_say_first(): the text of `say` in its events",
     "blocked_notice": "blocked_notice(): the BLOCKED notice that needs the owner",
     "status_cmd": "status_cmd(): `wab.py status`",
+    "owner_merge_regate": "owner_merge(): the exit text of the second gate after the threads were closed",
     "resolve_why": "_resolve_why(): the errors (a nested structure) of a thread that owner-merge could not resolve",
     "dash_waves_table": "dash.waves_table(): the table of the waves, an unknown status of a wave as its label",
     "dash_pipeline": "dash.pipeline(): the line of the waves (an unknown status of a wave takes no label there)",
@@ -4101,7 +4102,7 @@ def owner_merge(cfg, wave, run_id, sha):
         v2 = gate_check(cfg, wave, w)
         if v2["verdict"] != "pass":
             raise SystemExit(f"wab: owner-merge: гейт изменился после закрытия тредов: {v2['verdict']}: "
-                             f"{'; '.join(v2['reasons'])}; ничего не смержено")
+                             f"{_masked_line('; '.join(v2['reasons']), 600)}; ничего не смержено")
         if v2["head"] != w["gate_sha"] or v2["number"] != w.get("gate_pr"):
             raise SystemExit(f"wab: owner-merge: гейт изменился после закрытия тредов: PR head "
                              f"{str(v2['head'])[:12]} is not the gated {w['gate_sha'][:12]}; ничего не смержено")

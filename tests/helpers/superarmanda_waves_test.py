@@ -9036,6 +9036,23 @@ class OwnerMerge(GateBase):  # D3
         self.assertTrue(a.read_text(encoding="utf-8").rstrip().endswith(f"W1 {RUN_ID} {HEAD}"))
         self.assertTrue(b.read_text(encoding="utf-8").rstrip().endswith("W1 2099-01-01 " + "e" * 40))
 
+    def test_the_reasons_of_the_second_gate_are_masked_in_the_exit_text(self):  # #84
+        for name in ("build password\u200b=Hunter2SecretValue99", "build password=Hunter2SecretValue99",
+                     "build ghp_AbCd1234EfGh5678IjKl9012MnOp3456"):
+            with self.subTest(name=name):
+                for t in self.facts["threads"]:
+                    t["isResolved"] = t["id"] == "PRRT_b"
+                self.order.clear()
+                self.not_draft()
+                self.on_resolve = lambda v, n=name: self.facts.__setitem__(
+                    "check_runs", [{"id": 1, "name": n, "status": "completed", "conclusion": "failure"}])
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_it()
+                out = str(ctx.exception)
+                self.assertIn("гейт изменился после закрытия тредов", out)
+                self.assertIsNone(leaked(out, ["Hunter2SecretValue99", "AbCd1234EfGh5678"]), out)
+                self.assertEqual(self.merges(), [])
+
     def test_the_value_under_a_hiding_key_is_hidden_in_the_owner_merge_exit(self):  # r3-2
         for key in ("password", "Token", "pass\u200bword", "k\ufe0f", "pa\rss"):
             with self.subTest(key=key):
@@ -15676,6 +15693,23 @@ class W2OutputPaths(Base):
         with contextlib.redirect_stdout(buf):
             wab.status_cmd(cfg)
         return "\n".join(map(str, seen)) + "\n" + buf.getvalue()
+
+    def out_owner_merge_regate(self, raw):
+        """owner-merge: the threads are closed, then the SECOND gate fails; its reason names a check-run called `raw`."""
+        case = OwnerMerge("test_a_thread_is_closed_only_when_the_answer_says_so")
+        case.setUp()
+        try:
+            case.not_draft()
+            case.on_resolve = lambda v: case.facts.__setitem__(
+                "check_runs", [{"id": 1, "name": raw, "status": "completed", "conclusion": "failure"}])
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    case.run_it()
+                except SystemExit as e:
+                    return str(e)
+            return "no SystemExit"
+        finally:
+            case.doCleanups()
 
     def out_resolve_why(self, raw):
         # the errors of a GraphQL answer are a NESTED structure: key and value both carry the text
