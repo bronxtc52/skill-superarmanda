@@ -3324,7 +3324,7 @@ WHERE_TIMEOUT = 10
 RUNS_LIMIT = 2 * 1024 * 1024  # bytes of runs.json read by current_manifest
 
 
-def current_manifest(cfg, wave):
+def _current_manifest(cfg, wave):
     """The manifest of the wave's CURRENT run: (path, None), or (None, reason) for a closed refusal.
     No `<wave dir>/runs.json`, or an empty list of runs: the standard `<wave dir>/superarmanda/manifest.json`
     (the file itself may not exist yet: that is "no manifest", not an error here). Otherwise the last
@@ -3393,6 +3393,16 @@ def current_manifest(cfg, wave):
     return found, None
 
 
+def current_manifest(cfg, wave):
+    """The invariant of the choice of the run: it never raises. Any failure of reading or parsing
+    runs.json or of checking its record (RecursionError of a deeply nested file, an encoding error,
+    anything unexpected; not BaseException) is a closed refusal (None, reason), never the standard path."""
+    try:
+        return _current_manifest(cfg, wave)
+    except Exception:  # noqa: BLE001 - fail closed; the reason quotes nothing from the files
+        return None, "runs.json не разбирается или запись прогона не проверяется"
+
+
 def read_manifest(cfg, wave):
     """The current run's manifest (see current_manifest) as written by state.py; None when there is
     none, it cannot be read or the choice of the run was refused (gate_check names the reason)."""
@@ -3401,7 +3411,7 @@ def read_manifest(cfg, wave):
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except Exception:  # noqa: BLE001 - OSError, ValueError, RecursionError of a nested file: no manifest
         return None
     return data if isinstance(data, dict) else None
 
@@ -3422,6 +3432,8 @@ def manifest_where_of(path, timeout=WHERE_TIMEOUT):
         return {"error": f"state.py where: таймаут {timeout} с"}
     except (OSError, ValueError) as e:
         return {"error": str(e)[:150]}
+    except RecursionError:
+        return {"error": "state.py where: ответ не разбирается"}
     return result
 
 

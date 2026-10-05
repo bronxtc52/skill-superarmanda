@@ -14454,6 +14454,38 @@ class CurrentRunManifest(Base):
     def test_a_wave_name_with_nul_does_not_raise(self):
         self.assertEqual(wab.current_manifest(self.cfg, "W1\u0000")[0].name, "manifest.json")
 
+    def test_deeply_nested_runs_json_is_refused_not_raised(self):
+        (self.wave / "runs.json").write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+        path, why = wab.current_manifest(self.cfg, "W1")
+        self.assertIsNone(path)
+        self.assertTrue(why)
+        self.assertRefused()
+
+    def test_deeply_nested_runs_json_in_a_valid_envelope_is_refused(self):
+        text = '{"version": 1, "wave": "W1", "runs": [{"x": ' + "[" * 100000 + "]" * 100000 + "}]}"
+        self.set_runs(text)
+        self.assertRefused()
+
+    def test_broken_utf8_in_runs_json_is_refused(self):
+        (self.wave / "runs.json").write_bytes(b'{"version": 1, "wave": "W1", "runs": ["\xc3\x28"]}')
+        self.assertRefused()
+
+    def test_oversized_runs_json_is_refused_in_the_gate(self):
+        (self.wave / "runs.json").write_bytes(b" " * (wab.RUNS_LIMIT + 1))
+        self.assertRefused("слишком большой")
+
+    def test_current_manifest_never_raises(self):  # the invariant: any failure of a step is a refusal
+        steps = ((wab.json, "loads", KeyError("x")), (wab.os, "open", RuntimeError("x")),
+                 (wab.os, "fstat", MemoryError("x")), (wab.os, "read", ValueError("x")),
+                 (wab.pathlib.Path, "resolve", AttributeError("x")), (wab.os.path, "isabs", TypeError("x")))
+        for mod, name, exc in steps:
+            with self.subTest(step=name):
+                with mock.patch.object(mod, name, side_effect=exc):
+                    path, why = wab.current_manifest(self.cfg, "W1")
+                self.assertIsNone(path)
+                self.assertTrue(why)
+                self.assertNotIn("Error", why)  # a reason, not the text of the exception
+
     def test_a_last_record_that_is_not_an_object_is_refused(self):
         doc = self.runs_doc()
         doc["runs"][-1] = "x"
@@ -14588,7 +14620,7 @@ class CurrentRunManifest(Base):
             hits[name] = len(re.findall(r"""["']manifest\.json["']""", src))
         self.assertEqual(hits, {"wab.py": 1, "gate.py": 0, "dash.py": 0})
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
-        body = src[src.index("def current_manifest("):]
+        body = src[src.index("def _current_manifest("):]
         body = body[:body.index("\ndef ", 10)]
         self.assertRegex(body, r"""["']manifest\.json["']""")
 
