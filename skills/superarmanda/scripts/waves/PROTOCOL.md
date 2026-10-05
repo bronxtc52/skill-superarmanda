@@ -69,6 +69,13 @@
    `fix-loop --outcome failed` в пределах капа 3; кап исчерпан — `BLOCKED: [class=blocked_cap …]`.
    **Второй прогон.** Открывай его `init --from-plan` на новом пути (например, `superarmanda/manifest-run2.json`).
    Файлы manifest не переставляй и не переименовывай: гейт мерджа и дашборд найдут текущий прогон по последней записи `runs.json`.
+   **Fable-субагенты.** Роли `investigator` (задача-баг, до coder), `internal_reviewer` (задача high, до
+   внешнего ревью), `triage` (находки внешнего ревью) и `final_check` (задача high, перед `DONE`) обязательны в
+   применимых случаях и идут свежими субагентами на Fable; брифы — `references/role-briefs.md`. Результат:
+   `task-result --role <роль> --model fable`; Fable недоступна — `--status unavailable --model fable`, без
+   подмены. Находки внутреннего ревью: `fix-loop --outcome failed --source internal_reviewer` (кап не тратит,
+   не больше трёх кругов, только до первого внешнего ревью задачи). Пропуск применимой роли — строка с
+   причиной в `result.md`.
    **Гейт судит по риску волны.** Гейт мерджа берёт риск волны из одобренного плана, а не из manifest. В волне `high`
    каждой задаче нужны оба ревью текущего HEAD (`cross_provider_reviewer` и `second_reviewer`: Astra и Fable), какой бы
    риск ни стоял у самой задачи. Manifest, созданный старой версией скилла или с заниженным уровнем, гейт не пройдёт:

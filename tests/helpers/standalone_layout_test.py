@@ -17,6 +17,7 @@ EXPECTED_FILES = {
     "references/review-contract.md",
     "references/pr-review.md",
     "references/waves.md",
+    "references/role-briefs.md",
     "schemas/review-result.schema.json",
     "scripts/state.py",
     "scripts/review.py",
@@ -168,12 +169,10 @@ class ReleaseWaveGateDocs(unittest.TestCase):
     the plan checked by `launch`, the skill updated only between waves."""
 
     def test_release_1_2_2_is_versioned_and_names_the_compatibility_boundaries(self):
-        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.2"?$')
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         sections = re.split(r"(?m)^## ", changelog)
         section = next((s for s in sections if s.startswith("1.2.2 — 2026-10-05")), None)
         self.assertIsNotNone(section, "CHANGELOG has no section 1.2.2")
-        self.assertEqual(sections.index(section), 1, "1.2.2 must be the newest section")
         for issue in ("#86", "#91", "#92"):
             self.assertIn(issue, section)
         boundaries = [l for l in flat(section).split(" - ") if "Граница совместимости" in l]
@@ -245,6 +244,121 @@ class ReleaseWaveGateDocs(unittest.TestCase):
                 text = flat(doc(relative))
                 self.assertIn("#91", text)
                 self.assertIn("не проверен живым событием квоты", text)
+
+
+class ReleaseFableRolesDocs(unittest.TestCase):
+    """1.2.3 (W3, #86 п.5-10): the Fable subagent roles of the ordinary pipeline and their briefs."""
+
+    # role id -> how the docs name it (a stem: the word is declined in the text)
+    ROLES = {
+        "architect": "архитектор",
+        "internal_reviewer": "внутренн",
+        "triage": "триаж",
+        "investigator": "следовател",
+        "final_check": "финальн",
+    }
+    RULE = "обязательны в применимых случаях"
+    MODEL_COMMANDS = ("`/model`", "`claude --model claude-fable-5-1`")
+
+    def test_release_1_2_3_is_versioned_and_names_the_accepted_limitation(self):
+        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.3"?$')
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        sections = re.split(r"(?m)^## ", changelog)
+        section = next((s for s in sections if s.startswith("1.2.3 — 2026-10-05")), None)
+        self.assertIsNotNone(section, "CHANGELOG has no section 1.2.3")
+        self.assertEqual(sections.index(section), 1, "1.2.3 must be the newest section")
+        self.assertTrue(sections[2].startswith("1.2.2 — "), "1.2.2 follows 1.2.3")
+        self.assertIn("#86", section)
+        items = flat(section).split(" - ")
+        limitation = next((l for l in items if "Принятое ограничение" in l), "")
+        for needle in ("архитектор", "триаж", "следовател", "машинно не проверяются", "`internal_reviewer`",
+                       "`final_check`", "1.2.4"):
+            with self.subTest(limitation=needle):
+                self.assertIn(needle, limitation)
+        boundary = next((l for l in items if "Граница совместимости" in l), "")
+        for needle in ("`version: 1`", "`version: 2`", "1.2.2", "без новых полей"):
+            with self.subTest(boundary=needle):
+                self.assertIn(needle, boundary)
+        fixed = section.split("### Исправлено", 1)[-1]
+        for needle in ("Is a directory", "`wave.risk`"):
+            with self.subTest(fixed=needle):
+                self.assertIn(needle, fixed)
+
+    def test_skill_and_workflow_name_the_roles_their_model_and_the_applicability_rule(self):
+        for relative in ("SKILL.md", "references/workflow.md"):
+            text = doc(relative)
+            whole = flat(text)
+            for role, word in self.ROLES.items():
+                with self.subTest(doc=relative, role=role):
+                    self.assertIn(f"`{role}`", whole)
+                    self.assertIn(word, whole.lower())
+                    # the model stands next to the role: one paragraph names both
+                    paragraphs = [flat(part) for part in re.split(r"\n(?=\s*(?:[-*]|\d+\.) |\s*\n)", text)]
+                    self.assertTrue(any(f"`{role}`" in part and "Fable" in part for part in paragraphs),
+                                    f"{relative}: no paragraph names `{role}` together with Fable")
+            with self.subTest(doc=relative, rule=self.RULE):
+                self.assertIn(self.RULE, whole)
+                sentence = next(part for part in re.split(r"(?<=[.;:]) ", whole) if self.RULE in part)
+                self.assertNotIn("рекоменд", sentence.lower())
+            self.assertIn("role-briefs.md", text)
+        workflow = flat(doc("references/workflow.md"))
+        rule = workflow.split(self.RULE, 1)[1][:900]
+        for needle in ("архитектор", "шаге 1", "high", "триаж", "находках внешнего ревью", "следователь",
+                       "баг", "внутреннее ревью", "финальная сверка", "отклонение", "причин"):
+            with self.subTest(rule=needle):
+                self.assertIn(needle, rule)
+        for needle in ("машинно не проверяются", "W4", "1.2.4",
+                       "task-result --role <роль> --status unavailable --model fable", "поле `model`",
+                       "--source internal_reviewer", "`internal_rounds`", "`external_review`",
+                       "requires manifest version 2"):
+            with self.subTest(workflow=needle):
+                self.assertIn(needle, workflow)
+
+    def test_every_role_brief_carries_the_model_and_the_way_to_record_the_result(self):
+        text = doc("references/role-briefs.md")
+        blocks = fenced_blocks(text)
+        for role in self.ROLES:
+            brief = next((b for b in blocks if re.search(rf"(?m)^Роль: {role}\b", b)), None)
+            with self.subTest(role=role):
+                self.assertIsNotNone(brief, f"role-briefs.md has no brief of {role}")
+                self.assertRegex(brief, r"(?m)^model: fable$")
+                for needle in ("Вход:", "Выход:", "Запреты:", "Fable недоступна"):
+                    self.assertIn(needle, brief)
+                command = flat(brief.replace("\\\n", " "))
+                self.assertRegex(command, rf"task-result [^\n]*--role {role} [^\n]*--model fable")
+                self.assertIn(f"task-result --role {role} --status unavailable --model fable", command)
+        for relative in ("SKILL.md", "references/profiles.md"):
+            with self.subTest(link=relative):
+                self.assertIn("(references/role-briefs.md)" if relative == "SKILL.md" else "(role-briefs.md)",
+                              doc(relative))
+        profiles = flat(doc("references/profiles.md"))
+        for role in self.ROLES:
+            with self.subTest(profiles=role):
+                self.assertIn(f"`{role}`", profiles)
+
+    def test_session_model_warning_for_high_risk_is_one_line_with_the_command(self):
+        for relative, extra in (("SKILL.md", ()), ("references/waves.md", ("chain.json",))):
+            lines = [l for l in doc(relative).splitlines() if all(c in l for c in self.MODEL_COMMANDS)]
+            with self.subTest(doc=relative):
+                self.assertEqual(len(lines), 1, f"{relative}: the warning must be exactly one line")
+                for needle in ("high", "Fable", "не переключа", *extra):
+                    self.assertIn(needle, lines[0])
+        self.assertIn("координатор", next(l for l in doc("SKILL.md").splitlines()
+                                          if all(c in l for c in self.MODEL_COMMANDS)).lower())
+
+    def test_waves_doc_has_the_1_2_3_row_and_the_extended_gate_border(self):
+        text = doc("references/waves.md")
+        table = text.split("## Что реализовано", 1)[1].split("## Фаза A", 1)[0]
+        row = next((l for l in table.splitlines() if "1.2.3; #86" in l), "")
+        for needle in ("`architect`", "`internal_reviewer`", "`triage`", "`investigator`", "`final_check`",
+                       "--source internal_reviewer"):
+            with self.subTest(row=needle):
+                self.assertIn(needle, row)
+        gate = flat(text.split("### Гейт мерджа: `merge_gate: auto`", 1)[1].split("\n### ", 1)[0])
+        border = gate.split("Известная граница: manifest не подписан", 1)[1]
+        for needle in ("согласованно вычищен", "след", "одним ревью", "под пином", "`version: 2`"):
+            with self.subTest(border=needle):
+                self.assertIn(needle, border)
 
 
 if __name__ == "__main__":

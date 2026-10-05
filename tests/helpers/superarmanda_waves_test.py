@@ -9939,6 +9939,31 @@ class ManifestDashboard(Base):
                    "--session-id", "s3", "--head", head)
         self.assertRegex(row(), r"cross_provider_reviewer: —\s+second_reviewer: pass\s+github_codex_review: —")
 
+    def test_frame_survives_the_fable_subagent_roles_and_the_internal_round(self):
+        """1.2.3 (W3): results of the Fable subagent roles and a round of the internal review do not break
+        the manifest block: the verdicts are listed after the known roles, the round has its own counter."""
+        cfg = self.running()
+        repo = self.tmp / "gitrepo"
+        repo.mkdir()
+        git = ["git", "-C", str(repo), "-c", "user.email=a@b", "-c", "user.name=n"]
+        subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "i"], check=True)
+        head = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        manifest = cfg["run_dir"] / "W1" / "superarmanda" / "manifest.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        self.state(manifest, "init", "--repo", str(repo), "--base", head, "--head", head, "--risk", "high")
+        for number, (role, status) in enumerate((("architect", "pass"), ("coder", "pass"),
+                                                 ("internal_reviewer", "findings"))):
+            self.state(manifest, "task-result", "--task", "T1", "--role", role, "--status", status,
+                       "--session-id", f"s{number}", "--head", head, "--model", "fable")
+        self.state(manifest, "fix-loop", "--task", "T1", "--outcome", "failed", "--source", "internal_reviewer")
+        self.dash.MANIFEST_CACHE.clear()
+        text = self.frame(cfg)
+        self.assertNotIn("manifest:", text)
+        for part in ("T1", "needs_fix", "шаг 6", "internal_reviewer 1/3", "total 0/3", "architect: pass",
+                     "internal_reviewer: findings"):
+            self.assertIn(part, text)
+
     def test_pr_falls_back_to_gate_pr_and_the_table_has_a_pr_column(self):
         cfg = self.running(gate_pr=44)
         text = self.frame(cfg)

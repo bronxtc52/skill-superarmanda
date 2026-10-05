@@ -44,6 +44,14 @@ request как `session_id`; не приписывайте сервису кон
 State хранит эти значения как metadata. Coordinator подтверждает существование артефакта и
 `gate_ready: true` adapter report перед записью pass.
 
+## Внутреннее ревью — не внешнее (1.2.3, #86)
+
+Внутреннее ревью Fable-субагента (`internal_reviewer`, [role-briefs.md](role-briefs.md)) идёт до пакета
+внешнего ревью и его не заменяет: готовность задачи и гейт по-прежнему требуют ревью по этому
+контракту. Отчёт `review.py` (профили `claude-host`, `codex-host`, `codex-host-opus`) как артефакт
+внутреннего ревью не принимается, а источник `fix-loop --source internal_reviewer` закрывается с
+первой записью внешнего ревью задачи — правила в [workflow.md](workflow.md), «Local state interface».
+
 ## Ревью задачи с риском high (1.2.1, #86)
 
 Задача с эффективным риском high (см. [profiles.md](profiles.md), «Модель роли по риску») проходит

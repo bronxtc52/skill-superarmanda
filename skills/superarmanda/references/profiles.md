@@ -11,6 +11,7 @@
 | coder | по риску задачи (раздел ниже): `coder@sonnet`, при high — Fable | fresh explicit native model (`coder@gpt-5.6-terra`); задачи high здесь не ведутся (#92) |
 | tester | по риску задачи (раздел ниже): `tester@sonnet`, при high — Fable | fresh explicit native model (`tester@gpt-5.6-terra`); задачи high здесь не ведутся (#92) |
 | task reviewer | Codex CLI / fixed adapter; при риске high — оба адаптера | Claude CLI / fixed adapter; при риске high — оба адаптера |
+| Fable-субагенты: `architect`, `internal_reviewer`, `triage`, `investigator`, `final_check` | всегда Fable (`claude-fable-5-1`), свежая сессия | Fable на этом host нет: запись `unavailable`, без подмены (#92) |
 | context / drafts | `reader`/`drafter@haiku` | `reader`/`drafter@gpt-5.6-luna` |
 | required PR review | GitHub Codex | GitHub Codex |
 | optional PR review | CodeRabbit | CodeRabbit |
@@ -64,8 +65,18 @@
   `role-model` для них отдаёт рекомендацию для Claude-хоста (Sonnet) и Codex-хосту её не навязывает.
 
 Manifest `version: 1` (созданный до 1.2.1) оценивается по правилам 1.2.0: одна модель по таблице
-host-профилей ниже, одно ревью; `role-model`, `task-risk`, `--model`, `second_reviewer` и
-`--quota-evidence` на нём — отказ.
+host-профилей ниже, одно ревью; `role-model`, `task-risk`, `--model`, `second_reviewer`,
+`--quota-evidence`, роли Fable-субагентов и `--source internal_reviewer` на нём — отказ.
+
+### Fable-субагенты (1.2.3, #86)
+
+Роли `architect`, `internal_reviewer`, `triage`, `investigator`, `final_check` от риска не зависят:
+их модель — всегда Fable (`claude-fable-5-1`), и `state.py role-model` для них не нужен. Шаблоны
+брифов со строкой `model: fable` — в [role-briefs.md](role-briefs.md); когда роль применима —
+[workflow.md](workflow.md), «Fable-субагенты». Результат записывается `task-result --role <роль>
+--model fable`; без модели Fable запись отклоняется при любом статусе и риске. Fable недоступна —
+`task-result --role <роль> --status unavailable --model fable`, без подмены моделью слабее. Роли
+есть только в manifest `version: 2`.
 
 ### Шаблон брифа coder и tester
 

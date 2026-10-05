@@ -124,6 +124,14 @@ bound; run `check` later or resume from saved state. Keep the PR draft until the
 is ready. Manual Codex review on draft PR #426 has been proven; there is still no ready-PR/API
 fallback or automatic draft transition.
 
+## Финальная сверка перед снятием draft (1.2.3, #86)
+
+Для задачи `high` перед снятием draft свежий Fable-субагент (`final_check`, бриф — в
+[role-briefs.md](role-briefs.md)) сверяет итоговый diff с ТЗ: каждый пункт приёмки закрыт и доказан
+тестом или командой. Пробелы возвращаются в работу обычным кругом; результат записывается
+`task-result --role final_check --model fable` и попадает в тело PR. В 1.2.3 гейт мерджа эту запись
+не требует (машинная обязательность — 1.2.4): пропуск сверки называется в отчёте с причиной.
+
 ## Шаблон тела PR
 
 Тело PR собирает координатор по manifest (`state.py where`: `risk`, `artifacts`,
@@ -140,6 +148,7 @@ fallback or automatic draft transition.
 - Риск задачи: <low|medium|high>. Модель coder и tester: <claude-fable-5-1 | claude-sonnet-5-5> (из manifest).
 - Ревью задачи: Astra (`claude-host`) — <pass | findings: решение>; для риска high также Fable (`codex-host`) — <pass | findings: решение>.
 - Запасное Opus-ревью (`codex-host-opus`): <нет | да — вместо Fable; подтверждение квоты Fable: отчёт `codex-host` с `error_category: quota` на этом HEAD и пакете, `<путь из quota_evidence>`>.
+- Финальная сверка с ТЗ (`final_check`, Fable): <pass | пробелы: что возвращено в работу | не применялась или пропущена: причина>.
 
 ## Принятые ограничения
 
