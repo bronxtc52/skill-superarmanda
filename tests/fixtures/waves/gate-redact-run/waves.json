@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "chain": "waves-gate-redact",
+  "repo": "bronxtc52/skill-superarmanda",
+  "base_branch": "main",
+  "waves": [
+    {
+      "id": "W1",
+      "title": "Гейт видит текущий прогон",
+      "goal": "заглушка",
+      "requirements": "заглушка",
+      "acceptance": [
+        "заглушка",
+        "заглушка",
+        "заглушка",
+        "заглушка",
+        "заглушка"
+      ],
+      "risk": "high",
+      "checks": [
+        {
+          "name": "waves",
+          "cmd": "bash tests/superarmanda-waves.test.sh"
+        },
+        {
+          "name": "all-tests",
+          "cmd": "bash scripts/run-tests.sh"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "W2",
+      "title": "Один путь маскировки и релиз 1.2.0",
+      "goal": "заглушка",
+      "requirements": "заглушка",
+      "acceptance": [
+        "заглушка",
+        "заглушка",
+        "заглушка",
+        "заглушка",
+        "заглушка",
+        "заглушка"
+      ],
+      "risk": "high",
+      "checks": [
+        {
+          "name": "waves",
+          "cmd": "bash tests/superarmanda-waves.test.sh"
+        },
+        {
+          "name": "all-tests",
+          "cmd": "bash scripts/run-tests.sh"
+        }
+      ],
+      "depends_on": [
+        "W1"
+      ]
+    }
+  ]
+}

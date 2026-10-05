@@ -113,6 +113,7 @@ import wab  # noqa: E402
 
 REAL_SH = wab.sh
 REAL_FIND_PR = wab.find_pr
+REAL_CHECK_PLAN_REVIEW = getattr(wab, "check_plan_review", None)  # Base turns it off; W2PlanReview puts it back
 OWN_HEAD = {"headRepositoryOwner": {"login": "o"}, "headRepository": {"name": "r"}}  # PR from the chain repo "o/r"
 CHAIN = "demo"
 RUN_ID = "2026-10-01"
@@ -227,6 +228,10 @@ class Base(unittest.TestCase):
         # ProcessFacts / BgBase put the real function back over a faked `ps`
         patch("wave_children", return_value=[])
         patch("_send_telegram", side_effect=lambda cfg, text: self.tg.append(text))
+        # the launch of a NEW chain checks the two reviews of the plan (1.2.2, #86): the chains of these tests
+        # have no approved plan, the check has its own tests (W2PlanReview, which puts the real one back)
+        if REAL_CHECK_PLAN_REVIEW is not None:
+            patch("check_plan_review")
         sleeper = mock.patch("time.sleep")
         sleeper.start()
         self.addCleanup(sleeper.stop)
@@ -16312,6 +16317,329 @@ class W2WaveRisk(GateBase):
                 (cfg["run_dir"] / "waves.json").unlink(missing_ok=True)
         cfg = self.pinned(raw=plan_bytes(plan_wave("W2", "low")))
         self.assertIn("W1", wab.plan_wave_risk(cfg, "W1")["error"])
+
+
+REVIEW_PY = ROOT / "skills" / "superarmanda" / "scripts" / "review.py"
+GATE_REDACT_RUN = ROOT / "tests" / "fixtures" / "waves" / "gate-redact-run"
+
+
+def review_cli_doubles():
+    """The subscription CLI doubles of the review suite (tests/helpers/superarmanda_review_test.py): the
+    review reports of these tests are written by review.py itself, not by hand."""
+    spec = importlib.util.spec_from_file_location("superarmanda_review_suite_for_waves",
+                                                  Path(__file__).with_name("superarmanda_review_test.py"))
+    suite = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(suite)
+    return {"claude": suite.MOCK, "codex": suite.CODEX_MOCK}
+
+
+class PlanReviewBase(Base):
+    """A new chain with a pinned plan and `<run_dir>/plan-review/` made by the real review.py: the plan is
+    committed into a throwaway repository, `review.py packet` builds the packet whose diff adds waves.json,
+    `review.py run` writes the reports over the CLI doubles."""
+
+    def setUp(self):
+        super().setUp()
+        self.alive = False
+        p = mock.patch.object(wab, "check_plan_review", REAL_CHECK_PLAN_REVIEW)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+        self.prompt = self.tmp / "p.md"
+        self.prompt.write_text("go\n", encoding="utf-8")
+        self.plan = plan_bytes(plan_wave("W1", "high"), plan_wave("W2", "medium", ["W1"]))
+        self.pin = hashlib.sha256(self.plan).hexdigest()
+        self.bin = self.tmp / "review-bin"
+        self.bin.mkdir()
+        for name, source in review_cli_doubles().items():
+            (self.bin / name).write_text(source, encoding="utf-8")
+            (self.bin / name).chmod(0o755)
+        self.serial = 0
+
+    def git(self, repo, *args):
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.email=a@b", "-c", "user.name=n", *args],
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def packet(self, out, plan=None, note="plan review\n", name="waves.json"):
+        """`review.py packet` over a repository whose only change adds the plan as `name`."""
+        self.serial += 1
+        repo = self.tmp / f"planrepo-{self.serial}"
+        repo.mkdir()
+        self.git(repo, "init", "-q", "-b", "main")
+        (repo / "README.md").write_text("plan\n", encoding="utf-8")
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-qm", "base")
+        base = self.git(repo, "rev-parse", "HEAD")
+        (repo / name).write_bytes(self.plan if plan is None else plan)
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-qm", "plan")
+        req, ev = self.tmp / f"req-{self.serial}.md", self.tmp / f"ev-{self.serial}.md"
+        req.write_text(note, encoding="utf-8")
+        ev.write_text("checked\n", encoding="utf-8")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run([sys.executable, str(REVIEW_PY), "packet", "--repo", str(repo), "--base", base,
+                               "--head", self.git(repo, "rev-parse", "HEAD"), "--requirements", str(req),
+                               "--test-evidence", str(ev), "--output", str(out)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return repo, out
+
+    def report(self, repo, packet, profile, out, mode="success"):
+        env = dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}", SA_TEST_MODE=mode,
+                   SA_TEST_LOG=str(self.tmp / "cli-log.jsonl"))
+        subprocess.run([sys.executable, str(REVIEW_PY), "run", "--repo", str(repo), "--packet", str(packet),
+                        "--profile", profile, "--output", str(out), "--timeout", "20"],
+                       capture_output=True, text=True, env=env)
+        self.assertTrue(out.exists(), f"review.py wrote no report for {profile}/{mode}")
+        return out
+
+    def new_chain(self, **over):
+        cfg, path = self.chain(plan_sha256=self.pin, **over)
+        (cfg["run_dir"] / "waves.json").write_bytes(self.plan)
+        return cfg, path
+
+    def reviewed(self, cfg, profiles=("claude-host", "codex-host"), modes=None, **packet_kw):
+        """plan-review/ of the current round: plan.sha256, packet.json and one report per profile."""
+        d = cfg["run_dir"] / "plan-review"
+        repo, packet = self.packet(d / "packet.json", **packet_kw)
+        (d / "plan.sha256").write_text(self.pin + "\n", encoding="utf-8")
+        for profile in profiles:
+            self.report(repo, packet, profile, d / f"result-{profile}.json", (modes or {}).get(profile, "success"))
+        return d, repo, packet
+
+    def attempt(self, cfg, wave="W1", **kw):
+        self.tmux_calls.clear()
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd):
+            return wab.launch(cfg, wave, self.prompt, **kw)
+
+    def refused(self, cfg, *needles, wave="W1"):
+        with self.assertRaises(SystemExit) as ctx:
+            self.attempt(cfg, wave)
+        text = str(ctx.exception)
+        for needle in ("launch refused", "plan review", *needles):
+            self.assertIn(needle, text)
+        self.assertEqual([c for c in self.tmux_calls if "new-session" in c], [])
+        self.assertFalse(wab.state_path(cfg).exists() and wave in self.get_state(cfg).get("waves", {}))
+        self.assertIn("plan review", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+        return text
+
+    def launched(self, cfg, wave="W1", **kw):
+        self.assertTrue(self.attempt(cfg, wave, **kw))
+        self.assertIn(wave, self.get_state(cfg)["waves"])
+
+
+class W2PlanReview(PlanReviewBase):
+    """1.2.2 (W2, #86 п.3): `launch` of a NEW chain needs both reviews of the approved plan."""
+
+    def test_both_reviews_of_the_current_packet_let_the_chain_start(self):
+        cfg, _ = self.new_chain()
+        d, _, _ = self.reviewed(cfg)
+        for name in ("result-claude-host.json", "result-codex-host.json"):
+            self.assertIs(json.loads((d / name).read_text(encoding="utf-8"))["gate_ready"], True)
+        self.launched(cfg)
+
+    def test_launch_without_two_gate_ready_reviews_is_refused_with_the_reason(self):
+        cfg, _ = self.new_chain()
+        self.refused(cfg, "plan-review")  # no directory at all
+        d, repo, packet = self.reviewed(cfg, profiles=("claude-host",))
+        self.refused(cfg, "result-codex-host.json")
+        self.report(repo, packet, "codex-host", d / "result-codex-host.json", "findings")
+        self.assertIs(json.loads((d / "result-codex-host.json").read_text(encoding="utf-8"))["gate_ready"], False)
+        self.refused(cfg, "result-codex-host.json", "gate_ready")
+        (d / "result-claude-host.json").unlink()
+        self.report(repo, packet, "codex-host", d / "result-codex-host.json")
+        self.refused(cfg, "result-claude-host.json")
+        # one review under both names is not two reviews
+        shutil.copy(d / "result-codex-host.json", d / "result-claude-host.json")
+        self.refused(cfg, "result-claude-host.json", "profile")
+        relabelled = json.loads((d / "result-codex-host.json").read_text(encoding="utf-8"))
+        relabelled["profile"] = "claude-host"
+        (d / "result-claude-host.json").write_text(json.dumps(relabelled), encoding="utf-8")
+        self.refused(cfg, "result-claude-host.json", "models")
+        self.report(repo, packet, "claude-host", d / "result-claude-host.json")
+        self.launched(cfg)
+
+    def test_results_of_an_earlier_round_are_not_counted(self):
+        cfg, _ = self.new_chain()
+        d, repo, packet = self.reviewed(cfg, profiles=("claude-host",))
+        # round 1 reviewed another packet (other requirements): its pass sits next to the current packet
+        old_repo, old_packet = self.packet(d / "history" / "r1-packet.json", note="round 1\n")
+        self.report(old_repo, old_packet, "codex-host", d / "history" / "r1-codex-host.json")
+        self.report(old_repo, old_packet, "claude-host", d / "history" / "r1-claude-host.json")
+        self.refused(cfg, "result-codex-host.json")  # history/ is not read
+        shutil.copy(d / "history" / "r1-codex-host.json", d / "result-codex-host.json")
+        self.refused(cfg, "result-codex-host.json", "another packet")
+        self.report(repo, packet, "codex-host", d / "result-codex-host.json")
+        self.launched(cfg)
+
+    def test_packet_must_add_the_pinned_plan(self):
+        other = plan_bytes(plan_wave("W1", "low"), plan_wave("W2", "low", ["W1"]))
+        cases = {
+            "another plan": dict(plan=other),
+            "no waves.json": dict(name="plan.json"),
+            "waves.json in a subdirectory only": dict(name="waves.json.bak"),
+        }
+        for label, kw in cases.items():
+            with self.subTest(case=label):
+                cfg, _ = self.new_chain(run_id=f"r-{len(label)}")
+                self.reviewed(cfg, **kw)
+                self.refused(cfg, "packet.json", "waves.json", "plan_sha256")
+        # plan.sha256 of the directory is another plan's
+        cfg, _ = self.new_chain(run_id="r-sha")
+        d, _, _ = self.reviewed(cfg)
+        (d / "plan.sha256").write_text(hashlib.sha256(other).hexdigest() + "\n", encoding="utf-8")
+        self.refused(cfg, "plan.sha256", "plan_sha256")
+        (d / "plan.sha256").unlink()
+        self.refused(cfg, "plan.sha256")
+        # a packet edited after the review: its hash no longer matches its payload
+        (d / "plan.sha256").write_text(self.pin + "\n", encoding="utf-8")
+        envelope = json.loads((d / "packet.json").read_text(encoding="utf-8"))
+        envelope["packet"]["diff"] += "\n"
+        (d / "packet.json").write_text(json.dumps(envelope), encoding="utf-8")
+        self.refused(cfg, "packet.json")
+
+    def test_opus_route_needs_the_quota_evidence_of_the_same_packet(self):
+        cfg, _ = self.new_chain()
+        d, repo, packet = self.reviewed(cfg, profiles=("claude-host", "codex-host", "codex-host-opus"),
+                                        modes={"codex-host": "quota_failure"})
+        evidence = json.loads((d / "result-codex-host.json").read_text(encoding="utf-8"))
+        self.assertEqual((evidence["status"], evidence["error_category"], evidence["gate_ready"]),
+                         ("error", "quota", False))
+        self.assertIs(json.loads((d / "result-codex-host-opus.json").read_text(encoding="utf-8"))["gate_ready"], True)
+        self.launched(cfg)
+
+    def test_opus_without_evidence_or_with_evidence_of_another_packet_is_refused(self):
+        cfg, _ = self.new_chain()
+        d, repo, packet = self.reviewed(cfg, profiles=("claude-host", "codex-host-opus"))
+        self.refused(cfg, "codex-host-opus", "quota")  # no codex-host report at all
+        self.report(repo, packet, "codex-host", d / "result-codex-host.json", "claude_auth_unauthorized")
+        self.refused(cfg, "codex-host-opus", "quota")  # Fable failed, but not on the quota
+        old_repo, old_packet = self.packet(d / "history" / "r1-packet.json", note="round 1\n")
+        self.report(old_repo, old_packet, "codex-host", d / "result-codex-host.json", "quota_failure")
+        self.refused(cfg, "codex-host-opus", "quota")  # the quota error of another packet
+        self.report(repo, packet, "codex-host", d / "result-codex-host.json", "quota_failure")
+        self.launched(cfg)
+
+    def test_new_chain_without_the_plan_pin_is_refused(self):
+        cfg, _ = self.chain()
+        text = self.refused(cfg, "plan_sha256")
+        self.assertIn("waves.json", text)
+
+    def test_only_the_launch_of_a_new_chain_checks_the_plan_review(self):
+        # the next wave of a chain that already runs, and a restart of its stopped wave: no check
+        cfg, _ = self.new_chain(waves=["W1", "W2", "W3"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="done")}})
+        self.launched(cfg, "W2")
+        self.put_state(cfg, {"current": "W2", "waves": {"W1": self.wave_rec("W1", phase="done"),
+                                                        "W2": self.wave_rec("W2", phase="not_ready")}})
+        self.launched(cfg, "W2")
+        self.assertNotIn("plan review", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+
+class W2RunningChainWithoutPlanReview(PlanReviewBase):
+    """The run directory of a chain started before 1.2.2 (tests/fixtures/waves/gate-redact-run, cut from the
+    live run waves-gate-redact) has no plan-review/: `watch` and the next wave go on without a refusal."""
+
+    def live_run(self, edit=None, state=True):
+        cfgdir = self.tmp / "live"
+        cfgdir.mkdir(exist_ok=True)
+        chain = json.loads((GATE_REDACT_RUN / "chain.json").read_text(encoding="utf-8"))
+        path = cfgdir / "chain.json"
+        path.write_text(json.dumps(chain, ensure_ascii=False), encoding="utf-8")
+        cfg = wab.load_chain(path)
+        for name in ("waves.json", "mandate.md"):
+            shutil.copy(GATE_REDACT_RUN / name, cfg["run_dir"] / name)
+        raw = (GATE_REDACT_RUN / "state.json").read_text(encoding="utf-8")
+        st = json.loads(raw.replace("@RUN_DIR@", str(cfg["run_dir"])).replace("@REPO@", self.cwd))
+        if edit:
+            edit(st)
+        if state:
+            self.put_state(cfg, st)
+        self.assertFalse((cfg["run_dir"] / "plan-review").exists())
+        return cfg, path, st
+
+    def test_fixture_is_a_chain_of_before_the_check(self):
+        cfg, _, st = self.live_run()
+        self.assertIsNone(cfg["model"])  # the live chain.json has no `model`
+        self.assertIn("plan_sha256", cfg)
+        # the identity computed today is the one the first launch saved then: no new field joined it
+        self.assertEqual(wab._pinned_identity(cfg), st["identity"])
+
+    def test_watch_of_a_running_chain_goes_on_without_the_plan_review(self):
+        def mid_run(st):  # the state as it was while W2 was running
+            st["current"] = "W2"
+            w = st["waves"]["W2"]
+            w["phase"] = "running"
+            for key in ("merged", "finished", "gate_sha", "gate_pr", "gate_at", "merge_called", "merge_rc",
+                        "merge_poll_at", "done_head"):
+                w.pop(key, None)
+        self.alive = True
+        cfg, path, _ = self.live_run(mid_run)
+        self.set_status(cfg, "W2", "RUNNING")
+        wab.watch(cfg, path, max_ticks=1)  # no SystemExit
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("watch started", log)
+        self.assertNotIn("refused", log)
+        self.assertNotIn("plan review", log)
+        self.assertEqual(self.get_state(cfg)["waves"]["W2"]["phase"], "running")
+
+    def test_next_wave_of_a_running_chain_starts_without_the_plan_review(self):
+        def between(st):  # the state as it was after W1 was merged, before W2
+            st["current"] = "W1"
+            del st["waves"]["W2"]
+        cfg, _, _ = self.live_run(between)
+        with mock.patch.object(wab, "refresh_workdir"):  # the working copy of the test is not a git clone
+            self.launched(cfg, "W2", by_dispatcher=True)
+        self.assertNotIn("plan review", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_same_chain_json_as_a_new_chain_is_refused(self):
+        cfg, _, _ = self.live_run(state=False)
+        self.refused(cfg, "plan-review")
+
+
+class W2ModelWarning(PlanReviewBase):
+    """1.2.2 (W2, #86): chain.json without `model` gets ONE warning event; the launch is not refused."""
+
+    WARNING = "chain.json has no `model`"
+
+    def warnings(self, cfg):
+        log = cfg["run_dir"] / "events.log"
+        return [l for l in log.read_text(encoding="utf-8").splitlines() if self.WARNING in l] if log.exists() else []
+
+    def test_launch_without_model_warns_once_and_starts(self):
+        cfg, _ = self.new_chain(waves=["W1", "W2", "W3"])
+        self.assertIsNone(cfg["model"])
+        self.reviewed(cfg)
+        self.launched(cfg)
+        (line,) = self.warnings(cfg)
+        self.assertIn("claude-fable-5-1", line)
+        self.assertNotIn("--model", [a for c in self.tmux_calls for a in c])  # the CLI default, as before
+        # the next waves of the same run do not repeat it
+        st = self.get_state(cfg)
+        st["waves"]["W1"]["phase"] = "done"
+        self.put_state(cfg, st)
+        self.launched(cfg, "W2")
+        self.assertEqual(len(self.warnings(cfg)), 1)
+
+    def test_launch_with_model_does_not_warn(self):
+        cfg, _ = self.new_chain(model="claude-fable-5-1")
+        self.reviewed(cfg)
+        self.launched(cfg)
+        self.assertEqual(self.warnings(cfg), [])
+        self.assertIn("claude-fable-5-1", [a for c in self.tmux_calls for a in c])
+
+    def test_chain_started_before_the_warning_gets_it_once_at_its_next_launch(self):
+        cfg, _ = self.new_chain(waves=["W1", "W2", "W3"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="done")}})
+        self.launched(cfg, "W2")
+        self.assertEqual(len(self.warnings(cfg)), 1)
+
+    def test_identity_of_a_chain_json_without_new_fields_is_unchanged(self):
+        cfg, _ = self.chain()
+        self.assertEqual(wab._pinned_identity(cfg),
+                         {"chain": CHAIN, "run_id": RUN_ID, "repo": "o/r", "waves": ["W1", "W2"],
+                          "tmux_prefix": "wv-", "run_dir": str(cfg["run_dir"])})
 
 
 class Packaging(unittest.TestCase):

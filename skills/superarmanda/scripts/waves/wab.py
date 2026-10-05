@@ -2564,6 +2564,160 @@ def plan_wave_risk(cfg, wave):
     return {"error": f"волны {wave} нет в одобренном waves.json"}
 
 
+# ---------- the two reviews of the approved plan (1.2.2, #86 п.3) ----------
+#
+# Phase A leaves in <run_dir>/plan-review/ (see references/waves.md):
+#   plan.sha256                   the sha256 of the approved waves.json (= chain.json plan_sha256);
+#   packet.json                   the packet of `review.py packet` whose diff ADDS waves.json with those bytes;
+#   result-claude-host.json       the report of `review.py run --profile claude-host` (Astra) for that packet;
+#   result-codex-host.json        the report of profile codex-host (Fable) for that packet;
+#   result-codex-host-opus.json   only for the fallback: codex-host-opus counts when result-codex-host.json
+#                                 is the quota error report of codex-host for the same packet.
+# Only these names are read: reports of earlier rounds kept beside them (history/ ...) are never counted,
+# and a report copied over one of the names is told apart by its `state_packet_hash`.
+
+PLAN_REVIEW_DIR = "plan-review"
+PLAN_REVIEW_PACKET_LIMIT = 8 * 1024 * 1024  # the diff carries the whole plan (at most PLAN_MAX_BYTES)
+_review_py = None
+
+
+def review_py():
+    """review.py as a module (the packet format and `state_packet_hash` are its, not a copy)."""
+    global _review_py
+    if _review_py is None:
+        _review_py = gate._load("review")
+    return _review_py
+
+
+def diff_added_file(diff, name):
+    """The bytes of `name` when the unified diff of a review packet ADDS it as a new file (one section
+    `diff --git a/<name> b/<name>` with `new file mode`, `--- /dev/null` and one hunk of added lines);
+    None for anything else: no such section, a change of an existing file, a rename, a binary patch."""
+    lines = diff.split("\n")
+    starts = [i for i, line in enumerate(lines) if line == f"diff --git a/{name} b/{name}"]
+    if len(starts) != 1:
+        return None
+    new = hunk = bare = False
+    body = []
+    for line in lines[starts[0] + 1:]:  # the rest of the diff after the header
+        if line.startswith("diff --git "):
+            break
+        if hunk:
+            if line.startswith("+"):
+                body.append(line.removeprefix("+"))
+            elif line == "\\ No newline at end of file":
+                bare = True
+            elif line:  # a second hunk, a context or a removed line: not a plain addition
+                return None
+        elif line.startswith("new file mode "):
+            new = True
+        elif line.startswith("@@ "):
+            if not line.startswith("@@ -0,0 +"):
+                return None
+            hunk = True
+        elif line not in ("--- /dev/null", f"+++ b/{name}") and not line.startswith("index "):
+            return None
+    if not (new and hunk):
+        return None
+    return ("\n".join(body) + ("" if bare else "\n")).encode("utf-8")
+
+
+def _plan_report(directory, profile):
+    """(report, None) of plan-review/result-<profile>.json, or (None, reason). Read by state.read_report:
+    a regular file, not a symlink, bounded, one JSON object."""
+    name = f"result-{profile}.json"
+    try:
+        report, _digest = gate.state.read_report(str(directory / name), name)
+    except SystemExit:
+        return None, f"{name} is missing or is not a readable review.py report"
+    return report, None
+
+
+def _plan_report_problem(report, profile, envelope):
+    """Why a report is not a gate_ready review of THIS packet by `profile` (None: it is). The rules of a
+    review report are state.py's (report_models_problem, report_verified), as for a task review."""
+    name = f"result-{profile}.json"
+    state, packet_hash = gate.state, review_py().state_packet_hash(envelope)
+    if report.get("profile") != profile:
+        return f"{name} is not a report of profile {profile}"
+    if state.report_models_problem(report, profile):
+        return f"{name}: its models do not belong to profile {profile}"
+    if report.get("state_packet_hash") != packet_hash:
+        return f"{name} is a review of another packet (an earlier round of the plan?), not of packet.json"
+    response = report.get("response")
+    if not (report.get("status") == "pass" and report.get("gate_ready") is True and state.report_verified(report)
+            and isinstance(response, dict) and response.get("reviewed_head") == envelope["packet"]["head"]):
+        return f"{name} is not a gate_ready pass (status {report.get('status')!r}, gate_ready {report.get('gate_ready')!r})"
+    return None
+
+
+def plan_review_problem(cfg):
+    """Why the approved plan of this chain does not carry its two reviews (None: it does)."""
+    if "plan_sha256" not in cfg:
+        return ("chain.json has no plan_sha256: a new chain starts from an approved waves.json pinned by "
+                "plan_sha256 and reviewed by both reviewers")
+    state, review = gate.state, review_py()
+    pin, directory = cfg["plan_sha256"], cfg["run_dir"] / PLAN_REVIEW_DIR
+    if not directory.is_dir():
+        return f"no {PLAN_REVIEW_DIR}/ in the run directory"
+    try:
+        fd = os.open(directory / "plan.sha256", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # bytes ("rb"), no text encoding
+        with os.fdopen(fd, "rb") as f:
+            recorded = f.read(200).decode("ascii", "replace").strip() if stat.S_ISREG(os.fstat(f.fileno()).st_mode) else None
+    except OSError:
+        recorded = None
+    if recorded is None:
+        return "plan.sha256 is missing or unreadable"
+    if recorded != pin:
+        return "plan.sha256 differs from chain.json plan_sha256: the reviews are of another plan"
+    try:
+        envelope, _raw = review.load_packet(directory / "packet.json", PLAN_REVIEW_PACKET_LIMIT)
+    except Exception:  # noqa: BLE001 - ValueError of review.py and whatever a hostile file raises
+        return "packet.json is missing or is not a review.py packet (its hash must match its payload)"
+    added = diff_added_file(envelope["packet"]["diff"], "waves.json")
+    if added is None or hashlib.sha256(added).hexdigest() != pin:
+        return ("the diff of packet.json does not add waves.json with sha256 equal to chain.json plan_sha256: "
+                "the reviewed packet is not the approved plan")
+    packet_hash = review.state_packet_hash(envelope)
+    astra, why = _plan_report(directory, state.ASTRA_PROFILE)
+    why = why or _plan_report_problem(astra, state.ASTRA_PROFILE, envelope)
+    if why:
+        return why
+    fable, missing = _plan_report(directory, state.FABLE_PROFILE)
+    why = missing or _plan_report_problem(fable, state.FABLE_PROFILE, envelope)
+    if not why:
+        return None
+    opus, no_opus = _plan_report(directory, state.OPUS_PROFILE)
+    if no_opus:
+        return why  # no fallback offered: the reason is the Fable report itself
+    opus_why = _plan_report_problem(opus, state.OPUS_PROFILE, envelope)
+    if opus_why:
+        return opus_why
+    evidence = state.quota_evidence_problem(fable, envelope["packet"]["head"], packet_hash) if fable else "is missing"
+    if evidence:
+        return (f"result-{state.OPUS_PROFILE}.json counts only with the quota evidence of this packet: "
+                f"result-{state.FABLE_PROFILE}.json {evidence}")
+    return None
+
+
+def check_plan_review(cfg):
+    """The launch of a NEW chain (no wave was ever launched in this run) is refused without both reviews of
+    the approved plan: an event and SystemExit with the reason. A chain that already runs is not asked."""
+    try:
+        why = plan_review_problem(cfg)
+    except Exception as e:  # noqa: BLE001 - fail closed: the launch never starts on an unchecked plan
+        why = f"the check failed ({type(e).__name__})"
+    if why:
+        text = (f"launch refused: plan review: {why}. A new chain needs gate_ready reviews of the approved plan "
+                f"by claude-host and codex-host in {cfg['run_dir'] / PLAN_REVIEW_DIR} (references/waves.md, phase A)")
+        event(cfg, text)
+        raise SystemExit(f"wab: {text}")
+
+
+NO_MODEL_WARNING = ("warning: chain.json has no `model`: the waves run on the default model of the Claude CLI; "
+                    "the default of phase A is \"model\": \"claude-fable-5-1\" (launch is not refused)")
+
+
 def _check_launch_allowed(cfg, st, wave, name):
     """The chain state decides, before any outside action. No bypass flag."""
     waves, records, cur = cfg["waves"], st["waves"], st.get("current")
@@ -2647,6 +2801,11 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     if wave == cfg["waves"][0] and wave not in st["waves"]:
         warn_stale_chains(cfg)  # a hint about finished chains' leftovers; nothing is closed here
     check_plan_pin(cfg)  # before prepare_clone, the workdir and the STARTING record
+    if not st["waves"]:  # a NEW chain: no wave of this run was ever launched
+        check_plan_review(cfg)
+    if not cfg["model"] and not st.get("model_warned"):
+        event(cfg, NO_MODEL_WARNING)  # once per run: the mark is saved with the launch intent
+        st["model_warned"] = True
     wdir = wave_dir(cfg, wave)
     cur = st.get("current")
     restart = cur == wave and st["waves"].get(cur, {}).get("phase") in STOPPED
