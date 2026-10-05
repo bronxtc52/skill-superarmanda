@@ -1,6 +1,6 @@
-W1: BLOCKED: [class=question rec=defer_dup red=no] W1 r2, Codex на b5e7fbb: P0/P1 нет, 2×P2 — (1) last_run не обновляется после живого max_runs, (2) --accept из @S@ конец
-W1: BLOCKED: [class=blocked_cap rec=new_run red=no] blocked W1: кап 3/3 в прогоне r1 (ревьюер r1 medium — исправлен; Codex на d135d17: 2×P1 + P2 — @S@
-W1: say: РЕШЕНИЕ КООРДИНАТОРА (в рамках мандата: до 2 прогонов на волну): вариант new_run. Открой прогон r2 — @S@
+W1: BLOCKED: [class=question rec=defer_dup red=no] W1 r2, Codex на b5e7fbb: P0/P1 нет, 2×P2 — текст вопроса волны заменён нейтральным, длина и разметка как в живой строке @S@ конец
+W1: BLOCKED: [class=blocked_cap rec=new_run red=no] blocked W1: кап 3/3 в прогоне r1 (текст вопроса волны заменён нейтральным; Codex на d135d17: 2×P1 + P2 — @S@
+W1: say: РЕШЕНИЕ КООРДИНАТОРА (текст ответа заменён нейтральным, длина как в живой строке): вариант new_run. Открой прогон r2 — @S@
 W2: фоновые хвосты в окне волны: pid 3217426 (30 мин без работы, только sleep, 30 мин): until [ -s /tmp/green.txt ] && @S@
 wave-autobot: волна W1 ждёт тебя. @S@
 - PR: https://github.com/bronxtc52/skill-superarmanda/pull/82 (не draft), headRefOid `b495d7ddd75b24af12bcf13b329d21cbd236b194`, @S@
