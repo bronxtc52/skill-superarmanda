@@ -344,6 +344,10 @@ def wave_pr(w):
     return None
 
 
+def _safe_mark():
+    return wab.MASK
+
+
 def _masked(value, key=None):
     """`where` (what state.py printed) with every text in it masked by safe_text: the block shows names, tasks,
     next actions and errors of the wave. The `artifact` path stays as it is: it is only OPENED (finding_counts),
@@ -351,7 +355,9 @@ def _masked(value, key=None):
     if isinstance(value, str):
         return value if key == "artifact" else _safe(value)
     if isinstance(value, dict):
-        return {(_safe(k) if isinstance(k, str) else k): _masked(v, k) for k, v in value.items()}
+        # a key that hides its value (invisible character, secret word) takes the value whole, like wab._masked_leaves
+        return {(_safe(k) if isinstance(k, str) else k): (_safe_mark() if wab._key_hides_value(k) else _masked(v, k))
+                for k, v in value.items()}
     if isinstance(value, list):
         return [_masked(v) for v in value]
     return value

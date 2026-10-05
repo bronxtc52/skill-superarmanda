@@ -1175,6 +1175,10 @@ _OPAQUE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}")
 # prefix or suffix (`key-<hex>`, `<hex>-us21`, `id_<hex>`, `v<hex>`, `cache/<hex>`) only the hex
 # part is masked, the rest stays.
 _HEX_KEY = re.compile(r"(?=(?:-?[0-9A-Fa-f]){32})[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*")
+# The words of a key that hides its value: ONE source for the `key=value` rule below and for _key_hides_value (the
+# dict keys of a structure that is masked by its leaves).
+_SECRET_KEY = (r"(?:[\w.-]*(?:secret|token|password|passwd|pwd|api[_-]?key|private[_-]?key|dsn|cookie|session|"
+               r"credential|connection[_-]?string|accountkey|sharedaccesskey|signature)[\w.-]*|sig)")
 _STRUCTURED = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
     re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"),
@@ -1184,9 +1188,7 @@ _STRUCTURED = [
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
     re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"),                      # Telegram bot token
     re.compile(r"(?i)\b(set-cookie|cookie)(\s*:\s*)[^\r\n]*"),                 # whole header value
-    re.compile(r"(?i)(?<![\w-])([\"']?(?:[\w.-]*(?:secret|token|password|passwd|pwd|api[_-]?key|"
-               r"private[_-]?key|dsn|cookie|session|credential|connection[_-]?string|accountkey|"
-               r"sharedaccesskey|signature)[\w.-]*|sig)[\"']?)(\s*[:=]\s*)"
+    re.compile(r"(?i)(?<![\w-])([\"']?" + _SECRET_KEY + r"[\"']?)(\s*[:=]\s*)"
                r"(?!\[скрыто\])(?:\"(?:[^\"\\]|\\.)*\"?|'(?:[^'\\]|\\.)*'?|[^\s,;&}\]]+)"),             # key as a word, value as a whole
     re.compile(r"(?i)\b((?:proxy-)?authorization)(\s*:\s*)(?:(?:bearer|basic|token|digest)\s+)?\S+"),
     re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}"),
@@ -1408,6 +1410,23 @@ def _require_masked(text, owner_paths=False):
 DEPTH_MARK = "[скрыто: глубина]"
 
 
+_SECRET_KEY_RE = re.compile(r"(?i)(?:" + _SECRET_KEY + r"|(?:proxy-)?authorization)")
+
+
+def _key_hides_value(key):
+    """True when the value under this dict key must be hidden WHOLE (and everything nested in it): the key holds an
+    invisible, control or default-ignorable character (it is masked, so what it names is unknown), a lone CR, or it
+    looks secret by the rule of `key=value` of redact (_SECRET_KEY, any case). gate.py (stdlib-only, imported by this
+    module) asks the same function through gate.key_hides_value."""
+    if not isinstance(key, str):
+        return False
+    k = key.replace("\r\n", "\n")
+    return bool(_CTRL_WORD.search(k) or "\r" in k or _SECRET_KEY_RE.fullmatch(k.strip().strip("\"'")))
+
+
+gate.key_hides_value = _key_hides_value  # the one predicate: gate._leaves hides by it (its own default hides every value)
+
+
 def _masked_leaves(obj, owner_paths, depth=0):
     """A container with every str leaf AND dict key masked (safe_text of each), the rest as it is: str() of a
     list or dict turns an invisible character into a literal `\\u200b` (repr), which no mask can find, so the
@@ -1418,7 +1437,10 @@ def _masked_leaves(obj, owner_paths, depth=0):
         return DEPTH_MARK  # never str()/repr() of what is left: it would write an invisible character as `\\u200b`
     nxt = depth + 1
     if isinstance(obj, dict):
-        return {_masked_leaves(k, owner_paths, nxt): _masked_leaves(v, owner_paths, nxt) for k, v in obj.items()}
+        # a key that hides its value takes the value WHOLE (a structure under it too): key and value are not masked
+        # independently, else `{"password<ZWSP>": "Hunter2…"}` shows the value of a masked key
+        return {_masked_leaves(k, owner_paths, nxt): (MASK if _key_hides_value(k) else _masked_leaves(v, owner_paths, nxt))
+                for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         items = [_masked_leaves(v, owner_paths, nxt) for v in obj]
         return tuple(items) if isinstance(obj, tuple) else items

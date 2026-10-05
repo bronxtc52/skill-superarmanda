@@ -9036,6 +9036,18 @@ class OwnerMerge(GateBase):  # D3
         self.assertTrue(a.read_text(encoding="utf-8").rstrip().endswith(f"W1 {RUN_ID} {HEAD}"))
         self.assertTrue(b.read_text(encoding="utf-8").rstrip().endswith("W1 2099-01-01 " + "e" * 40))
 
+    def test_the_value_under_a_hiding_key_is_hidden_in_the_owner_merge_exit(self):  # r3-2
+        for key in ("password", "Token", "pass\u200bword", "k\ufe0f", "pa\rss"):
+            with self.subTest(key=key):
+                self.graphql_answer = {"errors": [{"extensions": {key: "Q7vZk2LmPx9Wt4Yb"}}], "data": None}
+                for t in self.facts["threads"]:  # an earlier subtest closed them in the fixture
+                    t["isResolved"] = t["id"] == "PRRT_b"
+                self.order.clear()
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_it()
+                self.assertIn("PRRT_a", str(ctx.exception))
+                self.assertIsNone(leaked(str(ctx.exception), ["Q7vZk2LmPx9Wt4Yb"]), str(ctx.exception))
+
     def test_a_collect_error_of_the_resolve_is_masked_in_the_exit_text(self):  # tester-r3-1 F1
         for text in ("gh: password=Hunter2SecretValue99", "gh: password\u200b=Hunter2SecretValue99",
                      "gh: ghp_AbCd1234EfGh5678IjKl9012MnOp3456"):
@@ -15757,6 +15769,57 @@ class W2OutputPaths(Base):
                         piece = leaked(out, values)
                         if piece is not None:
                             self.fail(f"«{piece}» of [{sname}] with {cname} in a {fname} reached {out!r}")
+
+    SECRET_VALUE = "Q7vZk2LmPx9Wt4Yb"
+
+    def secret_key_forms(self):
+        """{name: (the errors of an answer, what must not be seen)}: the value under a key that hides it: a key with an
+        invisible/control character, a key that looks secret (any case), a structure under such a key."""
+        v = self.SECRET_VALUE
+        forms = {}
+        for cname, ch in {**INVISIBLE_CLASSES, **SPLIT_CLASSES}.items():
+            forms[f"invisible key {cname}"] = [{"extensions": {f"pass{ch}word": v}}]
+            forms[f"invisible key {cname} (structure)"] = [{"extensions": {f"k{ch}": {"inner": [v]}}}]
+        for key in ("password", "Password", "PASSWORD", "api_key", "Api-Key", "token", "accessToken", "secret", "sig",
+                    "x-session-id", "client_secret", "connection_string", "dsn", "Authorization-Token"):
+            forms[f"secret key {key}"] = [{"extensions": {key: v}}]
+            forms[f"secret key {key} (structure)"] = [{"extensions": {key: {"a": [{"b": v}]}}}]
+        forms["nested under a secret key"] = {"errors": {"password": {"deeper": {"token": [v]}}}}
+        return forms
+
+    def test_the_value_under_a_hiding_key_is_hidden_whole(self):  # r3-2: key and value were masked independently
+        import gate
+        for name, errors in self.secret_key_forms().items():
+            with self.subTest(form=name):
+                for out in (wab.safe_text(errors, 10 ** 6), wab._resolve_why({"errors": errors}),
+                            wab.safe_text(wab._exc_text(KeyError(errors)), 10 ** 6),
+                            wab.safe_text(wab._exc_text(ValueError("a", errors)), 10 ** 6)):
+                    self.assertIsNone(leaked(out, [self.SECRET_VALUE]), out)
+                with self.assertRaises(gate.CollectError) as cm:
+                    gate._threads(lambda q, vv: {"errors": errors}, "o/r", 1)
+                self.assertIsNone(leaked(str(cm.exception), [self.SECRET_VALUE]), str(cm.exception))
+                self.assertIsNone(leaked(wab.safe_text(cm.exception, 10 ** 6), [self.SECRET_VALUE]))
+
+    def test_the_manifest_block_hides_the_value_under_a_hiding_key(self):
+        cfg, _ = self.chain()
+        for key in ("password", "Token", "pass\u200bword", "k\ufe0f"):
+            where = {"task": "T1", "task_status": "open", "step": 1, "role": "coder", "error": None,
+                     "verdicts": {key: self.SECRET_VALUE, "tester": "pass"}, "open_findings": []}
+            with mock.patch.object(self.dash, "manifest_where", return_value=where):
+                out = "\n".join(l.plain for l in self.dash.manifest_lines(cfg, "W1", self.wave_rec()))
+            self.assertIsNone(leaked(out, [self.SECRET_VALUE]), (key, out))
+            self.assertIn("tester: pass", out)
+
+    def test_the_value_under_an_ordinary_key_stays_visible(self):
+        import gate
+        errors = [{"message": "Resource not accessible", "path": ["resolveReviewThread"], "type": "FORBIDDEN",
+                   "extensions": {"code": "E1", "status": 403}}]
+        for out in (wab.safe_text(errors, 10 ** 6), wab._resolve_why({"errors": errors})):
+            for want in ("Resource not accessible", "resolveReviewThread", "FORBIDDEN", "E1", "403"):
+                self.assertIn(want, out)
+        with self.assertRaises(gate.CollectError) as cm:
+            gate._threads(lambda q, vv: {"errors": errors}, "o/r", 1)
+        self.assertIn("Resource not accessible", str(cm.exception))
 
     def test_a_structure_nested_deeper_than_the_limit_leaks_nothing(self):  # B
         for depth in (19, 20, 21, 25, 60):

@@ -95,6 +95,14 @@ def _object(api, path):
 
 
 DEPTH_MARK = "[скрыто: глубина]"
+HIDDEN = "[скрыто]"
+
+
+def key_hides_value(key):
+    """Whether the value under a dict key is hidden. wab.py replaces this with its predicate (_key_hides_value: the
+    invisible characters and the secret words of redact live there) when it is imported; used alone, gate.py hides
+    EVERY value (keys only): the safe side."""
+    return True
 
 
 def _leaves(obj, depth=0):
@@ -107,7 +115,10 @@ def _leaves(obj, depth=0):
     elif isinstance(obj, dict):
         for k, v in obj.items():
             yield from _leaves(k, depth + 1)
-            yield from _leaves(v, depth + 1)
+            if key_hides_value(k):  # the value under a secret or invisible key is not shown at all
+                yield HIDDEN
+            else:
+                yield from _leaves(v, depth + 1)
     elif isinstance(obj, (list, tuple, set, frozenset)):
         for v in obj:
             yield from _leaves(v, depth + 1)
