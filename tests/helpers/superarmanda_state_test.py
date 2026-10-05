@@ -5188,6 +5188,123 @@ class HighRiskReviews(PolicyBase):
                             gate.manifest_problems(value, value["head"], value["tree_fingerprint"])))
 
 
+class W2StateRules(PolicyBase):
+    """1.2.2 (W2, #86): the remainder of W1 in state.py."""
+
+    def opus_report(self):
+        # its own session: the CLI doubles give Fable and Opus one session id
+        return self.edited(self.report("codex-host-opus"), session_id="opus-review-session")
+
+    def test_medium_task_ignores_a_second_reviewer_that_gave_no_review(self):
+        """Fable (low) of W1: below high the second review is optional; its unavailable/error/
+        incomplete must not leave a ready task with `BLOCKED: second_reviewer`."""
+        for level in ("medium", "low"):
+            for status in ("unavailable", "error", "incomplete"):
+                with self.subTest(level=level, status=status):
+                    self.init(risk=level)
+                    self.record("coder")
+                    self.record("tester")
+                    self.record("cross_provider_reviewer", reviewed_head=self.head(),
+                                packet_hash="ab12" * 16, artifact="not-a-file")
+                    entry = self.record("second_reviewer", status)
+                    self.assertEqual(entry["status"], "ready_for_pr_review")
+                    where = self.where()
+                    self.assertNotIn("BLOCKED", where["next_action"])
+                    self.assertNotIn("second_reviewer", where["next_action"])
+                    self.assertEqual((where["step"], where["role"]), (7, "github_codex_review"))
+                    self.assertEqual(where["verdicts"]["second_reviewer"], status)  # still shown
+        # its findings are findings at any risk: they need a disposition, as before
+        self.init(risk="medium")
+        self.record("coder")
+        self.record("tester")
+        self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.record("second_reviewer", "findings")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (6, "coordinator"))
+        self.assertIn("--source second_reviewer", where["next_action"])
+
+    def test_high_task_still_blocks_on_a_second_reviewer_that_gave_no_review(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        self.record("second_reviewer", "unavailable")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (5, "second_reviewer"))
+        self.assertTrue(where["next_action"].startswith("BLOCKED: second_reviewer unavailable"))
+
+    def test_opus_recorded_before_fable_and_astra_counts_no_more(self):
+        """Astra of W1: Opus -> Fable -> Astra on one HEAD must not leave the task ready with
+        the earlier Opus: the history says Fable reviewed this HEAD."""
+        for status, mode in (("pass", "success"), ("findings", "findings")):
+            with self.subTest(fable=status):
+                self.init()
+                self.code_and_test()
+                quota = self.report("codex-host", "quota_failure")
+                opus = self.opus_report()
+                self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
+                self.review("cross_provider_reviewer", "codex-host", mode, status=status)
+                if status == "findings":
+                    self.ok("fix-loop", "--task", "t1", "--defer", "--source", "cross_provider_reviewer",
+                            "--note", "low: nit")
+                entry, _ = self.review("cross_provider_reviewer", "claude-host")
+                self.assertEqual(sorted(r["profile"] for r in entry["results"].values() if "profile" in r),
+                                 ["claude-host", "codex-host-opus"])
+                self.assertEqual(entry["status"], "in_progress")
+                where = self.where()
+                self.assertEqual((where["step"], where["role"]), (5, "second_reviewer"))
+                self.assertIn("codex-host reviewed this HEAD", where["next_action"])
+                self.assertNotIn("done", where["next_action"])
+                # the way out: the Fable review itself as the second review
+                entry, _ = self.review("second_reviewer", "codex-host")
+                self.assertEqual(entry["status"], "ready_for_pr_review")
+
+    def test_where_does_not_offer_the_opus_fallback_where_task_result_refuses_it(self):
+        offer = "the only fallback is profile codex-host-opus"
+        # 1. Fable already reviewed this HEAD: unavailable afterwards opens no fallback
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        quota = self.report("codex-host", "quota_failure")
+        opus = self.opus_report()
+        self.review("second_reviewer", "codex-host")
+        self.record("second_reviewer", "unavailable", artifact=str(quota))
+        where = self.where()
+        self.assertTrue(where["next_action"].startswith("BLOCKED: second_reviewer unavailable"))
+        self.assertNotIn(offer, where["next_action"])
+        self.assertIn("no fallback", where["next_action"])
+        self.record_refused("second_reviewer", needle="codex-host review",
+                            **self.review_flags(opus, quota_evidence=str(quota)))
+        # 2. the reason is not the quota: no fallback either
+        for mode in ("claude_auth_unauthorized", "timeout"):
+            with self.subTest(mode=mode):
+                self.init()
+                self.code_and_test()
+                self.review("cross_provider_reviewer", "claude-host")
+                failed = self.report("codex-host", mode)
+                self.record("second_reviewer", "error", artifact=str(failed))
+                where = self.where()
+                self.assertTrue(where["next_action"].startswith("BLOCKED: second_reviewer error"))
+                self.assertNotIn(offer, where["next_action"])
+                self.assertIn("no fallback", where["next_action"])
+                self.record_refused("second_reviewer",
+                                    **self.review_flags(self.opus_report(), quota_evidence=str(failed)))
+        # 3. no report at all behind the result: nothing proves the quota
+        self.init()
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        self.record("second_reviewer", "unavailable")
+        self.assertNotIn(offer, self.where()["next_action"])
+        # 4. a quota report of this HEAD and no Fable review: the fallback is offered and accepted
+        self.init()
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        quota = self.report("codex-host", "quota_failure")
+        self.record("second_reviewer", "error", artifact=str(quota))
+        where = self.where()
+        self.assertIn(offer, where["next_action"])
+        entry = self.record("second_reviewer",
+                            **self.review_flags(self.opus_report(), quota_evidence=str(quota)))
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+
+
 class LiveVersion1Manifests(PolicyBase):
     """Manifests of finished chains (tests/fixtures/manifests/README.md) keep the rules of 1.2.0."""
 
