@@ -14854,7 +14854,6 @@ _allow("wab.py", "_pending_alarm_enter", _DEDUP, "str(e)[:150]")
 _allow("wab.py", "note_question", _LIST, "qs[:-QUESTIONS_CAP]")
 _allow("wab.py", "write_chain_result", _SHA, "str(sha)[:12]")
 _allow("wab.py", "blocked_notice", "the question was masked by safe_text above; it is split at `Варианты:`", "question[:m.start()]")
-_allow("dash.py", "_pulse_phrase", _MASKED + " (humanize_event)", "status[:40]")
 _allow("dash.py", "fold_events", "the time of an events.log line `HH:MM:SS`", "line[11:19]", "ts[:5]")
 _allow("gate.py", "manifest_problems", _SHA, "str(manifest.get('head'))[:12]", "head[:12]")
 _allow("gate.py", "evaluate", _SHA, "str(pr.get('head'))[:12]", "head[:12]", "str(work.get('head'))[:12]")
@@ -14955,10 +14954,7 @@ OUTPUT_FUNCS = {
 MASKERS = {"safe_text", "_masked_line", "_one_line", "_first_line", "render_notice", "quote", "_safe", "_safe_screen",
            "_require_masked", "_clip", "_head", "_policy_question", "_say_first", "_resolve_why"}
 SPLITTERS = {"split", "rsplit", "splitlines", "partition", "rpartition"}
-SPLIT_ALLOWED = {  # (file, function, receiver) -> why
-    ("wab.py", "blocked_notice", "question.strip()"): "the question is masked by safe_text at the top of the function",
-    ("wab.py", "blocked_notice", "options.strip()"): "a part of that masked question, cut at `Варианты:`",
-}
+SPLIT_ALLOWED = {}  # (file, function, receiver) -> why: nothing today
 
 
 def _masked_expr(node, names):
@@ -14970,6 +14966,8 @@ def _masked_expr(node, names):
             return True
         if isinstance(f, ast.Attribute):  # masked.strip() / masked.lower() / masked.replace(...)
             return _masked_expr(f.value, names)
+    if isinstance(node, ast.Constant):
+        return True  # a literal holds no outside text
     if isinstance(node, ast.Name):
         return node.id in names
     if isinstance(node, ast.Subscript):
@@ -14981,31 +14979,108 @@ def _masked_expr(node, names):
     return False
 
 
+def _names(target):
+    import ast
+    return {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+
+
 def unmasked_splits(waves_dir):
+    """Rule C, flow-sensitive: a name is masked only AFTER an assignment of a masked value and until the next
+    assignment of an unmasked one; after an if / try / loop only when it is masked on every way through."""
     import ast
     found = []
+
+    def check_expr(node, masked, fn, path):
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp, ast.SetComp, ast.DictComp)):
+            inner = set(masked)
+            for g in node.generators:
+                check_expr(g.iter, inner, fn, path)
+                (inner.update if _masked_expr(g.iter, inner) else inner.difference_update)(_names(g.target))
+                for cond in g.ifs:
+                    check_expr(cond, inner, fn, path)
+            for part in ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)):
+                check_expr(part, inner, fn, path)
+            return
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in SPLITTERS:
+            if not _masked_expr(node.func.value, masked):
+                found.append((path.name, fn.name, ast.unparse(node.func.value)))
+        if isinstance(node, ast.NamedExpr):
+            check_expr(node.value, masked, fn, path)
+            (masked.update if _masked_expr(node.value, masked) else masked.difference_update)(_names(node.target))
+            return
+        for child in ast.iter_child_nodes(node):
+            check_expr(child, masked, fn, path)
+
+    def assign(target, value, masked):
+        if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)) \
+                and len(target.elts) == len(value.elts):
+            for t, v in zip(target.elts, value.elts):
+                assign(t, v, masked)
+            return
+        (masked.update if _masked_expr(value, masked) else masked.difference_update)(_names(target))
+
+    def run(stmts, masked, fn, path):
+        for st in stmts:
+            if isinstance(st, ast.Assign):
+                check_expr(st.value, masked, fn, path)
+                for t in st.targets:
+                    assign(t, st.value, masked)
+            elif isinstance(st, ast.AugAssign):
+                check_expr(st.value, masked, fn, path)
+                if not (_masked_expr(st.target, masked) and _masked_expr(st.value, masked)):
+                    masked.difference_update(_names(st.target))
+            elif isinstance(st, ast.AnnAssign):
+                if st.value is not None:
+                    check_expr(st.value, masked, fn, path)
+                    assign(st.target, st.value, masked)
+            elif isinstance(st, ast.If):
+                check_expr(st.test, masked, fn, path)
+                a, b = set(masked), set(masked)
+                run(st.body, a, fn, path)
+                run(st.orelse, b, fn, path)
+                masked.intersection_update(a & b)
+            elif isinstance(st, (ast.For, ast.AsyncFor)):
+                check_expr(st.iter, masked, fn, path)
+                body = set(masked)
+                (body.update if _masked_expr(st.iter, masked) else body.difference_update)(_names(st.target))
+                run(st.body, body, fn, path)
+                orelse = set(masked)
+                run(st.orelse, orelse, fn, path)
+                masked.intersection_update(body & orelse)  # the body may not run at all
+            elif isinstance(st, ast.While):
+                check_expr(st.test, masked, fn, path)
+                body = set(masked)
+                run(st.body, body, fn, path)
+                masked.intersection_update(body)
+            elif isinstance(st, ast.Try):
+                body = set(masked)
+                run(st.body, body, fn, path)
+                run(st.orelse, body, fn, path)
+                ways = [body]
+                for h in st.handlers:
+                    hs = set(masked)  # an exception may come before any assignment of the body
+                    run(h.body, hs, fn, path)
+                    ways.append(hs)
+                after = set.intersection(*ways)
+                run(st.finalbody, after, fn, path)
+                masked.intersection_update(after)
+            elif isinstance(st, (ast.With, ast.AsyncWith)):
+                for item in st.items:
+                    check_expr(item.context_expr, masked, fn, path)
+                    if item.optional_vars is not None:
+                        masked.difference_update(_names(item.optional_vars))
+                run(st.body, masked, fn, path)
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                run(st.body, set(masked) - {a.arg for a in st.args.args}, fn, path)  # a nested def: its parameters are raw
+            else:
+                for child in ast.iter_child_nodes(st):
+                    if isinstance(child, ast.expr):
+                        check_expr(child, masked, fn, path)
+
     for path in sorted(Path(waves_dir).glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in OUTPUT_FUNCS.get(path.name, ())):
-            names = set()
-            for _ in range(3):  # a name assigned from a masked expression is masked (a few passes: chains)
-                for node in ast.walk(fn):
-                    targets = []
-                    if isinstance(node, ast.Assign):
-                        targets, value = node.targets, node.value
-                    elif isinstance(node, ast.NamedExpr):
-                        targets, value = [node.target], node.value
-                    elif isinstance(node, (ast.For, ast.comprehension)):
-                        targets, value = [node.target], node.iter
-                    else:
-                        continue
-                    if _masked_expr(value, names):
-                        for t in targets:
-                            names |= {n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
-            for node in ast.walk(fn):
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in SPLITTERS:
-                    if not _masked_expr(node.func.value, names):
-                        found.append((path.name, fn.name, ast.unparse(node.func.value)))
+            run(fn.body, set(), fn, path)
     return sorted(c for c in set(found) if c not in SPLIT_ALLOWED)
 
 
@@ -15031,9 +15106,7 @@ class W2EveryCut(Base):
 
     def test_no_output_function_splits_a_value_that_is_not_masked(self):
         self.assertEqual(unmasked_splits(WAVES), [])
-        self.assertEqual([k for k in SPLIT_ALLOWED if k not in {
-            (f, fn, r) for f, fn, r in [("wab.py", "blocked_notice", "question.strip()"),
-                                        ("wab.py", "blocked_notice", "options.strip()")]}], [])
+        self.assertEqual(SPLIT_ALLOWED, {})
 
     def mutate(self, name, old, new, file="wab.py"):
         tmp = self.tmp / f"cut-{name}"
@@ -15060,6 +15133,15 @@ class W2EveryCut(Base):
         self.assertIn(("wab.py", "_gate_failed", "reasons"), unmasked_splits(tmp))
         tmp = self.mutate("rawsplit2", "safe_text(text, 10 ** 9).splitlines() if l.strip()]\n    return _clip(lines[0], 120)",
                           "text.splitlines() if l.strip()]\n    return _clip(lines[0], 120)")
+        self.assertIn(("wab.py", "_say_first", "text"), unmasked_splits(tmp))
+
+    def test_a_raw_split_before_the_assignment_of_the_mask_is_caught(self):  # tester-r2-1 F1
+        tmp = self.mutate("flow", "    text = _one_line(safe_text(text, 10 ** 9, owner_paths=True))",
+                          "    text = ' '.join(text.split())\n    text = _one_line(safe_text(text, 10 ** 9, owner_paths=True))")
+        self.assertIn(("wab.py", "_write_status", "text"), unmasked_splits(tmp))
+        # a branch that masks is not enough: the name is masked after an if only on every way through
+        tmp = self.mutate("flow2", "def _say_first(text):\n",
+                          "def _say_first(text):\n    if len(text) > 3:\n        text = safe_text(text, 100)\n    first = text.split()\n")
         self.assertIn(("wab.py", "_say_first", "text"), unmasked_splits(tmp))
 
     def test_a_helper_that_does_not_mask_first_is_caught(self):
@@ -15401,6 +15483,39 @@ class W2OutputPaths(Base):
         for cname, ch in SPLIT_CLASSES.items():
             out = wab._one_line(f"r password=sec{ch}retvalue99")
             self.assertIsNone(leaked(out, ["retvalue99"]), (cname, out))
+
+    CHEAP_PATHS = ("quote", "render_notice", "first_line", "short_command", "note_question", "policy_question",
+                   "say_echo", "blocked_notice", "dash_event", "attention")
+
+    @staticmethod
+    def torn_mask(out):
+        """A piece of `[скрыто]` without its pair: a prefix not followed by the rest, or a rest not preceded by it."""
+        mask = wab.MASK
+        for k in range(2, len(mask)):
+            if re.search(re.escape(mask[:k]) + "(?!" + re.escape(mask[k:]) + ")", out):
+                return mask[:k]
+        for k in range(1, len(mask) - 1):
+            if re.search("(?<!" + re.escape(mask[:k]) + ")" + re.escape(mask[k:]), out):
+                return mask[k:]
+        return None
+
+    def test_no_path_tears_the_mask_at_any_limit(self):
+        adapters = self.adapters()
+        pads = sorted({lim - d for lim in (40, 80, 120, 140, 160, 200, 220, 300, 400) for d in range(0, 30)})
+        for token in ("ghp_AbCd1234EfGh5678IjKl9012MnOp3456", "password=Hunter2SecretValue99"):
+            for pad in pads:
+                raw = "x" * pad + " " + token + " хвост слов"
+                for path in self.CHEAP_PATHS:
+                    out = adapters[path](raw)
+                    piece = self.torn_mask(out)
+                    if piece is not None:
+                        self.fail(f"{path}: a torn mask «{piece}» at pad {pad}: {out[-80:]!r}")
+
+    def test_the_pulse_phrase_does_not_tear_the_mask(self):  # tester-r2-1 F2
+        for pad in range(20, 45):
+            msg = f"W1: phase=running ctx=1k restarts=0 status={'x' * pad} ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+            phrase, details, _c, _k = self.dash.humanize_event(msg)
+            self.assertIsNone(self.torn_mask(f"{phrase}\n{details or ''}"), (pad, phrase))
 
     def test_the_fixture_is_live_and_clean(self):
         forms = live_forms()

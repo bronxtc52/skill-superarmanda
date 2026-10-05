@@ -488,7 +488,7 @@ def _pulse_phrase(m):
     if status.startswith("BLOCKED:"):
         return _blocked_phrase(wave, status[len("BLOCKED:"):])
     word = {"RUNNING": "работает", "STARTING": "стартует", "RESUMING": "поднимается после /clear",
-            "HANDOFF_READY": "готов handoff", "DONE": "закончила работу"}.get(status, status[:40])
+            "HANDOFF_READY": "готов handoff", "DONE": "закончила работу"}.get(status, wab._head(status, 40))
     where = f", фаза {m['phase']}" if m["phase"] not in ("running", "") else ""
     return (f"⚙ {wave} {word}{where}", f"ctx={m['ctx']} restarts={m['restarts']}", INFO_GREY)
 
