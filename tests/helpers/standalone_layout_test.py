@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Acceptance checks for the installable standalone skill layout."""
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -77,6 +78,91 @@ class StandaloneLayoutTest(unittest.TestCase):
             (ROOT / "LICENSE").read_text(encoding="utf-8"),
             (SKILL / "LICENSE").read_text(encoding="utf-8"),
         )
+
+
+def flat(text):
+    """Text with every whitespace run folded into one space: a rule may wrap across lines."""
+    return " ".join(text.split())
+
+
+def doc(relative):
+    return (SKILL / relative).read_text(encoding="utf-8")
+
+
+def fenced_blocks(text):
+    return re.findall(r"```[^\n]*\n(.*?)```", text, flags=re.S)
+
+
+class ReleasePolicyDocs(unittest.TestCase):
+    """1.2.1 (#86): the model of a role follows the risk, a high-risk task needs two reviews."""
+
+    RULE = "задачи про безопасность и маскировку обязаны иметь `risk: high`"
+
+    def test_release_1_2_1_is_versioned_and_names_the_compatibility_boundary(self):
+        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.1"?$')
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        sections = re.split(r"(?m)^## ", changelog)
+        section = next((s for s in sections if s.startswith("1.2.1 — 2026-10-05")), None)
+        self.assertIsNotNone(section, "CHANGELOG has no section 1.2.1")
+        self.assertEqual(sections.index(section), 1, "1.2.1 must be the newest section")
+        self.assertIn("#86", section)
+        boundary = next((l for l in flat(section).split(" - ") if "Граница совместимости" in l), "")
+        for needle in ("`version: 1`", "1.2.0", "`version: 2`", "двух ревью", "Fable", "metadata"):
+            self.assertIn(needle, boundary)
+
+    def test_fixtures_carry_no_home_paths_or_host_names(self):
+        # Home paths are matched as written (`/users/` of a GitHub API URL is not one); the login
+        # and the host names of the machines fixtures are captured on, in any letter case.
+        paths = ("/home/", "/Users/")
+        names = ("azureuser", "mh-central", "imac-mini", "macbook")
+        found = []
+        for path in sorted((ROOT / "tests" / "fixtures").rglob("*")):
+            if not path.is_file():
+                continue
+            text = path.read_bytes().decode("utf-8", errors="replace")
+            found += [f"{path.relative_to(ROOT)}: {word}" for word in paths if word in text]
+            found += [f"{path.relative_to(ROOT)}: {word}" for word in names if word in text.lower()]
+        self.assertEqual(found, [])
+
+    def test_pr_body_template_reports_the_opus_fallback_and_the_fable_quota(self):
+        text = doc("references/pr-review.md")
+        template = next((b for b in fenced_blocks(text) if "Принятые ограничения" in b), None)
+        self.assertIsNotNone(template, "pr-review.md has no PR body template with «Принятые ограничения»")
+        line = next((l for l in template.splitlines() if "codex-host-opus" in l), "")
+        self.assertIn("Запасное Opus-ревью", line)
+        self.assertRegex(line, r"квот\w+ Fable")
+
+    def test_brief_template_takes_the_model_from_state_and_high_review_runs_both_profiles(self):
+        profiles = doc("references/profiles.md")
+        template = next((b for b in fenced_blocks(profiles) if re.search(r'state\.py"? role-model', b)), None)
+        self.assertIsNotNone(template, "profiles.md has no brief template with state.py role-model")
+        self.assertIn("--role <coder|tester>", template)
+        self.assertIn("claude-fable-5-1", template)
+        contract = doc("references/review-contract.md")
+        command = next((b for b in fenced_blocks(contract)
+                        if len(re.findall(r'review\.py"? run', b)) == 2 and "--profile claude-host" in b), None)
+        self.assertIsNotNone(command, "review-contract.md has no high-risk review command")
+        self.assertRegex(command, r"--profile codex-host(?!-)")
+        self.assertNotIn("codex-host-opus", command)
+        self.assertEqual(len(set(re.findall(r"--packet (\S+)", command))), 1, "both runs take one packet")
+
+    def test_docs_describe_the_risk_policy_second_reviewer_and_opus_fallback(self):
+        for relative in ("references/profiles.md", "SKILL.md", "references/review-contract.md"):
+            text = doc(relative)
+            for needle in ("claude-fable-5-1", "claude-sonnet-5-5", "--model", "second_reviewer",
+                           "codex-host-opus", "--quota-evidence"):
+                with self.subTest(doc=relative, needle=needle):
+                    self.assertIn(needle, text)
+            with self.subTest(doc=relative, needle="risk"):
+                self.assertRegex(flat(text), r"риск\w* high")
+        for relative in ("references/profiles.md", "references/waves.md"):
+            with self.subTest(doc=relative):
+                self.assertIn(self.RULE, flat(doc(relative)).lower())
+        workflow = doc("references/workflow.md")
+        for needle in ("review_policy", "task-risk", "role-model", "--model", "second_reviewer",
+                       "--quota-evidence", "unavailable"):
+            with self.subTest(doc="references/workflow.md", needle=needle):
+                self.assertIn(needle, workflow)
 
 
 if __name__ == "__main__":

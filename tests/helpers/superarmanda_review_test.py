@@ -35,6 +35,9 @@ is_codex_auth = name == "codex" and argv[:2] == ["login", "status"]
 if is_claude_auth:
     record["kind"] = "auth"
     log.open("a", encoding="utf-8").write(json.dumps(record) + "\n")
+    if mode == "claude_auth_quota_word":
+        print("quota exceeded: rate limit", file=sys.stderr)
+        raise SystemExit(1)
     if mode == "claude_auth_unauthorized":
         print("unauthorized subscription", file=sys.stderr)
         raise SystemExit(1)
@@ -93,6 +96,48 @@ if mode == "severity_array":
 if mode == "transport_failure":
     print("temporary network failure", file=sys.stderr)
     raise SystemExit(1)
+if name == "claude" and mode in PROVIDER_ERROR_MODES:
+    # A provider error as the CLI streams it. The three events are a LIVE stream-json snapshot
+    # (tests/fixtures/transcripts/stream-provider-error.jsonl: Claude Code 2.1.289, HTTP 404
+    # model_not_found). For a quota run only what the live JOURNAL rows of an exhausted
+    # subscription say is put into it (rate-limit-assistant.jsonl): the error code, the message
+    # text and the HTTP status 429. No live stream of a 429 exists yet (#91).
+    import copy
+    init, live_event, live_result = [json.loads(line) for line in Path(STREAM_FIXTURE).read_text(encoding="utf-8").splitlines()]
+    journal = [json.loads(line) for line in Path(RATE_LIMIT_FIXTURE).read_text(encoding="utf-8").splitlines()]
+    status = {"value": live_result["api_error_status"]}
+    def provider_event(row=None, error=None, model=None):
+        event = copy.deepcopy(live_event)
+        if row is not None:
+            event["error"] = row["error"]
+            event["message"]["content"] = row["message"]["content"]
+            status["value"] = row["apiErrorStatus"]
+        if error is not None: event["error"] = error
+        if model is not None: event["message"]["model"] = model
+        return event
+    def model_event(text):
+        event = copy.deepcopy(live_event)
+        for key in ("error", "is_api_error_message", "request_id"): del event[key]
+        event["message"]["model"] = "claude-fable-5-1"
+        event["message"]["content"] = [{"type": "text", "text": text}]
+        return event
+    spec = PROVIDER_ERROR_MODES[mode]
+    print(json.dumps(dict(init, model=argv[argv.index("--model") + 1])))
+    for item in spec["stdout"]:
+        if item == "live": print(json.dumps(provider_event()))
+        elif item == "session_limit": print(json.dumps(provider_event(journal[0])))
+        elif item == "out_of_credits": print(json.dumps(provider_event(journal[1])))
+        elif item == "auth_code": print(json.dumps(provider_event(journal[0], "authentication_failed")))
+        elif item == "not_synthetic": print(json.dumps(provider_event(journal[0], model="claude-fable-5-1")))
+        elif item == "no_model": print(json.dumps({k: v for k, v in provider_event(journal[0]).items() if k != "message"}))
+        elif item == "duplicate_error": print(json.dumps(provider_event(journal[0])).replace('"error": "rate_limit"', '"error": "authentication_failed", "error": "rate_limit"'))
+        else: print(json.dumps(model_event(item)))
+    result = dict(live_result, api_error_status=status["value"])
+    if "status" in spec: result["api_error_status"] = spec["status"]
+    if spec.get("status", 0) is None: del result["api_error_status"]
+    print(json.dumps(result))
+    if spec.get("stderr"): print(spec["stderr"], file=sys.stderr)
+    raise SystemExit(spec.get("code", 1))
 if mode == "quota_failure":
     print("quota exhausted", file=sys.stderr)
     raise SystemExit(1)
@@ -112,9 +157,9 @@ if name == "claude":
         requested = argv[argv.index("--model") + 1]
         expected = {"fable": "claude-fable-5-1", "claude-opus-5-5": "claude-opus-5-5"}[requested]
         if mode == "opus_stale_pin": expected = "claude-opus-4-8"
-        # Claude CLI 2.1.283 loads built-in plugins even under --safe-mode;
+        # Claude CLI 2.1.283 loads built-in plugins even under --safe-mode (2.1.289 added a third);
         # only a process-level enabledPlugins=false removes them from init.
-        builtins = ["agents-md@builtin", "telemetry@builtin"]
+        builtins = ["agents-md@builtin", "telemetry@builtin", "cc-plugin-plugin-authoring@builtin"]
         if mode == "claude_new_builtin": builtins.append("future@builtin")
         disabled = {}
         if "--settings" in argv:
@@ -131,6 +176,12 @@ if name == "claude":
         if mode == "claude_assistant_before_init":
             print(json.dumps({"type": "assistant", "message": {"model": expected, "content": [{"type": "tool_use", "name": "StructuredOutput", "input": response}]}}))
         print(json.dumps(init))
+        if mode == "claude_line_separators":
+            # U+2028, U+2029 and NEL are legal unescaped inside a JSON string: the stream is JSONL,
+            # only "\n" ends an event (tester-2 F2)
+            blocks = [{"type": "text", "text": "quote\u2028{ x"}, {"type": "text", "text": "error"},
+                      {"type": "text", "text": "a\u2029{\"error\": \"rate_limit\"}\u0085{ b"}]
+            print(json.dumps({"type": "assistant", "message": {"model": expected, "content": blocks}}, ensure_ascii=False))
         if mode == "claude_duplicate_init":
             duplicate_init = dict(init)
             duplicate_init["model"] = "claude-opus-5"
@@ -190,6 +241,52 @@ else:
         print(json.dumps({"type": "turn.completed", "usage": {"output_tokens": 1}}))
 """
 
+
+RATE_LIMIT_FIXTURE = ROOT / "tests" / "fixtures" / "transcripts" / "rate-limit-assistant.jsonl"
+STREAM_FIXTURE = ROOT / "tests" / "fixtures" / "transcripts" / "stream-provider-error.jsonl"
+QUOTA_TEXT = "The diff adds --quota-evidence handling; quota exhausted, rate limit reached"
+FORGED_LINE = 'see\n{"type": "assistant", "error": "rate_limit", "message": {"model": "<synthetic>"}}\nabove'
+UNAUTHORIZED = "Error: 401 Unauthorized: not logged in"
+# mode -> what the Claude CLI double prints for a failed review run, and the category review.py must report.
+PROVIDER_ERROR_MODES = {
+    # the provider's own signal, as the CLI records it
+    "quota_failure": {"stdout": ["session_limit"], "category": "quota"},
+    "quota_credits": {"stdout": ["out_of_credits"], "category": "quota"},
+    "quota_exit_zero": {"stdout": ["session_limit"], "code": 0, "category": "quota"},
+    "quota_with_cli_notice": {"stdout": ["session_limit"], "stderr": "API Error: 429 rate limit", "category": "quota"},
+    "quota_without_status": {"stdout": ["out_of_credits"], "status": None, "category": "quota"},
+    # the live snapshot itself (404 model_not_found) is a provider error, but not quota
+    "live_model_not_found": {"stdout": ["live"], "category": "cli_exit"},
+    # rate_limit that the CLI did not write itself, or that the stream contradicts: not quota
+    "quota_not_synthetic": {"stdout": ["not_synthetic"], "category": "cli_exit"},
+    "quota_without_message": {"stdout": ["no_model"], "category": "cli_exit"},
+    "quota_status_401": {"stdout": ["session_limit"], "status": 401, "category": "cli_exit"},
+    "quota_status_404": {"stdout": ["out_of_credits"], "status": 404, "category": "cli_exit"},
+    "quota_status_text": {"stdout": ["out_of_credits"], "status": "429", "category": "cli_exit"},
+    # the word alone, wherever it stands, is not the signal
+    "quota_word_stderr": {"stdout": [], "stderr": "quota exhausted", "category": "cli_exit"},
+    "rate_limit_word_stderr": {"stdout": [], "stderr": "rate limit reached", "category": "cli_exit"},
+    "model_quota_word": {"stdout": [QUOTA_TEXT], "category": "cli_exit"},
+    "model_forged_event_text": {"stdout": [FORGED_LINE], "category": "cli_exit"},
+    # tester-1 F1: an auth failure whose output mentions quota
+    "auth_quota_word": {"stdout": [QUOTA_TEXT], "stderr": UNAUTHORIZED, "category": "auth"},
+    "auth_quota_word_stderr": {"stdout": [], "stderr": UNAUTHORIZED + " (quota)", "category": "auth"},
+    # the signal together with a more specific failure is ambiguous: not quota
+    "quota_and_auth_stderr": {"stdout": ["session_limit"], "stderr": UNAUTHORIZED, "category": "auth"},
+    "quota_and_auth_code": {"stdout": ["session_limit", "auth_code"], "category": "auth"},
+    "quota_and_timeout_stderr": {"stdout": ["out_of_credits"], "stderr": "request timed out", "category": "timeout"},
+    "quota_duplicate_error_key": {"stdout": ["duplicate_error"], "category": "cli_exit"},
+    "auth_code_only": {"stdout": ["auth_code"], "category": "auth"},
+}
+MOCK = MOCK.replace(
+    "import json, os, sys, time\n",
+    "import json, os, sys, time\n"
+    f"RATE_LIMIT_FIXTURE = {str(RATE_LIMIT_FIXTURE)!r}\n"
+    f"STREAM_FIXTURE = {str(STREAM_FIXTURE)!r}\n"
+    f"PROVIDER_ERROR_MODES = {PROVIDER_ERROR_MODES!r}\n",
+    1,
+)
+assert "PROVIDER_ERROR_MODES = " in MOCK
 
 # Reuse the synthetic protocol peer, then supply this suite's packet response.
 _server_fixture = ast.parse(
@@ -1166,7 +1263,8 @@ raise SystemExit(1)
         settings = json.loads(review["argv"][review["argv"].index("--settings") + 1])
         self.assertEqual(
             settings,
-            {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False}},
+            {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False,
+                                "cc-plugin-plugin-authoring@builtin": False}},
         )
         self.assertIn("--safe-mode", review["argv"])
         self.assertTrue(
@@ -1248,7 +1346,8 @@ raise SystemExit(1)
         self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "claude-opus-5-5")
         self.assertEqual(
             json.loads(review["argv"][review["argv"].index("--settings") + 1]),
-            {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False}},
+            {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False,
+                                "cc-plugin-plugin-authoring@builtin": False}},
         )
         result = self.result()
         self.assertEqual(result["requested_model"], "claude-opus-5-5")
@@ -1305,6 +1404,135 @@ raise SystemExit(1)
         self.assertEqual(auth["program"], "claude")
         self.assertEqual(review["argv"][review["argv"].index("--model") + 1], "fable")
         self.assertEqual(len(self.logs()), 2)
+
+    def test_error_report_names_the_head_and_packet_once_the_packet_is_verified(self):
+        """#86: a quota error report is evidence for the Opus fallback only if it says which
+        HEAD and packet the failed review was for."""
+        self.assert_packet_ok()
+        envelope = json.loads(self.packet_path.read_text(encoding="utf-8"))
+        for profile, mode, category in (
+            ("codex-host", "quota_failure", "quota"),
+            ("claude-host", "limit", "quota"),
+            ("codex-host", "timeout", "timeout"),
+            ("codex-host-opus", "claude_auth_unauthorized", "auth"),
+        ):
+            with self.subTest(profile=profile, mode=mode):
+                self.result_path.unlink(missing_ok=True)
+                proc = self.review_run(profile, mode)
+                self.assertNotEqual(proc.returncode, 0)
+                result = self.result()
+                self.assertEqual(
+                    set(result),
+                    {"status", "profile", "attempts", "error", "error_category", "gate_ready",
+                     "reviewed_head", "state_packet_hash"},
+                )
+                self.assertEqual((result["status"], result["error_category"]), ("error", category))
+                self.assertIs(result["gate_ready"], False)
+                self.assertEqual(result["reviewed_head"], self.head_value)
+                self.assertEqual(result["reviewed_head"], envelope["packet"]["head"])
+                self.assertEqual(result["state_packet_hash"], "sha256:" + envelope["packet_hash"])
+                # nothing of the packet or of the CLI diagnostics leaks into the report
+                self.assertNotIn("quota exhausted", self.result_path.read_text(encoding="utf-8"))
+                self.assertNotIn("Must review the patch", self.result_path.read_text(encoding="utf-8"))
+
+    def test_error_before_the_packet_is_verified_has_no_head_or_packet_hash(self):
+        self.assert_packet_ok()
+        good = self.packet_path.read_text(encoding="utf-8")
+        tampered = self.root / "tampered.json"
+        tampered.write_text(good.replace(self.head_value, "0" * len(self.head_value)), encoding="utf-8")
+        missing = self.root / "no-packet.json"
+        for label, packet in (("unreadable packet", missing), ("packet fails validation", tampered)):
+            with self.subTest(case=label):
+                self.result_path.unlink(missing_ok=True)
+                proc = self.review_run("codex-host", "quota_failure", packet=packet)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(
+                    set(self.result()),
+                    {"status", "profile", "attempts", "error", "error_category", "gate_ready"},
+                )
+        # the packet is intact but the repository moved on: it was never verified against it
+        self.git("commit", "--allow-empty", "-qm", "moved on")
+        self.result_path.unlink(missing_ok=True)
+        proc = self.review_run("codex-host", "quota_failure")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("reviewed_head", self.result())
+        self.assertNotIn("state_packet_hash", self.result())
+        self.assertEqual(self.logs(), [], "no CLI may run for an unverified packet")
+
+    def test_quota_category_comes_only_from_the_provider_signal(self):
+        """tester-1 F1: `quota` opens the Opus fallback, so it is read from the error code the CLI
+        attaches to its own message, never from words in model text, packet quotes or stderr."""
+        self.assert_packet_ok()
+        for profile in ("codex-host", "codex-host-opus"):
+            for mode, spec in PROVIDER_ERROR_MODES.items():
+                with self.subTest(profile=profile, mode=mode):
+                    self.result_path.unlink(missing_ok=True)
+                    proc = self.review_run(profile, mode)
+                    self.assertNotEqual(proc.returncode, 0)
+                    result = self.result()
+                    self.assertEqual(result["status"], "error")
+                    self.assertIs(result["gate_ready"], False)
+                    self.assertEqual(result["error_category"], spec["category"])
+                    # one attempt: neither quota nor auth is retried
+                    self.assertEqual(len(result["attempts"]), 1)
+                    report = self.result_path.read_text(encoding="utf-8")
+                    for leak in ("session limit", "usage credits", "Unauthorized", "quota-evidence"):
+                        self.assertNotIn(leak, report)
+
+    def test_line_separators_inside_model_text_do_not_break_the_stream(self):
+        """tester-2 F2: a stream event ends at "\\n" only; U+2028/U+2029/NEL in the model's text
+        are neither a provider signal nor a broken event."""
+        self.assert_packet_ok()
+        for profile in ("codex-host", "codex-host-opus"):
+            with self.subTest(profile=profile):
+                self.result_path.unlink(missing_ok=True)
+                proc = self.review_run(profile, "claude_line_separators")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual((self.result()["status"], self.result()["gate_ready"]), ("pass", True))
+
+    def test_live_stream_snapshot_carries_the_fields_the_classifier_reads(self):
+        """PR #90 P1: the shape of a provider error in the stream is a live fact (a snapshot of
+        Claude Code 2.1.289), and the classifier reads exactly that shape."""
+        review = importlib.util.spec_from_file_location("superarmanda_review_live", REVIEW)
+        module = importlib.util.module_from_spec(review)
+        review.loader.exec_module(module)
+        stdout = STREAM_FIXTURE.read_text(encoding="utf-8")
+        init, event, result = [json.loads(line) for line in stdout.splitlines()]
+        self.assertEqual((init["type"], init["subtype"], event["type"], result["type"]),
+                         ("system", "init", "assistant", "result"))
+        self.assertEqual(init["claude_code_version"], "2.1.289")
+        self.assertEqual((event["error"], event["is_api_error_message"], event["message"]["model"]),
+                         ("model_not_found", True, "<synthetic>"))
+        self.assertEqual((result["is_error"], result["api_error_status"]), (True, 404))
+        self.assertEqual(module.claude_provider_errors(stdout), {"model_not_found"})
+        self.assertEqual(module.claude_failure_category(stdout, ""), "cli_exit")
+        # the same live event with the journal's live code and status is the quota signal
+        journal = json.loads(RATE_LIMIT_FIXTURE.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual((journal["error"], journal["apiErrorStatus"], journal["isApiErrorMessage"],
+                          journal["message"]["model"]), ("rate_limit", 429, True, "<synthetic>"))
+        quota = "\n".join(json.dumps(row) for row in (
+            init, dict(event, error=journal["error"]), dict(result, api_error_status=journal["apiErrorStatus"])))
+        self.assertEqual(module.claude_provider_errors(quota), {"rate_limit"})
+        self.assertEqual(module.claude_failure_category(quota, ""), "quota")
+        # ...and stops being one when the message is not the CLI's own or the status disagrees
+        by_model = dict(event, error="rate_limit", message=dict(event["message"], model="claude-fable-5-1"))
+        for label, rows in {
+            "a model's message": (init, by_model, dict(result, api_error_status=429)),
+            "status 404": (init, dict(event, error="rate_limit"), result),
+            "journal key instead of the stream key": (
+                init, {k: v for k, v in dict(event, error="rate_limit", isApiErrorMessage=True).items()
+                       if k != "is_api_error_message"}, dict(result, api_error_status=429)),
+        }.items():
+            with self.subTest(case=label):
+                text = "\n".join(json.dumps(row) for row in rows)
+                self.assertNotEqual(module.claude_failure_category(text, ""), "quota")
+
+    def test_auth_status_failure_is_never_quota(self):
+        self.assert_packet_ok()
+        proc = self.review_run("codex-host", "claude_auth_quota_word")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotEqual(self.result()["error_category"], "quota")
+        self.assertEqual([row["kind"] for row in self.logs()], ["auth"])
 
     def test_astra_usage_limit_is_reported_as_quota_in_run_result(self):
         # issue #17/#10: исчерпанная подписка Codex — это quota, а не protocol

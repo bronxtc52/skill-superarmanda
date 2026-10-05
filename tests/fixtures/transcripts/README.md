@@ -47,3 +47,60 @@
 самого Claude Code), числа (в том числе `usage`: тест перезаписывает их, чтобы задать размер контекста).
 
 Подстановка заглушек — `Journal` в `tests/helpers/superarmanda_waves_e2e_test.py`.
+
+## `rate-limit-assistant.jsonl` — исчерпанная подписка Claude (1.2.1, #86)
+
+Две живые строки журнала сессии Claude Code, которые CLI записал сам, когда провайдер ответил 429:
+
+1. лимит сессии подписки (Claude Code 2.1.259, 2026-09-06): текст «You've hit your session limit · resets …»,
+   поле `quotaLimits` со `status: rejected`;
+2. закончились кредиты (Claude Code 2.1.263, 2026-09-09): текст «You're out of usage credits…», поле `errorDetails`
+   с ответом API `rate_limit_error`.
+
+Обе строки — `type: assistant` с **верхнеуровневым** `error: "rate_limit"`, `isApiErrorMessage: true`,
+`apiErrorStatus: 429` и `message.model: "<synthetic>"`: сообщение сочинил CLI, а не модель. Именно поле `error`
+(а не слова в тексте) читает `review.py`, когда решает, что сбой Fable — квота.
+
+Заменено по таблице выше (`uuid`, `parentUuid`, `requestId`, `agentId`, `message.id` → `{UUID:n}`, `sessionId` →
+`{SESSION_ID}`, `timestamp` → `{TIMESTAMP}`), `req_…` внутри `errorDetails` → `{REQUEST_ID}`; `cwd`, `gitBranch`, `slug`
+удалены. Текст сообщения и `errorDetails` оставлены как есть: это служебные строки CLI и API без личных данных.
+
+Это форма ЖУРНАЛА сессии. Форма события в ПОТОКЕ снята отдельно — следующий раздел.
+
+## `stream-provider-error.jsonl` — живой поток `stream-json` с ошибкой провайдера (1.2.1, #86)
+
+Весь stdout одного живого запуска Claude Code 2.1.289 (2026-10-05, Linux) с теми же флагами, что у `review.py`,
+и несуществующей моделью — инференса нет, провайдер отвечает 404:
+
+```
+echo 'Reply ok.' | claude --safe-mode -p --model claude-nonexistent-9 --tools "" --strict-mcp-config \
+  --mcp-config '{"mcpServers":{}}' --settings '{"enabledPlugins":{…:false}}' --no-session-persistence \
+  --permission-mode dontAsk --disable-slash-commands --output-format stream-json --verbose
+```
+
+Код выхода 1, в stderr одна строка `[claude-code:unrecognized_model] …`. В stdout три события, по одному на строку:
+
+1. `system` / `init` (`plugins: []`, `tools: []`, `mcp_servers: []`);
+2. `assistant` с верхнеуровневыми `error: "model_not_found"` и `is_api_error_message: true`, `message.model:
+   "<synthetic>"` — сообщение сочинил CLI, а не модель;
+3. `result` с `is_error: true`, `api_error_status: 404`, `terminal_reason: "api_error"`.
+
+Заменено: `session_id` → `{SESSION_ID}`, `uuid`, `request_id`, `message.id` → `{UUID:n}`, `timestamp` →
+`{TIMESTAMP}`, `cwd` → `{CWD}`, `messaging_socket_path` → `{PATH}`, `duration_ms` и `duration_api_ms` → 0.
+Остальное — как в потоке, включая текст сообщения CLI.
+
+Что отсюда читает код (`review.py::claude_stream_facts`): событие `assistant`, верхнеуровневый `error`,
+`is_api_error_message: true`, `message.model == "<synthetic>"` и `api_error_status` события `result`. Имена полей
+потока отличаются от журнала (`is_api_error_message` против `isApiErrorMessage`, `api_error_status` в `result`
+против `apiErrorStatus` в строке журнала) — тест сверяет оба снимка.
+
+Что живое, а что нет:
+
+- форма события ошибки провайдера в потоке — живая (этот снимок, HTTP 404);
+- значение `error: "rate_limit"`, статус 429 и тексты сообщений об исчерпанной подписке — живые, из журнала
+  сессии (`rate-limit-assistant.jsonl`);
+- живого ПОТОКА именно при 429 нет (#91). Двойник CLI в `tests/helpers/superarmanda_review_test.py` берёт три
+  живых события этого снимка и меняет в них только то, что говорит журнал: `error`, текст сообщения и
+  `api_error_status`. Если настоящий поток при исчерпанной подписке окажется другим, `review.py` не даст
+  категорию `quota` и запасной Opus не откроется: ошибка возможна только в закрытую сторону. Появится живой снимок
+  при 429 — положить рядом и перевести двойник на него.

@@ -44,6 +44,121 @@ request как `session_id`; не приписывайте сервису кон
 State хранит эти значения как metadata. Coordinator подтверждает существование артефакта и
 `gate_ready: true` adapter report перед записью pass.
 
+## Ревью задачи с риском high (1.2.1, #86)
+
+Задача с эффективным риском high (см. [profiles.md](profiles.md), «Модель роли по риску») проходит
+только с двумя ревью ОДНОГО пакета на текущем HEAD: Astra и Fable. Документированная команда:
+
+```bash
+python3 "$SUPERARMANDA_DIR/scripts/review.py" run --repo /repo \
+  --packet /outside/packet.json --profile claude-host --output /outside/review-astra.json
+python3 "$SUPERARMANDA_DIR/scripts/review.py" run --repo /repo \
+  --packet /outside/packet.json --profile codex-host --output /outside/review-fable.json
+```
+
+Затем оба отчёта записываются в manifest; `--packet-hash` — поле `state_packet_hash` отчёта:
+
+```bash
+python3 "$SUPERARMANDA_DIR/scripts/state.py" task-result --manifest <path> --task <id> \
+  --role cross_provider_reviewer --status pass --session-id <id> --head <sha> \
+  --artifact /outside/review-astra.json --reviewed-head <sha> --packet-hash <sha256:...>
+python3 "$SUPERARMANDA_DIR/scripts/state.py" task-result --manifest <path> --task <id> \
+  --role second_reviewer --status pass --session-id <id> --head <sha> \
+  --artifact /outside/review-fable.json --reviewed-head <sha> --packet-hash <sha256:...>
+```
+
+Для такой задачи `state.py` не верит слову координатора, а сам читает отчёт из `--artifact`
+(обычный файл, не симлинк, не больше 1 MiB, один JSON-объект) и отказывает, если: `profile` не из
+`claude-host`, `codex-host`, `codex-host-opus`; `status` отчёта не равен записываемому; для `pass`
+нет `gate_ready: true`; для `findings` нет `capabilities.primary_model_verified: true` или
+`capabilities.tool_isolation` равен `unverified`; `state_packet_hash` не равен `--packet-hash`;
+`response.reviewed_head` не равен HEAD. Отчёт обязан быть согласован сам с собой: `requested_model`
+и `observed_models` должны принадлежать его профилю по таблице `PROFILE_MODELS` из `review.py`
+(`claude-host` → `gpt-6-astra`; `codex-host` → запрошена `fable`, наблюдается `claude-fable-5-1`;
+`codex-host-opus` → `claude-opus-5-5`), а `session_id` ревью — непустая строка. У Astra
+`observed_models` — ровно один элемент; у Claude-профилей это объект `modelUsage`, где рядом с
+основной моделью допустимы записи вспомогательных вызовов CLI, поэтому целиком он не
+сравнивается: основная модель обязана в нём быть, а `capabilities.primary_model_verified: true`
+и проверенная изоляция инструментов требуются и для `pass`, и для `findings`. Один и тот же
+отчёт или одна сессия ревью не закрывает обе роли: вторая запись — отказ. В результат пишутся
+`profile`, `artifact_sha256` (SHA-256 байтов отчёта) и `review_session_id`. `error`, `unavailable`
+и `incomplete` отчёта не требуют и pass не дают. Известная граница: отчёт не подписан, поэтому
+`state.py` проверяет его форму, согласованность и привязку к HEAD и пакету, но не доказывает его
+подлинность.
+
+Задача high готова, когда coder и tester прошли на Fable (`--model`, поле `model` результата —
+`claude-fable-5-1`; при medium и low — `claude-sonnet-5-5` либо без модели), а оба ревью — `pass`
+либо `findings`, покрытые `fix-loop --defer`/`--accept` ровно на этот результат, причём пара
+профилей — ровно один `claude-host` и ровно один `codex-host` с одним `packet_hash`. Один Astra,
+два Astra, Fable без Astra, ревью разных пакетов — не pass; причину называет `next_action`
+команды `where`. Какая роль (`cross_provider_reviewer` или `second_reviewer`) несёт какой профиль,
+не важно: важна пара. Находки второго ревьюера идут тем же `fix-loop`, что и у первого.
+
+**Запасной Opus и quota evidence.** Fable-ревью с ошибкой квоты не закрывает gate и не
+заменяется само. Единственный запасной маршрут — отдельный запуск `--profile codex-host-opus` на
+том же пакете и запись его отчёта с `--quota-evidence <путь>`. Quota evidence — это отчёт ошибки
+`review.py run --profile codex-host` с полями `status: error`, `error_category: quota`,
+`gate_ready: false`, чьи `reviewed_head` и `state_packet_hash` равны HEAD и пакету записываемого
+результата. Другого источника нет: текст диагностики, уведомление провайдера, отчёт другого HEAD
+или пакета, отчёт без этих двух полей (написанный до 1.2.1) не подходят. В результат пишутся
+`fallback_for: codex-host` и `quota_evidence: {artifact, sha256}`; оба пути видны в `where`.
+`--quota-evidence` с любым другим профилем — отказ.
+
+**Сказанное ревью о HEAD нельзя отменить.** Для задачи high `state.py` ведёт в записи задачи
+дописываемую историю `review_history`: каждый записанный результат обеих ролей ревью (роль,
+профиль, статус, HEAD, `tree_fingerprint`, `packet_hash`, `result_id`, дайджест результата
+`result_sha256`, `artifact`, время). Историю не очищает ни новая запись роли, ни `resume`. Правила
+ниже смотрят в историю текущего HEAD, а не только в текущие результаты:
+
+- Запасной Opus заменяет только Fable, которая ревью НЕ дала. Если в истории на этом HEAD есть
+  результат профиля `codex-host` со статусом `pass` или `findings` — в любой роли, покрытый
+  `--defer`/`--accept` или нет, перезаписанный позже (`unavailable`, `error`, `incomplete`) или
+  нет, — запись `codex-host-opus` — отказ. Прежний отчёт квоты его не отменяет.
+- Находки не стираются. Пока в истории на этом HEAD есть `findings` роли ревью, не покрытые
+  `fix-loop --defer`/`--accept` ровно на тот результат, задача не становится готовой, а новый
+  `task-result` этой роли (любого статуса и профиля) — отказ. Это верно и после `resume`
+  «туда-обратно» (тронули дерево, вернули): сверка идёт по HEAD, а не по дереву. `where` называет
+  причину в `next_action` и показывает такие находки в `open_findings`.
+- Выход прежний: `fix-loop --defer` или `--accept --source <роль>` — они привязываются к тому
+  самому результату, даже если он уже ушёл из текущих (привязка по дайджесту из истории), — либо
+  исправление кода: новый коммит это другой HEAD, история прежнего к нему не относится, и
+  результаты пишутся свободно. Ложную находку координатор принимает
+  `fix-loop --accept --severity low --note "<почему>"` и после этого может повторить ревью на том
+  же HEAD. `incomplete`, `error` и `unavailable` до первого `pass`/`findings` повторяются свободно.
+- Принятое ограничение остаётся ограничением этого HEAD: `where.accepted_limitations` показывает
+  запись `--accept` и после того, как её результат заменён другим.
+
+При риске medium и low и для manifest `version: 1` история не ведётся, ключа `review_history` нет,
+повторная запись, как и раньше, заменяет результат. Если риск задачи подняли до high, её текущие
+результаты ревью попадают в историю в момент подъёма.
+
+Категорию `quota` у Claude-профилей `review.py` выводит только из сигнала провайдера: событие
+потока `assistant`, которое CLI пишет сам (`message.model: "<synthetic>"`, `is_api_error_message:
+true`), с верхнеуровневым `error: "rate_limit"`; если событие `result` несёт `api_error_status`, он
+обязан быть 429. Маршрут проверен на живой форме события ошибки провайдера в потоке (снимок Claude
+Code 2.1.289, HTTP 404 — `tests/fixtures/transcripts/stream-provider-error.jsonl`) и на живом
+значении `rate_limit` со статусом 429 из журнала сессии (`rate-limit-assistant.jsonl`). Живого
+потока при исчерпанной подписке нет (#91): если он окажется другим, `quota` не будет и запасной
+Opus не откроется — ошибка возможна только в закрытую сторону. Stdout потока текстовой эвристикой
+не читается вовсе: прочие категории сбоя Claude-профиля берутся из stderr. Слова «quota» и «rate limit» в тексте
+модели, в цитатах пакета, в stderr и в выводе `claude auth status` категорию не дают: текстовая
+эвристика `quota` больше не возвращает. Неоднозначность закрывается в сторону «не evidence»:
+код авторизации в потоке (`authentication_failed` и родственные) или признак auth, таймаута,
+транспорта, отказа в stderr рядом с `rate_limit` — это соответствующая категория, а не `quota`;
+событие с повторным ключом — не сигнал. У Astra категория идёт из `codexErrorInfo:
+"usageLimitExceeded"` текущего thread/turn, то есть тоже из структуры, а не из текста. Auth, таймаут, отказ модели и любая другая
+недоступность Fable — `error`/`unavailable` роли `second_reviewer`: задача не pass, отката на
+Sonnet, Astra вторым разом или иную модель нет.
+
+**Поля отчёта ошибки.** Отчёт `status: error` несёт `profile`, `attempts`, `error`,
+`error_category`, `gate_ready: false`, а с 1.2.1 ещё `reviewed_head` (полный HEAD пакета) и
+`state_packet_hash` (`sha256:<hex>`) — только когда конверт пакета загружен и сверен с
+репозиторием. При ошибке раньше (нечитаемый или изменённый пакет, HEAD ушёл) этих полей нет.
+Сырых диагностик и содержимого пакета в отчёте по-прежнему нет.
+
+При риске medium и low, а также для manifest `version: 1`, действует прежнее правило: одно
+ревью `cross_provider_reviewer`, отчёт state не разыменовывает.
+
 Runner принимает только packet envelope v1. Его лимит измеряет весь сериализованный
 envelope вместе с завершающим newline, хотя `packet_hash` остаётся SHA-256
 канонического внутреннего payload. Ошибка packet или CLI event даёт nonzero

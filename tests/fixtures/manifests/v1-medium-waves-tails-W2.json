@@ -1,0 +1,167 @@
+{
+  "base": "@BASE@",
+  "created_at": "2026-10-04T13:24:16+00:00",
+  "head": "@HEAD@",
+  "plan": {
+    "approved_by": "plan@f42a437bb92a2aa83254cfc47c4241404a6733b6981f2f4c64e36289effdd4f2",
+    "path": "@PATH@/waves-tails/runs/waves-tails/2026-10-04-wt/waves.json",
+    "sha256": "f42a437bb92a2aa83254cfc47c4241404a6733b6981f2f4c64e36289effdd4f2",
+    "wave": "W2",
+    "wave_sha256": "fd6b9b825910108dceea621065a2fea39d5cc407523ccb5086f629a75ef45d59"
+  },
+  "position": {
+    "head": "@HEAD@",
+    "recorded_at": "2026-10-04T14:32:39+00:00",
+    "safe_point": true,
+    "step": 7,
+    "task": "w2-coderabbit",
+    "tree_fingerprint": "@TREE@"
+  },
+  "repo": "@REPO@",
+  "run": {
+    "index": 1,
+    "max": 2
+  },
+  "run_id": null,
+  "tasks": {
+    "w2-coderabbit": {
+      "acceptances": [
+        {
+          "head": "@HEAD@",
+          "note": "<заметка убрана>",
+          "recorded_at": "2026-10-04T14:46:05+00:00",
+          "result_recorded_at": "2026-10-04T14:46:05+00:00",
+          "result_sha256": "6efc3790ff7a24bf113e6b30964f688afd089974b428fb1a3c5410a5c964bcbf",
+          "severity": "medium",
+          "source": "github_codex_review"
+        }
+      ],
+      "decision_required_for": null,
+      "decisions": [],
+      "deferrals": [
+        {
+          "head": "@HEAD@",
+          "note": "<заметка убрана>",
+          "recorded_at": "2026-10-04T14:46:06+00:00",
+          "result_recorded_at": "2026-10-04T14:46:05+00:00",
+          "result_sha256": "96ace4c684af71f9ef4c639777a0dc0e2a8500b9c2b4fa05c71888c124eeff30",
+          "source": "coderabbit"
+        }
+      ],
+      "fix_cycles": 2,
+      "fix_sources": {
+        "cross_provider_reviewer": 1,
+        "github_codex_review": 1
+      },
+      "results": {
+        "coder": {
+          "artifact": "@PATH@/waves-tails/runs/waves-tails/2026-10-04-wt/W2/superarmanda/reports/coder-3.md",
+          "head": "@HEAD@",
+          "packet_hash": null,
+          "recorded_at": "2026-10-04T14:24:44+00:00",
+          "result_id": "d80f78b363da4689a4184bfa2632f658",
+          "reviewed_head": null,
+          "session_id": "coder-w2-3",
+          "status": "pass",
+          "tree_fingerprint": "@TREE@"
+        },
+        "coderabbit": {
+          "artifact": "https://github.com/bronxtc52/skill-superarmanda/pull/78#pullrequestreview-5406709683",
+          "head": "@HEAD@",
+          "packet_hash": null,
+          "recorded_at": "2026-10-04T14:46:05+00:00",
+          "result_id": "c1a90c53693c47d19139a1a942c05591",
+          "reviewed_head": null,
+          "session_id": "coderabbit-review-5406709683",
+          "status": "findings",
+          "tree_fingerprint": "@TREE@"
+        },
+        "cross_provider_reviewer": {
+          "artifact": "@PATH@/waves-tails/runs/waves-tails/2026-10-04-wt/W2/superarmanda/review/astra-3.json",
+          "head": "@HEAD@",
+          "packet_hash": "sha256:b1b1432636e776e4b452ea45469f66aceb88962c5cef443d846d51d32f507b7c",
+          "recorded_at": "2026-10-04T14:32:38+00:00",
+          "result_id": "9f93c9654e0f457bbbb063f958786d37",
+          "reviewed_head": "@HEAD@",
+          "session_id": "01a10754-6bb2-7772-a4e4-1ba4133a0515",
+          "status": "pass",
+          "tree_fingerprint": "@TREE@"
+        },
+        "github_codex_review": {
+          "artifact": "https://github.com/bronxtc52/skill-superarmanda/pull/78#pullrequestreview-5406695099",
+          "head": "@HEAD@",
+          "packet_hash": null,
+          "recorded_at": "2026-10-04T14:46:05+00:00",
+          "result_id": "07ae6804287f4e7993e954d10822708a",
+          "reviewed_head": null,
+          "session_id": "codex-review-5406695099",
+          "status": "findings",
+          "tree_fingerprint": "@TREE@"
+        },
+        "tester": {
+          "artifact": "@PATH@/waves-tails/runs/waves-tails/2026-10-04-wt/W2/superarmanda/reports/tester-3.md",
+          "head": "@HEAD@",
+          "packet_hash": null,
+          "recorded_at": "2026-10-04T14:32:07+00:00",
+          "result_id": "99aa4b17251a40868db2d86325dface5",
+          "reviewed_head": null,
+          "session_id": "tester-w2-3",
+          "status": "pass",
+          "tree_fingerprint": "@TREE@"
+        }
+      },
+      "session_roles": {
+        "01a1072d-a169-7560-b1d8-429c87f0f039": "cross_provider_reviewer",
+        "01a1073e-7d7e-7262-bd06-033538a68f2a": "cross_provider_reviewer",
+        "01a10754-6bb2-7772-a4e4-1ba4133a0515": "cross_provider_reviewer",
+        "coder-w2-1": "coder",
+        "coder-w2-2": "coder",
+        "coder-w2-3": "coder",
+        "coderabbit-review-5406709683": "coderabbit",
+        "codex-comment-5981115680": "github_codex_review",
+        "codex-review-5406607992": "github_codex_review",
+        "codex-review-5406695099": "github_codex_review",
+        "tester-w2-1": "tester",
+        "tester-w2-2": "tester",
+        "tester-w2-3": "tester"
+      },
+      "status": "ready_for_pr_review"
+    }
+  },
+  "tree_fingerprint": "@TREE@",
+  "updated_at": "2026-10-04T14:46:06+00:00",
+  "version": 1,
+  "wave": {
+    "acceptance": [
+      "<текст волны убран>",
+      "<текст волны убран>",
+      "<текст волны убран>",
+      "<текст волны убран>",
+      "<текст волны убран>",
+      "<текст волны убран>",
+      "<текст волны убран>"
+    ],
+    "checks": [
+      {
+        "cmd": "bash tests/superarmanda-pr-review.test.sh",
+        "name": "pr-review"
+      },
+      {
+        "cmd": "bash tests/superarmanda-waves.test.sh",
+        "name": "waves"
+      },
+      {
+        "cmd": "bash scripts/run-tests.sh",
+        "name": "all-tests"
+      }
+    ],
+    "depends_on": [
+      "W1"
+    ],
+    "goal": "<текст волны убран>",
+    "id": "W2",
+    "requirements": "<текст волны убран>",
+    "risk": "medium",
+    "title": "<текст волны убран>"
+  }
+}

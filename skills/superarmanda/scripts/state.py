@@ -4,6 +4,7 @@
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import uuid
 import os
@@ -21,24 +22,28 @@ ROLES = {
     "cross_provider_reviewer",
     "github_codex_review",
     "coderabbit",
+    "second_reviewer",
 }
 STATUSES = {"pass", "findings", "incomplete", "error", "unavailable"}
-FIX_SOURCES = {"cross_provider_reviewer", "github_codex_review", "coderabbit", "tester"}
+FIX_SOURCES = {
+    "cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit", "tester",
+}
 DECISIONS = {"invariant", "cut_surface", "accept_limitation"}
 # Reviewer channels whose low/P3-only findings may be deferred to the remainder
 # of the next wave/task without spending the fix cap (#36). Tester is excluded:
 # a failed check is never a nit.
-DEFER_SOURCES = {"cross_provider_reviewer", "github_codex_review", "coderabbit"}
+DEFER_SOURCES = {"cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit"}
 MAX_DECISION_NOTE_LENGTH = 500
 # Every key state.py writes into a manifest. The merge gate refuses a manifest
 # carrying a key outside these sets: it cannot judge a record type it does not know.
 MANIFEST_KEYS = {
     "version", "run_id", "repo", "base", "head", "tree_fingerprint", "tasks",
-    "created_at", "updated_at", "plan", "wave", "position", "run",
+    "created_at", "updated_at", "plan", "wave", "position", "run", "review_policy",
 }
 TASK_KEYS = {
     "status", "fix_cycles", "results", "session_roles", "fix_sources", "decisions",
-    "decision_required_for", "deferrals", "acceptances", "blocked_reason",
+    "decision_required_for", "deferrals", "acceptances", "blocked_reason", "risk",
+    "review_history",
 }
 DEFAULT_MAX_RUNS = 2
 MAX_RUNS_LIMIT = 1000
@@ -47,6 +52,35 @@ MAX_PLAN_BYTES = 1024 * 1024
 NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
 REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 RISKS = {"low", "medium", "high"}
+RISK_ORDER = ("low", "medium", "high")
+# Manifest version 1 is judged by the rules of 1.2.0 (one cross-provider review, no model in
+# the result). Version 2 carries `review_policy` and is judged by the policy below (#86).
+MANIFEST_VERSIONS = (1, 2)
+POLICY_VERSION = "1.2.1"
+POLICY_VERSIONS = {POLICY_VERSION}
+POLICY_KEYS = {"version", "level"}
+V2_ONLY_ROLES = {"second_reviewer"}
+# Closed dictionary of coder/tester models. Matching is exact: no trim, no case folding, no prefix.
+FABLE_MODEL = "claude-fable-5-1"
+SONNET_MODEL = "claude-sonnet-5-5"
+MODEL_ALIASES = {
+    FABLE_MODEL: FABLE_MODEL,
+    SONNET_MODEL: SONNET_MODEL,
+    "fable": FABLE_MODEL,
+    "sonnet": SONNET_MODEL,
+}
+MODEL_ROLES = ("coder", "tester")
+# The two task reviews of a high-risk task, and the review.py profiles their reports may carry:
+# exactly one claude-host (Astra) and one codex-host (Fable); codex-host-opus stands in for
+# codex-host only with a quota error report of codex-host for the same HEAD and packet.
+REVIEW_ROLES = ("cross_provider_reviewer", "second_reviewer")
+ASTRA_PROFILE = "claude-host"
+FABLE_PROFILE = "codex-host"
+OPUS_PROFILE = "codex-host-opus"
+REVIEW_PROFILES = {ASTRA_PROFILE, FABLE_PROFILE, OPUS_PROFILE}
+MAX_REPORT_BYTES = 1024 * 1024
+# Keys of a `review_history` item that the rules read; each must be a string.
+HISTORY_TEXT_KEYS = ("role", "status", "head", "result_sha256")
 PLAN_KEYS = {"version", "chain", "repo", "base_branch", "waves"}
 WAVE_KEYS = {
     "id",
@@ -84,13 +118,79 @@ def check_position(position):
         fail("malformed position in manifest")
 
 
+def check_schema(value):
+    """The one schema check behind every command that reads a manifest. Closed: an unknown
+    version, or a version 2 without a well-formed `review_policy`, is refused, never guessed."""
+    version = value.get("version") if isinstance(value, dict) else None
+    if type(version) is not int or version not in MANIFEST_VERSIONS:
+        fail("unsupported or malformed manifest")
+    tasks = value.get("tasks")
+    if not isinstance(tasks, dict):
+        fail("unsupported or malformed manifest")
+    if version == 1:
+        # Version 1 keeps the shape of 1.2.0: nothing of the policy may ride on it.
+        if "review_policy" in value:
+            fail("malformed manifest: review_policy requires manifest version 2")
+        for entry in tasks.values():
+            if not isinstance(entry, dict):
+                continue
+            used = set(entry.get("results") or ()) if isinstance(entry.get("results"), dict) else set()
+            if isinstance(entry.get("session_roles"), dict):
+                used |= {role for role in entry["session_roles"].values() if isinstance(role, str)}
+            if "risk" in entry or "review_history" in entry or used & V2_ONLY_ROLES:
+                fail(
+                    "malformed manifest: task risk, review_history and second_reviewer "
+                    "require manifest version 2"
+                )
+        return
+    policy = value.get("review_policy")
+    if "review_policy" not in value:
+        fail("manifest version 2 has no review_policy: refusing to judge it")
+    if not isinstance(policy, dict) or set(policy) != POLICY_KEYS:
+        fail(f"malformed review_policy: must be an object with exactly {sorted(POLICY_KEYS)}")
+    if not isinstance(policy["version"], str) or policy["version"] not in POLICY_VERSIONS:
+        fail(f"unknown review_policy version: this state.py knows {sorted(POLICY_VERSIONS)}")
+    if not isinstance(policy["level"], str) or policy["level"] not in RISKS:
+        fail(f"review_policy level must be one of {sorted(RISKS)}")
+    for name, entry in tasks.items():
+        if isinstance(entry, dict) and "risk" in entry and not (
+            isinstance(entry["risk"], str) and entry["risk"] in RISKS
+        ):
+            fail(f"task {name} risk must be one of {sorted(RISKS)}")
+        history = entry.get("review_history", []) if isinstance(entry, dict) else []
+        if not isinstance(history, list) or not all(
+            isinstance(item, dict)
+            and all(isinstance(item.get(key), str) for key in HISTORY_TEXT_KEYS)
+            for item in history
+        ):
+            fail(f"task {name} review_history is malformed")
+
+
+def require_v2(data, what):
+    if data["version"] != 2:
+        fail(f"{what} requires manifest version 2 (version 1 is judged by the rules of 1.2.0)")
+
+
+def task_risk(data, entry):
+    """Effective risk of a task: the higher of the run's policy level and the task's own risk.
+    None for manifest version 1, which has no policy."""
+    if data["version"] != 2:
+        return None
+    level = data["review_policy"]["level"]
+    own = (entry or {}).get("risk", level)
+    return max(level, own, key=RISK_ORDER.index)
+
+
+def role_model(risk):
+    return FABLE_MODEL if risk == "high" else SONNET_MODEL
+
+
 def read(path):
     try:
         value = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         fail(f"cannot read manifest: {exc}")
-    if value.get("version") != 1 or not isinstance(value.get("tasks"), dict):
-        fail("unsupported or malformed manifest")
+    check_schema(value)
     check_position(value.get("position"))
     session_owners(value)
     return value
@@ -722,13 +822,171 @@ def effective_status(entry, role):
     return result.get("status")
 
 
-def update_task_status(entry):
-    """Only coder, tester and cross-provider review can make a task PR-ready.
-    Coder and tester need pass; the reviewer may also be findings + deferral/acceptance."""
+def note_review(entry, role, record):
+    """Append a task-review result to the task's `review_history`.
+
+    Kept for high-risk tasks of a version 2 manifest only. The history is append-only: neither
+    a later result of the role nor `resume` removes an item. It is what makes a verdict stick:
+    what a review said about a HEAD cannot be unsaid by overwriting or invalidating the result."""
+    entry.setdefault("review_history", []).append(
+        {
+            "role": role,
+            "profile": record.get("profile"),
+            "status": record["status"],
+            "head": record["head"],
+            "tree_fingerprint": record["tree_fingerprint"],
+            "packet_hash": record.get("packet_hash"),
+            "result_id": record.get("result_id"),
+            "result_sha256": result_digest(record),
+            "artifact": record.get("artifact"),
+            "recorded_at": record.get("recorded_at"),
+        }
+    )
+
+
+def history_cover(entry, item, kinds=("deferrals", "acceptances")):
+    """The deferral/acceptance bound to exactly this history item (its result digest and head),
+    or None. The binding is the same as for a current result, so a cover outlives the result."""
+    for kind in kinds:
+        for record in entry.get(kind) or ():
+            if (
+                isinstance(record, dict)
+                and record.get("source") == item["role"]
+                and record.get("head") == item["head"]
+                and record.get("result_sha256") == item["result_sha256"]
+            ):
+                return record
+    return None
+
+
+def open_review_findings(entry, head, role=None):
+    """History items of this HEAD that are findings nobody deferred or accepted. Matched by
+    HEAD alone: findings are about the commit, and touching the working tree does not answer them."""
+    return [
+        item
+        for item in (entry or {}).get("review_history") or ()
+        if item["status"] == "findings"
+        and item["head"] == head
+        and (role is None or item["role"] == role)
+        and item["role"] in REVIEW_ROLES
+        and history_cover(entry, item) is None
+    ]
+
+
+OPEN_FINDINGS = "open findings"
+
+
+def open_findings_reason(role):
+    return (
+        f"{OPEN_FINDINGS}: {role} reported findings on this HEAD that were neither deferred nor "
+        f"accepted; record fix-loop --defer or --accept --source {role} for them, or fix the "
+        "code (new HEAD) after fix-loop --outcome failed"
+    )
+
+
+def required_roles(risk):
+    """Roles whose pass makes a task PR-ready. A high-risk task needs both task reviews."""
+    return ("coder", "tester") + (REVIEW_ROLES if risk == "high" else REVIEW_ROLES[:1])
+
+
+def high_risk_gaps(entry, results, head):
+    """Why the passed results of a high-risk task still do not make it ready: {role: reason}.
+
+    `results` are the task's results on the current head and tree, `head` that HEAD. Findings
+    of a review recorded for this HEAD and left open block the task whatever the current result
+    of the role is (`review_history`). Otherwise only results that read as
+    pass (pass, or findings covered by a deferral/acceptance) are judged here; a missing or
+    failed role is the ordinary flow's business. The single rule behind update_task_status,
+    is_complete, derive_step and where: coder and tester ran on Fable; each review carries a
+    report verified at recording time; the pair is one claude-host and one codex-host
+    (codex-host-opus only with quota evidence) over one packet."""
+    gaps = {}
+
+    def passed(role):
+        result = results.get(role)
+        if not isinstance(result, dict):
+            return None
+        if result.get("status") == "pass" or is_covered(entry, role, result):
+            return result
+        return None
+
+    for role in MODEL_ROLES:
+        result = passed(role)
+        if result is not None and result.get("model") != FABLE_MODEL:
+            gaps[role] = (
+                f"{role} result has model {result.get('model') or 'not recorded'}; a high-risk "
+                f"task requires {FABLE_MODEL}: re-run {role} on it, no weaker model"
+            )
+    reviews = {}
+    for role in REVIEW_ROLES:
+        if open_review_findings(entry, head, role):
+            gaps[role] = open_findings_reason(role)
+            continue
+        result = passed(role)
+        if result is None:
+            continue
+        profile = result.get("profile")
+        if (
+            profile not in REVIEW_PROFILES
+            or not isinstance(result.get("artifact_sha256"), str)
+            or not isinstance(result.get("review_session_id"), str)
+        ):
+            gaps[role] = (
+                f"{role} result carries no verified review.py report; a high-risk task requires "
+                "task-result --artifact <report> --reviewed-head --packet-hash"
+            )
+        elif profile == OPUS_PROFILE and not (
+            isinstance(result.get("quota_evidence"), dict)
+            and result.get("fallback_for") == FABLE_PROFILE
+        ):
+            gaps[role] = (
+                f"{role} is a {OPUS_PROFILE} review without quota evidence; the fallback counts "
+                f"only with --quota-evidence <{FABLE_PROFILE} quota error report>"
+            )
+        else:
+            reviews[role] = result
+    if len(reviews) == len(REVIEW_ROLES) and not gaps.keys() & set(REVIEW_ROLES):
+        last = REVIEW_ROLES[-1]
+        profiles = sorted(result["profile"] for result in reviews.values())
+        if any(
+            len({result[key] for result in reviews.values()}) != len(reviews)
+            for key in ("artifact_sha256", "review_session_id")
+        ):
+            gaps[last] = (
+                "the two results are the same review (one report or one review session); "
+                "a high-risk task requires two separate reviews"
+            )
+        elif profiles not in ([ASTRA_PROFILE, FABLE_PROFILE], [ASTRA_PROFILE, OPUS_PROFILE]):
+            gaps[last] = (
+                f"the two reviews are {' + '.join(profiles)}; a high-risk task requires one "
+                f"{ASTRA_PROFILE} and one {FABLE_PROFILE} review "
+                f"({OPUS_PROFILE} only with quota evidence)"
+            )
+        elif len({result.get("packet_hash") for result in reviews.values()}) != 1:
+            gaps[last] = (
+                "the two reviews cover different packets; a high-risk task requires both "
+                "reviews of one packet_hash"
+            )
+    return gaps
+
+
+def task_ready(entry, risk, head):
+    """The single readiness rule of a task for its effective risk (None: manifest version 1).
+    `risk` has no default here or in any caller that recomputes a status: a forgotten argument
+    must be an error, never a silent return to the rules of 1.2.0. Callers take it from
+    `task_risk(data, entry)`; `head` is the manifest HEAD the entry's results belong to."""
+    if not all(effective_status(entry, role) == "pass" for role in required_roles(risk)):
+        return False
+    return risk != "high" or not high_risk_gaps(entry, entry["results"], head)
+
+
+def update_task_status(entry, risk, head):
+    """Only coder, tester and the task review(s) can make a task PR-ready.
+    Coder and tester need pass; a reviewer may also be findings + deferral/acceptance.
+    A high-risk task (manifest version 2) also needs Fable models and the second review."""
     if entry["status"] == "blocked":
         return
-    required = ("coder", "tester", "cross_provider_reviewer")
-    if all(effective_status(entry, role) == "pass" for role in required):
+    if task_ready(entry, risk, head):
         entry["status"] = "ready_for_pr_review"
     elif entry["results"]:
         entry["status"] = "in_progress"
@@ -1061,18 +1319,24 @@ def init(args):
             fail("--expect-sha256 requires --from-plan")
         if not re.fullmatch(r"[0-9a-f]{64}", args.expect_sha256):
             fail("--expect-sha256 must be 64 lowercase hex characters")
+    if args.risk is not None and args.from_plan is not None:
+        fail("--risk is not allowed with --from-plan: the wave's risk is the policy level")
     counter = run_counter_settings(args)
     base, head = validate_revision_pair(location, args.base, args.head)
     plan = wave_copy = None
+    level = args.risk or "low"
     if args.from_plan is not None:
         plan, wave_copy = load_plan(args.from_plan)
+        # the wave's risk is the floor for every task of the run, the model of its roles included
+        level = wave_copy["risk"]
         if args.expect_sha256 is not None and plan["sha256"] != args.expect_sha256:
             fail(
                 f"plan sha256 {plan['sha256']} != expected {args.expect_sha256}: "
                 "plan changed since approval"
             )
     data = {
-        "version": 1,
+        "version": 2,
+        "review_policy": {"version": POLICY_VERSION, "level": level},
         "run_id": args.run_id,
         "repo": location,
         "base": base,
@@ -1178,7 +1442,14 @@ def result(args):
         fail("result head differs from manifest; run resume first")
     if fingerprint(location) != data["tree_fingerprint"]:
         fail("working tree changed; run resume before recording a result")
+    if args.role in V2_ONLY_ROLES:
+        require_v2(data, f"role {args.role}")
+    if args.model is not None:
+        require_v2(data, "--model")
+    if args.quota_evidence is not None:
+        require_v2(data, "--quota-evidence")
     entry = task(data, args.task)
+    risk = task_risk(data, entry)
     if entry["status"] == "blocked":
         fail("task is blocked after three fix cycles; explicit human reset is required")
     if entry["status"] == "needs_decision":
@@ -1186,6 +1457,14 @@ def result(args):
             "decision required for source "
             f"{entry['decision_required_for']}: run fix-loop --decision ..."
         )
+    model = result_model(args, risk)
+    if risk == "high" and args.role in REVIEW_ROLES and open_review_findings(
+        entry, data["head"], args.role
+    ):
+        # Nothing may be recorded over findings nobody disposed of: not a pass of another
+        # report, not `unavailable`, and not after `resume` has dropped the result itself.
+        # After a fix the HEAD is new, and this HEAD's history no longer applies.
+        fail(open_findings_reason(args.role))
     owner = session_owners(data).get(args.session_id)
     if owner is not None and owner != (args.task, args.role):
         fail("session_id is already used by another task or role for this run")
@@ -1208,8 +1487,9 @@ def result(args):
             fail("GitHub Codex pass requires reviewed_head and HTTPS artifact URL")
         if packet_hash is not None:
             fail("GitHub Codex review does not accept packet_hash")
+    verified = verified_review(args, risk, packet_hash, entry)
     entry["session_roles"][args.session_id] = args.role
-    entry["results"][args.role] = {
+    record = {
         "status": args.status,
         "head": args.head,
         "session_id": args.session_id,
@@ -1222,29 +1502,272 @@ def result(args):
         # is still another result, and a deferral covers exactly one (#36 п.3)
         "result_id": uuid.uuid4().hex,
     }
-    update_task_status(entry)
+    # Policy fields exist only where the policy produced them: a version 1 result and an
+    # unverified version 2 result keep the shape of 1.2.0.
+    if model is not None:
+        record["model"] = model
+    record.update(verified)
+    entry["results"][args.role] = record
+    if risk == "high" and args.role in REVIEW_ROLES:
+        note_review(entry, args.role, record)
+    update_task_status(entry, risk, data["head"])
     data["updated_at"] = now()
     write(path, data)
     print(json.dumps(entry, sort_keys=True))
+
+
+def result_model(args, risk):
+    """Canonical model ID for the `model` field of a coder/tester result, or None.
+    A high-risk task requires Fable at ANY status: `unavailable` with `--model fable` is the
+    record "Fable was requested and is unavailable"; nothing weaker may take the role."""
+    if args.model is not None and args.role not in MODEL_ROLES:
+        fail(f"--model is only allowed for roles {', '.join(MODEL_ROLES)}")
+    model = MODEL_ALIASES.get(args.model) if args.model is not None else None
+    if risk == "high" and args.role in MODEL_ROLES and model != FABLE_MODEL:
+        given = "no --model" if args.model is None else repr(args.model)
+        fail(
+            f"high-risk task requires --model {FABLE_MODEL} for {args.role} (got {given}); "
+            "no substitution by a weaker or another model. If this host cannot run "
+            f"{args.role} on Fable, record --status unavailable --model fable: the task is "
+            "then not pass, as the policy intends"
+        )
+    if args.model is not None and model is None:
+        fail(
+            f"unknown --model {args.model!r}: must be exactly one of "
+            f"{', '.join(sorted(MODEL_ALIASES))}"
+        )
+    return model
+
+
+def read_report(location, label):
+    """(parsed object, sha256 of the bytes) of a local review.py report. A regular file, not a
+    symlink, at most 1 MiB, one JSON object without duplicate keys; anything else is refused."""
+    if not isinstance(location, str) or not location:
+        fail(f"{label} must be a path to a review.py report")
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("platform does not support safe report opening")
+    try:
+        fd = os.open(location, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (OSError, ValueError) as exc:
+        fail(f"cannot open {label} (missing, symlink or unreadable): {exc}")
+    with os.fdopen(fd, "rb") as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            fail(f"{label} must be a regular file")
+        raw = file.read(MAX_REPORT_BYTES + 1)
+    if len(raw) > MAX_REPORT_BYTES:
+        fail(f"{label} exceeds {MAX_REPORT_BYTES} bytes")
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=plan_pairs)
+    except (PlanError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        fail(f"{label} is not a valid JSON report: {exc}")
+    if not isinstance(value, dict):
+        fail(f"{label} must be a JSON object")
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def review_profile_models():
+    """`PROFILE_MODELS` of the sibling review.py: profile -> (CLI, requested model, observed
+    model). Read from the runner itself, so the two scripts cannot disagree; loaded only when a
+    report is verified. An unloadable runner is a refusal, not a skipped check."""
+    path = Path(__file__).resolve().parent / "review.py"
+    try:
+        spec = importlib.util.spec_from_file_location("superarmanda_review_profiles", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        table = module.PROFILE_MODELS
+    except Exception as exc:
+        fail(f"cannot read review profiles from {path.name}: {exc}")
+    if not isinstance(table, dict) or set(table) != REVIEW_PROFILES:
+        fail("review.py profiles differ from the profiles state.py knows")
+    return table
+
+
+def verified_review(args, risk, packet_hash, entry):
+    """Policy fields of a task-review result, taken from its review.py report.
+
+    The report is checked for shape, for agreement with its own profile and for its binding to
+    this HEAD and packet. That stops a wrong or carelessly relabelled file; a report is not
+    signed, so its origin is not proven (the same trust as the manifest itself).
+
+    For a high-risk task a `pass` or `findings` of either task review is recorded only with a
+    report that state.py reads and checks itself: the coordinator's word is not enough. Other
+    statuses (error, unavailable, incomplete) need no report and never pass. Below high the
+    report is not dereferenced, as in 1.2.0."""
+    checked = risk == "high" and args.role in REVIEW_ROLES and args.status in ("pass", "findings")
+    if not checked:
+        if args.quota_evidence is not None:
+            fail(
+                "--quota-evidence is only allowed with a pass or findings of a high-risk task's "
+                f"review recorded from a {OPUS_PROFILE} report"
+            )
+        return {}
+    if args.artifact is None or args.reviewed_head is None or packet_hash is None:
+        fail(
+            f"high-risk {args.role} {args.status} requires --artifact <review.py report>, "
+            "--reviewed-head and --packet-hash"
+        )
+    report, digest = read_report(args.artifact, "--artifact")
+    profile = report.get("profile")
+    if not isinstance(profile, str) or profile not in REVIEW_PROFILES:
+        fail(f"review report profile must be one of {sorted(REVIEW_PROFILES)}")
+    if report.get("status") != args.status:
+        fail(f"review report status {report.get('status')!r} differs from --status {args.status}")
+    # The report must agree with itself: the model review.py requests for this profile and
+    # the model it observed running. One edited `profile` field does not make another review.
+    # review.py writes `observed_models` as the adapter's list for Astra (exactly the one model)
+    # and as the CLI's modelUsage object for the Claude profiles, where entries of ancillary
+    # CLI calls beside the primary model are legitimate. So the object is not compared as a
+    # whole; the primary model must be there and `primary_model_verified` must be true.
+    cli, requested, observed = review_profile_models()[profile]
+    models = report.get("observed_models")
+    if cli == "claude":
+        models_fit = isinstance(models, dict) and isinstance(models.get(observed), dict)
+    else:
+        models_fit = models == [observed]
+    if report.get("requested_model") != requested or not models_fit:
+        fail(f"review report models do not belong to profile {profile}")
+    session = report.get("session_id")
+    if not isinstance(session, str) or not session:
+        fail("review report has no review session_id")
+    for other in REVIEW_ROLES:
+        previous = entry["results"].get(other)
+        if other != args.role and isinstance(previous, dict) and (
+            previous.get("artifact_sha256") == digest
+            or previous.get("review_session_id") == session
+        ):
+            fail(
+                f"this report is the review already recorded as {other}: one review cannot "
+                "fill both review roles"
+            )
+    capabilities = report.get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    isolation = capabilities.get("tool_isolation")
+    if args.status == "pass" and report.get("gate_ready") is not True:
+        fail("review report is not gate_ready: it cannot be recorded as pass")
+    if not (
+        capabilities.get("primary_model_verified") is True
+        and isinstance(isolation, str)
+        and isolation != "unverified"
+    ):
+        fail(
+            f"review report has no verified model and tool isolation: {args.status} is not recorded"
+        )
+    if report.get("state_packet_hash") != packet_hash:
+        fail("review report state_packet_hash differs from --packet-hash")
+    response = report.get("response")
+    if not isinstance(response, dict) or response.get("reviewed_head") != args.head:
+        fail("review report reviewed_head differs from the result head")
+    fields = {"profile": profile, "artifact_sha256": digest, "review_session_id": session}
+    if profile != OPUS_PROFILE:
+        if args.quota_evidence is not None:
+            fail(f"--quota-evidence is only allowed with a {OPUS_PROFILE} report, got {profile}")
+        return fields
+    # The fallback stands in for a Fable that gave NO review of this HEAD. A Fable pass or
+    # findings in the history (either role, covered or not, overwritten since or not) proves
+    # Fable was available: an older quota report must not let Opus replace or outvote it.
+    for item in entry.get("review_history") or ():
+        if (
+            item.get("profile") == FABLE_PROFILE
+            and item["status"] in ("pass", "findings")
+            and item["head"] == args.head
+        ):
+            fail(
+                f"{item['role']} recorded a {FABLE_PROFILE} review ({item['status']}) of this "
+                f"HEAD: {OPUS_PROFILE} is a fallback only when {FABLE_PROFILE} gave no review"
+            )
+    if args.quota_evidence is None:
+        fail(
+            f"a {OPUS_PROFILE} review is accepted only with --quota-evidence "
+            f"<{FABLE_PROFILE} quota error report for this HEAD and packet>"
+        )
+    evidence, evidence_digest = read_report(args.quota_evidence, "--quota-evidence")
+    if not (
+        evidence.get("profile") == FABLE_PROFILE
+        and evidence.get("status") == "error"
+        and evidence.get("error_category") == "quota"
+        and evidence.get("gate_ready") is False
+    ):
+        fail(
+            f"--quota-evidence must be a {FABLE_PROFILE} review.py report with status error, "
+            "error_category quota and gate_ready false"
+        )
+    if evidence.get("reviewed_head") != args.head or evidence.get("state_packet_hash") != packet_hash:
+        fail("--quota-evidence is not for this HEAD and packet (or predates review.py 1.2.1)")
+    fields["fallback_for"] = FABLE_PROFILE
+    fields["quota_evidence"] = {"artifact": args.quota_evidence, "sha256": evidence_digest}
+    return fields
+
+
+def set_risk(args):
+    """task-risk: raise (or repeat) the task's own risk; lowering it is refused."""
+    if not valid_name(args.task):
+        fail("invalid task id")
+    path = Path(args.manifest)
+    data = read(path)
+    require_v2(data, "task-risk")
+    entry = task(data, args.task)
+    own = entry.get("risk")
+    if own is not None and RISK_ORDER.index(args.risk) < RISK_ORDER.index(own):
+        fail(f"task risk can only be raised: refusing to lower {own} to {args.risk}")
+    entry["risk"] = args.risk
+    risk = task_risk(data, entry)
+    if risk == "high":
+        # the review results recorded below high enter the history now: from here on they
+        # cannot be wiped either
+        known = {item.get("result_id") for item in entry.get("review_history") or ()}
+        for role in REVIEW_ROLES:
+            current = entry["results"].get(role)
+            if isinstance(current, dict) and current.get("result_id") not in known:
+                note_review(entry, role, current)
+    # A task that was ready by the old rules is ready no more once the new ones ask for more.
+    if entry["status"] == "ready_for_pr_review" and not task_ready(entry, risk, data["head"]):
+        entry["status"] = "in_progress"
+    data["updated_at"] = now()
+    write(path, data)
+    print(json.dumps(entry, sort_keys=True))
+
+
+def show_role_model(args):
+    """role-model: the model a coder/tester session of this task must run on. Read-only."""
+    if not valid_name(args.task):
+        fail("invalid task id")
+    data = read(Path(args.manifest))
+    require_v2(data, "role-model")
+    risk = task_risk(data, data["tasks"].get(args.task))
+    print(
+        json.dumps(
+            {
+                "task": args.task,
+                "role": args.role,
+                "risk": risk,
+                "model": role_model(risk),
+                "policy_version": data["review_policy"]["version"],
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def fix_loop(args):
     path = Path(args.manifest)
     data = read(path)
     location = repo(data["repo"])
+    if args.source in V2_ONLY_ROLES:
+        require_v2(data, f"--source {args.source}")
     entry = task(data, args.task)
+    risk = task_risk(data, entry)
     if entry["status"] == "blocked":
         fail("task is blocked after three fix cycles; explicit human reset is required")
     if args.severity is not None and not args.accept:
         fail("--severity is only allowed with --accept")
     if args.accept:
-        record_acceptance(args, entry, data, location)
+        record_acceptance(args, entry, data, location, risk)
     elif args.defer:
-        record_deferral(args, entry, data, location)
+        record_deferral(args, entry, data, location, risk)
     elif args.decision is not None:
         record_decision(args, entry)
     else:
-        record_fix_outcome(args, entry, data, location)
+        record_fix_outcome(args, entry, data, location, risk)
     data["updated_at"] = now()
     write(path, data)
     print(json.dumps(entry, sort_keys=True))
@@ -1259,7 +1782,7 @@ def check_note(note, flag):
         fail("--note must not contain line breaks")
 
 
-def coverable_result(args, entry, data, location, flag):
+def coverable_result(args, entry, data, location, flag, risk):
     """Preconditions shared by --defer and --accept: a reviewer's findings result on
     the current head and tree, in a task that is not waiting for a decision."""
     if entry["status"] == "needs_decision":
@@ -1282,10 +1805,22 @@ def coverable_result(args, entry, data, location, flag):
     ):
         fail(f"working tree changed; run resume before recording {flag[2:]}")
     result_entry = entry["results"].get(args.source)
-    if not isinstance(result_entry, dict) or (
-        result_entry.get("head") != data["head"]
-        or result_entry.get("tree_fingerprint") != data["tree_fingerprint"]
-    ):
+    current = isinstance(result_entry, dict) and (
+        result_entry.get("head") == data["head"]
+        and result_entry.get("tree_fingerprint") == data["tree_fingerprint"]
+    )
+    if risk == "high" and not (current and result_entry.get("status") == "findings"):
+        # The findings may have left the results (`resume` there and back) but not the
+        # history: the disposition is bound to that very result, as if it were still current.
+        left_open = open_review_findings(entry, data["head"], args.source)
+        if left_open:
+            item = left_open[-1]
+            return {
+                "head": item["head"],
+                "recorded_at": item["recorded_at"],
+                "result_sha256": item["result_sha256"],
+            }
+    if not current:
         fail(f"{flag} requires a {args.source} findings result on the current head")
     if result_entry.get("status") != "findings":
         fail(
@@ -1295,55 +1830,57 @@ def coverable_result(args, entry, data, location, flag):
     return result_entry
 
 
-def settle_after_cover(entry):
+def cover_digest(target):
+    """Digest a deferral/acceptance binds to: of a current result, or the one the history kept."""
+    return target.get("result_sha256") or result_digest(target)
+
+
+def settle_after_cover(entry, risk, head):
     """A deferral/acceptance may complete the task. From needs_fix it may only promote to
     ready_for_pr_review (every role pass or covered): update_task_status would otherwise
     demote a still-open needs_fix to in_progress. blocked/needs_decision never get here."""
     if entry["status"] != "needs_fix":
-        update_task_status(entry)
-    elif all(
-        effective_status(entry, role) == "pass"
-        for role in ("coder", "tester", "cross_provider_reviewer")
-    ):
+        update_task_status(entry, risk, head)
+    elif task_ready(entry, risk, head):
         entry["status"] = "ready_for_pr_review"
 
 
-def record_deferral(args, entry, data, location):
+def record_deferral(args, entry, data, location, risk):
     """Defer low/P3-only findings of a reviewer to the next wave/task remainder.
     Spends no fix cycle, touches no per-source counter and is not a decision."""
-    result_entry = coverable_result(args, entry, data, location, "--defer")
+    result_entry = coverable_result(args, entry, data, location, "--defer", risk)
     entry["deferrals"].append(
         {
             "source": args.source,
             "note": args.note,
             "head": result_entry["head"],
-            "result_sha256": result_digest(result_entry),
+            "result_sha256": cover_digest(result_entry),
             "result_recorded_at": result_entry["recorded_at"],
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }
     )
-    settle_after_cover(entry)
+    settle_after_cover(entry, risk, data["head"])
 
 
-def record_acceptance(args, entry, data, location):
+def record_acceptance(args, entry, data, location, risk):
     """Accept a reviewer's findings of any severity as a known limitation (#54).
     Like a deferral it spends no fix cycle and is bound to the exact result; unlike
     a deferral it records the severity so medium/high ones reach the PR body."""
     if args.severity is None:
         fail("--accept requires --severity <low|medium|high>")
-    result_entry = coverable_result(args, entry, data, location, "--accept")
+    result_entry = coverable_result(args, entry, data, location, "--accept", risk)
     entry.setdefault("acceptances", []).append(
         {
             "source": args.source,
             "severity": args.severity,
             "note": args.note,
             "head": result_entry["head"],
-            "result_sha256": result_digest(result_entry),
+            "result_sha256": cover_digest(result_entry),
             "result_recorded_at": result_entry["recorded_at"],
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }
     )
-    settle_after_cover(entry)
+    settle_after_cover(entry, risk, data["head"])
 
 
 def record_decision(args, entry):
@@ -1370,7 +1907,7 @@ def record_decision(args, entry):
     entry["status"] = "needs_fix"
 
 
-def record_fix_outcome(args, entry, data, location):
+def record_fix_outcome(args, entry, data, location, risk):
     if entry["status"] == "needs_decision":
         fail(
             "decision required for source "
@@ -1385,7 +1922,7 @@ def record_fix_outcome(args, entry, data, location):
             or fingerprint(location) != data["tree_fingerprint"]
         ):
             fail("working tree changed; run resume before recording a pass")
-        update_task_status(entry)
+        update_task_status(entry, risk, data["head"])
         if entry["status"] != "ready_for_pr_review":
             entry["status"] = "needs_verification"
         return
@@ -1439,8 +1976,28 @@ def current_verdicts(entry, head, tree):
     }
 
 
-def is_complete(entry, head, tree):
-    step, role, _note = derive_step(entry, current_verdicts(entry, head, tree))
+def current_results(entry, head, tree):
+    """The task's results recorded on the current head and tree."""
+    return {
+        role: item
+        for role, item in ((entry or {}).get("results") or {}).items()
+        if item.get("head") == head and item.get("tree_fingerprint") == tree
+    }
+
+
+def current_gaps(entry, head, tree, risk):
+    if risk != "high" or not entry:
+        return {}
+    return high_risk_gaps(entry, current_results(entry, head, tree), head)
+
+
+def is_complete(entry, head, tree, risk):
+    step, role, _note = derive_step(
+        entry,
+        current_verdicts(entry, head, tree),
+        risk=risk,
+        gaps=current_gaps(entry, head, tree, risk),
+    )
     return step == 7 and role is None
 
 
@@ -1449,10 +2006,14 @@ def pick_task(data, head, tree):
     names = sorted(tasks)
     position = data.get("position")
     marked = position["task"] if position is not None else None
-    if marked in tasks and not is_complete(tasks[marked], head, tree):
+
+    def done(entry):
+        return is_complete(entry, head, tree, task_risk(data, entry))
+
+    if marked in tasks and not done(tasks[marked]):
         return marked
     for name in names:
-        if not is_complete(tasks[name], head, tree):
+        if not done(tasks[name]):
             return name
     if marked in tasks:
         return marked
@@ -1473,12 +2034,24 @@ def one_line(text):
 REVIEW_ORDER = (
     ("tester", 5),
     ("cross_provider_reviewer", 5),
+    ("second_reviewer", 5),
     ("github_codex_review", 7),
+)
+NO_WEAKER_MODEL = (
+    f"a high-risk task requires {FABLE_MODEL}: retry once explicitly or escalate to the owner, "
+    "no substitution by a weaker model (not a fix-loop)"
+)
+SECOND_REVIEW_FALLBACK = (
+    f"; the only fallback is profile {OPUS_PROFILE} recorded with --quota-evidence "
+    f"<{FABLE_PROFILE} quota error report for this HEAD and packet>, no other model"
 )
 
 
-def derive_step(entry, verdicts, last_run=False):
+def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None):
     """Return (step, role, note); note overrides the default next_action.
+    `risk` is the task's effective risk (None for manifest version 1) and `gaps` the
+    high_risk_gaps of its current results: with risk high the second review is required and a
+    passed role named in `gaps` is not a pass.
     On the last permitted run of a wave there is no new `init --from-plan`, but fix rounds
     of the current run go on: findings that break the acceptance are a normal fix-loop
     --outcome failed; only findings outside the acceptance are deferred/accepted."""
@@ -1514,13 +2087,24 @@ def derive_step(entry, verdicts, last_run=False):
             f"record fix-loop --outcome failed --source {disposition[0]} "
             "after disposing the findings",
         )
+    high = risk == "high"
+    gaps = gaps or {}
+    for role in REVIEW_ROLES:
+        # findings of this HEAD that left the results but were never disposed of
+        if gaps.get(role, "").startswith(OPEN_FINDINGS):
+            return 6, "coordinator", gaps[role]
+    if high and verdicts.get("coder") in ("error", "unavailable"):
+        return 4, "coder", f"BLOCKED: coder {verdicts['coder']}; {NO_WEAKER_MODEL}"
     for role, step in REVIEW_ORDER:
         if verdicts.get(role) in ("error", "unavailable"):
+            if high and role == "tester":
+                return step, role, f"BLOCKED: tester {verdicts[role]}; {NO_WEAKER_MODEL}"
             return (
                 step,
                 role,
                 f"BLOCKED: {role} {verdicts[role]}; retry once explicitly "
-                "or escalate to the owner (not a fix-loop)",
+                "or escalate to the owner (not a fix-loop)"
+                + (SECOND_REVIEW_FALLBACK if role == "second_reviewer" else ""),
             )
     for role, step in REVIEW_ORDER:
         if verdicts.get(role) == "incomplete":
@@ -1535,10 +2119,17 @@ def derive_step(entry, verdicts, last_run=False):
         if verdicts.get("coder") is not None:
             return 4, "coder", "step 4 coder: coder must finish or fix before tester"
         return 4, "coder", None
+    if "coder" in gaps:
+        return 4, "coder", f"step 4 coder: {gaps['coder']}"
     if verdicts.get("tester") != "pass":
         return 5, "tester", None
-    if verdicts.get("cross_provider_reviewer") != "pass":
-        return 5, "cross_provider_reviewer", None
+    if "tester" in gaps:
+        return 5, "tester", f"step 5 tester: {gaps['tester']}"
+    for role in required_roles(risk)[2:]:
+        if verdicts.get(role) != "pass":
+            return 5, role, None
+        if role in gaps:
+            return 5, role, f"step 5 {role}: {gaps[role]}"
     if verdicts.get("github_codex_review") != "pass":
         return 7, "github_codex_review", None
     return 7, None, None
@@ -1561,13 +2152,8 @@ def where(args):
     check = plan_check(data)
     name = pick_task(data, current_head, current_tree)
     entry = data["tasks"].get(name) if name is not None else None
-    results = (entry or {}).get("results", {})
-    current = {
-        role: item
-        for role, item in results.items()
-        if item.get("head") == current_head
-        and item.get("tree_fingerprint") == current_tree
-    }
+    risk = task_risk(data, entry)
+    current = current_results(entry, current_head, current_tree)
     verdicts = {role: item["status"] for role, item in sorted(current.items())}
     deferred_roles = {
         role for role, item in current.items() if is_covered(entry, role, item)
@@ -1576,6 +2162,13 @@ def where(args):
         {"role": role, "status": item["status"], "artifact": item.get("artifact")}
         for role, item in sorted(current.items())
         if item["status"] != "pass" and role not in deferred_roles
+    ]
+    left_open = open_review_findings(entry, current_head) if risk == "high" else []
+    current_ids = {item.get("result_id") for item in current.values()}
+    open_findings += [
+        {"role": item["role"], "status": item["status"], "artifact": item.get("artifact")}
+        for item in left_open
+        if item.get("result_id") not in current_ids
     ]
     # links to the CURRENT results only (head and tree match): data for the next coordinator, not instructions
     artifacts = [
@@ -1586,6 +2179,10 @@ def where(args):
             "reviewed_head": item.get("reviewed_head"),
             "packet_hash": item.get("packet_hash"),
             "session_id": item.get("session_id"),
+            "model": item.get("model"),
+            "profile": item.get("profile"),
+            "fallback_for": item.get("fallback_for"),
+            "quota_evidence": item.get("quota_evidence"),
         }
         for role, item in sorted(current.items())
     ]
@@ -1598,7 +2195,13 @@ def where(args):
     run_max = live_run_cap(run["max"]) if run else None
     run_label = f"{run['index']}/{run_max}" if run else None
     last_run = bool(run) and run["index"] >= run_max
-    step, role, note = derive_step(entry, effective, last_run)
+    step, role, note = derive_step(
+        entry,
+        effective,
+        last_run,
+        risk=risk,
+        gaps=current_gaps(entry, current_head, current_tree, risk),
+    )
     position = data.get("position")
     precode = (
         entry is not None
@@ -1663,6 +2266,12 @@ def where(args):
         for record in (accepted_record(entry, role, item) for role, item in sorted(current.items()))
         if record is not None
     ]
+    if risk == "high":
+        # an acceptance made on this HEAD stays a limitation of this HEAD after its result was replaced
+        for item in (entry or {}).get("review_history") or ():
+            record = history_cover(entry, item, ("acceptances",)) if item["head"] == current_head else None
+            if record is not None and not any(record is seen for seen in acceptances):
+                acceptances.append(record)
     print(
         json.dumps(
             {
@@ -1670,6 +2279,8 @@ def where(args):
                 "plan_check": check,
                 "task": name,
                 "task_status": status_value,
+                "risk": risk,
+                "review_policy": data.get("review_policy"),
                 "step": step,
                 "marked_step": marked_step,
                 "role": role,
@@ -1713,6 +2324,7 @@ def parser():
     q.add_argument("--expect-sha256", default=None)
     q.add_argument("--max-runs", default=None)
     q.add_argument("--runs-file", default=None)
+    q.add_argument("--risk", choices=RISK_ORDER, default=None)
     q.set_defaults(func=init)
     q = sub.add_parser("status", parents=[common])
     q.set_defaults(func=status)
@@ -1730,7 +2342,17 @@ def parser():
     q.add_argument("--artifact")
     q.add_argument("--reviewed-head")
     q.add_argument("--packet-hash")
+    q.add_argument("--model")
+    q.add_argument("--quota-evidence")
     q.set_defaults(func=result)
+    q = sub.add_parser("task-risk", parents=[common])
+    q.add_argument("--task", required=True)
+    q.add_argument("--risk", required=True, choices=RISK_ORDER)
+    q.set_defaults(func=set_risk)
+    q = sub.add_parser("role-model", parents=[common])
+    q.add_argument("--task", required=True)
+    q.add_argument("--role", required=True, choices=MODEL_ROLES)
+    q.set_defaults(func=show_role_model)
     q = sub.add_parser("fix-loop", parents=[common])
     q.add_argument("--task", required=True)
     outcome_or_decision = q.add_mutually_exclusive_group(required=True)

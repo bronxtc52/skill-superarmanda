@@ -3,6 +3,80 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 1.2.1 — 2026-10-05
+
+### Добавлено
+
+- Модель роли по риску (#86): `state.py role-model --task <id> --role <coder|tester>` отдаёт модель по эффективному
+  риску задачи: `high` → Fable (`claude-fable-5-1`), `medium` и `low` → Sonnet (`claude-sonnet-5-5`). Эффективный риск —
+  больший из риска прогона (`review_policy.level`: риск волны при `init --from-plan`, иначе `init --risk`) и риска
+  задачи (`state.py task-risk`, только поднять). Риск волны — нижняя граница и для модели.
+- Модель в metadata результата: `task-result --model` для `coder` и `tester` принимает закрытый словарь
+  (`claude-fable-5-1`, `claude-sonnet-5-5`, алиасы `fable`, `sonnet`; совпадение точное) и пишет полный ID в поле
+  `model`. Для задачи `high` результат без модели Fable отклоняется при любом статусе; `unavailable` с
+  `--model fable` — запись «Fable запрошена и недоступна», `where` отдаёт `BLOCKED` без подмены моделью слабее.
+- Два ревью для задачи `high`: новая роль `second_reviewer`. Задача готова, только когда оба ревью — отчёты
+  `review.py` одного пакета на текущем HEAD, ровно один `claude-host` (Astra) и ровно один `codex-host` (Fable).
+  `state.py` сам читает отчёт из `--artifact` и сверяет профиль, статус, `gate_ready`, HEAD и пакет; в результат
+  пишутся `profile` и `artifact_sha256`. Один Astra, два Astra, Fable без Astra, разные пакеты — не pass, причина
+  стоит в `next_action`.
+- Запасной Opus только с подтверждением квоты: отчёт `codex-host-opus` принимается с `--quota-evidence <отчёт
+  codex-host с error_category: quota для того же HEAD и пакета>`; в manifest остаются оба артефакта
+  (`quota_evidence`, `fallback_for`). Auth, таймаут и прочая недоступность Fable — не pass, без отката на Sonnet.
+- `review.py`: отчёт ошибки несёт `reviewed_head` и `state_packet_hash`, когда пакет загружен и сверен с
+  репозиторием (нужно для quota evidence); при более ранней ошибке полей нет.
+- `review.py`: категория `quota` Claude-профилей выводится только из сигнала провайдера — события потока
+  `assistant` с верхнеуровневым `error: "rate_limit"`, которое CLI пишет сам. Слова «quota» и «rate limit» в
+  тексте модели, цитатах пакета, stderr и выводе `claude auth status` её больше не дают (раньше сбой
+  авторизации с таким словом в выводе получал `quota` и открывал запасной Opus). Признак auth, таймаута,
+  транспорта или отказа рядом с сигналом квоты — не `quota`. Изменение поведения: сбой, где о квоте говорит
+  только текст stderr, теперь `cli_exit`. Событие считается сигналом, только если его написал сам CLI
+  (`message.model: "<synthetic>"`, `is_api_error_message: true`), а `api_error_status` события `result`, если
+  он есть, равен 429. Форма события снята с живого потока Claude Code 2.1.289 (ошибка провайдера 404,
+  `tests/fixtures/transcripts/stream-provider-error.jsonl`), значение `rate_limit` и статус 429 — с живого журнала
+  сессии; живого потока при 429 нет (#91), ошибка возможна только в закрытую сторону. Прочие категории сбоя
+  Claude-профиля берутся только из stderr: stdout — поток событий, и живое событие `result` содержит счётчик
+  `refused`, из-за которого текстовая эвристика по stdout всегда отвечала `refusal`.
+- Сказанное ревью о HEAD нельзя отменить: для задачи `high` ведётся дописываемая история результатов ревью
+  `review_history` (новый ключ задачи; не очищается ни новой записью роли, ни `resume`). Запасной Opus — только
+  вместо Fable, которая ревью не дала: запись `codex-host-opus` — отказ, если в истории на этом HEAD есть `pass`
+  или `findings` профиля `codex-host` в любой роли, что бы ни было записано позже. Непокрытые `findings` роли
+  ревью на этом HEAD не дают задаче стать готовой и не дают записать другой результат роли — в том числе после
+  перезаписи и после `resume` туда-обратно; выход — `fix-loop --defer`/`--accept` на тот результат или новый
+  коммит. Принятое ограничение остаётся в `where.accepted_limitations` после замены результата. Для `medium`,
+  `low` и manifest `version: 1` история не ведётся, поведение прежнее.
+- `review.py` выключает третий встроенный плагин Claude CLI 2.1.289 `cc-plugin-plugin-authoring@builtin`: без этого
+  `init.plugins` непуст и ревью профилей `codex-host`/`codex-host-opus` не получает `gate_ready: true`. Правило
+  «новый или не выключенный плагин оставляет `gate_ready: false`» остаётся.
+- `review.py` делит поток `stream-json` только по `\n`: U+2028, U+2029 и NEL в тексте модели больше не роняют
+  успешное ревью и не читаются как событие.
+- `state.py` сверяет отчёт ревью с его же профилем (`requested_model`, `observed_models` по таблице
+  `review.PROFILE_MODELS`) и требует `session_id` ревью; один отчёт или одна сессия ревью не закрывает обе роли
+  (`review_session_id` в результате). `observed_models`: у Astra ровно одна модель, у Claude-профилей основная
+  модель в `modelUsage` и `primary_model_verified: true` для `pass` и `findings`. Подлинность неподписанного
+  отчёта по-прежнему не доказывается.
+- `where` отдаёт `risk`, `review_policy`, а в `artifacts` — `model`, `profile`, `fallback_for`, `quota_evidence`.
+- Документация: таблица моделей по риску и шаблон брифа с `state.py role-model` (`profiles.md`), команда ревью
+  задачи `high` и определение quota evidence (`review-contract.md`), шаблон тела PR со строкой о запасном
+  Opus-ревью (`pr-review.md`), правило «задачи про безопасность и маскировку обязаны иметь `risk: high`»
+  (`profiles.md`, `waves.md`).
+
+### Изменено
+
+- **Граница совместимости:** manifest `version: 1` оценивается по правилам 1.2.0 (одно ревью, модель не
+  требуется; `role-model`, `task-risk`, `--model`, `second_reviewer`, `--quota-evidence` на нём — отказ); новые
+  manifest — `version: 2` с полем `review_policy`; pass задачи `high` требует двух ревью и модели Fable в metadata
+  результатов coder и tester. Manifest `version: 2` без `review_policy`, с неизвестной версией политики или
+  уровнем — закрытый отказ любой команды.
+- **High на Codex-хосте:** задача `risk: high` требует Fable у coder и tester, а Codex-хост ведёт роли на
+  `gpt-5.6-terra`. Такие задачи ведутся на Claude Code host; на хосте без Fable роль записывается
+  `task-result --status unavailable --model fable`, задача не pass — это ожидаемое поведение, подмены нет, отказ
+  `task-result` с другой моделью называет этот выход. Модель для high на Codex-хосте — решение владельца (#92).
+  Medium и low на Codex-хосте — как в 1.2.0.
+- Гейт мерджа диспетчера волн читает manifest `version: 2` без изменений правил; собственная проверка двух ревью
+  в гейте — следующая волна цепочки (#86).
+- Фикстуры тестов не содержат домашних путей и имён хоста: заглушки `@HOME@`/`@PATH@`, проверка — тест.
+
 ## 1.2.0 — 2026-10-05
 
 ### Исправлено

@@ -747,18 +747,31 @@ def authenticated(cli, timeout, env, cwd):
 
 
 DISABLED_BUILTIN_PLUGINS = json.dumps(
-    {"enabledPlugins": {"agents-md@builtin": False, "telemetry@builtin": False}},
+    {
+        "enabledPlugins": {
+            "agents-md@builtin": False,
+            "telemetry@builtin": False,
+            # Claude CLI 2.1.289 loads this one under --safe-mode as well
+            "cc-plugin-plugin-authoring@builtin": False,
+        }
+    },
     separators=(",", ":"),
 )
 
 
+# profile -> (CLI, model the runner requests, model the CLI must be observed running).
+# The single table behind `profiles()`, the `requested_model` of a report and the consistency
+# check `state.py` applies to a report before it counts as a review of that profile.
+PROFILE_MODELS = {
+    "claude-host": ("codex", "gpt-6-astra", "gpt-6-astra"),
+    "codex-host": ("claude", "fable", "claude-fable-5-1"),
+    "codex-host-opus": ("claude", "claude-opus-5-5", "claude-opus-5-5"),
+}
+
+
 def profiles(host):
-    claude_profiles = {
-        "codex-host": "fable",
-        "codex-host-opus": "claude-opus-5-5",
-    }
-    if host in claude_profiles:
-        selector = claude_profiles[host]
+    if PROFILE_MODELS[host][0] == "claude":
+        selector = PROFILE_MODELS[host][1]
         return (
             "claude",
             selector,
@@ -790,14 +803,19 @@ def profiles(host):
                 SCHEMA.read_text(),
             ],
         )
-    return "codex", "gpt-6-astra", None
+    return PROFILE_MODELS[host][0], PROFILE_MODELS[host][1], None
 
 
 def expected_primary_model(profile):
-    return {
-        "codex-host": "claude-fable-5-1",
-        "codex-host-opus": "claude-opus-5-5",
-    }.get(profile)
+    cli, _requested, observed = PROFILE_MODELS[profile]
+    return observed if cli == "claude" else None
+
+
+def stream_lines(stdout):
+    """Events of a Claude stream-json output. The format is JSONL: only "\n" ends an event.
+    `str.splitlines()` would also cut at U+2028, U+2029, NEL and the other separators that are
+    legal unescaped inside a JSON string, that is inside the model's text."""
+    return stdout.split("\n")
 
 
 def response_from_stdout(cli, stdout, expected_model="claude-fable-5-1"):
@@ -839,7 +857,7 @@ def response_from_stdout(cli, stdout, expected_model="claude-fable-5-1"):
         return json_value(messages[0], "Codex agent message"), {"events": "completed"}
     events = [
         json_value(line, "Claude stream event")
-        for line in stdout.splitlines()
+        for line in stream_lines(stdout)
         if line.strip()
     ]
     if any(not isinstance(event, dict) for event in events):
@@ -1027,12 +1045,14 @@ def transient(code, stderr):
 
 
 def cli_error_category(output, error):
-    """Return a small diagnostic code without retaining CLI output or secrets."""
+    """Return a small diagnostic code without retaining CLI output or secrets.
+
+    A heuristic over free text, good for diagnostics only. It never answers `quota`: that
+    category opens the Opus fallback (`state.py --quota-evidence`), and the text it reads holds
+    the model's words and quotes of the packet. See `claude_failure_category`."""
     value = (output + "\n" + error).casefold()
     if "invalid_json_schema" in value:
         return "invalid_json_schema"
-    if re.search(r"\b(?:quota|rate limit)\b", value):
-        return "quota"
     if re.search(r"\brefus(?:e|al|ed|ing)?\b", value):
         return "refusal"
     if re.search(
@@ -1044,6 +1064,86 @@ def cli_error_category(output, error):
     if re.search(r"\b(?:network|connection) (?:failure|error|reset)\b", value):
         return "transport"
     return "cli_exit"
+
+
+# Error codes the Claude CLI puts on the assistant message it writes ITSELF when the provider
+# refuses a request. Shape of the stream event, from a live run of Claude Code 2.1.289
+# (tests/fixtures/transcripts/stream-provider-error.jsonl): `type: assistant`, top-level `error`
+# and `is_api_error_message`, `message.model: "<synthetic>"`, then a `result` event with
+# `is_error: true` and `api_error_status`. The value `rate_limit` with HTTP 429 is live in session
+# journals (rate-limit-assistant.jsonl); a live STREAM of an exhausted subscription has not been
+# captured (#91), so a mistake here can only withhold `quota`, never grant it.
+# `error` sits beside `message`, not inside it: neither the model's text nor a quote of the
+# packet can set it, and the model does not write messages of the model "<synthetic>".
+PROVIDER_QUOTA_ERROR = "rate_limit"
+PROVIDER_QUOTA_STATUS = 429
+SYNTHETIC_MODEL = "<synthetic>"
+PROVIDER_AUTH_ERRORS = {
+    "authentication_failed",
+    "oauth_org_not_allowed",
+    "account_on_hold",
+    "verification_required",
+}
+
+
+def claude_stream_facts(stdout):
+    """(provider error codes, api_error_status values) of a Claude stream.
+
+    A code counts only on an `assistant` event the CLI wrote itself (`message.model` is
+    "<synthetic>" and `is_api_error_message` is true) and only as a non-empty string; an `error` anywhere else on an assistant
+    event, a line with duplicate keys, a non-string code are recorded as `invalid`. A line that
+    is not one JSON object is not an event and carries no signal."""
+    codes, statuses = set(), []
+    for line in stream_lines(stdout):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line, object_pairs_hook=reject_duplicate_keys)
+        except (ValueError, RecursionError):
+            if '"error"' in line:
+                codes.add("invalid")
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "result" and "api_error_status" in event:
+            statuses.append(event["api_error_status"])
+        if event.get("type") == "assistant" and "error" in event:
+            code, message = event["error"], event.get("message")
+            own = (
+                isinstance(message, dict)
+                and message.get("model") == SYNTHETIC_MODEL
+                and event.get("is_api_error_message") is True
+            )
+            codes.add(code if own and isinstance(code, str) and code else "invalid")
+    return codes, statuses
+
+
+def claude_provider_errors(stdout):
+    return claude_stream_facts(stdout)[0]
+
+
+def claude_failure_category(stdout, stderr):
+    """Category of a failed Claude review run.
+
+    `quota` only on the provider's own signal and only when nothing contradicts it: every
+    provider error code of the stream is `rate_limit`, every `api_error_status` the stream
+    reports is 429, and stderr (the CLI's own diagnostics) names no more specific failure.
+    An auth code is auth. Everything else is the text heuristic over STDERR alone: stdout is the
+    event stream, whose text belongs to the model and the packet and whose JSON keys (a live
+    `result` event has a `refused` counter) are not diagnostics; that heuristic cannot answer
+    `quota`."""
+    codes, statuses = claude_stream_facts(stdout)
+    if codes & PROVIDER_AUTH_ERRORS:
+        return "auth"
+    from_stderr = cli_error_category("", stderr)
+    if (
+        codes == {PROVIDER_QUOTA_ERROR}
+        and from_stderr == "cli_exit"
+        and all(type(status) is int and status == PROVIDER_QUOTA_STATUS for status in statuses)
+    ):
+        return "quota"
+    return from_stderr
 
 
 def verify_packet_repo(repo, envelope):
@@ -1112,19 +1212,24 @@ def failure_category(exc):
     return "validation"
 
 
-def write_error(output, profile, attempts, category):
+def write_error(output, profile, attempts, category, envelope=None):
+    """Write the error report. `envelope` is the packet envelope once it has been loaded AND
+    verified against the repository: only then does the report name the HEAD and the packet
+    the failed review was for (what `state.py --quota-evidence` checks). Nothing else of the
+    packet and no raw CLI diagnostics go into the report."""
+    value = {
+        "status": "error",
+        "profile": profile,
+        "attempts": attempts,
+        "error": "review failed",
+        "error_category": category,
+        "gate_ready": False,
+    }
+    if envelope is not None:
+        value["reviewed_head"] = envelope["packet"]["head"]
+        value["state_packet_hash"] = state_packet_hash(envelope)
     try:
-        write_result(
-            output,
-            {
-                "status": "error",
-                "profile": profile,
-                "attempts": attempts,
-                "error": "review failed",
-                "error_category": category,
-                "gate_ready": False,
-            },
-        )
+        write_result(output, value)
         return True
     except OSError:
         return False
@@ -1136,9 +1241,11 @@ def review(args):
     packet_path = absolute_lexical(args.packet)
     reject_output_aliases(output, packet_path)
     attempts = []
+    verified_envelope = None
     try:
         envelope, raw = load_packet(packet_path, args.max_bytes)
         verify_packet_repo(repo, envelope)
+        verified_envelope = envelope
         cli, requested, command = profiles(args.profile)
         env = scrubbed_environment()
         prompt = (
@@ -1202,6 +1309,9 @@ def review(args):
                     command, args.timeout, env, cwd, prompt
                 )
                 attempts.append({"state": state, "returncode": code})
+                if state == "ok" and code == 0 and claude_provider_errors(stdout):
+                    # the provider refused the request; whatever else the stream holds is no review
+                    fail(f"review CLI failed: {claude_failure_category(stdout, stderr)}")
                 if state == "ok" and code == 0:
                     response, metadata = response_from_stdout(
                         cli, stdout, expected_primary_model(args.profile)
@@ -1257,7 +1367,7 @@ def review(args):
                 if state == "timeout":
                     fail("review CLI failed: timeout")
                 if not transient(code, stderr) or attempt:
-                    fail(f"review CLI failed: {cli_error_category(stdout, stderr)}")
+                    fail(f"review CLI failed: {claude_failure_category(stdout, stderr)}")
         fail("review CLI failed")
     except (
         ValueError,
@@ -1267,7 +1377,9 @@ def review(args):
         AttributeError,
         RecursionError,
     ) as exc:
-        if not write_error(output, args.profile, attempts, failure_category(exc)):
+        if not write_error(
+            output, args.profile, attempts, failure_category(exc), verified_envelope
+        ):
             print("review: output unavailable", file=sys.stderr)
         else:
             print("review: validation failed", file=sys.stderr)

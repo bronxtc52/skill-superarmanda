@@ -29,9 +29,12 @@ worktree с собственным origin пользователя. Устано
    После подтверждённого provider quota event/notice Fable coordinator может
    сделать отдельную Opus-попытку через `codex-host-opus`, сохранив оба artifact;
    никакой runner не переключает профиль автоматически.
+   Задача с риском high проходит два ревью одного пакета — Astra (`cross_provider_reviewer`) и
+   Fable (`second_reviewer`); команда и правила — в [review-contract.md](review-contract.md).
 5. Findings возвращаются coder. После каждой неудачной corrective attempt, включая failure от
    fresh tester, единственный coordinator вызывает `fix-loop --outcome failed --source <источник>`,
-   где источник — `cross_provider_reviewer` (единственный решающий task reviewer),
+   где источник — `cross_provider_reviewer` (решающий task reviewer; при риске high второй
+   решающий — `second_reviewer`),
    `github_codex_review` (PR-гейт), `coderabbit` (advisory: его находки разбираются, но его два
    круга тоже ведут к решению) или `tester`; coder → tester → reviewer повторяется. Это ручная
    дисциплина coordinator, а не автономное доказательство durable enforcement. Третья неудача
@@ -103,8 +106,53 @@ reviewer или Codex-гейта точки покоя нет: сначала д
 
 `SUPERARMANDA_DIR` задаётся для выбранного host в [profiles.md](profiles.md).
 
-`python3 "$SUPERARMANDA_DIR/scripts/state.py" init --manifest <path> --repo <repo> --base <sha> --head <sha>`
-creates one manifest atomically. Before any result after a code or working-tree change, run
+`python3 "$SUPERARMANDA_DIR/scripts/state.py" init --manifest <path> --repo <repo> --base <sha> --head <sha> [--risk <low|medium|high>]`
+creates one manifest atomically.
+
+**Manifest `version: 2` и политика ревью (1.2.1, #86).** Новый manifest несёт `"version": 2` и
+`"review_policy": {"version": "1.2.1", "level": "<low|medium|high>"}`. `level` — риск прогона:
+риск волны при `init --from-plan` (`--risk` вместе с `--from-plan` — отказ), иначе `--risk`, по
+умолчанию `low`. Каждая команда, читающая manifest, проверяет схему одной функцией: неизвестная
+`version`, `version: 2` без `review_policy`, с лишними или недостающими ключами, с неизвестной
+версией политики или уровнем — закрытый отказ, manifest не меняется. Manifest `version: 1`
+оценивается строго по правилам 1.2.0 (одно ревью, модель не требуется); всё перечисленное ниже на
+нём — отказ `requires manifest version 2`.
+
+- `task-risk --manifest <path> --task <id> --risk <low|medium|high>` — собственный риск задачи
+  (поле `risk` задачи). Только поднять или повторить; понижение — отказ. Эффективный риск —
+  больший из `review_policy.level` и риска задачи; после подъёма готовая задача, не
+  удовлетворяющая новым правилам, перестаёт быть `ready_for_pr_review`.
+- `role-model --manifest <path> --task <id> --role <coder|tester>` — read-only, одна строка JSON
+  `{"task", "role", "risk", "model", "policy_version"}`: high → `claude-fable-5-1`, иначе
+  `claude-sonnet-5-5`. Задача может ещё не существовать.
+- `task-result --model <fable|sonnet|claude-fable-5-1|claude-sonnet-5-5>` — только роли `coder` и
+  `tester`; в результат пишется полный ID в поле `model`. Для задачи high флаг обязателен при любом
+  статусе и обязан означать Fable. Fable недоступна — `task-result --role <coder|tester> --status
+  unavailable --model fable`: запись «Fable запрошена и недоступна», поле `model` результата,
+  `where` отдаёт `BLOCKED` без подмены моделью слабее. То же на хосте без Fable (Codex host):
+  задачи `risk: high` ведутся на Claude Code host, на Codex-хосте такая запись и не-pass задачи —
+  ожидаемое поведение, а не сбой (#92); отказ `task-result` с другой моделью сам называет этот
+  выход. Для medium и low `--model` необязателен, `role-model` — рекомендация для Claude-хоста.
+- роль `second_reviewer` — второе ревью задачи (шаг 5 после `cross_provider_reviewer`), источник
+  для `fix-loop --outcome failed`, `--defer` и `--accept` по тем же правилам.
+- `task-result --quota-evidence <путь>` — только с отчётом профиля `codex-host-opus` у ревью
+  задачи high; правила — в [review-contract.md](review-contract.md). В результат ревью high
+  пишутся `profile`, `artifact_sha256`, `review_session_id`, а для запасного Opus — `fallback_for` и
+  `quota_evidence`. Один отчёт или одна сессия ревью не закрывает обе роли ревью задачи. Для задачи
+  high ведётся дописываемая история `review_history` (ключ задачи; не очищается ни новой записью, ни
+  `resume`), и правила смотрят в неё: Opus не записывается, если Fable хоть раз дала `pass` или
+  `findings` на этом HEAD; непокрытые `findings` роли ревью на этом HEAD не дают задаче стать готовой
+  и не дают записать поверх другой результат роли, пока нет `fix-loop --defer`/`--accept` на тот
+  результат или нового коммита. Подробно — [review-contract.md](review-contract.md).
+- `where` дополнительно отдаёт `risk` (эффективный риск задачи), `review_policy`, а в `artifacts` —
+  `model`, `profile`, `fallback_for`, `quota_evidence`. Причина, по которой задача high не готова
+  (не та модель, не та пара профилей, разные пакеты, Opus без подтверждения квоты), стоит в
+  `next_action`.
+
+Гейт мерджа диспетчера волн в 1.2.1 читает manifest `version: 2` и статус задачи, который ставит
+`state.py`; собственная проверка двух ревью в гейте — следующая волна (#86).
+
+Before any result after a code or working-tree change, run
 `resume` with the same `--repo --base` and current `--head`; it removes stale results but keeps
 `fix_cycles`, `fix_sources`, `decisions` and `decision_required_for`. A `needs_decision` status is
 never reset by `resume`, even when it also invalidates stale role results for that task. Один
@@ -117,8 +165,8 @@ tree it downgrades every displayed task status to `pending` for the printed repo
 mirroring what `resume` itself preserves.
 
 Record a role with `task-result --task <id> --role <role> --status <status> --session-id <id> --head <sha>`.
-The only valid roles are `coder`, `tester`, `cross_provider_reviewer`,
-`github_codex_review`, and `coderabbit`; valid statuses are `pass`, `findings`,
+The only valid roles are `coder`, `tester`, `cross_provider_reviewer`, `second_reviewer`
+(manifest version 2 only), `github_codex_review`, and `coderabbit`; valid statuses are `pass`, `findings`,
 `incomplete`, `error`, and `unavailable`.
 Cross-provider `pass` must contain matching `--reviewed-head <sha>` and `--packet-hash`: either
 `sha256:<64 lowercase hex>` (the report field `state_packet_hash` of `review.py run`) or the bare
@@ -131,12 +179,14 @@ assert its continued existence; coordinator validates the artifact and adapter r
 `gate_ready: true` before recording a pass.
 The script rejects a session ID used by another task or role anywhere in the run and rejects a changed worktree
 until `resume`. A task becomes `ready_for_pr_review` only when current coder, tester and
-cross-provider reviewer results all pass; a reviewer `findings` result counts as passed only
+cross-provider reviewer results all pass (a high-risk task of a version 2 manifest also needs
+Fable models and the `second_reviewer`, see above); a reviewer `findings` result counts as passed only
 through a `fix-loop --defer` bound to exactly that result (its digest and head). GitHub Codex review remains a separate PR gate;
 CodeRabbit cannot satisfy either gate. `fix-loop --outcome failed --source <source>` persists each
 failed round and increments both the task-wide `fix_cycles` and the per-source `fix_sources[source]`
 counter; `--source` is required with `--outcome failed`, rejected with `--outcome pass`, and must be
-one of `cross_provider_reviewer` (the only decisive task reviewer), `github_codex_review` (the PR
+one of `cross_provider_reviewer` (the decisive task reviewer), `second_reviewer` (the second
+decisive task reviewer of a high-risk task), `github_codex_review` (the PR
 gate), `coderabbit` (advisory: its findings are triaged, but two rounds from it also force a
 decision) or `tester`. The third failed round still makes the task permanently `blocked` in v1,
 unchanged from before. Two-round-per-source limit: when, after the increment, a source's own count
@@ -155,8 +205,8 @@ global cap has not already fired first. `fix-loop --outcome pass` never substitu
 role results. Legacy manifests without `fix_sources`/`decisions`/`decision_required_for` get them
 defaulted via `setdefault` on first touch. `fix-loop --defer --source <source> --note <text>`
 (mutually exclusive with `--outcome`/`--decision`) records a deferral of low/P3-only findings into the
-remainder of the next wave/task: `--source` must be `cross_provider_reviewer`, `github_codex_review`
-or `coderabbit` (never `tester`), the task must hold a `findings` result of that role on the current
+remainder of the next wave/task: `--source` must be `cross_provider_reviewer`, `second_reviewer`,
+`github_codex_review` or `coderabbit` (never `tester`), the task must hold a `findings` result of that role on the current
 head and tree, `--note` follows the `--decision` rules, and the task must not be `blocked` or
 `needs_decision`. It appends `{source, note, head, result_recorded_at, recorded_at}` to `deferrals`
 (not to `decisions`) and leaves `fix_cycles`, `fix_sources` and `decision_required_for` untouched.
