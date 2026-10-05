@@ -9037,9 +9037,11 @@ class OwnerMerge(GateBase):  # D3
         self.assertTrue(b.read_text(encoding="utf-8").rstrip().endswith("W1 2099-01-01 " + "e" * 40))
 
     def test_the_reasons_of_the_second_gate_are_masked_in_the_exit_text(self):  # #84
+        runs = json.loads(json.dumps(self.facts["check_runs"]))
         for name in ("build password\u200b=Hunter2SecretValue99", "build password=Hunter2SecretValue99",
                      "build ghp_AbCd1234EfGh5678IjKl9012MnOp3456"):
             with self.subTest(name=name):
+                self.facts["check_runs"] = json.loads(json.dumps(runs))  # the first gate passes again
                 for t in self.facts["threads"]:
                     t["isResolved"] = t["id"] == "PRRT_b"
                 self.order.clear()
@@ -14990,6 +14992,7 @@ JOIN_ALLOWLIST = {
     ("wab.py", "process_table", "_masked_line(f'ps: {type(e).__name__}: {_exc_text(e)}', 150)"): "raw error text of ps, no policy",
     ("wab.py", "handoff_gate_line", "_masked_line('; '.join(v['reasons']), 300)"): "raw reasons of the gate, no policy",
     ("wab.py", "owner_merge", "_masked_line('; '.join(v['reasons']), 600)"): "raw reasons of the gate, no policy",
+    ("wab.py", "owner_merge", "_masked_line('; '.join(v2['reasons']), 600)"): "raw reasons of the second gate, no policy (#84)",
 }
 
 
