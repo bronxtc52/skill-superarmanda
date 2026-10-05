@@ -2658,6 +2658,8 @@ def plan_review_problem(cfg):
                 "plan_sha256 and reviewed by both reviewers")
     state, review = gate.state, review_py()
     pin, directory = cfg["plan_sha256"], cfg["run_dir"] / PLAN_REVIEW_DIR
+    if directory.is_symlink():  # like the files inside (O_NOFOLLOW): the reviews live in the run directory itself
+        return f"{PLAN_REVIEW_DIR}/ is a symlink: it must be a real directory inside the run directory"
     if not directory.is_dir():
         return f"no {PLAN_REVIEW_DIR}/ in the run directory"
     try:
@@ -2668,6 +2670,11 @@ def plan_review_problem(cfg):
         recorded = None
     if recorded is None:
         return "plan.sha256 is missing or unreadable"
+    # the bare hash or a line of `sha256sum waves.json`: the first field is the hash
+    recorded = (recorded.split() or [""])[0]
+    if not MANDATE_PIN.fullmatch(recorded):
+        return ("plan.sha256 must start with the sha256 of the approved waves.json as 64 lowercase hex characters "
+                "(the bare hash or a line of `sha256sum waves.json`)")
     if recorded != pin:
         return "plan.sha256 differs from chain.json plan_sha256: the reviews are of another plan"
     try:
@@ -2803,9 +2810,6 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     check_plan_pin(cfg)  # before prepare_clone, the workdir and the STARTING record
     if not st["waves"]:  # a NEW chain: no wave of this run was ever launched
         check_plan_review(cfg)
-    if not cfg["model"] and not st.get("model_warned"):
-        event(cfg, NO_MODEL_WARNING)  # once per run: the mark is saved with the launch intent
-        st["model_warned"] = True
     wdir = wave_dir(cfg, wave)
     cur = st.get("current")
     restart = cur == wave and st["waves"].get(cur, {}).get("phase") in STOPPED
@@ -2873,7 +2877,12 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
         st["waves"][wave]["restart"] = len(attempts) + 1
     if carried:
         st["waves"][wave]["outbox"] = carried
+    warn_model = not cfg["model"] and not st.get("model_warned")
+    if warn_model:
+        st["model_warned"] = True  # once per run: the mark is saved with the launch intent, the event follows it
     save_state(cfg, st)
+    if warn_model:  # after every refusal of this launch: a refused and repeated launch does not repeat it
+        event(cfg, NO_MODEL_WARNING)
     start_session(cfg, st, wave)
     return deliver_first_prompt(cfg, st, wave)
 

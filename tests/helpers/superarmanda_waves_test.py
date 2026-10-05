@@ -16521,6 +16521,34 @@ class W2PlanReview(PlanReviewBase):
         self.report(repo, packet, "codex-host", d / "result-codex-host.json", "quota_failure")
         self.launched(cfg)
 
+    def test_plan_review_directory_must_not_be_a_symlink(self):
+        """tester F3: the files inside cannot be symlinks; the directory itself cannot either."""
+        cfg, _ = self.new_chain()
+        d, _, _ = self.reviewed(cfg)
+        real = cfg["run_dir"] / "plan-review-elsewhere"
+        d.rename(real)
+        d.symlink_to(real, target_is_directory=True)
+        self.refused(cfg, "plan-review", "symlink")
+        d.unlink()
+        real.rename(d)
+        self.launched(cfg)
+
+    def test_plan_sha256_file_may_be_a_line_of_sha256sum(self):
+        """tester F4: `<hex>  waves.json` (what `sha256sum waves.json > plan.sha256` writes) is the same pin."""
+        for index, text in enumerate((f"{self.pin}  waves.json\n", f"{self.pin} *waves.json\n", self.pin)):
+            with self.subTest(text=text):
+                cfg, _ = self.new_chain(run_id=f"r-ok-{index}")
+                d, _, _ = self.reviewed(cfg)
+                (d / "plan.sha256").write_text(text, encoding="utf-8")
+                self.launched(cfg)
+        for index, text in enumerate(("", "waves.json\n", self.pin.upper() + "\n", f"sha256:{self.pin}\n",
+                                      self.pin[:63] + "\n")):
+            with self.subTest(bad=text):
+                cfg, _ = self.new_chain(run_id=f"r-bad-{index}")
+                d, _, _ = self.reviewed(cfg)
+                (d / "plan.sha256").write_text(text, encoding="utf-8")
+                self.refused(cfg, "plan.sha256", "64 lowercase hex")
+
     def test_new_chain_without_the_plan_pin_is_refused(self):
         cfg, _ = self.chain()
         text = self.refused(cfg, "plan_sha256")
@@ -16621,6 +16649,19 @@ class W2ModelWarning(PlanReviewBase):
         self.put_state(cfg, st)
         self.launched(cfg, "W2")
         self.assertEqual(len(self.warnings(cfg)), 1)
+
+    def test_launch_that_fails_after_the_checks_and_is_repeated_warns_once(self):
+        """review of Fable: the warning goes out with the saved launch intent, not before the later refusals."""
+        cfg, _ = self.new_chain()
+        self.reviewed(cfg)
+        with mock.patch.object(wab, "prepare_clone", side_effect=SystemExit("admission refused")):
+            for _ in range(2):
+                with self.assertRaises(SystemExit):
+                    wab.launch(cfg, "W1", self.prompt)
+        self.assertEqual(self.warnings(cfg), [])  # nothing was launched: nothing to warn about yet
+        self.launched(cfg)
+        self.assertEqual(len(self.warnings(cfg)), 1)
+        self.assertIs(self.get_state(cfg).get("model_warned"), True)
 
     def test_launch_with_model_does_not_warn(self):
         cfg, _ = self.new_chain(model="claude-fable-5-1")

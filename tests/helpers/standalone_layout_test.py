@@ -190,7 +190,10 @@ class ReleaseWaveGateDocs(unittest.TestCase):
         gate = flat(text.split("### Гейт мерджа: `merge_gate: auto`", 1)[1].split("\n### ", 1)[0])
         for needle in ("Риск волны", "`<run_dir>/waves.json`", "`plan_sha256`", "каждая задача", "`second_reviewer`",
                        "`version: 1`", "новый прогон волны", "`review_policy.level`", "`review_history`",
-                       "не верит сохранённому", "закрытый отказ"):
+                       "не верит сохранённому", "закрытый отказ",
+                       # fix round 1: the highest known risk, the traces of the high policy, the honest border
+                       "`wave.risk`", "наибольший", "`plan.wave_sha256`", "Записи политики high",
+                       "Известная граница", "manifest не подписан"):
             with self.subTest(needle=needle):
                 self.assertIn(needle, gate)
 
@@ -212,7 +215,8 @@ class ReleaseWaveGateDocs(unittest.TestCase):
                 with self.subTest(part=name, needle=needle):
                     self.assertIn(needle, part)
         for needle in ("`plan.sha256`", "`packet.json`", "`result-claude-host.json`", "`result-codex-host.json`",
-                       "`result-codex-host-opus.json`", "`state_packet_hash`", "`wab.py launch`", "прошлых кругов"):
+                       "`result-codex-host-opus.json`", "`state_packet_hash`", "`wab.py launch`", "прошлых кругов",
+                       "`sha256sum waves.json`", "не симлинк"):
             with self.subTest(needle=needle):
                 self.assertIn(needle, whole)
         # the installed skill is updated only between waves

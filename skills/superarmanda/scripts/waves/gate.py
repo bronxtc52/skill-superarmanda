@@ -310,6 +310,36 @@ TWO_REVIEWS = ("нужны два gate_ready-ревью текущего HEAD: c
                "`state.py task-result --role second_reviewer`")
 # Fields of a result that only the policy of manifest version 2 writes (state.py result/verified_review).
 V2_RESULT_KEYS = ("model", "profile", "artifact_sha256", "review_session_id", "fallback_for", "quota_evidence")
+# Fields state.py writes only into a task review of a HIGH-risk task (verified_review); `model` is not one of them.
+HIGH_RESULT_KEYS = ("profile", "artifact_sha256", "review_session_id", "fallback_for", "quota_evidence")
+
+
+def _high_traces(name, entry, results):
+    """What a task carries of the high policy: state.py keeps `review_history` and the fields of a verified
+    report only for a task whose risk is high, and a risk is never lowered by it. On a task judged below high
+    they mean the risk (the task's own or the level of the run) was lowered by hand. The role `second_reviewer`
+    alone is no trace: below high it is an optional review."""
+    traces = [f"{name}.review_history"] if entry.get("review_history") else []
+    for role in state.REVIEW_ROLES:
+        res = results.get(role)
+        if isinstance(res, dict):
+            traces += [f"{name}.{role}.{key}" for key in HIGH_RESULT_KEYS if key in res]
+    return traces
+
+
+def _wave_copy_problem(manifest):
+    """A version 2 manifest of `init --from-plan` carries the wave (`wave`) and its digest (`plan.wave_sha256`):
+    a copy that no longer matches the digest was edited. Not a signature (both are in one unsigned file); it
+    stops the careless edit of `wave.risk` alone."""
+    if "wave" not in manifest and "plan" not in manifest:
+        return None
+    wave, plan = manifest.get("wave"), manifest.get("plan")
+    try:
+        same = isinstance(wave, dict) and isinstance(plan, dict) and state.canonical_sha256(wave) == plan.get("wave_sha256")
+    except Exception:  # noqa: BLE001 - a value json cannot encode: not the copy state.py wrote
+        same = False
+    return None if same else (f"manifest: копия волны (`wave`) не совпадает с `plan.wave_sha256` этого manifest: её "
+                              f"правили вручную; нужен {NEW_RUN}")
 
 
 def _v2_traces(manifest, tasks):
@@ -330,31 +360,43 @@ def _v2_traces(manifest, tasks):
     return traces
 
 
-def _policy_problems(manifest, tasks, wave_risk):
-    """(problems, version) of the review policy of the manifest against the risk of the wave from the approved
-    plan. version None: the manifest cannot be judged by any rules (the tasks are not looked at for readiness)."""
+def _policy_problems(manifest, tasks, plan_risk):
+    """(problems, version, wave_risk) of the review policy of the manifest against the risk of the wave.
+    version None: the manifest cannot be judged by any rules (the tasks are not looked at for readiness).
+
+    The risk of the wave is the HIGHEST of what is known about it: the approved plan under the pin
+    (`plan_risk`), and for a manifest version 2 also the copy of the wave that `init --from-plan` put into it
+    (`wave.risk`) and the level of the run (`review_policy.level`). So neither a pin removed from chain.json of
+    a running chain nor a lowered level makes a high wave judged as a lower one. A manifest version 1 has no
+    policy: a live 1.2.0 manifest carries `wave.risk: high` too, so there only the plan raises the rules."""
     version = manifest.get("version", 1)  # no field: the shape of before the policy, judged as version 1
     if isinstance(version, bool) or version not in state.MANIFEST_VERSIONS:
-        return ["manifest: неизвестная версия: этот гейт её не судит"], None
+        return ["manifest: неизвестная версия: этот гейт её не судит"], None, plan_risk
     if version == 2:
         try:
             state.check_schema(manifest)  # the one schema check of state.py, not a copy
         except SystemExit as e:
-            return [f"manifest: {_exc_str(e).removeprefix('state: ')}"], None
+            return [f"manifest: {_exc_str(e).removeprefix('state: ')}"], None, plan_risk
         level = manifest["review_policy"]["level"]
+        wave = manifest.get("wave")
+        copied = wave.get("risk") if isinstance(wave, dict) and wave.get("risk") in state.RISKS else None
+        known = {"одобренному waves.json": plan_risk, "копии волны в manifest (`wave.risk`)": copied}
+        wave_risk = max((r for r in (plan_risk, copied, level) if r), key=state.RISK_ORDER.index)
+        problems = [p for p in [_wave_copy_problem(manifest)] if p]
         if wave_risk == "high" and level != "high":
-            return [f"волна high по одобренному waves.json, а review_policy.level в manifest — {level}: уровень "
-                    f"занижен; нужен {NEW_RUN} (`--from-plan` берёт риск волны)"], 2
-        return [], 2
+            source = next(text for text, risk in known.items() if risk == "high")
+            problems.append(f"волна high по {source}, а review_policy.level в manifest — {level}: уровень "
+                            f"занижен; нужен {NEW_RUN} (`--from-plan` берёт риск волны)")
+        return problems, 2, wave_risk
     problems = []
     traces = _v2_traces(manifest, tasks)
     if traces:
         problems.append(f"manifest version 1 несёт записи версии 2 ({', '.join(traces)}): правила ревью "
                         f"понижены вручную или manifest повреждён; нужен {NEW_RUN}")
-    if wave_risk == "high":
+    if plan_risk == "high":
         problems.append(f"волна high по одобренному waves.json, а manifest version 1: два ревью по нему не "
                         f"проверить; нужен {NEW_RUN}")
-    return problems, 1
+    return problems, 1, plan_risk
 
 
 def _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk):
@@ -404,7 +446,7 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
     plan = plan if isinstance(plan, dict) else {} if plan is None else {"error": "риск волны не получен"}
     if plan.get("error") or (plan and plan.get("risk") not in state.RISKS):
         problems.append(f"план волн: {plan.get('error') or 'риск волны не получен'}")
-    wave_risk = plan.get("risk") if not plan.get("error") else None
+    plan_risk = plan.get("risk") if not plan.get("error") and plan.get("risk") in state.RISKS else None
     for key in sorted(k for k in manifest if k not in state.MANIFEST_KEYS):
         problems.append(f"manifest: unknown record type {key!r}: this gate cannot judge it")
     if manifest.get("head") != head:
@@ -413,7 +455,7 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
     if not isinstance(tasks, dict) or not tasks:
         return problems + ["в manifest нет задач"]
     problems += _shape_problems(manifest, tasks)
-    policy, version = _policy_problems(manifest, tasks, wave_risk)
+    policy, version, wave_risk = _policy_problems(manifest, tasks, plan_risk)
     problems += policy
     if version is None:
         return problems
@@ -444,6 +486,10 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
                 problems.append(f"задача {name}: {role} {other.get('status')}")
         if risk == "high":
             problems += _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk)
+        elif version == 2 and _high_traces(name, entry, results):
+            problems.append(f"задача {name}: несёт записи политики high ({', '.join(_high_traces(name, entry, results))}), "
+                            f"а её риск в manifest — {risk}: риск задачи или review_policy.level понижен вручную; "
+                            f"нужен {NEW_RUN}")
         coder = results.get("coder")
         if not (isinstance(coder, dict) and coder.get("status") == "pass" and coder.get("head") == head):
             problems.append(f"задача {name}: нет coder pass на HEAD")

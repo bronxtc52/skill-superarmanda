@@ -5286,12 +5286,16 @@ class W2StateRules(PolicyBase):
                 self.assertIn("no fallback", where["next_action"])
                 self.record_refused("second_reviewer",
                                     **self.review_flags(self.opus_report(), quota_evidence=str(failed)))
-        # 3. no report at all behind the result: nothing proves the quota
+        # 3. no report at all behind the result: the quota could not be checked (not «there is no fallback»)
         self.init()
         self.code_and_test()
         self.review("cross_provider_reviewer", "claude-host")
         self.record("second_reviewer", "unavailable")
-        self.assertNotIn(offer, self.where()["next_action"])
+        action = self.where()["next_action"]
+        self.assertNotIn(offer, action)
+        self.assertNotIn("no fallback", action)
+        self.assertIn("could not be checked", action)
+        self.assertIn("--quota-evidence", action)
         # 4. a quota report of this HEAD and no Fable review: the fallback is offered and accepted
         self.init()
         self.code_and_test()
@@ -5547,6 +5551,90 @@ class W2GateRules(PolicyBase):
         self.assertEqual(v["verdict"], "fail")
         self.assert_reason(v["reasons"], "план волн", "W9")
 
+    # ----- fix round 1: the hand lowering of the rules as a class -----
+    def from_plan(self, risk):
+        plan = self.root / "waves.json"
+        plan.write_text(json.dumps(plan_doc([wave("w1", risk=risk)])), encoding="utf-8")
+        return self.init("--from-plan", f"{plan}#w1", risk="")
+
+    def ready(self, value):
+        for entry in value["tasks"].values():
+            entry["status"] = "ready_for_pr_review"
+
+    def test_lowered_task_risk_or_level_of_version_2_is_caught_by_the_traces_of_the_high_policy(self):
+        """tester F1: outside a high wave a version 2 manifest whose task was high keeps the traces (the
+        review history, the fields of a verified report); with the risk lowered by hand they are a refusal."""
+        # A: the task's own risk removed
+        self.init(risk="medium")
+        self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        lowered = self.forge(lambda v: (v["tasks"]["t1"].pop("risk"), self.ready(v)))
+        for plan in (MEDIUM_WAVE, None):
+            with self.subTest(case="task risk removed", plan=plan):
+                self.assert_reason(self.problems(plan, lowered), "t1", "review_history", "понижен",
+                                   "новый прогон волны")
+        # the history removed too: the fields of the verified report still tell
+        del lowered["tasks"]["t1"]["review_history"]
+        self.assert_reason(self.problems(MEDIUM_WAVE, lowered), "t1", "cross_provider_reviewer.profile", "понижен")
+        # B: the level of the run lowered
+        self.init(risk="high")
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        lowered = self.forge(lambda v: (v["review_policy"].__setitem__("level", "medium"), self.ready(v)))
+        for plan in (MEDIUM_WAVE, None):
+            with self.subTest(case="level lowered", plan=plan):
+                self.assert_reason(self.problems(plan, lowered), "t1", "review_history", "понижен",
+                                   "новый прогон волны")
+        # an honest medium task has no such traces, with or without an optional second review
+        self.init(risk="medium")
+        self.record("coder")
+        self.record("tester")
+        self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.record("second_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.assertEqual(self.problems(MEDIUM_WAVE), [])
+        self.assertEqual(self.problems(None), [])
+
+    def test_risk_of_the_wave_is_the_highest_of_the_plan_the_wave_copy_and_the_level(self):
+        """tester F2 and the pin: a manifest made by `init --from-plan` carries the wave (`wave.risk`); with the
+        pin removed from chain.json (plan None) or the level lowered, the wave is still high."""
+        self.from_plan("high")
+        self.assertEqual((self.data()["wave"]["risk"], self.data()["review_policy"]["level"]), ("high", "high"))
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        lowered = self.forge(lambda v: (v["review_policy"].__setitem__("level", "medium"), self.ready(v)))
+        for plan in (None, MEDIUM_WAVE, {}):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan, lowered) if plan != {} else \
+                    self.gate.manifest_problems(lowered, lowered["head"], lowered["tree_fingerprint"], plan={})
+                self.assert_reason(problems, "волна high", "review_policy.level", "medium", "занижен",
+                                   "новый прогон волны")
+                self.assert_reason(problems, "t1", "нет second_reviewer на HEAD PR", "волна high")
+        # the copy of the wave edited too: it no longer matches plan.wave_sha256 of the same manifest
+        both = self.forge(lambda v: v["wave"].__setitem__("risk", "medium"))
+        self.assert_reason(self.problems(None, both), "manifest", "wave", "plan.wave_sha256", "новый прогон волны")
+        # with both reviews the untouched manifest passes without the pin, as a high wave
+        self.from_plan("high")
+        self.two_reviews()
+        self.assertEqual(self.problems(None), [])
+        self.assertEqual(self.problems(HIGH_WAVE), [])
+        # the plan says high, the manifest came from a plan that said medium: the higher one rules
+        self.from_plan("medium")
+        self.record("coder")
+        self.record("tester")
+        self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.assertEqual(self.problems(None), [])
+        self.assertEqual(self.problems(MEDIUM_WAVE), [])
+        self.assert_reason(self.problems(HIGH_WAVE), "волна high", "review_policy.level")
+
+    def test_live_version_1_manifest_of_a_high_wave_keeps_the_rules_of_1_2_0_without_the_plan(self):
+        """The known border: a live 1.2.0 manifest carries `wave.risk: high` with version 1, so its wave copy
+        cannot raise the rules without the pinned plan (a manifest lowered to a spotless version 1 looks the same)."""
+        live = LiveVersion1Manifests.load_live(self, "v1-high-waves-gate-redact-W1.json")
+        self.assertEqual((live["version"], live["wave"]["risk"]), (1, "high"))
+        self.assertEqual(self.problems(None, live), [])
+        self.assert_reason(self.problems(HIGH_WAVE, live), "новый прогон волны")
+
     def test_medium_task_with_a_second_reviewer_that_gave_no_review_passes_the_gate(self):
         """The same rule as state.py derive_step: below high the second review is optional."""
         for status in ("unavailable", "error", "incomplete"):
@@ -5559,6 +5647,34 @@ class W2GateRules(PolicyBase):
                 self.assertEqual(self.problems(MEDIUM_WAVE), [])
         self.record("second_reviewer", "findings")
         self.assert_reason(self.problems(MEDIUM_WAVE), "t1", "second_reviewer findings")
+
+
+class W2FixRound1State(PolicyBase):
+    """Fix round 1 (review of Fable): the advice of `where` uses the acceptance rule of the quota evidence."""
+
+    def test_quota_report_of_another_packet_of_this_head_is_not_offered_as_the_fallback(self):
+        offer = "the only fallback is profile codex-host-opus"
+        self.code_and_test()
+        quota = self.report("codex-host", "quota_failure")  # the packet of the first round
+        old_hash = self.packet_hash
+        self.packet("Must review the patch; the requirements changed.\n")  # the same HEAD, another packet
+        self.assertNotEqual(self.packet_hash, old_hash)
+        self.review("cross_provider_reviewer", "claude-host")
+        self.record("second_reviewer", "error", artifact=str(quota))
+        action = self.where()["next_action"]
+        self.assertTrue(action.startswith("BLOCKED: second_reviewer error"), action)
+        self.assertNotIn(offer, action)
+        self.assertIn("no fallback", action)
+        self.assertIn("not for this HEAD and packet", action)
+        opus = self.edited(self.report("codex-host-opus"), session_id="opus-review-session")
+        self.record_refused("second_reviewer", needle="not for this HEAD and packet",
+                            **self.review_flags(opus, quota_evidence=str(quota)))
+        # the quota report of the current packet: offered and accepted
+        fresh = self.report("codex-host", "quota_failure")
+        self.record("second_reviewer", "error", artifact=str(fresh))
+        self.assertIn(offer, self.where()["next_action"])
+        entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(fresh)))
+        self.assertEqual(entry["status"], "ready_for_pr_review")
 
 
 class LiveVersion1Manifests(PolicyBase):

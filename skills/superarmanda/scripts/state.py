@@ -2112,27 +2112,39 @@ NO_SECOND_REVIEW_FALLBACK = (
 def second_review_fallback(entry, head):
     """The tail of the `BLOCKED: second_reviewer error|unavailable` advice of a high-risk task:
     the codex-host-opus fallback is offered only where task-result would accept it. Not when
-    Fable already reviewed this HEAD (fable_review_of), and not when the recorded result is not
-    a codex-host quota error report of this HEAD (is_quota_report): the advice must not send
-    the coordinator into a refusal."""
+    Fable already reviewed this HEAD (fable_review_of), and not when the report behind the
+    recorded result fails the acceptance rule of the quota evidence (quota_evidence_problem:
+    this HEAD and the packet of the other review): the advice must not send the coordinator
+    into a refusal. A report that cannot be read is said to be unchecked, not absent."""
     reviewed = fable_review_of(entry, head)
     if reviewed is not None:
         return (
             f"{NO_SECOND_REVIEW_FALLBACK} ({FABLE_PROFILE} already reviewed it: "
             f"{reviewed['status']} recorded as {reviewed['role']})"
         )
-    result = ((entry or {}).get("results") or {}).get("second_reviewer")
+    results = (entry or {}).get("results") or {}
+    result = results.get("second_reviewer")
     artifact = result.get("artifact") if isinstance(result, dict) else None
     try:
         evidence, _digest = read_report(artifact, "artifact")
     except SystemExit:
-        evidence = None
-    if is_quota_report(evidence) and evidence.get("reviewed_head") == head:
-        return SECOND_REVIEW_FALLBACK
-    return (
-        f"{NO_SECOND_REVIEW_FALLBACK} (the recorded result is not a {FABLE_PROFILE} review.py "
-        "report with error_category quota for this HEAD)"
+        # nothing readable behind the result (no --artifact, a relative path from another directory):
+        # the quota is neither proven nor disproven here, task-result will check the report it is given
+        return (
+            "; the quota report could not be checked (no readable review.py report behind the "
+            f"recorded result): {OPUS_PROFILE} counts only with --quota-evidence <{FABLE_PROFILE} "
+            "quota error report for this HEAD and packet>, no other model"
+        )
+    # The acceptance rule itself (quota_evidence_problem), against the packet the other review of this
+    # HEAD was recorded for; without one the report's own packet is all there is to compare.
+    other = results.get("cross_provider_reviewer")
+    packet_hash = other.get("packet_hash") if isinstance(other, dict) and other.get("head") == head else None
+    problem = quota_evidence_problem(
+        evidence, head, packet_hash if packet_hash is not None else evidence.get("state_packet_hash")
     )
+    if problem is None:
+        return SECOND_REVIEW_FALLBACK
+    return f"{NO_SECOND_REVIEW_FALLBACK} (the recorded {FABLE_PROFILE} report {problem})"
 
 
 def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None, fallback=SECOND_REVIEW_FALLBACK):
