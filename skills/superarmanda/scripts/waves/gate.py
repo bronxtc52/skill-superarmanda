@@ -94,12 +94,28 @@ def _object(api, path):
     return data
 
 
+def _leaves(obj, depth=0):
+    """Every str leaf (and dict key) of a nested answer, AS IT IS: str()/repr() of a list writes an invisible
+    character as a literal `\\u200b`, which wab's mask cannot find; wab masks the whole message where it shows it."""
+    if isinstance(obj, str):
+        yield obj
+    elif depth < 20 and isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _leaves(k, depth + 1)
+            yield from _leaves(v, depth + 1)
+    elif depth < 20 and isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _leaves(v, depth + 1)
+    elif obj is not None:
+        yield str(obj)
+
+
 def _threads(graphql, repo, number):
     owner, name = repo.split("/", 1)
     data = graphql(THREADS_QUERY, {"owner": owner, "name": name, "number": number})
     try:
         if data.get("errors"):
-            raise CollectError(f"review threads: {data['errors']}")
+            raise CollectError(f"review threads: {' '.join(_leaves(data['errors']))}")
         box = data["data"]["repository"]["pullRequest"]["reviewThreads"]
         nodes, more = box["nodes"], box["pageInfo"]["hasNextPage"]
     except (AttributeError, KeyError, TypeError):

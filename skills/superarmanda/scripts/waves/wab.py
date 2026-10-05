@@ -1405,6 +1405,45 @@ def _require_masked(text, owner_paths=False):
     return text if isinstance(text, Masked) else safe_text(text, 10 ** 9, owner_paths)
 
 
+_CONTAINERS = (dict, list, tuple, set, frozenset)
+
+
+def _masked_leaves(obj, owner_paths, depth=0):
+    """A container with every str leaf AND dict key masked (safe_text of each), the rest as it is: str() of a
+    list or dict turns an invisible character into a literal `\\u200b` (repr), which no mask can find, so the
+    leaves are masked BEFORE the container is written."""
+    if isinstance(obj, str):
+        return safe_text(obj, 10 ** 9, owner_paths)
+    if depth > 20:
+        return "…"
+    nxt = depth + 1
+    if isinstance(obj, dict):
+        return {_masked_leaves(k, owner_paths, nxt): _masked_leaves(v, owner_paths, nxt) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        items = [_masked_leaves(v, owner_paths, nxt) for v in obj]
+        return tuple(items) if isinstance(obj, tuple) else items
+    if isinstance(obj, (set, frozenset)):
+        return [_masked_leaves(v, owner_paths, nxt) for v in obj]
+    if isinstance(obj, BaseException):
+        args = [_masked_leaves(a, owner_paths, nxt) for a in obj.args]
+        return args[0] if len(args) == 1 else tuple(args)
+    if isinstance(obj, (bytes, bytearray)):
+        return safe_text(bytes(obj).decode("utf-8", errors="replace"), 10 ** 9, owner_paths)
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+    return safe_text(str(obj), 10 ** 9, owner_paths)
+
+
+def _text_of(obj, owner_paths):
+    """The str that safe_text masks: a str as it is; a container (or an exception holding one) by its masked leaves."""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, BaseException) and not any(isinstance(a, _CONTAINERS) for a in obj.args):
+        return str(obj)  # the usual message: its args are plain text, str() keeps them as they are
+    masked = _masked_leaves(obj, owner_paths)
+    return masked if isinstance(masked, str) else str(masked)
+
+
 def safe_text(text, limit, owner_paths=False):
     """THE one masking of text that is shown to a human (Telegram, display-message, ATTENTION, the
     dashboard, chain-result.md, events.log, status): there is no other way to mask for output, and
@@ -1416,7 +1455,7 @@ def safe_text(text, limit, owner_paths=False):
     2. redact() over the whole text (no cut yet);
     3. the cut to `limit` at a safe border: the mask is never torn (a border inside it cuts before it),
        and the cut is never made BEFORE the masking."""
-    text = str(text).replace("\r\n", "\n")
+    text = _text_of(text, owner_paths).replace("\r\n", "\n")
     text = _CTRL_WORD.sub(MASK, text)
 
     def soft_word(m):  # masked whole when its glued form holds a secret, else the CR is a line break
@@ -1447,6 +1486,9 @@ OUTPUT_PATHS = {
     "say_echo": "_say_first(): the text of `say` in its events",
     "blocked_notice": "blocked_notice(): the BLOCKED notice that needs the owner",
     "status_cmd": "status_cmd(): `wab.py status`",
+    "resolve_why": "_resolve_why(): the errors (a nested structure) of a thread that owner-merge could not resolve",
+    "dash_waves_table": "dash.waves_table(): the table of the waves, an unknown status of a wave as its label",
+    "dash_pipeline": "dash.pipeline(): the line of the waves (an unknown status of a wave takes no label there)",
     "status_file": "_write_status(): the dispatcher's own `status` file and its return value (last_status)",
     "gate_failed": "_gate_failed(): status, last_status, the message to the window, events, notice of a failed merge gate",
     "dash_event": "dash.humanize_event(): the events panel of the dashboard",
@@ -1459,7 +1501,7 @@ def quote(text, limit=TG_LIMIT):
     """The wave's (or any outside) text for a notice: control characters (and so the quote markers) are
     removed, secrets masked WITHOUT the owner-script exemption, the length capped at `limit`, the whole
     wrapped in the quote markers. See render_notice."""
-    return QUOTE_OPEN + safe_text(str(text).strip(), limit, False).strip() + QUOTE_CLOSE
+    return QUOTE_OPEN + _clip(safe_text(text, 10 ** 9, False).strip(), limit).strip() + QUOTE_CLOSE
 
 
 def _head(text, n):
@@ -1944,7 +1986,8 @@ def attention_text(st):
     if latest is None:
         return None
     wave, w, item = latest
-    text = (f"time: {_utc(item.get('at'))}\nwave: {wave}\nsignal: {safe_text(item.get('line', ''), 300, owner_paths=True)}\n"
+    text = (f"time: {_utc(item.get('at'))}\nwave: {wave}\n"
+            f"signal: {safe_text(item.get('line', ''), 300, owner_paths=True)}\n"
             f"attach: {attach_cmd(str(w.get('tmux') or ''))}\n")
     if total > 1:
         text += f"open signals: {total} (wab.py status, events.log)\n"
@@ -4516,7 +4559,7 @@ def note_question(w, text, now):
     """Record a question to the owner (an owner-facing BLOCKED line) for the chain result: redacted,
     the same text twice in a row once, capped. In memory only: the caller saves it with its change."""
     qs = w.setdefault("questions", [])
-    text = safe_text(str(text), 300)
+    text = safe_text(text, 300)
     if not qs or qs[-1].get("text") != text:
         qs.append({"at": now, "text": text})
         del qs[:-QUESTIONS_CAP]
@@ -4596,7 +4639,7 @@ def write_chain_result(cfg, st):
              f"- волн: {len(cfg['waves'])}, PR: {prs}, перезапусков голов: {restarts_heads}, "
              f"перезапусков волн: {restarts_waves}, вопросов: {len(questions)}\n", "## Волны\n", *rows,
              "## Вопросы к владельцу\n"]
-    lines += ([f"- {_utc(q.get('at'))} {wave}: {safe_text(str(q.get('text') or ''), 300)}"
+    lines += ([f"- {_utc(q.get('at'))} {wave}: {safe_text(q.get('text') or '', 300)}"
                for wave, q in questions] or ["нет"])
     path = cfg["run_dir"] / "chain-result.md"
     path.parent.mkdir(parents=True, exist_ok=True)

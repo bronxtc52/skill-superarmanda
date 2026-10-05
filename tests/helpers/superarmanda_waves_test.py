@@ -15120,6 +15120,34 @@ def unmasked_splits(waves_dir):
     return sorted(c for c in set(found) if c not in SPLIT_ALLOWED)
 
 
+# Rule R. In the functions that turn an outside answer (errors, a status, a question, an exception) into text, no
+# str() / repr() / `!r` / json.dumps of a value: str() of a list or dict writes an invisible character as a literal
+# `\\u200b` that no mask can find. The value goes to safe_text AS IT IS (it masks the leaves of a container first).
+STRINGIFY_FUNCS = {"wab.py": {"_resolve_why", "quote", "note_question", "write_chain_result", "_policy_question",
+                              "_say_first", "_masked_line", "_one_line", "handoff_gate_line", "say_cmd", "event"},
+                   "dash.py": {"_safe", "_safe_screen", "_masked", "_clip", "humanize_event"}}
+STRINGIFY_ALLOWED = {
+    ("wab.py", "say_cmd", "str(e)"): "NotSubmitted: a message the dispatcher wrote itself, no outside structure",
+    ("wab.py", "write_chain_result", "str(sha)"): "a commit id of the record, 12 hex",
+}
+
+
+def stringified_values(waves_dir):
+    import ast
+    found = []
+    for path in sorted(Path(waves_dir).glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in STRINGIFY_FUNCS.get(path.name, ())):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("str", "repr"):
+                    found.append((path.name, fn.name, ast.unparse(node)))
+                elif isinstance(node, ast.Call) and ast.unparse(node.func) in ("json.dumps", "pformat", "pprint.pformat"):
+                    found.append((path.name, fn.name, ast.unparse(node)))
+                elif isinstance(node, ast.FormattedValue) and node.conversion in (114, 115):  # !r !s
+                    found.append((path.name, fn.name, "!" + chr(node.conversion) + " " + ast.unparse(node.value)))
+    return sorted(c for c in set(found) if c not in STRINGIFY_ALLOWED)
+
+
 def unlisted_cuts(waves_dir):
     return sorted(c for c in cut_sites(waves_dir) if c not in CUT_ALLOWLIST)
 
@@ -15179,6 +15207,20 @@ class W2EveryCut(Base):
         tmp = self.mutate("flow2", "def _say_first(text):\n",
                           "def _say_first(text):\n    if len(text) > 3:\n        text = safe_text(text, 100)\n    first = text.split()\n")
         self.assertIn(("wab.py", "_say_first", "text"), unmasked_splits(tmp))
+
+    def test_no_outside_value_is_stringified_before_the_mask(self):
+        self.assertEqual(stringified_values(WAVES), [])
+
+    def test_str_of_the_errors_in_resolve_why_is_caught_statically_and_by_behaviour(self):  # H1
+        tmp = self.mutate("strerr", '        return _masked_line(out.get("errors"), 200)',
+                          '        return _masked_line(str(out.get("errors")), 200)')
+        self.assertIn(("wab.py", "_resolve_why", "str(out.get('errors'))"), stringified_values(tmp))
+        spec = importlib.util.spec_from_file_location("wab_mutant3", tmp / "wab.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        errors = {"errors": [{"message": "password\u200b=Hunter2SecretValue99"}]}
+        self.assertIsNotNone(leaked(mod._resolve_why(errors), ["Hunter2SecretValue99"]))
+        self.assertIsNone(leaked(wab._resolve_why(errors), ["Hunter2SecretValue99"]))
 
     def test_a_helper_that_does_not_mask_first_is_caught(self):
         tmp = self.mutate("nomask", 'text = Masked(" ".join(_require_masked(text).split()))\n    if len(text) <= limit:\n        return text\n    cut',
@@ -15508,6 +15550,22 @@ class W2OutputPaths(Base):
             wab.status_cmd(cfg)
         return "\n".join(map(str, seen)) + "\n" + buf.getvalue()
 
+    def out_resolve_why(self, raw):
+        # the errors of a GraphQL answer are a NESTED structure: key and value both carry the text
+        return wab._resolve_why({"errors": [{"message": raw, "extensions": {raw: [raw]}}, (raw,)]})
+
+    def out_dash_waves_table(self, raw):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", raw)  # an unknown status: the table shows it as its label
+        return self.render_plain(self.dash.waves_table(cfg, self.get_state(cfg)))
+
+    def out_dash_pipeline(self, raw):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        self.set_status(cfg, "W1", raw)
+        return self.render_plain(self.dash.pipeline(cfg, self.get_state(cfg)))
+
     def out_status_cmd(self, raw):
         cfg, _ = self.chain()
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
@@ -15558,6 +15616,37 @@ class W2OutputPaths(Base):
                          "a path without a test (or a test of a path nobody registered)")
         for name, what in registry.items():
             self.assertTrue(isinstance(what, str) and what.strip(), f"{name}: no description")
+
+    def nested_forms(self, secret):
+        """The text of a secret inside every kind of container (and an exception): what a non-str reaches safe_text as."""
+        return {
+            "list of dicts": [{"message": f"x {secret} y"}],
+            "key of a dict": {f"{secret}": 1},
+            "tuple": (f"a {secret}", 1),
+            "deep": {"a": [{"b": (f"{secret}",)}]},
+            "exception with a list": KeyError([f"x {secret}"]),
+            "set": {f"{secret}"},
+        }
+
+    def test_a_container_is_masked_by_its_leaves_before_it_is_written(self):
+        for cname, ch in {**INVISIBLE_CLASSES, **SPLIT_CLASSES}.items():
+            for sname, (secret, values) in secret_shapes(ch).items():
+                for fname, obj in self.nested_forms(secret).items():
+                    for fn in (lambda o: wab.safe_text(o, 10 ** 6), lambda o: wab._masked_line(o, 10 ** 6),
+                               lambda o: wab._one_line(o), lambda o: wab._clip(o, 10 ** 6)):
+                        out = fn(obj)
+                        piece = leaked(out, values)
+                        if piece is not None:
+                            self.fail(f"«{piece}» of [{sname}] with {cname} in a {fname} reached {out!r}")
+
+    def test_a_secret_in_an_unknown_status_is_masked_by_the_dashboard(self):  # H2
+        raw = "BLOCKED password\u200b=Hunter2SecretValue99"
+        for path in ("dash_waves_table", "dash_pipeline"):
+            self.assertIsNone(leaked(self.adapters()[path](raw), ["Hunter2SecretValue99"]), path)
+
+    def test_the_errors_of_a_failed_resolve_are_masked_through_their_leaves(self):  # H1
+        out = wab._resolve_why({"errors": [{"message": "password\u200b=Hunter2SecretValue99"}]})
+        self.assertIsNone(leaked(out, ["Hunter2SecretValue99"]), out)
 
     def test_every_path_hides_a_secret_torn_by_a_separator_of_str_split(self):
         adapters = self.adapters()
@@ -15701,8 +15790,8 @@ class W2SafeText(Base):
         tmp = self.tmp / "mut"
         shutil.copytree(WAVES, tmp, ignore=shutil.ignore_patterns("__pycache__"))
         src = (tmp / "wab.py").read_text(encoding="utf-8")
-        self.assertIn("safe_text(str(text), 300)", src)
-        (tmp / "wab.py").write_text(src.replace("safe_text(str(text), 300)", "redact(str(text), 300)"),
+        self.assertIn("safe_text(text, 300)", src)
+        (tmp / "wab.py").write_text(src.replace("safe_text(text, 300)", "redact(text, 300)"),
                                     encoding="utf-8")
         found = redact_uses_outside(tmp)
         self.assertIn("note_question", [f[2] for f in found], found)

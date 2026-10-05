@@ -263,11 +263,11 @@ def waves_table(cfg, st):
         key, w = wave_state(cfg, st, wave)
         icon, colour, label = STYLE.get(key, ("?", "white", key))
         if not w:
-            tb.add_row(Text(wave, style="grey50"), Text(f"{icon} {label}", style=colour), *[""] * 10)
+            tb.add_row(Text(wave, style="grey50"), Text(f"{icon} {_safe(label)}", style=colour), *[""] * 10)
             continue
         s = wave_stats(w)
         tb.add_row(
-            Text(wave, style="bold"), Text(f"{icon} {label}", style=colour),
+            Text(wave, style="bold"), Text(f"{icon} {_safe(label)}", style=colour),
             "" if wave_pr(w) is None else f"#{wave_pr(w)}", fmt_dur(wave_duration(w, now)), ctx_cell(w, cfg["ctx_limit"], 16),
             ktok(wave_peak(w)), str(wave_restarts(w)), str(s["turns"]), str(s["tools"]),
             str(s["agents"]), ktok(s["out"]), fmt_commits(wave_commits(w)))
