@@ -230,7 +230,7 @@ def pipeline(cfg, st):
             done = key in FINISHED
             t.append(" ━━▶ " if done else " ──▷ ", style="green" if done else "grey42")
     titles = cfg.get("titles") or {}
-    sub = Text("  ·  ".join(f"{w}: {titles[w]}" for w in cfg["waves"] if w in titles),
+    sub = Text("  ·  ".join(f"{w}: {_safe(titles[w])}" for w in cfg["waves"] if w in titles),
                style="grey62", justify="center")
     return Group(t, sub)
 
@@ -263,11 +263,11 @@ def waves_table(cfg, st):
         key, w = wave_state(cfg, st, wave)
         icon, colour, label = STYLE.get(key, ("?", "white", key))
         if not w:
-            tb.add_row(Text(wave, style="grey50"), Text(f"{icon} {label}", style=colour), *[""] * 10)
+            tb.add_row(Text(wave, style="grey50"), Text(f"{icon} {_safe(label)}", style=colour), *[""] * 10)
             continue
         s = wave_stats(w)
         tb.add_row(
-            Text(wave, style="bold"), Text(f"{icon} {label}", style=colour),
+            Text(wave, style="bold"), Text(f"{icon} {_safe(label)}", style=colour),
             "" if wave_pr(w) is None else f"#{wave_pr(w)}", fmt_dur(wave_duration(w, now)), ctx_cell(w, cfg["ctx_limit"], 16),
             ktok(wave_peak(w)), str(wave_restarts(w)), str(s["turns"]), str(s["tools"]),
             str(s["agents"]), ktok(s["out"]), fmt_commits(wave_commits(w)))
@@ -293,7 +293,7 @@ def manifest_where(cfg, wave):
         return {"error": why}
     try:
         stat = path.stat()
-    except OSError:
+    except (OSError, ValueError):  # ValueError: a NUL in the name of the wave (no runs.json to refuse it)
         return None
     sig, now = (stat.st_mtime_ns, stat.st_size), time.time()
     hit = MANIFEST_CACHE.get(path)
@@ -328,8 +328,13 @@ def finding_counts(artifact):
         items = data["findings"] if isinstance(data, dict) else data
         counts = {}
         for item in items:
-            sev = str(item.get("severity") or item.get("priority")).strip()
-            sev = sev.lower() if sev.lower() in SEVERITIES else sev.upper()
+            sev = item.get("severity") or item.get("priority")
+            if not isinstance(sev, (str, int, type(None))):  # str() of a nested value escapes an invisible
+                return None  # character of its key, and the mask would no longer see the hiding key (#85)
+            sev = str(sev)
+            # only a known level is trimmed and changes its case; anything else goes to the mask as it was:
+            # upper() hid `sk-…` from it, strip() took off the invisible character it hides a word for (#85)
+            sev = next((k for k in SEVERITIES if k.lower() == sev.strip().lower()), sev)
             counts[sev] = counts.get(sev, 0) + 1
         return counts
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -344,9 +349,37 @@ def wave_pr(w):
     return None
 
 
+def _safe_mark():
+    return wab.MASK
+
+
+def _masked(value, finding=False, top=False):
+    """`where` (what state.py printed) with every text in it masked by safe_text: the block shows names, tasks,
+    next actions and errors of the wave. Only the `artifact` path of an open finding stays as it is: it is only
+    OPENED (finding_counts), never shown; an `artifact` key anywhere else is text like any other (#85)."""
+    if isinstance(value, str):
+        return _safe(value)
+    if isinstance(value, dict):
+        def leaf(k, v):
+            if wab._key_hides_value(k):
+                # a key that hides its value (invisible character, secret word) takes the value whole, like wab._masked_leaves
+                return _safe_mark()
+            if finding and k == "artifact" and isinstance(v, str):
+                return v
+            if top and k == "open_findings" and isinstance(v, list):
+                return [_masked(f, finding=True) for f in v]
+            return _masked(v)
+        return {(_safe(k) if isinstance(k, str) else k): leaf(k, v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_masked(v) for v in value]
+    return value
+
+
 def manifest_lines(cfg, wave, w):
     """The superarmanda block of the current panel; never raises on a manifest it cannot read."""
     where = manifest_where(cfg, wave)
+    if isinstance(where, dict):
+        where = _masked(where, top=True)
     head = Text("superarmanda  ", style="bold")
     if where is None:
         return [head.append("manifest ещё нет", style="grey50")]
@@ -377,7 +410,7 @@ def manifest_lines(cfg, wave, w):
         counts = finding_counts(f.get("artifact"))
         label = "?" if counts is None else (", ".join(f"{k} {n}" for k, n in sorted(
             counts.items(), key=lambda kv: SEVERITIES.index(kv[0]) if kv[0] in SEVERITIES else 99)) or "0")
-        ft.append(f"{f.get('role')} {f.get('status')}: {label}  ", style="red")
+        ft.append(f"{f.get('role')} {f.get('status')}: {_safe(label)}  ", style="red")
     pr = wave_pr(w)
     codex = verdicts.get("github_codex_review") or "нет результата"
     pt = Text("PR  ", style="bold").append(f"#{pr}" if pr is not None else "—", style="cyan")
@@ -386,8 +419,12 @@ def manifest_lines(cfg, wave, w):
     if where.get("decision_required_for"):
         lines.append(Text(f"нужно решение: {where['decision_required_for']}", style="bold red"))
     nxt = str(where.get("next_action") or "")
-    lines.append(Text("дальше  ", style="bold").append(nxt if len(nxt) <= 110 else nxt[:109] + "…", style="grey78"))
+    lines.append(Text("дальше  ", style="bold").append(nxt if len(nxt) <= 110 else wab._head(nxt, 109) + "…", style="grey78"))
     return lines
+
+
+def _safe_screen(text):
+    return wab.safe_text(text, 10 ** 7, owner_paths=False)
 
 
 def current_panel(cfg, st):
@@ -409,18 +446,19 @@ def current_panel(cfg, st):
         # no window to attach to; the file's status is only the wave's last word
         _, colour, label = STYLE[key]
         head.append(label, style=colour)
-        head.append(f"   последний статус: {status}", style="grey62")
+        head.append(f"   последний статус: {_safe(status)}", style="grey62")
     else:
         head.append(wab.attach_cmd(w["tmux"]), style="bold white on grey23")
-        head.append(f"   статус: {status}", style="yellow" if key == "BLOCKED" else "green")
+        head.append(f"   статус: {_safe(status)}", style="yellow" if key == "BLOCKED" else "green")
     ctx = Group(Text("Контекст ", style="bold").append_text(ctx_cell(w, cfg["ctx_limit"], 40)),
                 Text("История  ", style="bold").append(spark(w.get("ctx_hist", []), cfg["ctx_limit"])))
-    lines = [l for l in wab.pane_text(w["tmux"]).splitlines() if l.strip()][-14:]
-    screen = Text("\n".join(l[:150] for l in lines), style="grey78")
+    # the screen of the wave is shown too: masked as a whole BEFORE it is cut into lines and into 150 characters
+    lines = [l for l in _safe_screen(wab.pane_text(w["tmux"])).splitlines() if l.strip()][-14:]
+    screen = Text("\n".join(wab._head(l, 150) for l in lines), style="grey78")
     try:
         block = manifest_lines(cfg, wave, w)
     except Exception as e:  # noqa: BLE001 - a block of the frame, not the frame
-        block = [Text(f"manifest: {type(e).__name__}: {e}", style="yellow")]
+        block = [Text(_safe(f"manifest: {type(e).__name__}: {wab._exc_text(e)}"), style="yellow")]
     return Panel(Group(head, Text(), ctx, Text(), *block, Text(), Panel(screen, title="экран волны (live)",
                                                          border_style="grey35", box=box.ROUNDED)),
                  title=f"⚙ Текущая волна {wave}", border_style="magenta")
@@ -428,7 +466,7 @@ def current_panel(cfg, st):
 
 # ---------- «📜 События»: an event type -> a short phrase for a human ----------
 # The full line stays in events.log; here it is a phrase with an emoji, the technical part (class=,
-# SHA, pid, paths) goes grey on a second line. Everything shown passes wab.redact(owner_paths=False):
+# SHA, pid, paths) goes grey on a second line. Everything shown passes wab.safe_text(owner_paths=False):
 # the text of an event may quote the wave.
 _WAVE = "(?P<w>" + wab.WAVE_NAME.pattern + ")"  # the dispatcher's own notion of a wave name
 _PULSE = re.compile(_WAVE + r": phase=(?P<phase>\S*) ctx=(?P<ctx>\S*) restarts=(?P<restarts>\S*) status=(?P<status>.*)", re.S)
@@ -445,8 +483,8 @@ _NEEDS_OWNER_CLASSES = ("plan_mismatch", "merge_gate")
 
 
 def _clip(text, limit):
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+    text = wab.Masked(" ".join(wab._require_masked(text).split()))  # masked FIRST, then collapsed and cut
+    return text if len(text) <= limit else wab.Masked(wab._head(text, limit - 1).rstrip() + "…")
 
 
 def _blocked_phrase(wave, rest):
@@ -468,7 +506,7 @@ def _pulse_phrase(m):
     if status.startswith("BLOCKED:"):
         return _blocked_phrase(wave, status[len("BLOCKED:"):])
     word = {"RUNNING": "работает", "STARTING": "стартует", "RESUMING": "поднимается после /clear",
-            "HANDOFF_READY": "готов handoff", "DONE": "закончила работу"}.get(status, status[:40])
+            "HANDOFF_READY": "готов handoff", "DONE": "закончила работу"}.get(status, wab._head(status, 40))
     where = f", фаза {m['phase']}" if m["phase"] not in ("running", "") else ""
     return (f"⚙ {wave} {word}{where}", f"ctx={m['ctx']} restarts={m['restarts']}", INFO_GREY)
 
@@ -560,7 +598,8 @@ _WAVE_RULES, _PLAIN_RULES = _wave_rules(), _plain_rules()
 
 
 def _safe(text):
-    return wab.redact(text, limit=400, owner_paths=False)
+    """Everything of the wave or the manifest that the dashboard shows: wab.safe_text, nothing else (#81)."""
+    return wab.safe_text(text, 400, owner_paths=False)
 
 
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # C0, DEL and C1: ESC/CSI/OSC would reach the terminal
@@ -569,11 +608,11 @@ _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # C0, DEL and C1: ESC/CSI/OSC wou
 def humanize_event(msg):
     """One events.log message (without the time) -> (phrase, details, colour, known). `known` is False
     for a type nobody described: the phrase is then the raw line cut to ~140 characters. Phrase and
-    details are masked with wab.redact; the raw line is not changed in events.log."""
+    details are masked with wab.safe_text; the raw line is not changed in events.log."""
     # Masking comes FIRST, over the WHOLE line, the way notices are masked: a token that holds an invisible or
     # control character is masked whole (it may glue or split a secret). Every cut below (phrases, details,
     # the raw line) then works on masked text, so a limit cannot split a secret into a piece redact() misses.
-    msg = wab._clean_redact(msg.replace("\r", "\x00"), 10 ** 7, owner_paths=False)  # a \r would split a token
+    msg = wab.safe_text(msg, 10 ** 7, owner_paths=False)  # a lone \r in a word is handled by safe_text itself
     msg = _CONTROL.sub("·", msg).strip()  # what is left (a tab, a line break): a visible sign for the terminal
     result = None
     m = _PULSE.fullmatch(msg)
@@ -590,9 +629,9 @@ def humanize_event(msg):
                     result = build(m)
                     break
     if result is None:
-        return (_safe(msg[:140]), None, INFO_GREY, False)
+        return (wab._head(_safe(msg), 140), None, INFO_GREY, False)
     phrase, details, colour = result
-    return (_safe(phrase), _safe(_clip(details, 160)) if details else None, colour, True)
+    return (_safe(phrase), _clip(_safe(details), 160) if details else None, colour, True)
 
 
 def _pulse_key(msg):
@@ -720,7 +759,7 @@ def safe_render(cfg):
     try:
         return render(cfg)
     except (Exception, SystemExit) as e:  # noqa: BLE001 - any read race; the next frame retries
-        return Panel(Text(f"кадр не отрисован: {type(e).__name__}: {e}\nповтор через 3 с",
+        return Panel(Text(f"кадр не отрисован: {type(e).__name__}: {_safe(e)}\nповтор через 3 с",
                           style="yellow"), title="dash", border_style="yellow")
 
 

@@ -94,12 +94,50 @@ def _object(api, path):
     return data
 
 
+DEPTH_MARK = "[скрыто: глубина]"
+HIDDEN = "[скрыто]"
+
+
+def key_hides_value(key):
+    """Whether the value under a dict key is hidden. wab.py replaces this with its predicate (_key_hides_value: the
+    invisible characters and the secret words of redact live there) when it is imported; used alone, gate.py hides
+    EVERY value (keys only): the safe side."""
+    return True
+
+
+def _leaves(obj, depth=0):
+    """Every str leaf (and dict key) of a nested answer, AS IT IS: str()/repr() of a list writes an invisible
+    character as a literal `\\u200b`, which wab's mask cannot find; wab masks the whole message where it shows it."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, (dict, list, tuple, set, frozenset)) and depth >= 20:
+        yield DEPTH_MARK  # never str()/repr() of what is left: it would write an invisible character as `\\u200b`
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _leaves(k, depth + 1)
+            if key_hides_value(k):  # the value under a secret or invisible key is not shown at all
+                yield HIDDEN
+            else:
+                yield from _leaves(v, depth + 1)
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        for v in obj:
+            yield from _leaves(v, depth + 1)
+    elif obj is not None:
+        yield str(obj)
+
+
+def _exc_str(e):
+    """An exception as text WITHOUT str(e) (str(KeyError("password<ZWSP>=x")) is the repr of the string): the leaves
+    of its args as they are, joined; wab masks the whole message where it shows it."""
+    return " ".join(x for a in e.args for x in _leaves(a))
+
+
 def _threads(graphql, repo, number):
     owner, name = repo.split("/", 1)
     data = graphql(THREADS_QUERY, {"owner": owner, "name": name, "number": number})
     try:
         if data.get("errors"):
-            raise CollectError(f"review threads: {str(data['errors'])[:200]}")
+            raise CollectError(f"review threads: {' '.join(_leaves(data['errors']))}")
         box = data["data"]["repository"]["pullRequest"]["reviewThreads"]
         nodes, more = box["nodes"], box["pageInfo"]["hasNextPage"]
     except (AttributeError, KeyError, TypeError):
@@ -184,7 +222,7 @@ def gather(repo, number, head, api, graphql):
     try:
         return collect(repo, number, head, api, graphql)
     except CollectError as e:
-        return {"error": str(e)}
+        return {"error": _exc_str(e)}
 
 
 # ---------- Codex and checks ----------
