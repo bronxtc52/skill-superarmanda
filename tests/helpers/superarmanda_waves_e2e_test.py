@@ -65,6 +65,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 WAVES = ROOT / "skills" / "superarmanda" / "scripts" / "waves"
 STATE_PY = ROOT / "skills" / "superarmanda" / "scripts" / "state.py"
+REVIEW_PY = ROOT / "skills" / "superarmanda" / "scripts" / "review.py"
 FIXTURES = ROOT / "tests" / "fixtures"
 FAKES = Path(__file__).resolve().parent / "wab_e2e_fakes"
 sys.path.insert(0, str(WAVES))
@@ -89,6 +90,21 @@ BG_SECONDS = 9 * 60  # how long W1's background shell lives: longer than the nud
 OLD_RUN = ("e2e/2026-01-01-old", "/elsewhere/runs/e2e/2026-01-01-old")  # (@wab_run, @wab_run_dir) of another run
 EXPECTED_TOOLS = ("tmux", "gh", "claude", "ps")
 TOOLS_THAT_MUST_NOT_RESOLVE = ("curl", "az", "wget", "ssh")
+
+
+WAVE_RISK = {"W1": "high", "W2": "medium"}  # the approved plan: one high wave (two reviews) and one medium
+
+
+def review_cli_doubles():
+    """The subscription CLI doubles of the review suite (tests/helpers/superarmanda_review_test.py): the
+    review reports of this test are written by the real review.py over them, never by hand. They live in
+    their own directory, used only for `review.py run`: the `claude` of the dispatcher's PATH still never runs."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("superarmanda_review_suite_for_e2e",
+                                                  Path(__file__).with_name("superarmanda_review_test.py"))
+    suite = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(suite)
+    return {"claude": suite.MOCK, "codex": suite.CODEX_MOCK}
 
 
 class Stalled(BaseException):
@@ -143,6 +159,7 @@ class World:
         self.sock = self.root / "tmux.sock"  # never created: the stand-in has no server
         self.chain_file = self.ctl / "chain.json"
         self.run_dir = self.ctl / "runs" / CHAIN / RUN_ID
+        self.reviewbin = self.root / "review-bin"
         self.policy = policy
         self.env = {
             "PATH": f"{self.bindir}{os.pathsep}{self.sysbin}", "HOME": str(self.home),
@@ -168,9 +185,66 @@ class World:
     def origin_git(self, *args):
         return self.run("git", "--git-dir", str(self.origin), *args).stdout.strip()
 
+    # -- reviews by the real review.py over the CLI doubles (the plan of phase A and the task reviews of a wave)
+    def review_py(self, *args, mode="success"):
+        env = dict(self.env, PATH=f"{self.reviewbin}{os.pathsep}{self.sysbin}", SA_TEST_MODE=mode,
+                   SA_TEST_LOG=str(self.root / "review-cli-log.jsonl"))
+        return subprocess.run([sys.executable, str(REVIEW_PY), *map(str, args)], env=env, capture_output=True,
+                              text=True, encoding="utf-8")
+
+    def review(self, repo, base, head, out_dir, note):
+        """A packet of base..head of `repo` and the reports of both reviewers for it:
+        (packet hash for state.py, {profile: report path})."""
+        out_dir.mkdir(parents=True, exist_ok=True)
+        req, ev, packet = out_dir / "requirements.md", out_dir / "evidence.md", out_dir / "packet.json"
+        req.write_text(note, encoding="utf-8")
+        ev.write_text("проверки пройдены\n", encoding="utf-8")
+        r = self.review_py("packet", "--repo", repo, "--base", base, "--head", head, "--requirements", req,
+                           "--test-evidence", ev, "--output", packet)
+        must(r.returncode == 0, f"review.py packet: {r.stderr.strip()}")
+        reports = {}
+        for profile in ("claude-host", "codex-host"):
+            reports[profile] = out_dir / f"result-{profile}.json"
+            self.review_py("run", "--repo", repo, "--packet", packet, "--profile", profile,
+                           "--output", reports[profile], "--timeout", "20")
+            must(reports[profile].exists() and json.loads(reports[profile].read_text(encoding="utf-8")).get("gate_ready") is True,
+                 f"review.py wrote no gate_ready report for {profile}")
+        return "sha256:" + json.loads(packet.read_text(encoding="utf-8"))["packet_hash"], reports
+
+    def approve_plan(self):
+        """Phase A: the approved waves.json in the run directory, its pin, and plan-review/ with the packet
+        whose diff adds the plan and the reports of both reviewers (`wab.py launch` checks them)."""
+        wave = lambda wid, deps: {  # noqa: E731
+            "id": wid, "title": f"Волна {wid}", "goal": f"добавить {wid.lower()}.txt", "requirements": "добавить файл",
+            "acceptance": ["файл добавлен"], "risk": WAVE_RISK[wid], "checks": [{"name": "tests", "cmd": "true"}],
+            "depends_on": deps}
+        plan = {"version": 1, "chain": CHAIN, "repo": REPO, "base_branch": "main",
+                "waves": [wave("W1", []), wave("W2", ["W1"])]}
+        raw = (json.dumps(plan, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        self.plan_sha256 = hashlib.sha256(raw).hexdigest()
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "waves.json").write_bytes(raw)
+        repo = self.root / "plan-repo"
+        repo.mkdir()
+        self.run("git", "init", "-q", cwd=repo)
+        self.git("symbolic-ref", "HEAD", "refs/heads/main", cwd=repo)
+        (repo / "README.md").write_text("plan of the chain\n", encoding="utf-8")
+        self.git("add", "-A", cwd=repo)
+        self.git("commit", "-q", "-m", "base", cwd=repo)
+        base = self.git("rev-parse", "HEAD", cwd=repo)
+        (repo / "waves.json").write_bytes(raw)
+        self.git("add", "-A", cwd=repo)
+        self.git("commit", "-q", "-m", "plan", cwd=repo)
+        review_dir = self.run_dir / "plan-review"
+        self.review(repo, base, self.git("rev-parse", "HEAD", cwd=repo), review_dir, "ревью плана волн\n")
+        (review_dir / "plan.sha256").write_text(self.plan_sha256 + "\n", encoding="utf-8")
+
     def setup(self):
-        for d in (self.home, self.bindir, self.sysbin, self.ctl, self.tmux_state, self.gh_state):
+        for d in (self.home, self.bindir, self.sysbin, self.ctl, self.tmux_state, self.gh_state, self.reviewbin):
             d.mkdir(parents=True, exist_ok=True)
+        for name, source in review_cli_doubles().items():
+            (self.reviewbin / name).write_text(source, encoding="utf-8")
+            (self.reviewbin / name).chmod(0o755)
         # the only system tools the dispatcher and the sessions may use
         for name, path in (("python3", sys.executable), ("git", shutil.which("git")), ("sh", shutil.which("sh")),
                            ("env", shutil.which("env")), ("cat", shutil.which("cat"))):
@@ -200,6 +274,8 @@ class World:
                  "idle_nudge_minutes": NUDGE_MINUTES, "telegram": False}
         if self.policy:
             chain["decision_policy"] = [{"class": "needs_decision", "rec": "A"}]
+        self.approve_plan()
+        chain["plan_sha256"] = self.plan_sha256
         self.chain_file.write_text(json.dumps(chain, indent=1), encoding="utf-8")
         (self.root / "w1-prompt.md").write_text(
             "Волна W1: добавь файл w1.txt в репозиторий.\n" + "\n".join(f"Пункт {i} задачи." for i in range(1, 7)) + "\n",
@@ -397,10 +473,13 @@ class Actor:
             os.utime(path, ns=(before + 5_000_000, before + 5_000_000))
         self.did(s, f"status {text[:40]}")
 
-    def state_py(self, *args):
-        r = subprocess.run([sys.executable, str(STATE_PY), *args], env=self.w.env, capture_output=True,
+    def state_py(self, *args, s=None):
+        env = dict(self.w.env)
+        if s is not None:  # what the dispatcher exports into the wave's tmux session (start_session)
+            env.update(WAB_DIR=str(s.wave_dir), WAB_WAVE=s.wave, WAB_MAX_RUNS="2", WAB_PLAN_SHA256=self.w.plan_sha256)
+        r = subprocess.run([sys.executable, str(STATE_PY), *map(str, args)], env=env, capture_output=True,
                            text=True, encoding="utf-8")
-        must(r.returncode == 0, f"state.py {' '.join(args[:3])}: {r.stderr.strip()}")
+        must(r.returncode == 0, f"state.py {' '.join(map(str, args[:3]))}: {r.stderr.strip()}")
 
     def manifest_path(self, s):
         return s.wave_dir / "superarmanda" / "manifest.json"
@@ -451,18 +530,36 @@ class Actor:
         head = self.w.git("rev-parse", "HEAD")
         base = self.w.git("rev-parse", "origin/main")
         self.manifest_path(s).parent.mkdir(parents=True, exist_ok=True)
-        self.state_py("init", "--manifest", str(self.manifest_path(s)), "--repo", str(self.w.workdir),
-                      "--base", base, "--head", head)
+        if self.mode == "lowered_policy" and s.wave == "W1":
+            # the mutant wave: not from the approved plan, the level lowered to medium (state.py then asks
+            # for one review only and calls the task ready)
+            return self.state_py("init", "--manifest", self.manifest_path(s), "--repo", self.w.workdir,
+                                 "--base", base, "--head", head, "--risk", "medium", s=s)
+        # as the protocol tells a wave: the manifest of the wave from the approved plan (its risk is the level)
+        self.state_py("init", "--manifest", self.manifest_path(s), "--repo", self.w.workdir, "--base", base,
+                      "--head", head, "--from-plan", f"{self.w.run_dir / 'waves.json'}#{s.wave}",
+                      "--expect-sha256", self.w.plan_sha256, s=s)
 
     def record_results(self, s):
         head = self.w.git("rev-parse", "HEAD")
         m = str(self.manifest_path(s))
+        high = WAVE_RISK[s.wave] == "high" and self.mode != "lowered_policy"
         for role in ("coder", "tester"):
             self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", role, "--status", "pass",
-                          "--session-id", f"e2e-{s.wave}-{role}", "--head", head)
-        self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", "cross_provider_reviewer",
-                      "--status", "pass", "--session-id", f"e2e-{s.wave}-reviewer", "--head", head,
-                      "--reviewed-head", head, "--packet-hash", hashlib.sha256(b"packet").hexdigest())
+                          "--session-id", f"e2e-{s.wave}-{role}", "--head", head,
+                          *(["--model", "fable"] if high else []))
+        if not high:  # below high: one review, its report is not dereferenced (the rules of 1.2.0)
+            return self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", "cross_provider_reviewer",
+                                 "--status", "pass", "--session-id", f"e2e-{s.wave}-reviewer", "--head", head,
+                                 "--reviewed-head", head, "--packet-hash", hashlib.sha256(b"packet").hexdigest())
+        # a high wave: both task reviews of this HEAD, written by the real review.py and verified by state.py
+        packet_hash, reports = self.w.review(self.w.workdir, self.w.git("rev-parse", "origin/main"), head,
+                                             s.wave_dir / "superarmanda" / "reports", f"задача волны {s.wave}\n")
+        for role, profile in (("cross_provider_reviewer", "claude-host"), ("second_reviewer", "codex-host")):
+            self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", role, "--status", "pass",
+                          "--session-id", f"e2e-{s.wave}-{role}", "--head", head, "--reviewed-head", head,
+                          "--packet-hash", packet_hash, "--artifact", reports[profile])
+        self.did(s, "two task reviews recorded")
 
     def finish(self, s, next_prompt=None):
         (s.wave_dir / "result.md").write_text(f"{s.wave} готова: {s.wave.lower()}.txt добавлен.\n", encoding="utf-8")
@@ -585,7 +682,8 @@ def run_scenario(mode="normal", limit=90 * 60):
     """mode: normal | gate_off (merge gate always passes, CI red) | gate_off_codex (the same, CI green but
     Codex reviewed an older commit) | no_rebind (find_new_session finds nothing) | no_policy (chain.json
     without decision_policy) | stale_base (the next wave starts on the old working copy) | no_checkpoint
-    (the context is never measured) | no_children_check (the nudge ignores the process tree) | no_nudge (no idle
+    (the context is never measured) | lowered_policy (the high wave W1 builds its manifest with the level
+    lowered to medium and one review) | no_children_check (the nudge ignores the process tree) | no_nudge (no idle
     nudge at all) | rabbit_blocks (a CodeRabbit that is `unavailable` blocks the gate) | kill_any (the cleanup
     does not check whose a pane is)."""
     base = Path(tempfile.mkdtemp(prefix="wabe2e-"))
@@ -635,8 +733,8 @@ def run_scenario(mode="normal", limit=90 * 60):
         if mode == "rabbit_blocks":
             real = wab.gate.manifest_problems
 
-            def strict(manifest, head, fingerprint):
-                out = real(manifest, head, fingerprint)
+            def strict(manifest, head, fingerprint, plan=None):
+                out = real(manifest, head, fingerprint, plan)
                 for name, entry in ((manifest or {}).get("tasks") or {}).items():
                     r = (entry.get("results") or {}).get("coderabbit") or {}
                     if r.get("head") == head and r.get("status") == "unavailable":
@@ -713,6 +811,34 @@ def oracle_gate(run):
         must("--match-head-commit" in m["argv"] and m["argv"][m["argv"].index("--match-head-commit") + 1] == m["sha"],
              f"PR #{m['pr']}: head not pinned")
         must("--squash" in m["argv"], f"PR #{m['pr']}: not a squash merge")
+
+
+def oracle_wave_risk(run):
+    """The gate judged each wave by its risk in the approved plan: the high wave W1 was merged with a manifest
+    version 2 of level high carrying BOTH task reviews of the merged head (claude-host and codex-host, verified
+    review.py reports of one packet); the medium wave W2 with one review, as in 1.2.0. The launch of the new
+    chain passed the check of the two reviews of the plan, and warned once about the missing `model`."""
+    w = run.world
+    merged = {m["pr"]: m["sha"] for m in w.jsonl(w.gh_state / "merges.jsonl")}
+    manifests = {}
+    for wave in ("W1", "W2"):
+        runs = json.loads((w.run_dir / wave / "runs.json").read_text(encoding="utf-8"))["runs"]
+        manifests[wave] = json.loads(Path(runs[-1]["manifest"]).read_text(encoding="utf-8"))
+        m = manifests[wave]
+        must((m["version"], m["review_policy"]["level"], m["plan"]["sha256"]) == (2, WAVE_RISK[wave], w.plan_sha256),
+             f"{wave}: manifest policy {m.get('version')}/{m.get('review_policy')}")
+    results = manifests["W1"]["tasks"]["T1"]["results"]
+    reviews = {role: results.get(role) or {} for role in ("cross_provider_reviewer", "second_reviewer")}
+    must(sorted(r.get("profile") for r in reviews.values()) == ["claude-host", "codex-host"],
+         f"the high wave W1 was merged without the two reviews: {sorted(results)}")
+    for role, r in reviews.items():
+        must(r["status"] == "pass" and r["head"] == merged.get(1) and r["artifact_sha256"], f"W1 {role}: {r}")
+    must(len({r["packet_hash"] for r in reviews.values()}) == 1, "the two reviews of W1 cover different packets")
+    must(all(results[role]["model"] == "claude-fable-5-1" for role in ("coder", "tester")), "W1 coder/tester model")
+    must("second_reviewer" not in manifests["W2"]["tasks"]["T1"]["results"], "the medium wave W2 needs one review")
+    warnings = [l for l in run.events_log.splitlines() if "chain.json has no `model`" in l]
+    must(len(warnings) == 1, f"one warning about the missing model, got {len(warnings)}")
+    must("plan review" not in run.events_log, "the launch complained about the plan review")
 
 
 def oracle_rebind(run):
@@ -857,6 +983,9 @@ class OfflineChain(unittest.TestCase):
     def test_session_is_followed_across_clear(self):
         oracle_rebind(self.chain)
 
+    def test_high_wave_is_merged_with_two_reviews_and_the_medium_one_with_one(self):
+        oracle_wave_risk(self.chain)
+
     def test_policy_answered_once(self):
         oracle_policy(self.chain)
 
@@ -912,6 +1041,11 @@ class Mutations(unittest.TestCase):
     def test_without_context_measuring_the_chain_stalls_at_the_checkpoint(self):
         with self.assertRaises(Stalled):
             run_scenario("no_checkpoint", limit=40 * 60)
+
+    def test_a_high_wave_with_a_lowered_policy_and_one_review_never_passes_the_gate(self):
+        """state.py calls the task ready (level medium, one review); the gate knows the wave is high by the plan."""
+        with self.assertRaises(Stalled):
+            run_scenario("lowered_policy", limit=70 * 60)
 
     def test_a_nudge_that_ignores_the_process_tree_is_a_false_nudge(self):
         run = run_scenario("no_children_check")
