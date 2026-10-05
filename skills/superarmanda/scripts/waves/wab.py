@@ -1369,8 +1369,32 @@ class Masked(str):
     """Text that has passed safe_text(): the mark that every cutting or joining helper (_clip, _head, _one_line,
     _masked_line) asks for FIRST (_require_masked). A str subclass: json, state.json and files take it as a str;
     an operation on it (a slice, join) gives a plain str again, so a helper wraps its result itself. Made only
-    by safe_text and those helpers (tests/…: the static check)."""
+    by safe_text and those helpers (tests/…: the static check). The methods that only trim or cut it (strip,
+    lstrip, rstrip, splitlines) give Masked back, so a part masked WITH a policy (owner_paths=True: the
+    owner-script path of a notice) keeps being a Masked part; an f-string or `+` with a plain str gives a str,
+    and a helper asked with it masks again WITHOUT the policy. Several parts are joined by _join_masked only."""
     __slots__ = ()
+
+    def strip(self, chars=None):
+        return Masked(str.strip(self, chars))
+
+    def lstrip(self, chars=None):
+        return Masked(str.lstrip(self, chars))
+
+    def rstrip(self, chars=None):
+        return Masked(str.rstrip(self, chars))
+
+    def splitlines(self, keepends=False):
+        return [Masked(l) for l in str.splitlines(self, keepends)]
+
+
+def _join_masked(parts, sep="", owner_paths=False):
+    """THE one way to join parts into a text that goes on to _clip / _head / _one_line / _masked_line: Masked parts
+    stay as they are (so the policy they were masked with is kept: render_notice masks the dispatcher's wording with
+    owner_paths=True), any other part (a literal of the dispatcher, a str) is masked first with `owner_paths`.
+    An f-string or `"".join` of Masked parts is a plain str, and the helper after it would mask it AGAIN
+    without the policy: the owner's merge script path in a notice became `[скрыто]`."""
+    return Masked(sep.join(_require_masked(p, owner_paths) for p in parts))
 
 
 def _require_masked(text, owner_paths=False):
@@ -1462,7 +1486,7 @@ def _render_quote(inner, before):
     inner = safe_text(inner, 10 ** 9, False)  # again, idempotent
     lines = inner.splitlines() or [""]
     if len(lines) == 1 and before and not before.endswith("\n"):
-        return f"«цитата волны: {lines[0]}»"
+        return _join_masked(["«цитата волны: ", lines[0], "»"])
     head = ("\n" if before and not before.endswith("\n") else "") + "Цитата волны:"
     # the cap applies to the quote AS SHOWN (the head and the `> ` of every line count): hundreds of
     # short lines must not swell it and push the dispatcher's own words after it out of the message
@@ -1475,7 +1499,7 @@ def _render_quote(inner, before):
             break
         shown.append(row)
         used += 1 + len(row)
-    return head + "\n" + "\n".join(shown)
+    return _join_masked([head, _join_masked(shown, "\n")], "\n")
 
 
 def render_notice(text, limit=TG_MESSAGE_LIMIT):
@@ -1488,17 +1512,17 @@ def render_notice(text, limit=TG_MESSAGE_LIMIT):
         out.append(_render_quote(m.group(1), "".join(out)))
         pos = m.end()
     out.append(safe_text(text[pos:], 10 ** 9, True))
-    return _clip("".join(out), limit)
+    return _clip(_join_masked(out), limit)  # NOT "".join: a plain str would be masked again without owner_paths
 
 
 def _first_line(text, limit):
     """The first non-empty line of a rendered notice, capped (display-message, ATTENTION, events)."""
-    lines = [l for l in render_notice(text, 10 ** 9).splitlines() if l.strip()]
+    lines = [l for l in render_notice(text, 10 ** 9).splitlines() if l.strip()]  # Masked lines
     if not lines:
-        return ""
+        return _join_masked([])
     if lines[0].strip() == "Цитата волны:" and len(lines) > 1:
         # the heading alone says nothing in ATTENTION / display-message: add the quote's first line
-        return _clip(f"{lines[0].strip()} {lines[1].lstrip('> ').strip()}", limit)
+        return _clip(_join_masked([lines[0].strip(), " ", lines[1].lstrip("> ").strip()]), limit)
     return _clip(lines[0], limit)
 
 
@@ -1587,7 +1611,8 @@ def notify(cfg, text, wave=None):
         label = chain_label(cfg)
         if body.startswith(f"{label}: "):
             body = body[len(label) + 2:]
-        short = _clip(f"{label}{' ' + wave if wave else ''}: {_first_line(body, DISPLAY_LIMIT)}", DISPLAY_LIMIT)
+        short = _clip(_join_masked([label, " " + wave if wave else "", ": ", _first_line(body, DISPLAY_LIMIT)]),
+                      DISPLAY_LIMIT)
         try:
             display_all(short)
         except (subprocess.CalledProcessError, OSError) as e:
@@ -1919,7 +1944,7 @@ def attention_text(st):
     if latest is None:
         return None
     wave, w, item = latest
-    text = (f"time: {_utc(item.get('at'))}\nwave: {wave}\nsignal: {safe_text(item.get('line', ''), 300)}\n"
+    text = (f"time: {_utc(item.get('at'))}\nwave: {wave}\nsignal: {safe_text(item.get('line', ''), 300, owner_paths=True)}\n"
             f"attach: {attach_cmd(str(w.get('tmux') or ''))}\n")
     if total > 1:
         text += f"open signals: {total} (wab.py status, events.log)\n"

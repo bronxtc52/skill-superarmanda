@@ -14909,7 +14909,8 @@ def cut_sites(waves_dir):
 # safe_text / redact, which make the mask) may construct Masked
 MASKING_HELPERS = {("wab.py", "_clip"), ("wab.py", "_head"), ("wab.py", "_one_line"), ("wab.py", "_masked_line"),
                    ("dash.py", "_clip")}
-MASKED_MAKERS = MASKING_HELPERS | {("wab.py", "safe_text"), ("wab.py", "redact")}
+MASKED_MAKERS = MASKING_HELPERS | {("wab.py", "safe_text"), ("wab.py", "redact"), ("wab.py", "_join_masked"),
+                                    ("wab.py", "Masked")}  # Masked: its own strip/lstrip/rstrip/splitlines
 
 
 def helper_violations(waves_dir):
@@ -14927,6 +14928,8 @@ def helper_violations(waves_dir):
                     bad.append((path.name, name, "does not call _require_masked"))
 
         def walk(node, func):
+            if isinstance(node, ast.ClassDef) and node.name == "Masked" and func == "<module>":
+                func = "Masked"
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and func == "<module>":
                 func = node.name
             if isinstance(node, ast.Call):
@@ -14938,6 +14941,39 @@ def helper_violations(waves_dir):
 
         walk(tree, "<module>")
     return bad
+
+
+# Rule E. A helper asked with a JOINED text (an f-string, `+`, `"".join`) masks it again WITHOUT the owner_paths policy
+# of its parts (the owner's merge script path of a notice became `[скрыто]`): parts are joined by _join_masked.
+# Allowed: a join of RAW outside text, where no part carries a policy.
+JOIN_ALLOWLIST = {
+    ("wab.py", "process_table", "_masked_line(f'ps: {type(e).__name__}: {e}', 150)"): "raw error text of ps, no policy",
+    ("wab.py", "handoff_gate_line", "_masked_line('; '.join(v['reasons']), 300)"): "raw reasons of the gate, no policy",
+}
+
+
+def joined_into_helpers(waves_dir):
+    import ast
+    found = []
+    for path in sorted(Path(waves_dir).glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        def walk(node, func):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and func == "<module>":
+                func = node.name
+            if isinstance(node, ast.Call) and node.args:
+                f = node.func
+                name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+                a = node.args[0]
+                if name in ("_clip", "_head", "_one_line", "_masked_line") and (
+                        isinstance(a, (ast.JoinedStr, ast.BinOp))
+                        or (isinstance(a, ast.Call) and isinstance(a.func, ast.Attribute) and a.func.attr == "join")):
+                    found.append((path.name, func, ast.unparse(node)))
+            for child in ast.iter_child_nodes(node):
+                walk(child, func)
+
+        walk(tree, "<module>")
+    return sorted(c for c in found if c not in JOIN_ALLOWLIST)
 
 
 # Rule C. Functions that show text to a human: in them str.split / splitlines / partition run ONLY on a masked
@@ -15154,6 +15190,21 @@ class W2EveryCut(Base):
         tmp = self.mutate("masked", "def _say_first(text):\n", "def _say_first(text):\n    text = Masked(text)\n")
         self.assertTrue([b for b in helper_violations(tmp) if b[1] == "_say_first"])
 
+    def test_no_helper_is_asked_with_a_joined_text(self):
+        self.assertEqual(joined_into_helpers(WAVES), [])
+
+    def test_render_notice_without_join_masked_is_caught_by_the_static_check_and_by_behaviour(self):
+        tmp = self.mutate("join", "return _clip(_join_masked(out), limit)", 'return _clip("".join(out), limit)')
+        self.assertTrue([j for j in joined_into_helpers(tmp) if j[1] == "render_notice"])
+        cfg, _ = self.chain()
+        path = wab.write_owner_script(cfg, "W1", "71234567890a" + "0" * 28)
+        notice = f"{wab.SIGN}Выполни: {wab.home_form(path)}"
+        spec = importlib.util.spec_from_file_location("wab_mutant2", tmp / "wab.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertIn(path.name, wab.render_notice(notice))
+        self.assertNotIn(path.name, mod.render_notice(notice))  # the mutant loses the policy: the test above is red on it
+
     def test_masked_is_a_str_that_json_and_files_take(self):
         m = wab.safe_text("a b", 10)
         self.assertIsInstance(m, wab.Masked)
@@ -15235,6 +15286,54 @@ class W2CutOutside(Base):
                     gate._threads(lambda query, variables: {"errors": text}, "o/r", 1)
                 self.assertIn(token, str(cm.exception))  # gate.py (stdlib-only) does not touch the text at all
                 self.assertIsNone(leaked(wab._masked_line(cm.exception, 200), [part]))
+
+
+class W2OwnerScriptPath(Base):
+    """The owner's merge script path `~/.cache/wab/<wave>.<sha12>.<id16>.merge` is the dispatcher's own wording:
+    it stays whole in every path of a notice (the exemption of owner_paths=True must not be lost by a helper that
+    masks again), and is masked inside a quote of the wave and when the file does not exist."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg, _ = self.chain()
+        path = wab.write_owner_script(self.cfg, "W1", "71234567890a" + "0" * 28)  # sha12 looks like a phone number
+        self.path, self.shown = path, wab.home_form(path)
+        self.notice = f"{wab.SIGN}волна W1 сдала PR. Выполни: {self.shown} (заново проверит гейт)\n\nещё строка"
+
+    def test_the_path_is_whole_in_every_path_of_a_notice(self):
+        self.assertIn(self.shown, wab.render_notice(self.notice))
+        self.assertIn(self.shown, wab._first_line(self.notice, 300))
+        self.assertIn(self.shown, wab._first_line(f"{wab.SIGN}Выполни: {self.shown}", 300))
+        att = wab.attention_text({"waves": {"W1": {"tmux": "wv-w1", "attention": {}}}})
+        w = {}
+        wab.note_attention(w, "blocked", f"{wab.SIGN}Выполни: {self.shown}", 1.0)
+        self.assertIn(self.shown, wab.attention_text({"waves": {"W1": {"tmux": "wv-w1", "attention": w["attention"]}}}))
+        self.assertIsNone(att)
+
+    def test_the_path_is_whole_in_telegram_and_in_display_message(self):
+        self.tg.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab.notify(self.cfg, f"{wab.SIGN}Выполни: {self.shown}")
+        self.assertIn(self.shown, "\n".join(self.tg))
+        cfg, _ = self.chain(telegram=None)
+        shown = []
+        with mock.patch.object(wab, "display_all", side_effect=shown.append), contextlib.redirect_stdout(io.StringIO()):
+            wab.notify(cfg, f"{wab.SIGN}Выполни: {self.shown}", "W1")
+        self.assertIn(self.shown, "\n".join(shown))
+
+    def test_the_path_inside_a_quote_of_the_wave_is_masked(self):
+        for out in (wab.render_notice(wab.quote(self.shown)), wab.render_notice(f"x {wab.quote(self.shown)}"),
+                    wab._first_line(wab.quote(self.shown), 300)):
+            self.assertNotIn(self.path.name, out)
+
+    def test_the_path_of_a_file_that_does_not_exist_is_masked(self):
+        self.path.unlink()
+        for out in (wab.render_notice(self.notice), wab._first_line(self.notice, 300)):
+            self.assertNotIn(self.path.name, out)
+
+    def test_the_status_of_the_dispatcher_keeps_the_path(self):
+        wdir = wab.wave_dir(self.cfg, "W1")
+        self.assertIn(self.shown, wab._write_status(wdir, f"BLOCKED: merge gate: выполни {self.shown}"))
 
 
 class W2CutBeforeMask(Base):
