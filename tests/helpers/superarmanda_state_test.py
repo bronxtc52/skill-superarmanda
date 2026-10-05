@@ -5764,5 +5764,354 @@ class LiveVersion1Manifests(PolicyBase):
                 self.refused(command, *args, needle="review_policy")
 
 
+# ---------------------------------------------------------------- 1.2.3 (W3, #86 п.5-10): Fable subagent roles
+FABLE_ROLES = ("architect", "internal_reviewer", "triage", "investigator", "final_check")
+EXTERNAL_REVIEW_ROLES = ("cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit")
+
+
+class W3FableRoles(PolicyBase):
+    """The five Fable subagent roles: recorded only with the Fable model, and (in W3) without any
+    effect on readiness, `where` or the merge gate."""
+
+    def way_out(self, role):
+        return f"task-result --role {role} --status unavailable --model fable"
+
+    def test_fable_roles_require_the_fable_model_at_any_status_and_any_risk(self):
+        for risk in ("low", "high"):
+            self.init(risk=risk)
+            for role in FABLE_ROLES:
+                for status in ("pass", "findings", "unavailable"):
+                    with self.subTest(risk=risk, role=role, status=status, model=None):
+                        self.record_refused(role, status, needle=self.way_out(role))
+                for model in ("sonnet", SONNET, "Fable", "fable ", "claude-opus-5-5"):
+                    with self.subTest(risk=risk, role=role, model=model):
+                        self.record_refused(role, model=model, needle=self.way_out(role))
+                with self.subTest(risk=risk, role=role, model="fable"):
+                    entry = self.record(role, model="fable")
+                    self.assertEqual(entry["results"][role]["model"], FABLE)
+                    # Fable unavailable: the record itself, with the model it was asked for
+                    entry = self.record(role, "unavailable", model=FABLE)
+                    self.assertEqual((entry["results"][role]["status"], entry["results"][role]["model"]),
+                                     ("unavailable", FABLE))
+            listed = {item["role"]: item for item in self.where()["artifacts"]}
+            for role in FABLE_ROLES:
+                with self.subTest(risk=risk, role=role, where="artifacts"):
+                    self.assertEqual((listed[role]["status"], listed[role]["model"]), ("unavailable", FABLE))
+
+    def test_fable_roles_change_neither_readiness_nor_where_nor_the_gate(self):
+        gate = _load("superarmanda_gate_for_w3_roles", GATE)
+
+        def problems(plan):
+            value = self.data()
+            return gate.manifest_problems(value, value["head"], value["tree_fingerprint"], plan=plan)
+
+        def position():
+            where = self.where()
+            return where["task_status"], where["step"], where["role"], where["next_action"]
+
+        for risk, plan in (("high", HIGH_WAVE), ("medium", MEDIUM_WAVE)):
+            self.init(risk=risk)
+            if risk == "high":
+                self.code_and_test()
+                self.review("cross_provider_reviewer", "claude-host")
+                self.review("second_reviewer", "codex-host")
+            else:
+                self.record("coder")
+                self.record("tester")
+                self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+            before = position()
+            self.assertEqual(before[0], "ready_for_pr_review")
+            self.assertEqual(problems(plan), [])
+            for status in ("pass", "findings", "unavailable", "error", "incomplete"):
+                for role in FABLE_ROLES:
+                    with self.subTest(risk=risk, role=role, status=status):
+                        entry = self.record(role, status, model="fable")
+                        self.assertEqual(entry["status"], "ready_for_pr_review")
+                        self.assertEqual(position(), before)
+                        self.assertEqual(problems(plan), [])
+            status = self.ok("status")
+            self.assertEqual(status["tasks"]["t1"]["status"], "ready_for_pr_review")
+            self.assertEqual(self.resume()["invalidated_tasks"], [])
+            self.assertEqual(position(), before)
+
+    def test_fable_roles_do_not_move_a_task_that_is_not_ready(self):
+        # before any code: the marked step 1..3 still drives `where` with an architect result recorded
+        self.ok("mark", "--task", "t1", "--step", "1", "--safe-point", "false")
+        before = self.where()
+        self.assertEqual((before["step"], before["role"]), (1, "coordinator"))
+        entry = self.record("architect", model="fable")
+        self.assertEqual(entry["status"], "pending")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"], where["next_action"]),
+                         (1, "coordinator", before["next_action"]))
+        self.record("investigator", model="fable")
+        self.assertEqual(self.entry()["status"], "pending")
+        # a task waiting for its fix stays so: a triage result is no step of the fix loop
+        self.record("coder", model="fable")
+        self.record("tester", "findings", model="fable")
+        failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.assertEqual(failed["status"], "needs_fix")
+        before = self.where()
+        for role in ("triage", "final_check", "internal_reviewer"):
+            with self.subTest(role=role):
+                self.assertEqual(self.record(role, "findings", model="fable")["status"], "needs_fix")
+                where = self.where()
+                self.assertEqual((where["step"], where["role"], where["next_action"], where["fix_round"]),
+                                 (before["step"], before["role"], before["next_action"], before["fix_round"]))
+
+    def test_fable_roles_are_not_recorded_over_blocked_or_needs_decision(self):
+        self.record("tester", "findings", model="fable")
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.record_refused("triage", model="fable", needle="decision required")
+
+
+class W3InternalReviewSource(PolicyBase):
+    """`fix-loop --outcome failed --source internal_reviewer`: the findings of the internal Fable review are
+    fixed before the first external packet and spend neither a fix cycle nor a round of an external source."""
+
+    def internal(self, status="findings", **flags):
+        return self.record("internal_reviewer", status, model="fable", **flags)
+
+    def failed(self, source):
+        return self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", source)
+
+    def internal_refused(self, needle=None):
+        return self.refused("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "internal_reviewer",
+                            needle=needle)
+
+    def next_head(self):
+        self.change(f"fix {next(self.serial)}\n")
+        self.resume()
+
+    def test_internal_round_spends_no_fix_cycle_and_is_no_round_of_the_two_round_rule(self):
+        self.record("coder", model="fable")
+        self.internal()
+        entry = self.failed("internal_reviewer")
+        self.assertEqual((entry["status"], entry["fix_cycles"], entry["fix_sources"], entry["decision_required_for"]),
+                         ("needs_fix", 0, {}, None))
+        self.assertEqual(len(entry["internal_rounds"]), 1)
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (6, "coder"))
+        self.assertEqual(where["fix_round"], {"internal_reviewer": "1/3", "total": "0/3"})
+        # the counter of the task survives resume onto the new HEAD of the fix
+        self.next_head()
+        self.assertEqual(len(self.entry()["internal_rounds"]), 1)
+        self.assertEqual(self.where()["fix_round"], {"internal_reviewer": "1/3", "total": "0/3"})
+        # a second round in a row from the internal source never asks for a decision
+        self.internal()
+        entry = self.failed("internal_reviewer")
+        self.assertEqual((entry["status"], entry["fix_cycles"], entry["fix_sources"], entry["decision_required_for"]),
+                         ("needs_fix", 0, {}, None))
+        # between the rounds of an ordinary source it neither resets nor adds anything
+        self.next_head()
+        self.record("tester", "findings", model="fable")
+        entry = self.failed("tester")
+        self.assertEqual((entry["status"], entry["fix_cycles"], entry["fix_sources"]), ("needs_fix", 1, {"tester": 1}))
+        self.next_head()
+        self.internal()
+        entry = self.failed("internal_reviewer")
+        self.assertEqual((entry["status"], entry["fix_cycles"], entry["fix_sources"]), ("needs_fix", 1, {"tester": 1}))
+        self.assertEqual(len(entry["internal_rounds"]), 3)
+        self.next_head()
+        self.record("tester", "findings", model="fable")
+        entry = self.failed("tester")
+        self.assertEqual((entry["status"], entry["fix_cycles"], entry["decision_required_for"]),
+                         ("needs_decision", 2, "tester"))
+        self.assertEqual(self.where()["fix_round"], {"internal_reviewer": "3/3", "tester": "2/2", "total": "2/3"})
+        # waiting for the decision: the internal source is refused like any other
+        self.internal_refused(needle="decision required")
+        self.ok("fix-loop", "--task", "t1", "--decision", "invariant", "--note", "fix the invariant")
+        # the cap of three cycles fires as before
+        entry = self.failed("tester")
+        self.assertEqual((entry["status"], entry["fix_cycles"], entry["blocked_reason"]),
+                         ("blocked", 3, "three unsuccessful fix cycles"))
+        self.internal_refused(needle="blocked")
+        self.assertTrue(self.where()["next_action"].startswith("BLOCKED: task t1 blocked after three fix cycles"))
+
+    def test_internal_round_needs_a_current_findings_result_and_one_round_per_result(self):
+        self.internal_refused(needle="internal_reviewer findings result")
+        self.internal("pass")
+        self.internal_refused(needle="findings")
+        self.internal()
+        self.failed("internal_reviewer")
+        self.internal_refused(needle="already")  # the same result is one round
+        self.internal()  # a rerun on the same HEAD is another result
+        self.assertEqual(len(self.failed("internal_reviewer")["internal_rounds"]), 2)
+        # findings of the previous HEAD are not the findings of this one
+        self.internal()
+        self.change("moved on\n")
+        self.internal_refused()
+        self.resume()
+        self.internal_refused(needle="internal_reviewer findings result")
+
+    def test_fourth_internal_round_is_refused_and_goes_under_an_ordinary_source(self):
+        for _ in range(3):
+            self.internal()
+            self.failed("internal_reviewer")
+            self.next_head()
+        self.internal()
+        proc = self.internal_refused(needle="--source tester")
+        self.assertIn("3", proc.stderr)
+        entry = self.entry()
+        self.assertEqual((len(entry["internal_rounds"]), entry["fix_cycles"]), (3, 0))
+        # the way out the refusal names: an ordinary source, which spends a cycle
+        entry = self.failed("tester")
+        self.assertEqual((entry["status"], entry["fix_cycles"], entry["fix_sources"]), ("needs_fix", 1, {"tester": 1}))
+
+    def test_internal_source_closes_with_the_first_external_packet_until_the_end_of_the_run(self):
+        statuses = {"cross_provider_reviewer": "unavailable", "second_reviewer": "error",
+                    "github_codex_review": "findings", "coderabbit": "unavailable"}
+        for role in EXTERNAL_REVIEW_ROLES:
+            with self.subTest(external=role):
+                self.init()
+                self.internal()
+                self.failed("internal_reviewer")  # open before the first external packet
+                self.next_head()
+                self.internal()
+                self.record(role, statuses[role])
+                self.assertEqual(self.entry()["external_review"]["role"], role)
+                self.internal_refused(needle="external")
+                # a new HEAD after the fix does not reopen it
+                self.next_head()
+                self.assertEqual(self.entry()["external_review"]["role"], role)
+                self.internal()
+                self.internal_refused(needle="external")
+                entry = self.entry()
+                self.assertEqual((len(entry["internal_rounds"]), entry["fix_cycles"], entry["fix_sources"]), (1, 0, {}))
+                # a manifest of 1.2.2 has no marker: the session history of the task says the same
+                value = self.data()
+                del value["tasks"]["t1"]["external_review"]
+                self.manifest.write_text(json.dumps(value), encoding="utf-8")
+                self.internal_refused(needle="external")
+                self.assertEqual(self.where()["task"], "t1")
+
+    def test_external_review_report_cannot_be_recorded_as_an_internal_finding(self):
+        self.packet()
+        for profile in ("claude-host", "codex-host", "codex-host-opus"):
+            with self.subTest(profile=profile):
+                report = self.report(profile, "findings")
+                self.assertEqual(json.loads(report.read_text(encoding="utf-8"))["profile"], profile)
+                self.record_refused("internal_reviewer", "findings", model="fable", artifact=str(report),
+                                    needle="external review")
+                link = self.root / f"link-{profile}.json"
+                link.symlink_to(report)
+                self.record_refused("internal_reviewer", "findings", model="fable", artifact=str(link),
+                                    needle="external review")
+        # the artifact is read again when the round is recorded: a report put in its place later is refused
+        notes = self.root / "internal-review.md"
+        notes.write_text("# Внутреннее ревью\n\n- находка\n", encoding="utf-8")
+        self.internal(artifact=str(notes))
+        notes.write_bytes(report.read_bytes())
+        self.internal_refused(needle="external review")
+        notes.write_text("# Внутреннее ревью\n\n- находка\n", encoding="utf-8")
+        self.assertEqual(len(self.failed("internal_reviewer")["internal_rounds"]), 1)
+        # a directory or a missing path behind the artifact is not a report: nothing to refuse, no traceback
+        for artifact in (str(self.root), str(self.root / "absent.md"), "https://example.invalid/review"):
+            with self.subTest(artifact=artifact):
+                self.internal(artifact=artifact)
+
+    def test_internal_source_has_no_defer_accept_or_pass_form(self):
+        self.internal()
+        self.refused("fix-loop", "--task", "t1", "--defer", "--source", "internal_reviewer", "--note", "n",
+                     needle="--outcome failed")
+        self.refused("fix-loop", "--task", "t1", "--accept", "--source", "internal_reviewer", "--severity", "low",
+                     "--note", "n", needle="--outcome failed")
+        self.refused("fix-loop", "--task", "t1", "--outcome", "pass", "--source", "internal_reviewer")
+
+    def test_malformed_internal_records_are_a_closed_refusal(self):
+        self.internal()
+        self.failed("internal_reviewer")
+        for key, bad in (("internal_rounds", 3), ("internal_rounds", ["x"]), ("external_review", "yes")):
+            with self.subTest(key=key, bad=bad):
+                value = self.data()
+                value["tasks"]["t1"][key] = bad
+                self.manifest.write_text(json.dumps(value), encoding="utf-8")
+                self.refused("where", needle=key)
+                self.refused("status", needle=key)
+
+
+class W3Version1(PolicyBase):
+    """Manifest version 1 knows nothing of 1.2.3: the roles, the source and the new task keys are refused."""
+
+    RISK = "low"
+    load_live = LiveVersion1Manifests.load_live
+
+    def test_fable_roles_and_the_internal_source_are_refused_on_version_1(self):
+        self.load_live("v1-medium-waves-tails-W2.json")
+        needle = "requires manifest version 2"
+        for role in FABLE_ROLES:
+            with self.subTest(role=role):
+                self.record_refused(role, model="fable", needle=needle)
+                self.record_refused(role, needle=needle)
+        self.refused("fix-loop", "--task", self.TASK, "--outcome", "failed", "--source", "internal_reviewer",
+                     needle=needle)
+        # recording an external review on version 1 leaves no marker of 1.2.3 in it
+        entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.assertNotIn("external_review", entry)
+        self.assertNotIn("internal_rounds", entry)
+        # a version 1 manifest carrying the records of 1.2.3 by hand is malformed
+        live = self.data()
+        for key, value in (("internal_rounds", []), ("external_review", {"role": "coderabbit"})):
+            with self.subTest(key=key):
+                forged = copy.deepcopy(live)
+                forged["tasks"][self.TASK][key] = value
+                self.manifest.write_text(json.dumps(forged), encoding="utf-8")
+                self.refused("where", needle=needle)
+        forged = copy.deepcopy(live)
+        forged["tasks"][self.TASK]["session_roles"]["architect-1"] = "architect"
+        self.manifest.write_text(json.dumps(forged), encoding="utf-8")
+        self.refused("where", needle=needle)
+
+
+class W3RemainderOfW2(PolicyBase):
+    """The remainder of W2 (1.2.2): `where` over a directory artifact, the gate over a non-string `wave.risk`."""
+
+    def test_where_survives_a_directory_behind_the_second_reviewer_artifact(self):
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        for status in ("unavailable", "error"):
+            with self.subTest(status=status):
+                self.record("second_reviewer", status, artifact=str(self.root))
+                proc = self.state("where")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                action = json.loads(proc.stdout)["next_action"]
+                self.assertTrue(action.startswith(f"BLOCKED: second_reviewer {status}"), action)
+                self.assertIn("could not be checked", action)
+        # the same reader behind task-result: a clean refusal, not an errno
+        proc = self.record_refused("second_reviewer", needle="regular file",
+                                   **self.review_flags(self.root))
+        self.assertNotIn("Errno", proc.stderr)
+
+    def test_gate_fails_with_a_reason_on_a_wave_risk_that_is_not_a_string(self):
+        gate = _load("superarmanda_gate_for_w3_remainder", GATE)
+        plan = self.root / "waves.json"
+        plan.write_text(json.dumps(plan_doc([wave("w1", risk="high")])), encoding="utf-8")
+        self.init("--from-plan", f"{plan}#w1", risk="")
+        self.code_and_test()
+        self.review("cross_provider_reviewer", "claude-host")
+        self.review("second_reviewer", "codex-host")
+        value = self.data()
+        self.assertEqual(gate.manifest_problems(value, value["head"], value["tree_fingerprint"], plan=HIGH_WAVE), [])
+        bot = {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+        facts = {"pr": {"state": "open", "merged": False, "draft": False, "head": self.head(), "base": "main"},
+                 "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}],
+                 "reviews": [{"user": bot, "commit_id": self.head(), "state": "COMMENTED"}],
+                 "review_comments": [], "issue_comments": [], "resolved": {}, "threads": []}
+        work = {"clean": True, "head": self.head(), "fingerprint": value["tree_fingerprint"]}
+        self.assertEqual(gate.evaluate(facts, self.head(), value, work, "main", plan=HIGH_WAVE)["verdict"], "pass")
+        for bad in (["high"], {"level": "high"}, 5, None, True, "extreme"):
+            for plan_risk in (HIGH_WAVE, MEDIUM_WAVE, None):
+                with self.subTest(risk=bad, plan=plan_risk):
+                    forged = copy.deepcopy(value)
+                    forged["wave"]["risk"] = bad
+                    problems = gate.manifest_problems(forged, forged["head"], forged["tree_fingerprint"],
+                                                      plan=plan_risk)
+                    self.assertTrue(any("wave.risk" in p and "новый прогон волны" in p for p in problems), problems)
+                    verdict = gate.evaluate(facts, self.head(), forged, work, "main", plan=plan_risk)
+                    self.assertEqual(verdict["verdict"], "fail")
+                    self.assertTrue(any("wave.risk" in p for p in verdict["reasons"]), verdict["reasons"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
