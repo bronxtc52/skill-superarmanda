@@ -230,7 +230,7 @@ def pipeline(cfg, st):
             done = key in FINISHED
             t.append(" ━━▶ " if done else " ──▷ ", style="green" if done else "grey42")
     titles = cfg.get("titles") or {}
-    sub = Text("  ·  ".join(f"{w}: {titles[w]}" for w in cfg["waves"] if w in titles),
+    sub = Text("  ·  ".join(f"{w}: {_safe(titles[w])}" for w in cfg["waves"] if w in titles),
                style="grey62", justify="center")
     return Group(t, sub)
 
@@ -328,8 +328,12 @@ def finding_counts(artifact):
         items = data["findings"] if isinstance(data, dict) else data
         counts = {}
         for item in items:
-            sev = str(item.get("severity") or item.get("priority")).strip()
-            sev = sev.lower() if sev.lower() in SEVERITIES else sev.upper()
+            sev = item.get("severity") or item.get("priority")
+            if not isinstance(sev, (str, int, type(None))):  # str() of a nested value escapes an invisible
+                return None  # character of its key, and the mask would no longer see the hiding key (#85)
+            sev = str(sev).strip()
+            # only a known level changes its case: upper() of free text would hide `sk-…` from the mask (#85)
+            sev = next((k for k in SEVERITIES if k.lower() == sev.lower()), sev)
             counts[sev] = counts.get(sev, 0) + 1
         return counts
     except (OSError, ValueError, KeyError, TypeError, AttributeError):

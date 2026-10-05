@@ -15736,7 +15736,7 @@ class W2OutputPaths(Base):
         return self.render_plain(self.dash.waves_table(cfg, self.get_state(cfg)))
 
     def out_dash_pipeline(self, raw):
-        cfg, _ = self.chain()
+        cfg, _ = self.chain(titles={"W1": raw})  # the title of a wave is shown on the line too (Codex on #85)
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", raw)
         return self.render_plain(self.dash.pipeline(cfg, self.get_state(cfg)))
@@ -15773,12 +15773,33 @@ class W2OutputPaths(Base):
         where = {"task": raw, "task_status": raw, "step": raw, "role": raw, "next_action": raw,
                  "decision_required_for": raw, "run": raw, "error": None,
                  "verdicts": {"tester": raw}, "open_findings": [{"role": raw, "status": raw}]}
+        for n, sev in enumerate(({raw: raw}, [raw], raw)):  # a malformed severity: never str() before the mask
+            art = self.tmp / f"findings-{n}.json"
+            art.write_text(json.dumps({"findings": [{"severity": sev}]}), encoding="utf-8")
+            where["open_findings"].append({"role": "tester", "status": "failed", "artifact": str(art)})
         with mock.patch.object(self.dash, "manifest_where", return_value=where):
             lines = self.dash.manifest_lines(cfg, "W1", self.wave_rec())
         err = {"error": raw}
         with mock.patch.object(self.dash, "manifest_where", return_value=err):
             lines += self.dash.manifest_lines(cfg, "W1", self.wave_rec())
         return "\n".join(l.plain for l in lines)
+
+    def test_a_severity_that_is_not_a_string_never_reaches_the_dashboard(self):
+        """Codex on #85: str() of a nested severity escapes the invisible character of its key
+        (`pass\\u200bword`), and the mask no longer sees the hiding key: such an artifact is invalid."""
+        for sev in ({"pass\u200bword": "Hunter2"}, ["pass\u200bword=Hunter2"], {"x": {"pass\u200bword": "Hunter2"}}):
+            with self.subTest(sev=sev):
+                art = self.tmp / "findings.json"
+                art.write_text(json.dumps({"findings": [{"severity": sev}]}), encoding="utf-8")
+                self.assertIsNone(self.dash.finding_counts(str(art)))
+                self.dash.MANIFEST_CACHE.clear()
+                cfg, _ = self.chain()
+                where = {"task": "W1", "open_findings": [{"role": "tester", "status": "failed", "artifact": str(art)}]}
+                with mock.patch.object(self.dash, "manifest_where", return_value=where):
+                    lines = self.dash.manifest_lines(cfg, "W1", self.wave_rec())
+                self.assertNotIn("hunter2", "\n".join(l.plain for l in lines).lower())
+        art.write_text(json.dumps({"findings": [{"severity": "p1"}, {"priority": "HIGH"}, {}]}), encoding="utf-8")
+        self.assertEqual(self.dash.finding_counts(str(art)), {"P1": 1, "high": 1, "None": 1})
 
     def adapters(self):
         return {name[4:]: getattr(self, name) for name in dir(self) if name.startswith("out_")}
