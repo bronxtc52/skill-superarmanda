@@ -14438,6 +14438,22 @@ class CurrentRunManifest(Base):
                 self.set_runs(doc)
                 self.assertRefused()
 
+    def test_a_path_with_nul_or_a_lone_surrogate_is_refused(self):
+        for bad in (f"{self.wave}/superarmanda/\u0000x", "/tmp/\udc80x", f"{self.wave}/\udc80"):
+            with self.subTest(manifest=bad):
+                doc = self.runs_doc()
+                doc["runs"][-1]["manifest"] = bad
+                self.set_runs(json.dumps(doc, ensure_ascii=True))
+                path, why = wab.current_manifest(self.cfg, "W1")  # must not raise
+                self.assertIsNone(path)
+                self.assertTrue(why)
+                self.assertRefused()
+                if "\u0000" in bad:
+                    self.assertIn("не разрешается", why)
+
+    def test_a_wave_name_with_nul_does_not_raise(self):
+        self.assertEqual(wab.current_manifest(self.cfg, "W1\u0000")[0].name, "manifest.json")
+
     def test_a_last_record_that_is_not_an_object_is_refused(self):
         doc = self.runs_doc()
         doc["runs"][-1] = "x"

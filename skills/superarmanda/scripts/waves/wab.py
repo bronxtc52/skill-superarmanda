@@ -3339,7 +3339,7 @@ def current_manifest(cfg, wave):
         return standard, None
     try:  # a FIFO without a writer or a symlink must not hang or redirect the gate
         fd = os.open(runs_file, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)  # bytes, decoded below (encoding utf-8)
-    except OSError:
+    except (OSError, ValueError):
         return None, "runs.json не обычный файл или нечитаем"
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -3376,15 +3376,19 @@ def current_manifest(cfg, wave):
         found = pathlib.Path(named).resolve(strict=True)
     except FileNotFoundError:
         return None, f"запись прогона {index} указывает на несуществующий файл"
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):  # NUL, a lone surrogate (UnicodeEncodeError)
         return None, f"путь manifest записи прогона {index} не разрешается"
     try:
         inside = found.is_relative_to(wdir.resolve(strict=True))
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return None, "каталог волны не разрешается"
     if not inside:
         return None, f"manifest прогона {index} вне каталога волны"
-    if not found.is_file():
+    try:
+        regular = found.is_file()
+    except (OSError, ValueError):
+        regular = False
+    if not regular:
         return None, f"manifest прогона {index} не обычный файл"
     return found, None
 
