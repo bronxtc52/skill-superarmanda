@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "wave": "W2",
+  "run": {
+    "index": 1,
+    "max": 2
+  },
+  "tasks": {
+    "t1": {
+      "status": "ready_for_pr_review",
+      "fix_cycles": 2
+    }
+  }
+}

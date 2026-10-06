@@ -18062,7 +18062,7 @@ class W6OwnerTime(Base):
     # ----- docs -----
     def test_release_docs_and_agent_docs(self):
         skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.2\.\d+"\s*$')  # the version itself is pinned by the newest release's test
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.[23]\.\d+"\s*$')  # the version itself is pinned by the newest release's test
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         m = re.search(r"(?ms)^## 1\.2\.6 — 2026-10-06\n(.*?)(?=^## )", log)
         self.assertTrue(m, "CHANGELOG.md: the section `## 1.2.6 — 2026-10-06`")
@@ -18522,9 +18522,7 @@ class W7NoticeTemplates(Base):
 
     # ----- docs -----
     def test_release_docs_1_2_7(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.2\.7"\s*$')
-        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")  # the version of the skill: Release130
         m = re.search(r"(?ms)^## 1\.2\.7 — [0-9-]+\n(.*?)(?=^## )", log)
         self.assertTrue(m, "CHANGELOG.md: the section `## 1.2.7 — <date>`")
         self.assertIn("#83", m.group(1))
@@ -18543,6 +18541,168 @@ class W7NoticeTemplates(Base):
             self.assertRegex(body, rule)
         self.assertIn("telegram_quote", waves)
         self.assertRegex(waves, r"(?m)^\|[^\n]*шаблон[^\n]*реализовано \(1\.2\.7")
+
+
+class MetricsScript(unittest.TestCase):
+    """scripts/waves/metrics.py (#86): runs, fix cycles and blocked_cap forks of a run directory."""
+    FIXTURE = ROOT / "tests" / "fixtures" / "waves" / "metrics-run"
+    SCRIPT = WAVES / "metrics.py"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.metrics = importlib.util.module_from_spec(importlib.util.spec_from_file_location("wab_metrics", cls.SCRIPT))
+        cls.metrics.__spec__.loader.exec_module(cls.metrics)
+
+    def cli(self, *argv):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("WAB_")}
+        return subprocess.run([sys.executable, str(self.SCRIPT), *map(str, argv)], capture_output=True, text=True,
+                              encoding="utf-8", env=env)
+
+    def rows(self, result):
+        return {r["wave"]: (r["runs"], r["fix_cycles"], r["blocked_cap"]) for r in result["waves"]}
+
+    def test_exact_numbers_on_the_fixture(self):
+        result = self.metrics.measure(self.FIXTURE)
+        # W1 and W3: manifest.json holds run 2, manifest-run1.json run 1 (found by run.index, runs.json names other files)
+        self.assertEqual(self.rows(result), {"W1": (2, 3, 1), "W2": (1, 2, 0), "W3": (2, 5, 1)})
+        self.assertEqual(result["total"], {"runs": 5, "fix_cycles": 10, "blocked_cap": 2})
+        self.assertTrue(result["ok"])
+
+    def test_cli_prints_the_table_and_json(self):
+        r = self.cli(self.FIXTURE)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("| Волна | Прогонов | Фикс-круги | Развилки blocked_cap |", r.stdout)
+        self.assertIn("| W3 | 2 | 5 | 1 |", r.stdout)
+        self.assertIn("| **Итого** | 5 | 10 | 2 |", r.stdout)
+        j = self.cli(self.FIXTURE, "--json")
+        self.assertEqual(j.returncode, 0, j.stderr)
+        data = json.loads(j.stdout)
+        self.assertEqual(data["total"], {"runs": 5, "fix_cycles": 10, "blocked_cap": 2})
+        self.assertEqual([w["wave"] for w in data["waves"]], ["W1", "W2", "W3"])
+
+    def test_one_fork_is_one_episode(self):
+        events = "\n".join([
+            "2026-10-04 12:28:17Z W1: BLOCKED: [class=blocked_cap rec=new_run red=no] вопрос",
+            "2026-10-04 12:38:17Z W1: BLOCKED: [class=blocked_cap rec=new_run red=no] вопрос",   # the same record again
+            "2026-10-04 12:39:17Z W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=blocked_cap rec=new_run red=no] вопрос",
+            "2026-10-04 13:00:00Z W1: BLOCKED: [class=blocked_cap rec=owner red=no] другой вопрос",  # another episode
+            "2026-10-04 13:10:00Z W2: BLOCKED: [class=question rec=A red=no] не blocked_cap",
+            "2026-10-04 14:00:00Z W2: BLOCKED: [class=blocked_cap rec=new_run red=no] вопрос"])
+        self.assertEqual(self.metrics.blocked_cap_by_wave(events), {"W1": 2, "W2": 1})
+
+    def test_episode_is_a_stretch_of_current_status(self):
+        cap = "[class=blocked_cap rec=new_run red=no] вопрос"
+        t = "2026-10-04 12:00:00Z"
+        blocked = f"{t} W1: BLOCKED: {cap}"
+        other = f"{t} W2: BLOCKED: [class=question rec=A red=no] q"
+        cases = {
+            "repeat of the same line": ([blocked, blocked], 1),
+            "phase status repeat, same text": ([blocked, f"{t} W1: phase=running ctx=1k restarts=0 status=BLOCKED: {cap}"], 1),
+            "RUNNING between": ([blocked, f"{t} W1: phase=running ctx=1k restarts=0 status=RUNNING", blocked], 2),
+            "DONE between": ([blocked, f"{t} W1: DONE", blocked], 2),
+            "policy answer between": ([blocked, f"{t} W1: policy auto-answer: class=needs_decision rec=invariant", blocked], 2),
+            "another BLOCKED between": ([blocked, f"{t} W1: BLOCKED: [class=question rec=A red=no] q", blocked], 2),
+            "other wave interleaved does not reset": ([blocked, other, blocked, other], 1),
+            "phase status is a truncated prefix": ([blocked, f"{t} W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=blocked_cap rec=new_run red"], 1),
+            "bare RUNNING between": ([blocked, f"{t} W1: RUNNING", blocked], 2),
+        }
+        for name, (lines, want) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.metrics.blocked_cap_by_wave("\n".join(lines)).get("W1", 0), want)
+
+    def make(self, mutate):
+        base = Path(tempfile.mkdtemp(prefix="wab-metrics-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        run = base / "run"
+        shutil.copytree(self.FIXTURE, run)
+        mutate(run)
+        return run
+
+    def test_a_broken_or_missing_file_is_named_not_skipped(self):
+        def break_it(run):
+            (run / "W1" / "runs.json").write_text("{", encoding="utf-8")                      # corrupt
+            (run / "W2" / "superarmanda" / "manifest.json").unlink()                              # missing
+            (run / "W3" / "superarmanda" / "manifest-run1.json").write_text("[]", encoding="utf-8")  # not a manifest
+        run = self.make(break_it)
+        result = self.metrics.measure(run)
+        self.assertFalse(result["ok"])
+        by = {r["wave"]: r for r in result["waves"]}
+        self.assertEqual((by["W1"]["runs"], by["W1"]["fix_cycles"]), (None, None))
+        self.assertEqual(by["W2"]["runs"], 1)
+        self.assertIsNone(by["W2"]["fix_cycles"])
+        self.assertTrue(all(by[w]["problems"] for w in ("W1", "W2", "W3")), by)
+        r = self.cli(run)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("W1: нет данных — ", r.stdout)
+        self.assertIn("нет данных", r.stdout.splitlines()[2])  # the row of W1 itself
+        self.assertIn("код выхода 1", r.stderr)
+
+    def test_no_events_log_leaves_the_forks_unknown(self):
+        run = self.make(lambda r: (r / "events.log").unlink())
+        result = self.metrics.measure(run)
+        self.assertEqual({w["blocked_cap"] for w in result["waves"]}, {None})
+        self.assertEqual(self.cli(run).returncode, 1)
+
+    def test_a_directory_without_waves_is_an_error(self):
+        empty = self.make(lambda r: [shutil.rmtree(d) for d in r.glob("W*")])
+        r = self.cli(empty)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("нет каталога прогона", r.stderr)
+        self.assertEqual(self.cli(empty / "nowhere").returncode, 2)
+
+    def test_it_only_reads(self):
+        before = sorted((p.relative_to(self.FIXTURE), p.stat().st_mtime_ns) for p in self.FIXTURE.rglob("*") if p.is_file())
+        self.cli(self.FIXTURE)
+        after = sorted((p.relative_to(self.FIXTURE), p.stat().st_mtime_ns) for p in self.FIXTURE.rglob("*") if p.is_file())
+        self.assertEqual(before, after)
+
+    def test_fixture_has_no_home_paths_or_host_names(self):
+        text = " ".join(p.read_text(encoding="utf-8") for p in self.FIXTURE.rglob("*") if p.is_file())
+        for needle in ("/home/", "/Users/", "azureuser", "mh-central", "bronxtc52"):
+            self.assertNotIn(needle, text)
+
+
+class Release130(unittest.TestCase):
+    """The release 1.3.0 (W8): version, CHANGELOG, the measuring table, the rows of «Что реализовано»."""
+
+    def section(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        m = re.search(r"(?ms)^## 1\.3\.0 — [0-9-]+\n(.*?)(?=^## )", log)
+        self.assertTrue(m, "CHANGELOG.md: the section `## 1.3.0 — <date>` on top")
+        self.assertTrue(log.index("## 1.3.0") < log.index("## 1.2.7"), "1.3.0 is above 1.2.7")
+        return m.group(1)
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.3\.0"\s*$')
+
+    def test_changelog_names_the_issues_and_the_compatibility_boundary(self):
+        body = self.section()
+        for issue in ("#86", "#89", "#88", "#83"):
+            self.assertIn(issue, body)
+        for wave in (f"W{i}" for i in range(1, 9)):
+            self.assertRegex(body, rf"(?m)^  - {wave} — ", wave)
+        boundary = body[body.index("Граница совместимости"):]
+        for needle in ("`model`", "ревью плана", "повторный `watch`", "`high`", "по Дубаю", "шаблонами без цитаты",
+                       "побайтно как в 1.2.0"):
+            self.assertIn(needle, boundary)
+
+    def test_changelog_has_the_measuring_table_of_this_chain_and_the_bases(self):
+        body = self.section()
+        self.assertIn("### Замер #86", body)
+        self.assertIn("metrics.py", body)
+        self.assertIn("| Волна | Прогонов | Фикс-круги | Развилки blocked_cap |", body)
+        for wave in (f"W{i}" for i in range(1, 8)):
+            self.assertRegex(body, rf"(?m)^\| {wave} \| \d+ \| \d+ \| \d+ \|$")
+        self.assertIn("W8 — в процессе, итог в `chain-result.md`", body)
+        for chain in ("waves-finish", "waves-tails", "waves-gate-redact"):
+            self.assertRegex(body, rf"(?m)^\| {chain} \| \d+ \| \d+ \| \d+ \| \d+ \|")
+
+    def test_waves_doc_has_the_rows_of_what_is_implemented(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        self.assertRegex(waves, r"(?m)^\| Сквозная приёмка 1\.3\.0:[^\n]*реализовано \(1\.3\.0;")
+        self.assertRegex(waves, r"(?m)^\| Замер цепочки `scripts/waves/metrics\.py`[^\n]*реализовано \(1\.3\.0;")
+        self.assertRegex(waves, r"(?m)^- `metrics\.py <run_dir> \[--json\]`")
 
 
 class Packaging(unittest.TestCase):

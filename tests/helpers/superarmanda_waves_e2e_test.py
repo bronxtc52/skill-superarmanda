@@ -85,6 +85,10 @@ CTX_LIMIT = 50_000
 TICK = 60
 DELAY = 20  # virtual seconds between what the dispatcher typed and the session's reaction
 BOT_STATUS = "[class=needs_decision rec=A red=no]"
+CAP_STATUS = "[class=blocked_cap rec=new_run red=no]"
+MODEL = "claude-fable-5-1"  # chain.json `model` (1.3.0): every wave session starts with it
+# unique words in the wave questions: no external text may carry them (telegram_quote is off, #83)
+QUESTION_MARKERS = {"W1": "ВОПРОС-КЕДР-7731", "W2": "ВОПРОС-ЯСЕНЬ-4418", "W2-owner": "ВОПРОС-ЛИПА-5902"}
 NUDGE_MINUTES = 5  # chain.json idle_nudge_minutes of the scenario
 BG_SECONDS = 9 * 60  # how long W1's background shell lives: longer than the nudge threshold
 OLD_RUN = ("e2e/2026-01-01-old", "/elsewhere/runs/e2e/2026-01-01-old")  # (@wab_run, @wab_run_dir) of another run
@@ -146,7 +150,7 @@ class Clock:
 # ------------------------------------------------------------------ the world on disk
 
 class World:
-    def __init__(self, base, policy=True):
+    def __init__(self, base, policy=True, quote=False):
         self.root = Path(base).resolve()
         self.home = self.root / "home"
         self.bindir = self.root / "bin"
@@ -161,6 +165,7 @@ class World:
         self.run_dir = self.ctl / "runs" / CHAIN / RUN_ID
         self.reviewbin = self.root / "review-bin"
         self.policy = policy
+        self.quote = quote
         self.env = {
             "PATH": f"{self.bindir}{os.pathsep}{self.sysbin}", "HOME": str(self.home),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1",
@@ -271,9 +276,12 @@ class World:
         chain = {"chain": CHAIN, "run_id": RUN_ID, "waves": ["W1", "W2"], "repo": REPO, "base_branch": "main",
                  "workdir": str(self.workdir), "merge_gate": "auto", "tick_seconds": TICK,
                  "ctx_limit": CTX_LIMIT, "idle_minutes": 1440, "handoff_timeout_minutes": 1440,
-                 "idle_nudge_minutes": NUDGE_MINUTES, "telegram": False}
+                 "idle_nudge_minutes": NUDGE_MINUTES, "telegram": False, "model": MODEL}
+        if self.quote:  # the mutant: the wave's question is allowed into the notices
+            chain["telegram_quote"] = True
         if self.policy:
-            chain["decision_policy"] = [{"class": "needs_decision", "rec": "A"}]
+            chain["decision_policy"] = [{"class": "needs_decision", "rec": "A"},
+                                        {"class": "blocked_cap", "rec": "new_run", "answer": "invariant"}]
         self.approve_plan()
         chain["plan_sha256"] = self.plan_sha256
         self.chain_file.write_text(json.dumps(chain, indent=1), encoding="utf-8")
@@ -388,6 +396,7 @@ class Session:
         self.journal = None
         self.marker = None
         self.started = False
+        self.manifest_name = "manifest.json"
 
 
 class Actor:
@@ -407,6 +416,7 @@ class Actor:
         self.bg_until = None  # virtual time at which W1's background shell ended
         self.bg_since = None
         self.worked = False
+        self.statuses = []   # every status line a wave wrote
 
     # -- scheduling
     def after(self, delay, label, fn):
@@ -469,6 +479,7 @@ class Actor:
         path = s.wave_dir / "status"
         before = path.stat().st_mtime_ns if path.exists() else 0
         path.write_text(text + "\n", encoding="utf-8")
+        self.statuses.append(text)
         if path.stat().st_mtime_ns <= before:  # a coarse filesystem clock: the dispatcher compares mtimes
             os.utime(path, ns=(before + 5_000_000, before + 5_000_000))
         self.did(s, f"status {text[:40]}")
@@ -481,8 +492,8 @@ class Actor:
                            text=True, encoding="utf-8")
         must(r.returncode == 0, f"state.py {' '.join(map(str, args[:3]))}: {r.stderr.strip()}")
 
-    def manifest_path(self, s):
-        return s.wave_dir / "superarmanda" / "manifest.json"
+    def manifest_path(self, s):  # the CURRENT run's manifest of the wave (a new run has its own file)
+        return s.wave_dir / "superarmanda" / s.manifest_name
 
     # -- messages
     def on_message(self, s, text):
@@ -498,7 +509,7 @@ class Actor:
             s.journal.first_message(s.marker)
             return self.after(DELAY, "first prompt", lambda: getattr(self, f"start_{s.wave.lower()}")(s))
         if "РЕШЕНИЕ ПО ПОЛИТИКЕ" in text:
-            return self.after(DELAY, "policy answer", lambda: self.w1_answered(s))
+            return self.after(DELAY, "policy answer", lambda: (self.w1_answered if s.wave == "W1" else self.w2_new_run)(s))
         if text.startswith("[wab] Толчок"):  # the idle nudge: the wave remembers its work and goes on
             return self.after(DELAY, "nudge answered", lambda: self.w1_work(s))
         if "Гейт мерджа не пройден" in text and s.wave == "W1":
@@ -526,7 +537,9 @@ class Actor:
         self.did(s, f"commit {self.w.git('rev-parse', 'HEAD')[:12]} and PR #{number}")
         return number
 
-    def init_manifest(self, s):
+    def init_manifest(self, s, name=None):
+        if name:
+            s.manifest_name = name
         head = self.w.git("rev-parse", "HEAD")
         base = self.w.git("rev-parse", "origin/main")
         self.manifest_path(s).parent.mkdir(parents=True, exist_ok=True)
@@ -576,7 +589,7 @@ class Actor:
     # -- W1: BLOCKED -> policy answer -> work -> DONE -> gate waits / fails / passes
     def start_w1(self, s):
         s.journal.turn(6_000)
-        self.write_status(s, f"BLOCKED: {BOT_STATUS} Какую схему выбрать? Варианты: A) тонкая правка, B) переделка.")
+        self.write_status(s, f"BLOCKED: {BOT_STATUS} Какую схему выбрать? {QUESTION_MARKERS['W1']}. Варианты: A) тонкая правка, B) переделка.")
 
     def w1_answered(self, s):
         # RUNNING again, then silence: the wave waits for a background shell (a long `sleep` of its Bash tool)
@@ -656,7 +669,44 @@ class Actor:
 
     def w2_resumed(self, s):
         self.write_status(s, "RUNNING")
-        self.after(80, "w2 done", lambda: self.w2_done(s))
+        self.after(80, "w2 asks", lambda: self.w2_asks(s))
+
+    def w2_asks(self, s):
+        """A fork no rule of the policy covers (class `question`): the owner is asked (the notice that needs a human,
+        ATTENTION) and answers in the window a few minutes later; the wave goes on."""
+        s.journal.turn(9_000)
+        self.write_status(s, f"BLOCKED: [class=question rec=A red=no] Нужен выбор. {QUESTION_MARKERS['W2-owner']}. "
+                             "Варианты: A) да, B) нет")
+        self.after(240, "owner answers", lambda: self.w2_owner_answered(s))
+
+    def w2_owner_answered(self, s):
+        s.journal.turn(10_000)
+        self.write_status(s, "RUNNING")
+        self.after(60, "w2 blocks", lambda: self.w2_blocks(s))
+
+    def w2_blocks(self, s):
+        """Three unsuccessful fix cycles on the manifest of the first run (state.py's own fix-loop): the task is
+        `blocked`, the wave asks the cap fork. The dispatcher answers it by the fixed answer `invariant`; the wave
+        then opens run 2 (a new manifest of the plan, runs.json counts it) and goes on there."""
+        s.journal.turn(11_000)
+        head, m = self.w.git("rev-parse", "HEAD"), str(self.manifest_path(s))
+        self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", "coder", "--status", "pass",
+                      "--session-id", "e2e-W2-coder-1", "--head", head, s=s)
+        self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", "tester", "--status", "findings",
+                      "--session-id", "e2e-W2-tester-1", "--head", head, s=s)
+        fix = lambda *a: self.state_py("fix-loop", "--manifest", m, "--task", "T1", "--source", "tester", *a, s=s)  # noqa: E731
+        fix("--outcome", "failed")
+        fix("--outcome", "failed")
+        fix("--decision", "invariant", "--note", "ещё круг")
+        fix("--outcome", "failed")
+        self.write_status(s, f"BLOCKED: {CAP_STATUS} Три круга исправления T1. {QUESTION_MARKERS['W2']}. "
+                             "Варианты: new_run | accept_limitation")
+
+    def w2_new_run(self, s):
+        s.journal.turn(12_000)
+        self.init_manifest(s, "manifest-2.json")
+        self.write_status(s, "RUNNING")
+        self.after(40, "w2 done", lambda: self.w2_done(s))
 
     def record_coderabbit_refusal(self, s):
         """CodeRabbit refused the review of this head: its live refusal comment (pr592 of the fixtures; the range
@@ -695,13 +745,15 @@ def run_scenario(mode="normal", limit=90 * 60):
     does not check whose a pane is)."""
     base = Path(tempfile.mkdtemp(prefix="wabe2e-"))
     atexit.register(shutil.rmtree, base, True)
-    world = World(base, policy=mode != "no_policy")
+    world = World(base, policy=mode != "no_policy", quote=mode == "telegram_quote")
     world.setup()
     clock = Clock(limit)
     actor = clock.actor = Actor(world, clock, mode)
     run = Run()
     run.world, run.actor, run.clock, run.mode, run.codes, run.out = world, actor, clock, mode, {}, io.StringIO()
     run.urlopen_calls = []
+    run.attention = []  # every text of the ATTENTION file as the dispatcher wrote it
+    run.telegram = []  # what Telegram would carry: render_notice() of EVERY notice that reaches notify()
 
     def no_network(*a, **kw):
         run.urlopen_calls.append(a)
@@ -714,7 +766,23 @@ def run_scenario(mode="normal", limit=90 * 60):
         except SystemExit as e:
             return e.code if isinstance(e.code, int) else 1
 
+    real_notify = wab.notify
+
+    def notify_seen(cfg, notice, wave=None):  # the one place every notice passes: record the Telegram text, then send
+        run.telegram.append(wab.render_notice(notice, wab.TG_MESSAGE_LIMIT))
+        return real_notify(cfg, notice, wave)
+
+    real_attention = wab.attention_text
+
+    def attention_seen(st, cfg=None):  # the one function that makes the text of ATTENTION
+        text = real_attention(st, cfg)
+        if text is not None:
+            run.attention.append(text)
+        return text
+
     with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(wab, "attention_text", attention_seen))
+        stack.enter_context(mock.patch.object(wab, "notify", notify_seen))
         stack.enter_context(mock.patch.dict(os.environ, world.env, clear=True))
         stack.enter_context(mock.patch.object(time, "time", clock.time))
         stack.enter_context(mock.patch.object(time, "sleep", clock.sleep))
@@ -766,6 +834,7 @@ def run_scenario(mode="normal", limit=90 * 60):
             raise
     run.state = json.loads((world.run_dir / "state.json").read_text(encoding="utf-8"))
     run.events_log = (world.run_dir / "events.log").read_text(encoding="utf-8")
+    run.display = [" ".join(d["args"]) for d in world.jsonl(world.tmux_state / "display.jsonl")]
     return run
 
 
@@ -860,8 +929,7 @@ def oracle_wave_risk(run):
          and final.get("after_reviews") == {role: reviews[role]["result_id"] for role in reviews},
          f"W1 final check: {final}")
     must("second_reviewer" not in manifests["W2"]["tasks"]["T1"]["results"], "the medium wave W2 needs one review")
-    warnings = [l for l in run.events_log.splitlines() if "chain.json has no `model`" in l]
-    must(len(warnings) == 1, f"one warning about the missing model, got {len(warnings)}")
+    must("chain.json has no `model`" not in run.events_log, "the chain has a model, the launch must not warn about it")
     must("plan review" not in run.events_log, "the launch complained about the plan review")
 
 
@@ -877,9 +945,72 @@ def oracle_rebind(run):
 
 
 def oracle_policy(run):
-    answers = [t for _, wave, t in run.actor.received if "РЕШЕНИЕ ПО ПОЛИТИКЕ" in t]
-    must(len(answers) == 1 and answers[0].startswith("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант A"),
-         f"policy answers: {answers}")
+    answers = [(wave, t) for _, wave, t in run.actor.received if "РЕШЕНИЕ ПО ПОЛИТИКЕ" in t]
+    must([w for w, _ in answers] == ["W1", "W2"], f"policy answers went to {[w for w, _ in answers]}")
+    must(answers[0][1].startswith("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант A"), f"policy answers: {answers}")
+
+
+def oracle_blocked_cap(run):
+    """The cap fork (#89): W2 got exactly ONE fixed answer `invariant`, after the dispatcher's machine check of
+    runs.json / the manifest / max_runs; the decision is logged with the answer, the recommendation and the class
+    as separate tokens; the wave went on in run 2 (runs.json counts two) and was merged."""
+    a, w = run.actor, run.world
+    got = [t for _, wave, t in a.received if wave == "W2" and "РЕШЕНИЕ ПО ПОЛИТИКЕ" in t]
+    must(len(got) == 1 and got[0].startswith("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант invariant."),
+         f"W2 policy answers: {got}")
+    must("(рекомендация волны: new_run)" in got[0], f"the answer does not name the wave's recommendation: {got[0]}")
+    log = (w.run_dir / "W2" / "policy-decisions.log").read_text(encoding="utf-8").splitlines()
+    must(len(log) == 1 and all(re.search(rf"(?<![\w=]){tok}(?![\w])", log[0])
+                               for tok in ("answer=invariant", "rec=new_run", "class=blocked_cap")),
+         f"policy-decisions.log of W2: {log}")
+    must(run.state["waves"]["W2"]["auto_answers"] == 1, "W2 auto answers")
+    must("W2: policy auto-answer: class=blocked_cap answer=invariant rec=new_run" in run.events_log, "no event of the answer")
+    runs = json.loads((w.run_dir / "W2" / "runs.json").read_text(encoding="utf-8"))["runs"]
+    must([r["index"] for r in runs] == [1, 2], f"W2 runs: {runs}")
+
+
+def oracle_model(run):
+    """chain.json `model` reaches the command of EVERY wave session (`claude ... --model <model>`), and the zone
+    the session is told is the default one (Dubai: SUPERARMANDA_TZ was cleared, #88)."""
+    news = run.world.jsonl(run.world.tmux_state / "new_sessions.jsonl")
+    must([n["name"] for n in news] == ["wab-w1", "wab-w2"], f"sessions: {[n['name'] for n in news]}")
+    for n in news:
+        cmd = n["command"]
+        must("--model" in cmd and cmd[cmd.index("--model") + 1] == MODEL, f"{n['name']}: command {cmd}")
+        must(n["env"].get("SUPERARMANDA_TZ") == "Asia/Dubai", f"{n['name']}: zone {n['env'].get('SUPERARMANDA_TZ')}")
+
+
+def external_texts(run):
+    """EVERY text that leaves the dispatcher, with its surface: what Telegram would carry (render_notice of each
+    notice at notify()), the status-line messages that reached tmux, every state of the ATTENTION file."""
+    return ([("telegram", t) for t in run.telegram] + [("display", t) for t in run.display]
+            + [("attention", t) for t in run.attention])
+
+
+def oracle_external(run):
+    """THE invariant of 1.2.7 + 1.2.6 over everything that leaves the machine: a line of time signed by the owner's
+    zone (Dubai by default), no machine tokens (class=, rec=, red=), no word of the wave's question (telegram_quote
+    is off). One sweep over all captured texts, whatever the surface or the event."""
+    texts = external_texts(run)
+    must(texts, "no external text was captured")
+    surfaces = {k for k, _ in texts}
+    must(surfaces == {"telegram", "display", "attention"}, f"surfaces captured: {sorted(surfaces)}")
+    must(any("Нужно:" in t for k, t in texts if k == "telegram"), "no notice that needs the owner (blocked) was captured")
+    must(any("по политике" in t for k, t in texts if k == "telegram"),
+         "no notice of a policy answer was captured")
+    must(any("завершена" in t for k, t in texts if k == "telegram"), "no notice of a finished (merged) wave was captured")
+    markers = tuple(QUESTION_MARKERS.values())
+    for kind, text in texts:
+        must(re.search(r"(?m)^(?:Время|time): .*Дубай", text) or (kind == "display" and re.search(r"Время: .*Дубай", text)),
+             f"{kind}: no line of time signed «Дубай»: {text[:160]!r}")
+        for token in ("class=", "rec=", "red="):
+            must(token not in text, f"{kind}: the machine token «{token}» in {text[:160]!r}")
+        for marker in markers:
+            must(marker not in text, f"{kind}: the wave's question leaked ({marker}) in {text[:160]!r}")
+    # the markers are real: the waves wrote them into their BLOCKED lines (so the sweep above can fail)
+    written = " ".join(run.actor.statuses)
+    for marker in markers:
+        must(marker in written, f"the scenario never wrote {marker}")
 
 
 def oracle_nudge(run):
@@ -903,7 +1034,8 @@ def oracle_nudge(run):
 def oracle_coderabbit(run):
     """An unavailable CodeRabbit (#72): the wave recorded the role, the gate did not count it against the PR."""
     w = run.world
-    manifest = json.loads((w.run_dir / "W2" / "superarmanda" / "manifest.json").read_text(encoding="utf-8"))
+    runs = json.loads((w.run_dir / "W2" / "runs.json").read_text(encoding="utf-8"))["runs"]
+    manifest = json.loads(Path(runs[-1]["manifest"]).read_text(encoding="utf-8"))
     rabbit = manifest["tasks"]["T1"]["results"].get("coderabbit")
     must(rabbit and rabbit["status"] == "unavailable", f"W2 did not record coderabbit=unavailable: {rabbit}")
     must(rabbit["head"] == manifest["head"], "the refusal was recorded on another head than the PR's")
@@ -1026,6 +1158,15 @@ class OfflineChain(unittest.TestCase):
         kinds = [(d.get("type"), bool(d.get("isMeta"))) for d in map(json.loads, cleared.read_text(encoding="utf-8").splitlines())]
         must(("user", True) in kinds and ("system", False) in kinds, "the caveat and the /clear echo are in the new journal")
 
+    def test_cap_fork_is_answered_by_the_fixed_answer_invariant(self):
+        oracle_blocked_cap(self.chain)
+
+    def test_chain_model_reaches_every_wave_session(self):
+        oracle_model(self.chain)
+
+    def test_every_external_text_has_dubai_time_and_no_machine_tokens_or_questions(self):
+        oracle_external(self.chain)
+
     def test_idle_nudge_waits_for_background_work_then_pushes_once(self):
         oracle_nudge(self.chain)
 
@@ -1100,6 +1241,11 @@ class Mutations(unittest.TestCase):
         run = run_scenario("kill_any")
         with self.assertRaisesRegex(AssertionError, "which is not the run's, was closed"):
             oracle_cleanup(run)
+
+    def test_a_quoted_question_in_a_notice_is_seen_by_the_external_sweep(self):
+        run = run_scenario("telegram_quote")
+        with self.assertRaisesRegex(AssertionError, "machine token|the wave's question leaked"):
+            oracle_external(run)
 
     def test_without_the_decision_policy_the_chain_stalls(self):
         with self.assertRaises(Stalled):
