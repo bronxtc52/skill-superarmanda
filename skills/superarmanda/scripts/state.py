@@ -1220,9 +1220,10 @@ def update_task_status(entry, risk, head, policy):
 
 
 def settle_mandatory_role(entry, risk, head, policy):
-    """After a result of internal_reviewer or final_check under the policy 1.2.4: it may complete
-    the task or take its readiness away; any other status (needs_fix, needs_verification,
-    pending) is not its business."""
+    """After a result of internal_reviewer or final_check of a HIGH-risk task under the policy
+    1.2.4 (the caller checks both): it may complete the task or take its readiness away; any
+    other status (needs_fix, needs_verification, pending) is not its business. Below high the
+    roles are records and never reach here."""
     if entry["status"] in ("blocked", "needs_decision"):
         return
     if task_ready(entry, risk, head, policy):
@@ -1783,9 +1784,12 @@ def result(args):
         )
     if args.role not in FABLE_ROLES:
         update_task_status(entry, risk, data["head"], policy)
-    elif mandatory:
+    elif mandatory and risk == "high":
         settle_mandatory_role(entry, risk, data["head"], policy)
-    # else: a result of a Fable subagent role is a record: the task status is not its business
+    # else: a result of a Fable subagent role is a record: the task status is not its business.
+    # Below high this holds for internal_reviewer and final_check too (task_ready does not read
+    # them there): a record of theirs must not promote a task that waits for its fix, nor touch
+    # a status at all; their credit and after_reviews above are kept for a later raise to high
     data["updated_at"] = now()
     write(path, data)
     print(json.dumps(entry, sort_keys=True))
