@@ -11798,6 +11798,7 @@ class FixedAnswerPolicy(Base):
         # directory of chain.json replaced by @ROOT@ (381 characters)
         root = self.tmp / "live"
         root.mkdir()
+        root = root.resolve()  # the identity holds the resolved path: macOS tmp is /var/… -> /private/var/…
         shutil.copy(GATE_REDACT_RUN / "chain.json", root / "chain.json")
         cfg = wab.load_chain(root / "chain.json")
         self.assertNotIn("answer", json.dumps(cfg["decision_policy"]))
