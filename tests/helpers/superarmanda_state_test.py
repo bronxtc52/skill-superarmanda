@@ -6483,6 +6483,63 @@ class W4MandatoryFableRoles(W4Base):
         self.manifest.write_text(json.dumps(value), encoding="utf-8")
         self.refused("where", needle="require manifest version 2")
 
+    def test_marker_null_is_refused_and_a_removed_marker_opens_no_way_round(self):
+        """Internal review F1: the marker `external_review` is not the only anchor. `null` (state.py never
+        writes it) is malformed; without the key the session history still says the packet went out."""
+        self.built()
+        self.reviews()
+        good = self.data()
+        # A: `external_review: null` — a closed refusal of every reader, not «no packet yet»
+        value = copy.deepcopy(good)
+        value["tasks"]["t1"]["external_review"] = None
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        self.refused("where", needle="external_review")
+        self.refused("status", needle="external_review")
+        self.refused("task-result", *self.result_args("internal_reviewer", model="fable"), needle="external_review")
+        # B: the key removed — the first packet is known from session_roles: no credit, new run
+        value = copy.deepcopy(good)
+        del value["tasks"]["t1"]["external_review"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        entry = self.internal()
+        self.assertNotIn("internal_review", entry)
+        self.assertEqual(self.final()["status"], "in_progress")
+        action = self.assert_not_ready("internal_reviewer", "new run")
+        self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+        # B': a marker without a HEAD cannot bind the credit: no credit, new run
+        value = copy.deepcopy(good)
+        value["tasks"]["t1"]["external_review"] = {"role": "cross_provider_reviewer"}
+        value["tasks"]["t1"]["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        where = self.where()
+        self.assertTrue(where["next_action"].startswith("BLOCKED: internal_reviewer"), where["next_action"])
+        self.assertIn("new run", where["next_action"])
+
+    def test_records_of_the_mandatory_roles_count_only_with_the_fable_model(self):
+        """Internal review F2: like coder/tester of a high-risk task, a final_check and the internal review
+        credit count only with `model` claude-fable-5-1 (state.py never records them otherwise)."""
+        self.built()
+        entry = self.internal()
+        self.assertEqual(entry["internal_review"]["model"], FABLE)
+        self.assertNotIn("result_sha256", entry["internal_review"])
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        good = self.data()
+        for label, edit in {
+            "final_check without model": lambda t: t["results"]["final_check"].pop("model"),
+            "final_check on sonnet": lambda t: t["results"]["final_check"].update(model=SONNET),
+            "credit without model": lambda t: t["internal_review"].pop("model"),
+            "credit on sonnet": lambda t: t["internal_review"].update(model=SONNET),
+        }.items():
+            with self.subTest(case=label):
+                value = copy.deepcopy(good)
+                edit(value["tasks"]["t1"])
+                self.manifest.write_text(json.dumps(value), encoding="utf-8")
+                where = self.where()
+                self.assertNotIn("done", where["next_action"])
+                self.assertIn(FABLE, where["next_action"])
+                self.assertEqual(where["role"], "final_check" if "final_check" in label else "internal_reviewer")
+
     # ----- acceptance 4 -----
     def test_policy_1_2_1_manifest_is_judged_without_the_roles(self):
         self.policy("1.2.1")
@@ -6618,6 +6675,17 @@ class W4GateRoles(W4Base):
             cases[f"internal review {status}"] = (
                 lambda t, status=status: t["internal_review"].update(status=status), "internal_reviewer",
                 "новый прогон волны")
+        # internal review F1/F2: the marker is not the only anchor, the model is part of the record
+        cases["external_review removed"] = (lambda t: t.pop("external_review"), "internal_reviewer",
+                                            "новый прогон волны")
+        cases["external_review without head"] = (lambda t: t.update(external_review={"role": "coderabbit"}),
+                                                 "internal_reviewer", "новый прогон волны")
+        cases["final_check without model"] = (lambda t: t["results"]["final_check"].pop("model"), "final_check",
+                                              "claude-fable-5-1")
+        cases["final_check on sonnet"] = (lambda t: t["results"]["final_check"].update(model="claude-sonnet-5-5"),
+                                          "final_check", "claude-fable-5-1")
+        cases["credit without model"] = (lambda t: t["internal_review"].pop("model"), "internal_reviewer",
+                                         "новый прогон волны")
         for label, (edit, role, action) in cases.items():
             # the saved status still says ready: the gate recomputes by the rules of state.py
             value = self.forged(edit)
@@ -6630,6 +6698,15 @@ class W4GateRoles(W4Base):
                         # all; state.task_ready reads the results `resume` left, which are all current)
                         self.assert_reason(problems, "t1", "не подтверждён пересчётом")
                     self.assertEqual(self.verdict(plan, value)["verdict"], "fail")
+
+    def test_marker_null_fails_the_gate_as_malformed(self):
+        self.complete()
+        value = self.forged(lambda t: t.update(external_review=None))
+        for plan in (HIGH_PLAN, MEDIUM_PLAN, None):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan, value)
+                self.assert_reason(problems, "manifest", "t1", "external_review")
+                self.assertEqual(self.verdict(plan, value)["verdict"], "fail")
 
     def test_recorded_non_pass_final_check_fails_the_gate(self):
         self.complete()

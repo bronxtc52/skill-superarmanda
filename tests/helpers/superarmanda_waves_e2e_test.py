@@ -1067,8 +1067,13 @@ class Mutations(unittest.TestCase):
     def test_a_high_wave_without_the_final_check_never_passes_the_gate(self):
         """1.2.4: the two reviews are there, the final check is not; state.py does not call the task ready and the
         gate of the high wave names the role."""
-        with self.assertRaises(Stalled):
+        with self.assertRaises(Stalled) as held:
             run_scenario("no_final_check", limit=70 * 60)
+        failures = [l for l in held.exception.run.events_log.splitlines() if "W1: merge gate failed" in l]
+        self.assertTrue(failures, "the gate of W1 never failed")
+        for line in failures:
+            self.assertIn("final_check", line)
+        self.assertNotIn("W2: merge gate", held.exception.run.events_log)
 
     def test_a_nudge_that_ignores_the_process_tree_is_a_false_nudge(self):
         run = run_scenario("no_children_check")
