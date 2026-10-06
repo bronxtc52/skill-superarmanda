@@ -11840,7 +11840,13 @@ class FixedAnswerPolicy(Base):
 
     def test_f2_corrupt_marks_in_state_json_go_to_the_owner(self):
         for name, junk in [("keys", {"policy_keys": None}), ("pending", {"policy_key_pending": "x"}),
-                           ("attempt", {"attempts": [{"policy_keys": [None]}]}), ("refusal", {"policy_refusal": "x"})]:
+                           ("attempt", {"attempts": [{"policy_keys": [None]}]}), ("refusal", {"policy_refusal": "x"}),
+                           # N2: a corrupt `attempts` container hides the archived keys — a refusal, not «no tries»
+                           ("attempts", {"attempts": "x"}), ("attempts-null", {"attempts": None}),
+                           ("attempts-item", {"attempts": ["x"]}),
+                           # N3: a refusal object with corrupt fields is a refusal too, never dropped and re-decided
+                           ("refusal-empty", {"policy_refusal": {}}), ("refusal-fields", {"policy_refusal": {"status": 5}}),
+                           ("refusal-stamp", {"policy_refusal": {"status": "s", "stamp": "x", "reason": "r"}})]:
             with self.subTest(name):
                 self.tg.clear()
                 self.sent.clear()
@@ -11856,7 +11862,7 @@ class FixedAnswerPolicy(Base):
                 self.tick(cfg)
                 self.assertEqual(self.answers(), [])
                 (ask,) = self.owner_asked()
-                if name != "refusal":
+                if not name.startswith("refusal"):
                     self.assertIn("отметки автоответов в state.json испорчены", ask)
                     self.assertEqual(self.log(cfg).count("policy answer not sent"), before + 1)
                     self.assertNotIn(None, st["waves"]["W1"].get("policy_keys") or [])
@@ -11889,6 +11895,79 @@ class FixedAnswerPolicy(Base):
         (ask,) = self.owner_asked()
         self.assertIn("отметки автоответов в state.json испорчены", ask)
         self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
+
+    # ----- round 2 of the internal review (N1, N4) -----
+    MIXED = [{"class": "needs_decision", "answer": "invariant"}, {"class": "question"}]
+    QN = "BLOCKED: [class=question rec=A red=no] q"
+    KEY = ["W1", RUN_ID, 1, "T1", "needs_decision", "tester"]
+
+    def test_n1_mixed_policy_an_abandoned_fixed_answer_keeps_its_fork_key(self):
+        for name, failed in [("status changed under the lock", None), ("nothing reached the window", False)]:
+            with self.subTest(name):
+                self.tg.clear()
+                self.sent.clear()
+                cfg, _ = self.mandate(policy=self.MIXED, max_runs=5)
+                shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+                self.fork(cfg)
+
+                def typed_then_watch_dies(name, text, on_typed=None, **kw):
+                    self.sent.append(("text", name, text))
+                    on_typed()
+                    raise KeyboardInterrupt
+                with mock.patch.object(wab, "send_text", typed_then_watch_dies):
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.tick(cfg, self.ND.format(rec="invariant"))
+                given_up = self.tick(cfg, "RUNNING")["waves"]["W1"]  # the typed answer is given up, possibly submitted
+                with mock.patch.object(wab, "_deliver", return_value=failed):  # the rule WITHOUT `answer` fails to deliver
+                    self.tick(cfg, self.QN)
+                self.tick(cfg, "RUNNING")
+                w = self.tick(cfg, self.ND.format(rec="cut_surface"))["waves"]["W1"]  # the same fork in the same run
+                self.assertEqual(len(self.answers()), 1)  # only the abandoned one: no second automatic answer
+                self.assertIn("уже получила автоответ", self.owner_asked()[-1])
+                for rec in (given_up, w):  # the key moved out of flight when its input was given up: answered
+                    self.assertEqual(rec["policy_keys"], [self.KEY])
+                    self.assertNotIn("policy_key_pending", rec)
+
+    def test_n1_a_rule_without_answer_leaves_a_foreign_fork_key_alone(self):
+        flight = {"key": self.KEY, "status": self.ND.format(rec="invariant"), "text": "t"}
+        for name, failed in [("none", None), ("false", False), ("sent", "sent")]:
+            for mark in (flight, "x"):  # a corrupt mark too: this path neither reads nor writes the fields
+                with self.subTest(name, mark=mark):
+                    self.sent.clear()
+                    cfg, _ = self.mandate(policy=self.MIXED, max_runs=5)
+                    st = wab.load_state(cfg)
+                    st["waves"]["W1"]["policy_key_pending"] = mark
+                    self.put_state(cfg, st)
+                    if failed == "sent":
+                        w = self.tick(cfg, self.QN)["waves"]["W1"]
+                        self.assertEqual(len(self.answers()), 1)
+                    else:
+                        with mock.patch.object(wab, "_deliver", return_value=failed):
+                            w = self.tick(cfg, self.QN)["waves"]["W1"]
+                    self.assertEqual(w["policy_key_pending"], mark)
+                    self.assertNotIn("policy_keys", w)
+
+    def test_n4_a_refusal_stays_while_the_status_file_does_not_read_as_its_line(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg, "blocked", index=5)
+        status = self.BC.format(rec="new_run")
+        self.tick(cfg, status)
+        cfg["max_runs"] = 6  # the reason of the refusal is gone
+        path = cfg["run_dir"] / "W1" / "status"
+        self.rewrite(cfg, "")  # the wave is mid-rewrite: an empty file with another stamp, decided on last_status
+        for step in ("empty", "missing"):
+            with mock.patch.object(wab, "fixed_answer", side_effect=AssertionError(f"re-checked on a {step} status")):
+                st = self.tick(cfg)
+            self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], status)
+            self.assertEqual(self.answers(), [])
+            self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
+            self.assertEqual(len(self.owner_asked()), 1)
+            path.unlink(missing_ok=True)
+        path.write_text(status, encoding="utf-8")  # the line is really written again: a new episode, decided anew
+        st = self.tick(cfg)
+        (text,) = self.answers()
+        self.assertIn("прогон 6 из 6", text)
+        self.assertNotIn("policy_refusal", st["waves"]["W1"])
 
     def test_l2_owner_say_over_a_typed_answer_the_real_marker(self):
         """acc20 without a mock: the answer is typed and waits for its Enter, the owner answers with `say`
