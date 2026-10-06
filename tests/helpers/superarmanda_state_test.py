@@ -6515,6 +6515,31 @@ class W4MandatoryFableRoles(W4Base):
         self.assertTrue(where["next_action"].startswith("BLOCKED: internal_reviewer"), where["next_action"])
         self.assertIn("new run", where["next_action"])
 
+    def test_witnesses_of_the_first_packet_survive_a_hand_edit_of_the_session_history(self):
+        """Internal review 2, F6: the packet went out on H1 without an internal review; after resume the
+        marker and the review sessions are removed by hand — review_history still says the reviews of H1
+        happened, so no credit is written on H2 and the task needs a new run."""
+        self.built()
+        self.reviews()
+        self.next_head()
+        value = self.data()
+        task = value["tasks"]["t1"]
+        del task["external_review"]
+        task["session_roles"] = {sid: role for sid, role in task["session_roles"].items()
+                                 if role not in ("cross_provider_reviewer", "second_reviewer")}
+        self.assertTrue(any(item["role"] in ("cross_provider_reviewer", "second_reviewer")
+                            for item in task["review_history"]))
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        action = self.where()["next_action"]
+        self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+        self.assertIn("new run", action)
+        entry = self.internal()
+        self.assertNotIn("internal_review", entry)
+        self.built()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "in_progress")
+        self.assert_not_ready("internal_reviewer", "new run")
+
     def test_records_of_the_mandatory_roles_count_only_with_the_fable_model(self):
         """Internal review F2: like coder/tester of a high-risk task, a final_check and the internal review
         credit count only with `model` claude-fable-5-1 (state.py never records them otherwise)."""
@@ -6698,6 +6723,30 @@ class W4GateRoles(W4Base):
                         # all; state.task_ready reads the results `resume` left, which are all current)
                         self.assert_reason(problems, "t1", "не подтверждён пересчётом")
                     self.assertEqual(self.verdict(plan, value)["verdict"], "fail")
+
+    def test_removed_marker_and_review_sessions_with_a_forged_credit_fail_the_gate(self):
+        """Internal review 2, F6 (scenario A): the gate reads the raw manifest, so the witnesses of the first
+        packet must be the records it reads — the results and review_history, not only session_roles."""
+        self.built()
+        self.reviews()
+        self.final()
+        value = self.data()
+        task = value["tasks"]["t1"]
+        del task["external_review"]
+        task["session_roles"] = {sid: role for sid, role in task["session_roles"].items()
+                                 if role not in ("cross_provider_reviewer", "second_reviewer")}
+        task["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        task["status"] = "ready_for_pr_review"
+        for plan in (HIGH_PLAN, MEDIUM_PLAN, None):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan, value)
+                self.assert_reason(problems, "t1", "internal_reviewer", "новый прогон волны")
+                self.assertEqual(self.verdict(plan, value)["verdict"], "fail")
+        # the same with the results of the reviews gone too: review_history alone is a witness
+        del task["results"]["cross_provider_reviewer"]
+        del task["results"]["second_reviewer"]
+        self.assert_reason(self.problems(HIGH_PLAN, value), "t1", "internal_reviewer", "новый прогон волны")
 
     def test_marker_null_fails_the_gate_as_malformed(self):
         self.complete()
