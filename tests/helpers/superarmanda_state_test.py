@@ -7475,6 +7475,12 @@ class W4GateRoles(W4Base):
         self.assertEqual(self.position(), (5, "internal_reviewer"))
         self.internal()
         self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+        # and back on the clean tree of the same SHA the credit of the dirty one does not count either
+        self.clean()
+        self.built()
+        self.assertEqual(self.position(), (5, "internal_reviewer"))
+        self.internal()
+        self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
         self.reviews()
         self.assertEqual(self.final()["status"], "ready_for_pr_review")
         self.assertEqual(self.problems(HIGH_PLAN), [])

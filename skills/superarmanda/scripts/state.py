@@ -1051,17 +1051,24 @@ NEW_RUN_REQUIRED = "new run required"
 INTERNAL_COUNTED = ("pass", "findings")
 
 
-def internal_review_gap(entry, head):
+def internal_review_gap(entry, results, head):
     """Why the internal Fable review of a high-risk task is not counted, or None (policy 1.2.4).
 
     The credit is the durable task record `internal_review`: the LAST task-result of
     internal_reviewer recorded before the first external packet of the task in this run
     (external_review_started: the marker `external_review`, behind it the session history);
-    `resume` keeps both. Counted: status pass or findings, model Fable, and its HEAD is the
-    HEAD of the first external packet (`external_review.head`), so the internal review read
-    exactly the diff that went out. Before the packet the requirement is open: the record must be of the current `head`,
-    the one the packet will be built from. After the packet a missing credit cannot be earned in
-    this run: the reason starts with NEW_RUN_REQUIRED."""
+    `resume` keeps both. The credit is bound to the exact state it judged — HEAD, tree
+    (`tree_fingerprint`) and epoch of the task (`epoch`, task_epoch after its own record) — and the
+    marker names the state the first packet went out at (HEAD, tree, epoch before the first
+    external record). Counted after the packet: status pass or findings, model Fable, and all
+    three equal the marker's, so the internal review read exactly the diff that went out and
+    nothing (a readiness role result, a fix-loop record, a change of the risk or of the tree)
+    happened in between; the reason names what differs. Before the packet the requirement is
+    open: the credit counts only as the current internal_reviewer result of this HEAD and tree
+    (`results`, the results `resume` left on the current tree; `result_id`) — record it again
+    otherwise. After the packet a missing credit cannot be earned in this run: the reason starts
+    with NEW_RUN_REQUIRED. A credit or marker without the binding fields (written before they
+    existed) is not counted: no live manifest carries one honestly."""
     record = entry.get("internal_review")
     record = record if isinstance(record, dict) else {}
     status = record.get("status")
@@ -1071,7 +1078,16 @@ def internal_review_gap(entry, head):
     # behind it the session history of the task — a removed marker reopens nothing
     started = external_review_started(entry)
     if started is None:
-        if status in INTERNAL_COUNTED and record.get("head") == head and model == FABLE_MODEL:
+        current = results.get(INTERNAL_SOURCE) if isinstance(results, dict) else None
+        current = current if isinstance(current, dict) else {}
+        if (
+            status in INTERNAL_COUNTED
+            and record.get("head") == head
+            and model == FABLE_MODEL
+            and record.get("result_id") is not None
+            and current.get("result_id") == record.get("result_id")
+            and current.get("tree_fingerprint") == record.get("tree_fingerprint")
+        ):
             return None
         if status is None:
             what = f"no {INTERNAL_SOURCE} result is recorded"
@@ -1079,8 +1095,13 @@ def internal_review_gap(entry, head):
             what = f"the {INTERNAL_SOURCE} result is of another HEAD ({str(record.get('head'))[:12]})"
         elif status not in INTERNAL_COUNTED:
             what = f"the last {INTERNAL_SOURCE} result is {status}"
-        else:
+        elif model != FABLE_MODEL:
             what = f"the {INTERNAL_SOURCE} record carries model {model or 'not recorded'}"
+        else:
+            what = (
+                f"the {INTERNAL_SOURCE} result is not a current result of this tree (the tree "
+                "changed since, or the credit carries no result_id)"
+            )
         return (
             f"{what}; a high-risk task requires the internal Fable review ({FABLE_MODEL}) of this "
             f"HEAD before the first external review packet: record {recorded} (Fable unavailable: "
@@ -1095,27 +1116,59 @@ def internal_review_gap(entry, head):
             f"the first external packet of the task is known ({started}), but the marker "
             "external_review that names its HEAD is missing or has no head"
         )
-    elif status in INTERNAL_COUNTED and record.get("head") == packet and model == FABLE_MODEL:
+    elif (
+        status in INTERNAL_COUNTED
+        and model == FABLE_MODEL
+        and record.get("head") == packet
+        and isinstance(record.get("tree_fingerprint"), str)
+        and record.get("tree_fingerprint") == marker.get("tree_fingerprint")
+        and type(record.get("epoch")) is int
+        and record.get("epoch") == marker.get("epoch")
+    ):
         return None
     elif status is None:
         what = f"no {INTERNAL_SOURCE} result was recorded before the first external packet"
     elif status not in INTERNAL_COUNTED:
         what = f"the last {INTERNAL_SOURCE} result before the first external packet is {status}"
+    elif model != FABLE_MODEL:
+        what = (
+            f"the {INTERNAL_SOURCE} record carries model {model or 'not recorded'}, "
+            f"required {FABLE_MODEL}"
+        )
     elif record.get("head") != packet:
         what = (
             f"the {INTERNAL_SOURCE} result is of HEAD {str(record.get('head'))[:12]}, the first "
             f"external packet of HEAD {packet[:12]}"
         )
+    elif not isinstance(record.get("tree_fingerprint"), str) or not isinstance(
+        marker.get("tree_fingerprint"), str
+    ):
+        what = (
+            f"the {INTERNAL_SOURCE} credit or the marker of the first external packet names no "
+            "tree (record of an older 1.2.4, or edited by hand)"
+        )
+    elif record.get("tree_fingerprint") != marker.get("tree_fingerprint"):
+        what = (
+            f"the {INTERNAL_SOURCE} result is of another tree than the first external packet "
+            f"({record['tree_fingerprint'][:12]} vs {marker['tree_fingerprint'][:12]}, HEAD "
+            f"{packet[:12]}): the tree was edited between the internal review and the packet"
+        )
+    elif type(record.get("epoch")) is not int or type(marker.get("epoch")) is not int:
+        what = (
+            f"the {INTERNAL_SOURCE} credit or the marker of the first external packet names no "
+            "epoch (record of an older 1.2.4, or edited by hand)"
+        )
     else:
         what = (
-            f"the {INTERNAL_SOURCE} record carries model {model or 'not recorded'}, "
-            f"required {FABLE_MODEL}"
+            f"the {INTERNAL_SOURCE} result is of another epoch of the task than the first external "
+            f"packet ({record['epoch']} vs {marker['epoch']}): a readiness role result, a fix-loop "
+            "record or a change of the risk came between the internal review and the packet"
         )
     return (
         f"{NEW_RUN_REQUIRED}: {what} ({started}); the internal review counts only "
-        "before the first external packet of the task and on its HEAD, so this run cannot make "
-        "the task ready: start a new run of the task (state.py init on a new manifest path; in "
-        "a wave: state.py init --from-plan, a new run of the wave)"
+        "before the first external packet of the task and on its HEAD, tree and epoch, so this "
+        "run cannot make the task ready: start a new run of the task (state.py init on a new "
+        "manifest path; in a wave: state.py init --from-plan, a new run of the wave)"
     )
 
 
@@ -1260,7 +1313,7 @@ def fable_role_gaps(entry, results, head, policy):
     if policy not in MANDATORY_ROLES_POLICIES:
         return {}
     gaps = {}
-    reason = internal_review_gap(entry, head)
+    reason = internal_review_gap(entry, results, head)
     if reason is not None:
         gaps["internal_reviewer"] = reason
     reason = final_check_gap(entry, results)
@@ -1865,6 +1918,7 @@ def result(args):
         record["model"] = model
     record.update(verified)
     mandatory = policy in MANDATORY_ROLES_POLICIES and args.role in MANDATORY_FABLE_ROLES
+    epoch_before = task_epoch(entry)  # the epoch the first external packet goes out at (marker)
     if mandatory and args.role == "final_check":
         # which results of the task reviews, and how many closed fix cycles, this check was
         # recorded after (final_check_gap)
@@ -1887,9 +1941,14 @@ def result(args):
     if mandatory and args.role == INTERNAL_SOURCE and started is None:
         # the credit of the internal review (internal_review_gap): the last record before the
         # first external packet; kept through resume, at any risk (a task may be raised to high)
+        # bound to the exact state it judged: the HEAD, the tree and the epoch of the task after
+        # this record (its own raise included), and the result it is the credit of
         entry["internal_review"] = {
             "status": args.status,
             "head": args.head,
+            "tree_fingerprint": data["tree_fingerprint"],
+            "epoch": task_epoch(entry),
+            "result_id": record["result_id"],
             "model": model,
             "recorded_at": record["recorded_at"],
         }
@@ -1899,9 +1958,17 @@ def result(args):
         # the first external packet of the task in this run: kept through resume and new HEADs.
         # A marker that is gone while a witness says the packet went out is not recreated: the
         # HEAD of the first packet is unknown, and a new one would bind the credit to a later HEAD
+        # The marker names the state the packet went out at: HEAD, tree and the epoch BEFORE this
+        # record — the credit of the internal review must name the same (internal_review_gap)
         entry.setdefault(
             "external_review",
-            {"role": args.role, "head": args.head, "recorded_at": record["recorded_at"]},
+            {
+                "role": args.role,
+                "head": args.head,
+                "tree_fingerprint": data["tree_fingerprint"],
+                "epoch": epoch_before,
+                "recorded_at": record["recorded_at"],
+            },
         )
     if args.role not in FABLE_ROLES:
         update_task_status(entry, risk, data["head"], policy)
