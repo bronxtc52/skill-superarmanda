@@ -774,6 +774,15 @@ def safe_render(cfg):
                           style="yellow"), title="dash", border_style="yellow")
 
 
+def reload_cfg(cfg, path):
+    """The owner's zone is tunable live: re-read chain.json each frame. A broken or missing file keeps
+    the last working settings (the frame must not fail)."""
+    try:
+        return wab.load_chain(path, create=False)
+    except (Exception, SystemExit):  # noqa: BLE001 - a half-written edit costs nothing
+        return cfg
+
+
 def own_session():
     """(session name, tmux socket id, pane id) of the tmux pane this process runs in, else (None, "", None).
     The server is the one in $TMUX (its socket file name; `default` is the default server)."""
@@ -822,6 +831,7 @@ def main():
         with Live(safe_render(cfg), refresh_per_second=1, screen=True) as live:
             while True:
                 time.sleep(3)
+                cfg = reload_cfg(cfg, sys.argv[1])
                 live.update(safe_render(cfg))
     finally:
         if session:  # a session that no longer shows the dashboard must not open the popup on Ctrl+\

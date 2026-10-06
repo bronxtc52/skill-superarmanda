@@ -3204,7 +3204,8 @@ def start_session(cfg, st, wave):
         cmd += ["--model", cfg["model"]]
     pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
     made = tmux("new-session", "-d", "-P", "-F", "#{pane_id}", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
-                "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", "-e", f"WAB_MAX_RUNS={cfg['max_runs']}", *pin, *cmd)
+                "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", "-e", f"WAB_MAX_RUNS={cfg['max_runs']}",
+                "-e", f"SUPERARMANDA_TZ={humantime.resolve(cfg.get('timezone'))[0]}", *pin, *cmd)
     mark_owner(cfg, w["tmux"], (made.stdout or "").strip())
     w["phase"] = "starting"
     save_state(cfg, st)

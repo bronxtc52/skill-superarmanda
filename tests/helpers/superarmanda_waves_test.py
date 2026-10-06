@@ -17757,6 +17757,44 @@ class W6OwnerTime(Base):
         cfg = self.cfg_for(zone)
         return wab.idle_notice_text(cfg, "W1", wab.quote("RUNNING"), ts)
 
+    # ----- the zone reaches the processes outside the watch loop (round 3) -----
+    def _session_env(self, **over):
+        cfg, _ = self.chain(**over)
+        self.alive = False
+        st = {"current": "W1", "waves": {"W1": self.wave_rec("W1", sessions=["sid-1"], phase="launching")}}
+        wab.start_session(cfg, st, "W1")
+        calls = [c for c in self.tmux_calls if "new-session" in c]
+        self.assertTrue(calls, self.tmux_calls)
+        c = list(calls[-1])
+        return [c[i + 1] for i, a in enumerate(c) if a == "-e" and i + 1 < len(c)]
+
+    def test_wave_session_gets_the_chain_zone(self):
+        env = self._session_env(timezone="Asia/Tashkent")
+        self.assertIn("SUPERARMANDA_TZ=Asia/Tashkent", env)
+
+    def test_wave_session_default_zone_is_dubai(self):
+        env = self._session_env()
+        self.assertIn("SUPERARMANDA_TZ=Asia/Dubai", env)
+
+    def test_dash_follows_a_live_zone_change(self):
+        cfg, path = self.chain(timezone="Asia/Dubai")
+        st = {"current": "W1", "waves": {}}
+        with mock.patch("time.time", return_value=self.T):
+            first = self.rich_text(self.dash.header(cfg, st))
+            self.assertIn("Дубай", first)
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            data["timezone"] = "Asia/Tashkent"
+            Path(path).write_text(json.dumps(data), encoding="utf-8")
+            cfg = self.dash.reload_cfg(cfg, path)
+            second = self.rich_text(self.dash.header(cfg, st))
+            self.assertIn(self.local(self.T, "Asia/Tashkent").strftime("%H:%M"), second)
+            self.assertIn("(+05)", second)
+            self.assertNotIn("Дубай", second)
+            Path(path).write_text("{broken", encoding="utf-8")
+            cfg = self.dash.reload_cfg(cfg, path)  # a broken file: the previous zone, no exception
+            third = self.rich_text(self.dash.header(cfg, st))
+            self.assertIn("(+05)", third)
+
     NOW_PATHS = {"dash_header", "notice_stamp"}  # they show the moment of the call: the date never differs
     DRIVERS = {"dash_header": "drv_dash_header", "dash_events": "drv_dash_events", "notice_stamp": "drv_notice",
                "attention": "drv_attention", "chain_result": "drv_chain_result", "status_cmd": "drv_status",
