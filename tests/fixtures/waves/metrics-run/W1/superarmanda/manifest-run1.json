@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "wave": "W1",
+  "run": {
+    "index": 1,
+    "max": 2
+  },
+  "tasks": {
+    "t1": {
+      "status": "blocked",
+      "fix_cycles": 3
+    }
+  }
+}

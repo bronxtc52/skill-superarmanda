@@ -28,6 +28,7 @@ EXPECTED_FILES = {
     "scripts/waves/dash.py",
     "scripts/waves/gate.py",
     "scripts/waves/humantime.py",
+    "scripts/waves/metrics.py",
     "scripts/waves/PROTOCOL.md",
     "scripts/waves/wab-open",
 }

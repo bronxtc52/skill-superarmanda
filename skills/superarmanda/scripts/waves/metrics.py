@@ -54,6 +54,7 @@ def _manifest_paths(wave_dir, problems):
     if why or not isinstance(runs, list) or not runs or not all(isinstance(r, dict) for r in runs):
         return _fail(problems, why or "runs.json не содержит списка прогонов")
     by_index = _by_index(wave_dir)
+    claimed = {p.resolve(): i for i, p in by_index.items()}
     found = []
     for r in runs:
         raw = r.get("manifest")
@@ -62,6 +63,8 @@ def _manifest_paths(wave_dir, problems):
             path = Path(raw)
             if not path.exists():
                 path = wave_dir / "superarmanda" / path.name  # каталог прогона перенесли: то же имя рядом
+            if path.resolve() in claimed and claimed[path.resolve()] != r.get("index"):
+                path = None  # файл называет себя другим прогоном: не подставлять его вместо потерянного
         if path is None or not path.exists():
             problems.append(f"manifest прогона {r.get('index')} не найден")
             found.append(None)

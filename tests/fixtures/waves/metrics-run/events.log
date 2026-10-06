@@ -1,0 +1,4 @@
+2026-10-04 12:28:17Z W1: BLOCKED: [class=blocked_cap rec=new_run red=no] <вопрос волны заменён>
+2026-10-04 12:48:04Z W1: BLOCKED: [class=question rec=owner_swap red=yes] <вопрос волны заменён>
+2026-10-04 12:53:04Z W1: phase=running ctx=100k restarts=0 status=BLOCKED: [class=question rec=owner_swap red=yes] <вопрос волны заменён>
+2026-10-04 15:55:29Z W3: BLOCKED: [class=blocked_cap rec=new_run red=no] <вопрос волны заменён>
