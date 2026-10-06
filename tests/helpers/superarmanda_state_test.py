@@ -6471,6 +6471,87 @@ class W4MandatoryFableRoles(W4Base):
         self.assertEqual(entry["results"]["final_check"]["after_fix_cycles"], 1)
         self.assert_ready()
 
+    def cover(self, flag, source="cross_provider_reviewer"):
+        severity = ["--severity", "low"] if flag == "--accept" else []
+        return self.ok("fix-loop", "--task", "t1", flag, "--source", source, *severity, "--note", "low: nit")
+
+    def test_a_fix_cycle_closed_by_defer_or_accept_asks_for_a_new_final_check_on_high(self):
+        """The third door (coordinator's decision on run 2): --defer/--accept out of needs_fix close the fix
+        cycle too, so a final_check recorded during the cycle is not counted — a high task leaves needs_fix
+        through needs_verification and a new final check, never straight to ready_for_pr_review."""
+        for flag in ("--defer", "--accept"):
+            with self.subTest(cover=flag):
+                self.init()
+                self.built()
+                self.internal()
+                self.record("cross_provider_reviewer", "findings",
+                            **self.review_flags(self.report("codex-host", "findings")))
+                entry = self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+                self.assertEqual(entry["status"], "in_progress")
+                failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed",
+                                 "--source", "cross_provider_reviewer")
+                self.assertEqual(failed["status"], "needs_fix")
+                entry = self.final()
+                self.assertEqual(entry["status"], "needs_fix")
+                covered = self.cover(flag)
+                self.assertEqual(covered["status"], "needs_verification")  # the defect: ready_for_pr_review
+                self.assertEqual(covered["fix_cycles_closed"], 1)
+                self.assert_not_ready("final_check", "before the fix cycle closed", "task-result --role final_check")
+                self.assertEqual(self.position(), (7, "final_check"))
+                entry = self.final()
+                self.assertEqual(entry["status"], "ready_for_pr_review")
+                self.assertEqual(entry["results"]["final_check"]["after_fix_cycles"], 1)
+                self.assert_ready()
+
+    def test_defer_or_accept_out_of_needs_fix_without_a_final_check_leaves_the_task_unready(self):
+        """No final_check at all: the cover does not make the task ready, so it closes no cycle and
+        needs_fix stays (as settle_after_cover always did); the way out is fix-loop --outcome pass, which
+        closes the cycle, then the final check — never a deadlock."""
+        self.built()
+        self.internal()
+        self.record("cross_provider_reviewer", "findings",
+                    **self.review_flags(self.report("codex-host", "findings")))
+        self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "cross_provider_reviewer")
+        covered = self.cover("--defer")
+        self.assertEqual((covered["status"], covered.get("fix_cycles_closed", 0)), ("needs_fix", 0))
+        self.assertEqual(self.position(), (6, "coder"))
+        verified = self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        self.assertEqual((verified["status"], verified["fix_cycles_closed"]), ("needs_verification", 1))
+        self.assertEqual(self.position(), (7, "final_check"))
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+
+    def test_defer_or_accept_out_of_needs_fix_stays_ready_below_high_and_under_1_2_1(self):
+        """Below high and under the policy 1.2.1 the cover out of needs_fix gives ready_for_pr_review as
+        before: the roles are no part of readiness there. The counter still grows (a task may be raised)."""
+        for risk, policy in (("medium", "1.2.4"), ("high", "1.2.1")):
+            for flag in ("--defer", "--accept"):
+                with self.subTest(risk=risk, policy=policy, cover=flag):
+                    self.init(risk=risk)
+                    self.policy(policy)
+                    if risk == "high":
+                        self.built()
+                        self.record("cross_provider_reviewer", "findings",
+                                    **self.review_flags(self.report("codex-host", "findings")))
+                        self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+                    else:
+                        self.record("coder")
+                        self.record("tester")
+                        self.record("cross_provider_reviewer", "findings", reviewed_head=self.head(),
+                                    packet_hash="ab12" * 16)
+                    failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed",
+                                     "--source", "cross_provider_reviewer")
+                    self.assertEqual(failed["status"], "needs_fix")
+                    covered = self.cover(flag)
+                    self.assertEqual((covered["status"], covered["fix_cycles_closed"]), ("ready_for_pr_review", 1))
+                    # a cover that does not make the task ready leaves needs_fix and closes nothing
+                    failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+                    self.assertEqual(failed["status"], "needs_fix")
+                    self.record("tester", "findings", model="fable" if risk == "high" else None)
+                    covered = self.cover(flag)
+                    self.assertEqual((covered["status"], covered["fix_cycles_closed"]), ("needs_fix", 1))
+
     def test_fable_roles_below_high_do_not_close_an_open_fix_cycle(self):
         """Astra round 1: below high the records of internal_reviewer and final_check are records, as in
         1.2.3 — a task waiting for its fix stays needs_fix whatever status they carry."""
