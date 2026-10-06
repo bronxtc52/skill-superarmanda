@@ -4,6 +4,7 @@
 Needs a terminal: `rich` draws nothing when stdout is a file or a pipe, so without a tty the
 command refuses to start. Transcripts are bound to a wave by the session ids in state.json
 and read incrementally (wab.TranscriptCache), so a frame costs only what was appended."""
+import calendar
 import json
 import math
 import os
@@ -643,8 +644,9 @@ def _pulse_key(msg):
     return (m["w"], m["phase"], m["status"], m["restarts"]) if m else None
 
 
-def fold_events(lines):
-    """Raw events.log lines -> [(time `HH:MM:SS`, phrase, details, colour)]. Consecutive pulses that keep
+def fold_events(lines, cfg=None):
+    """Raw events.log lines -> [(time `HH:MM:SS`, phrase, details, colour)]. With `cfg` the time is the owner's zone
+    with a signature (wab.hum, #88: events.log itself stays UTC); without it, the raw UTC `HH:MM:SS`. Consecutive pulses that keep
     the wave, phase, status and restarts fold into one «без изменений с HH:MM (×N)» (ctx may grow); any
     other event, or a changed pulse, ends the series. A line without a time is shown as it is."""
     items, series = [], None  # series: [key, first_hhmm, count, last_ts, last message]
@@ -661,10 +663,15 @@ def fold_events(lines):
         series = None
 
     for line in lines:
-        if re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ ", line):  # `YYYY-MM-DD HH:MM:SSZ msg`
+        stamp = re.match(r"(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)Z ", line)  # `YYYY-MM-DD HH:MM:SSZ msg`
+        if stamp:
             ts, msg = line[11:19], line[20:].lstrip()
+            short = ts[:5]
+            if cfg is not None:
+                epoch = calendar.timegm(tuple(int(g) for g in stamp.groups()))
+                ts, short = wab.hum(cfg, epoch, seconds=True), wab.hum(cfg, epoch)
         else:
-            ts, msg = "", line
+            ts, msg, short = "", line, ""
         key = _pulse_key(msg)
         if key is not None:
             if series is not None and series[0] == key:
@@ -673,7 +680,7 @@ def fold_events(lines):
                 series[4] = msg  # the state shown is the LAST pulse's, the time is the first's
                 continue
             flush()
-            series = [key, ts[:5], 1, ts, msg]
+            series = [key, short, 1, ts, msg]
             continue
         flush()
         phrase, details, colour, _ = humanize_event(msg)
@@ -685,7 +692,7 @@ def fold_events(lines):
 EVENTS_READ_LIMIT = 4 * 1024 * 1024  # bytes of events.log read from the end at most
 
 
-def tail_items(path, n, limit=EVENTS_READ_LIMIT, block=64 * 1024):
+def tail_items(path, n, limit=EVENTS_READ_LIMIT, block=64 * 1024, cfg=None):
     """The last `n` folded items of events.log. The file is read from the END in growing blocks until the
     fold gives n+1 items (so the oldest one shown is a whole series, however many pulses it holds), the
     start of the file, or `limit` bytes: then what there is is shown. Never reads the whole of a huge file.
@@ -702,7 +709,7 @@ def tail_items(path, n, limit=EVENTS_READ_LIMIT, block=64 * 1024):
                 if want < size:
                     chunks = chunks[1:]  # the first line of a block is cut: drop it
                 lines = [c.decode("utf-8", errors="replace").removesuffix("\r") for c in chunks]
-                items = fold_events([l for l in lines if l.strip()])
+                items = fold_events([l for l in lines if l.strip()], cfg)
                 if len(items) > n or want >= size or want >= limit:
                     return items[-n:]
                 block *= 4
@@ -712,7 +719,7 @@ def tail_items(path, n, limit=EVENTS_READ_LIMIT, block=64 * 1024):
 
 def events_panel(cfg, n=12):
     t = Text()
-    for ts, phrase, details, colour in tail_items(cfg["run_dir"] / "events.log", n):
+    for ts, phrase, details, colour in tail_items(cfg["run_dir"] / "events.log", n, cfg=cfg):
         t.append((ts + " ") if ts else "", style="grey50")
         t.append(phrase + "\n", style=colour)
         if details:
@@ -741,7 +748,7 @@ def header(cfg, st):
     t.append(f"·  свежих голов {restarts}  ", style="yellow")
     t.append(f"·  ходов {turns}  ", style="cyan")
     t.append(f"·  порог {ktok(cfg['ctx_limit'])}  ", style="grey62")
-    t.append(time.strftime("·  %H:%M:%S UTC", time.gmtime()), style="grey50")
+    t.append("·  " + wab.hum(cfg, time.time(), seconds=True, date=False), style="grey50")
     return t
 
 
@@ -765,6 +772,15 @@ def safe_render(cfg):
     except (Exception, SystemExit) as e:  # noqa: BLE001 - any read race; the next frame retries
         return Panel(Text(f"кадр не отрисован: {type(e).__name__}: {_safe(e)}\nповтор через 3 с",
                           style="yellow"), title="dash", border_style="yellow")
+
+
+def reload_cfg(cfg, path):
+    """The owner's zone is tunable live: re-read chain.json each frame. A broken or missing file keeps
+    the last working settings (the frame must not fail)."""
+    try:
+        return wab.load_chain(path, create=False)
+    except (Exception, SystemExit):  # noqa: BLE001 - a half-written edit costs nothing
+        return cfg
 
 
 def own_session():
@@ -815,6 +831,7 @@ def main():
         with Live(safe_render(cfg), refresh_per_second=1, screen=True) as live:
             while True:
                 time.sleep(3)
+                cfg = reload_cfg(cfg, sys.argv[1])
                 live.update(safe_render(cfg))
     finally:
         if session:  # a session that no longer shows the dashboard must not open the popup on Ctrl+\

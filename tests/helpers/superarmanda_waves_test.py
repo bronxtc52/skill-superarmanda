@@ -23,6 +23,8 @@ and live sessions are lost (incident W4, 2026-10-01):
 
 import ast
 import atexit
+import calendar
+import datetime
 import contextlib
 import fcntl
 import hashlib
@@ -40,6 +42,7 @@ import tempfile
 import time
 import unittest
 import uuid
+import zoneinfo
 from pathlib import Path
 from unittest import mock
 
@@ -58,7 +61,7 @@ def _install_tmux_guard():
     atexit.register(shutil.rmtree, tmpdir, True)
     os.environ["TMUX_TMPDIR"] = tmpdir
     # a wave session exports WAB_DIR/WAB_MAX_RUNS/...: nothing of the live run may leak into tests
-    for var in ["TMUX", "TMUX_PANE", *(k for k in os.environ if k.startswith("WAB_"))]:
+    for var in ["TMUX", "TMUX_PANE", "SUPERARMANDA_TZ", *(k for k in os.environ if k.startswith("WAB_"))]:
         os.environ.pop(var, None)
     real = shutil.which("tmux")
     if real:  # a shim that refuses a socketless tmux and then execs the real binary
@@ -109,6 +112,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WAVES = ROOT / "skills" / "superarmanda" / "scripts" / "waves"
 sys.path.insert(0, str(WAVES))
 
+import humantime  # noqa: E402
 import wab  # noqa: E402
 
 REAL_SH = wab.sh
@@ -172,6 +176,7 @@ class Base(unittest.TestCase):
         self.addCleanup(patcher.stop)
         os.environ.pop("TMUX", None)
         os.environ.pop("TMUX_PANE", None)
+        os.environ.pop("SUPERARMANDA_TZ", None)  # the owner's zone of the machine must not leak into tests (#88)
         self.tmux_calls = []
         self.sent = []  # (kind, name, text)
         self.alive = True
@@ -3867,7 +3872,8 @@ class W4Round27(Base):
             self.assertNotIn("outbox", old)  # an attempt is history, not a second outbox
         self.down = False
         wab.drain_notices(cfg)
-        self.assertEqual(sorted(t for t in self.tg if t.startswith("demo: old")), ["demo: old chain_done"])
+        self.assertEqual(sorted(re.sub(r"\nВремя: [^\n]*$", "", t) for t in self.tg if t.startswith("demo: old")),
+                         ["demo: old chain_done"])
 
     # ----- 2: only the confirmed wave is acknowledged; another wave keeps its notices -----
     def test_unconfirmed_waves_keep_their_notices(self):
@@ -4652,7 +4658,8 @@ class W4Round29EpisodeEnds(Base):
         self.put_state(self.cfg, {"current": None, "waves": {"W1": self.wave_rec(phase="done", outbox=box)}})
         self.restore()
         self.restore()
-        self.assertEqual(sorted(self.tg), ["demo: old chain_done", "demo: old done", "demo: old no_next"])
+        self.assertEqual(sorted(re.sub(r"\nВремя: [^\n]*$", "", t) for t in self.tg),
+                         ["demo: old chain_done", "demo: old done", "demo: old no_next"])
 
 
 class W4Round37DashTerminalPhase(Base):
@@ -10444,7 +10451,7 @@ class LocalAttention(Base):
         self.assertNotIn("hunter2hunter2", text)
         self.assertIn("W2", text)
         self.assertIn("attach -t wv-w2", text)
-        self.assertRegex(text, r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ")
+        self.assertRegex(text, r"time: (\d\d\.\d\d )?\d\d:\d\d Дубай")  # the owner's zone, not UTC (#88)
         self.assertNotIn("подробности", text)  # only the first line
         shown = self.displays()
         self.assertEqual(len(shown), 2, self.tmux_calls)  # every client of the waves' server
@@ -13463,8 +13470,8 @@ class W3Quote(Base):
         wab.notify(cfg, "просто текст")
         wab.notify(cfg, "wave-autobot: старая запись outbox")
         wab.notify(cfg, f"{chain}: уже подписано")
-        self.assertEqual(self.tg[-3:], [f"{chain}: просто текст", f"{chain}: старая запись outbox",
-                                        f"{chain}: уже подписано"])
+        self.assertEqual([re.sub(r"\nВремя: [^\n]*$", "", t) for t in self.tg[-3:]],  # the owner's time line (#88)
+                         [f"{chain}: просто текст", f"{chain}: старая запись outbox", f"{chain}: уже подписано"])
 
     def test_a_hostile_chain_name_cannot_break_the_signature(self):
         cfg, _ = self.chain_for(True)
@@ -15238,7 +15245,8 @@ class DashEvents(unittest.TestCase):
         Console(file=buf, width=140, color_system=None).print(self.dash.events_panel({"run_dir": run_dir}, n=12))
         out = buf.getvalue()
         self.assertIn("запущен", out)
-        self.assertIn("без изменений с 10:00 (×1000)", out)
+        first = wab.hum({"run_dir": run_dir}, calendar.timegm((2026, 10, 4, 10, 0, 0)))  # the owner's zone (#88)
+        self.assertIn(f"без изменений с {first} (×1000)", out)
 
     def test_an_invisible_character_inside_a_secret_does_not_hide_it(self):
         # one representative of every class of wab._INVISIBLE: Cf (zero width, joiner, word joiner, BOM, soft
@@ -17675,11 +17683,355 @@ class W2ModelWarning(PlanReviewBase):
                           "tmux_prefix": "wv-", "run_dir": str(cfg["run_dir"])})
 
 
+# ---------------------------------------------------------------- W6 (#88): the owner's time
+class W6OwnerTime(Base):
+    """ONE invariant for the whole surface (#88): a human sees the owner's zone with a signature, machine logs stay
+    UTC. Every path of wab.TIME_PATHS gets a driver here; ONE loop (zone x moment x failure) goes over all of them,
+    and one static ast test goes over the same registry."""
+
+    T = calendar.timegm((2026, 10, 5, 6, 20, 42))      # 10:20 in Dubai, 11:20 in Tashkent
+    T_NIGHT = calendar.timegm((2026, 10, 5, 21, 30, 0))  # 01:30 of the NEXT day in Dubai
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        self.dash = dash
+        dash.MANIFEST_CACHE.clear()
+
+    # ----- the drivers: (zone, moment) -> everything a human reads on that path -----
+    def cfg_for(self, zone, **over):
+        cfg, _ = self.chain(timezone=zone, **over)
+        return cfg
+
+    def rich_text(self, renderable):
+        from rich.console import Console
+        con = Console(width=200, record=True, file=io.StringIO())
+        con.print(renderable)
+        return con.export_text()
+
+    def drv_dash_header(self, zone, ts):
+        cfg = self.cfg_for(zone)
+        with mock.patch("time.time", return_value=ts):
+            return self.rich_text(self.dash.header(cfg, {"current": "W1", "waves": {}}))
+
+    def drv_dash_events(self, zone, ts):
+        cfg = self.cfg_for(zone)
+        line = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + "Z W1: say: ok\n"
+        cfg["run_dir"].mkdir(parents=True, exist_ok=True)
+        (cfg["run_dir"] / "events.log").write_text(line, encoding="utf-8")
+        return self.rich_text(self.dash.events_panel(cfg))
+
+    def drv_notice(self, zone, ts):
+        out = []
+        for telegram in (True, False):
+            cfg = self.cfg_for(zone, **({} if telegram else {"telegram": None}))
+            self.tg.clear()
+            shown = []
+            with mock.patch("time.time", return_value=ts), mock.patch.object(wab, "display_all", side_effect=shown.append), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                wab.notify(cfg, "{chain}: волна W1 ждёт тебя", wave="W1")
+            out += self.tg + shown
+        return "\n".join(out)
+
+    def drv_attention(self, zone, ts):
+        cfg = self.cfg_for(zone)
+        st = {"waves": {"W1": {"tmux": "wv-w1", "attention": {"blocked": {"at": ts, "line": "ждёт"}}}}}
+        return wab.attention_text(st, cfg)
+
+    def drv_chain_result(self, zone, ts):
+        cfg = self.cfg_for(zone)
+        w = self.wave_rec(started=ts, finished=ts + 60, phase="done", questions=[{"at": ts, "text": "вопрос"}])
+        return wab.write_chain_result(cfg, {"waves": {"W1": w}})[0].read_text(encoding="utf-8")
+
+    def drv_status(self, zone, ts):
+        cfg = self.cfg_for(zone)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(started=ts)}})
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            wab.status_cmd(cfg)
+        return printed.getvalue()
+
+    def drv_idle(self, zone, ts):
+        cfg = self.cfg_for(zone)
+        return wab.idle_notice_text(cfg, "W1", wab.quote("RUNNING"), ts)
+
+    # ----- the zone reaches the processes outside the watch loop (round 3) -----
+    def _session_env(self, **over):
+        cfg, _ = self.chain(**over)
+        self.alive = False
+        st = {"current": "W1", "waves": {"W1": self.wave_rec("W1", sessions=["sid-1"], phase="launching")}}
+        wab.start_session(cfg, st, "W1")
+        calls = [c for c in self.tmux_calls if "new-session" in c]
+        self.assertTrue(calls, self.tmux_calls)
+        c = list(calls[-1])
+        return [c[i + 1] for i, a in enumerate(c) if a == "-e" and i + 1 < len(c)]
+
+    def test_wave_session_gets_the_chain_zone(self):
+        env = self._session_env(timezone="Asia/Tashkent")
+        self.assertIn("SUPERARMANDA_TZ=Asia/Tashkent", env)
+
+    def test_wave_session_default_zone_is_dubai(self):
+        env = self._session_env()
+        self.assertIn("SUPERARMANDA_TZ=Asia/Dubai", env)
+
+    def test_dash_follows_a_live_zone_change(self):
+        cfg, path = self.chain(timezone="Asia/Dubai")
+        st = {"current": "W1", "waves": {}}
+        with mock.patch("time.time", return_value=self.T):
+            first = self.rich_text(self.dash.header(cfg, st))
+            self.assertIn("Дубай", first)
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            data["timezone"] = "Asia/Tashkent"
+            Path(path).write_text(json.dumps(data), encoding="utf-8")
+            cfg = self.dash.reload_cfg(cfg, path)
+            second = self.rich_text(self.dash.header(cfg, st))
+            self.assertIn(self.local(self.T, "Asia/Tashkent").strftime("%H:%M"), second)
+            self.assertIn("(+05)", second)
+            self.assertNotIn("Дубай", second)
+            Path(path).write_text("{broken", encoding="utf-8")
+            cfg = self.dash.reload_cfg(cfg, path)  # a broken file: the previous zone, no exception
+            third = self.rich_text(self.dash.header(cfg, st))
+            self.assertIn("(+05)", third)
+
+    NOW_PATHS = {"dash_header", "notice_stamp"}  # they show the moment of the call: the date never differs
+    DRIVERS = {"dash_header": "drv_dash_header", "dash_events": "drv_dash_events", "notice_stamp": "drv_notice",
+               "attention": "drv_attention", "chain_result": "drv_chain_result", "status_cmd": "drv_status",
+               "idle_notice": "drv_idle", "human_time": None}
+
+    def drivers(self):
+        return {k: getattr(self, v) for k, v in self.DRIVERS.items() if v}
+
+    @staticmethod
+    def local(ts, zone):
+        return datetime.datetime.fromtimestamp(ts, zoneinfo.ZoneInfo(zone))
+
+    def test_registry_and_drivers_are_the_same_set(self):
+        registry = getattr(wab, "TIME_PATHS", None)
+        self.assertIsInstance(registry, dict, "wab.TIME_PATHS: the registry of the paths that show a time to a human")
+        self.assertEqual(set(registry), set(self.DRIVERS))
+
+    def test_every_path_every_zone_every_moment(self):
+        for path, drive in self.drivers().items():
+            with self.subTest(path=path, case="dubai by default"):
+                text = drive(None, self.T)
+                self.assertIn("10:20", text)
+                self.assertIn("Дубай", text)
+                self.assertNotIn("UTC", text)
+                self.assertNotIn("06:20", text)
+            with self.subTest(path=path, case="Tashkent"):
+                text = drive("Asia/Tashkent", self.T)
+                want = self.local(self.T, "Asia/Tashkent")
+                off = want.utcoffset().total_seconds() // 3600
+                self.assertIn(want.strftime("%H:%M"), text)
+                self.assertIn(f"({int(off):+03d})", text)
+                self.assertNotIn("Дубай", text)
+                self.assertNotIn("UTC", text)
+            with self.subTest(path=path, case="the day changes"):
+                # «now» is 6 hours earlier: for a path that shows a past moment the event is on the next day
+                with mock.patch("time.time", return_value=float(self.T_NIGHT - 6 * 3600)):
+                    text = drive("Asia/Dubai", self.T_NIGHT)
+                want = self.local(self.T_NIGHT, "Asia/Dubai")
+                self.assertEqual(want.strftime("%H:%M"), "01:30")
+                self.assertIn("01:30", text)
+                if path not in self.NOW_PATHS:  # the clock of «now» has no other day than today
+                    self.assertIn(want.strftime("%d.%m"), text)
+                self.assertNotIn("UTC", text)
+            with self.subTest(path=path, case="a failure of formatting"):
+                with mock.patch.object(humantime, "fmt", side_effect=RuntimeError("boom")):
+                    text = drive("Asia/Dubai", self.T)
+                self.assertIn("06:20 UTC", text)
+                self.assertIn("пояс недоступен", text)
+
+    def test_the_loop_survives_a_failure_and_keeps_the_signals(self):
+        for telegram in (True, False):  # Telegram: the message; no transport: display-message and ATTENTION
+            with self.subTest(telegram=telegram):
+                cfg = self.cfg_for(None, idle_minutes=0, **({} if telegram else {"telegram": None}))
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+                self.set_status(cfg, "W1", "RUNNING")
+                self.tg.clear()
+                shown = []
+                t = [float(self.T)]
+                with mock.patch("time.time", side_effect=lambda: t[0]), mock.patch.object(wab, "display_all", side_effect=shown.append), \
+                        mock.patch.object(humantime, "fmt", side_effect=RuntimeError("boom")):
+                    for i in range(3):
+                        self.pane = f"work\nmore work\nthe end {i}\n"
+                        self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
+                        t[0] += 5
+                if telegram:
+                    self.assertTrue(self.tg, "the notification must go out")
+                    sent = self.tg[0]
+                else:
+                    sent = "\n".join(shown) + (cfg["run_dir"] / "ATTENTION").read_text(encoding="utf-8")
+                    self.assertTrue(shown, "display-message must go out")
+                self.assertIn("06:20 UTC", sent)
+                self.assertIn("пояс недоступен", sent)
+
+    def test_static_registry_paths_have_no_direct_time_formatting(self):
+        forbidden = {"strftime", "gmtime", "localtime", "ctime", "isoformat", "_utc", "fromtimestamp",
+                     "utcfromtimestamp", "asctime"}
+        trees = {m: ast.parse((WAVES / f"{m}.py").read_text(encoding="utf-8")) for m in ("wab", "dash")}
+
+        def functions(tree):
+            return {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+        def bad(fn):
+            found = []
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Call):
+                    f = n.func
+                    name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+                    if name in forbidden:
+                        found.append(f"{name}() at line {n.lineno}")
+                if isinstance(n, ast.Constant) and isinstance(n.value, str) and "UTC" in n.value and \
+                        not (isinstance(n, ast.Constant) and n is fn.body[0].value if isinstance(fn.body[0], ast.Expr) else False):
+                    found.append(f"literal {n.value!r} at line {n.lineno}")
+            return found
+
+        registered = set()
+        for path, ref in wab.TIME_PATHS.items():
+            module, _, name = ref.partition(":")[0].partition(".")
+            funcs = functions(trees[module]) if module in trees else {}
+            self.assertIn(name, funcs, f"{path}: {ref} is not a function of {module}.py")
+            registered.add((module, name))
+            if (module, name) != ("wab", "hum"):  # hum() is the adapter to the one function in humantime.py
+                self.assertEqual(bad(funcs[name]), [], f"{path}: {ref} formats a time itself")
+        # nothing OUTSIDE the registry may format a time either, except the machine writers (UTC on purpose)
+        machine = {("wab", "event"), ("wab", "_utc"), ("wab", "write_owner_answered"),
+                   ("wab", "_policy_answer")}
+        for module, tree in trees.items():
+            for name, fn in functions(tree).items():
+                if (module, name) in registered or (module, name) in machine:
+                    continue
+                self.assertEqual([b for b in bad(fn) if "literal" not in b], [],
+                                 f"{module}.{name} formats a time outside wab.TIME_PATHS: register it or "
+                                 f"route it through wab.hum()")
+
+    # ----- machine logs stay UTC -----
+    def test_machine_logs_stay_utc(self):
+        cfg = self.cfg_for("Asia/Tashkent")
+        with mock.patch("time.gmtime", return_value=time.gmtime(self.T)), contextlib.redirect_stdout(io.StringIO()):
+            wab.event(cfg, "W1: ok")
+        self.assertTrue((cfg["run_dir"] / "events.log").read_text(encoding="utf-8").startswith("2026-10-05 06:20:42Z W1"))
+        self.assertEqual(wab._utc(self.T), "2026-10-05 06:20:42Z")
+        spec = importlib.util.spec_from_file_location("state_w6", WAVES.parent / "state.py")
+        state = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(state)
+        self.assertRegex(state.now(), r"\+00:00$")
+        w = self.wave_rec(started=self.T)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": w}})
+        saved = self.get_state(cfg)
+        self.assertEqual(saved["waves"]["W1"]["started"], self.T)  # the state keeps numbers, no human text
+        self.assertNotIn("Дубай", json.dumps(saved, ensure_ascii=False))
+
+    # ----- the zone: where it comes from -----
+    def test_order_chain_then_env_then_dubai(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("SUPERARMANDA_TZ", None)
+            self.assertEqual(self.chain()[0]["timezone"], "Asia/Dubai")
+            os.environ["SUPERARMANDA_TZ"] = "Asia/Tashkent"
+            self.assertEqual(self.chain()[0]["timezone"], "Asia/Tashkent")
+            self.assertEqual(self.chain(timezone="Europe/Paris")[0]["timezone"], "Europe/Paris")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("SUPERARMANDA_TZ", None)
+            self.assertEqual(self.chain()[0]["timezone"], "Asia/Dubai")  # explicitly cleared: back to the default
+
+    def test_unknown_or_wrong_zone_refuses_load_chain_with_the_reason(self):
+        for bad in ("Mars/Olympus", "", " Asia/Dubai", 5, ["Asia/Dubai"], True, "../etc/passwd"):
+            with self.subTest(zone=bad):
+                with self.assertRaises(SystemExit) as cm:
+                    self.chain(timezone=bad)
+                self.assertIn("timezone", str(cm.exception))
+
+    def test_timezone_is_tunable_and_not_in_the_identity(self):
+        self.assertIn("timezone", wab.TUNABLE)
+        a, _ = self.chain()
+        b, _ = self.chain(timezone="Asia/Tashkent")
+        self.assertEqual(wab._pinned_identity(a), wab._pinned_identity(b))
+        self.assertNotIn("timezone", wab._pinned_identity(a))
+
+    def test_edit_between_launch_and_watch_passes_and_changes_the_display(self):
+        a, _ = self.chain()
+        st = {"waves": {}}
+        wab.check_identity(a, st, "launch")
+        b, _ = self.chain(timezone="Asia/Tashkent")
+        self.assertFalse(wab.check_identity(b, st, "watch"))  # no refusal
+        self.assertIn("Дубай", self.drv_attention(a["timezone"], self.T))
+        self.assertIn("(+05)", self.drv_attention(b["timezone"], self.T))
+
+    def test_scripts_outside_the_dispatcher_use_the_env_variable(self):
+        script = str(WAVES / "humantime.py")
+        run = lambda env: subprocess.run([sys.executable, script, "2026-10-05T06:20:42Z"], capture_output=True,
+                                         text=True, env={**os.environ, **env})
+        with mock.patch.dict(os.environ):
+            os.environ.pop("SUPERARMANDA_TZ", None)
+            r = run({})
+            self.assertEqual((r.returncode, "10:20 Дубай" in r.stdout), (0, True), r)
+            r = run({"SUPERARMANDA_TZ": "Asia/Tashkent"})
+            self.assertIn("(+05)", r.stdout)
+            self.assertNotIn("Дубай", r.stdout)
+            r = run({"SUPERARMANDA_TZ": "Mars/Olympus"})
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("Mars/Olympus", r.stderr)
+
+    def test_iso_time_without_offset_is_utc_whatever_the_host_zone(self):
+        script = str((WAVES / "humantime.py").resolve())
+        run = lambda arg: subprocess.run([sys.executable, script, arg], capture_output=True, text=True,
+                                         env={**os.environ, "TZ": "America/New_York", "SUPERARMANDA_TZ": "Asia/Dubai"})
+        naive, aware = run("2026-10-05T06:20:42"), run("2026-10-05T06:20:42Z")
+        self.assertEqual((naive.returncode, aware.returncode), (0, 0), (naive, aware))
+        self.assertEqual(naive.stdout, aware.stdout)
+        self.assertIn("10:20 Дубай", naive.stdout)
+
+    def test_handoff_template_and_docs_have_no_utc_only_time_placeholder(self):
+        skill = (WAVES / ".." / "..").resolve()
+        proto = (WAVES / "PROTOCOL.md").read_text(encoding="utf-8")
+        self.assertNotIn("<UTC время>", proto)
+        line = next(l for l in proto.splitlines() if l.startswith("# Handoff"))
+        self.assertIn("время владельца", line)
+        self.assertIn("UTC", line)
+        for rel in ("references/waves.md", "references/workflow.md", "SKILL.md"):
+            self.assertNotIn("<UTC время>", (skill / rel).read_text(encoding="utf-8"), rel)
+
+    def test_no_tzdata_is_an_explicit_refusal_at_the_entry(self):
+        missing = mock.patch.object(humantime, "ZoneInfo", side_effect=zoneinfo.ZoneInfoNotFoundError("no tzdata"))
+        with missing:
+            with self.assertRaises(SystemExit) as cm:
+                self.chain()
+            self.assertIn("tzdata", str(cm.exception))
+            for entry in ("launch", "watch", "status"):
+                with self.subTest(entry=entry), self.assertRaises(SystemExit) as cm:
+                    wab.main(["wab.py", entry, str(self.tmp / "cfg" / "chain.json"), "W1", "x"])
+                self.assertIn("tzdata", str(cm.exception))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(humantime.main(["humantime.py"]), 2)
+            self.assertIn("tzdata", err.getvalue())
+
+    # ----- docs -----
+    def test_release_docs_and_agent_docs(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.2\.6"\s*$')
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        m = re.search(r"(?ms)^## 1\.2\.6 — 2026-10-06\n(.*?)(?=^## )", log)
+        self.assertTrue(m, "CHANGELOG.md: the section `## 1.2.6 — 2026-10-06`")
+        self.assertIn("#88", m.group(1))
+        self.assertRegex(m.group(1), r"(?i)совместимост[^\n]*Дуба[йю]")
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        self.assertRegex(waves, r"`timezone`[^\n]*tunable|tunable[^\n]*`timezone`")
+        self.assertRegex(waves, r"(?m)^\|[^\n]*timezone[^\n]*реализовано \(1\.2\.6")
+        for rel in ("skills/superarmanda/scripts/waves/PROTOCOL.md", "skills/superarmanda/references/workflow.md"):
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            self.assertRegex(text, r"(?is)врем[^\n]*пояс[^\n]*владельц|пояс[^\n]*владельц[^\n]*врем", rel)
+            self.assertIn("SUPERARMANDA_TZ", text, rel)
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
         mods = set(re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", src))
-        stdlib = set(sys.stdlib_module_names) | {"gate"}  # gate.py is the sibling module, stdlib-only itself
+        stdlib = set(sys.stdlib_module_names) | {"gate", "humantime"}  # gate.py is the sibling module, stdlib-only itself
         self.assertFalse(mods - stdlib, mods - stdlib)
         gate_src = (WAVES / "gate.py").read_text(encoding="utf-8")
         gate_mods = set(re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", gate_src))

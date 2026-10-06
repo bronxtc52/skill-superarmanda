@@ -27,6 +27,7 @@ EXPECTED_FILES = {
     "scripts/waves/wab.py",
     "scripts/waves/dash.py",
     "scripts/waves/gate.py",
+    "scripts/waves/humantime.py",
     "scripts/waves/PROTOCOL.md",
     "scripts/waves/wab-open",
 }
@@ -436,13 +437,12 @@ class ReleaseDecisionPolicyAnswerDocs(unittest.TestCase):
         return text.split(heading, 1)[1].split("\n### ", 1)[0]
 
     def test_release_1_2_5_is_versioned_and_names_the_compatibility_boundary(self):
-        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.5"?$')
+        # the version of SKILL.md moved on to 1.2.6 (W6, #88): this wave's own test pins it
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         sections = re.split(r"(?m)^## ", changelog)
         section = next((s for s in sections if s.startswith("1.2.5 — 2026-10-06")), None)
         self.assertIsNotNone(section, "CHANGELOG has no section 1.2.5")
-        self.assertEqual(sections.index(section), 1, "1.2.5 must be the newest section")
-        self.assertTrue(sections[2].startswith("1.2.4 — "), "1.2.4 follows 1.2.5")
+        self.assertTrue(sections[sections.index(section) + 1].startswith("1.2.4 — "), "1.2.4 follows 1.2.5")
         self.assertIn("[#89](https://github.com/bronxtc52/skill-superarmanda/issues/89)", section)
         whole = flat(section)
         for needle in ("`answer`", "`invariant`", "`cut_surface`", "`accept_limitation`", "`new_run`",
