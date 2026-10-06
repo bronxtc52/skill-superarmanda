@@ -11838,6 +11838,103 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(len(self.answers()), 1)
         self.assertNotIn("policy_refusal", st["waves"]["W1"])
 
+    # ----- R1 (external review): under a rule with `answer` the `blocked` mark belongs to the EPISODE (the line
+    # AND the stamp): a new episode of the very same line that gets no auto-answer always reaches the owner -----
+    def answered_then_rewritten(self, restart=False, **over):
+        """An auto-answer to S, then the wave writes RUNNING and the same S within one tick (unseen RUNNING)."""
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5, **over)
+        self.fork(cfg)
+        status = self.ND.format(rec="invariant")
+        self.tick(cfg, status)
+        self.assertEqual(len(self.answers()), 1)
+        self.assertEqual(self.owner_asked(), [])
+        if restart:  # a new watch: only what state.json holds
+            self.put_state(cfg, json.loads(json.dumps(wab.load_state(cfg))))
+        self.rewrite(cfg, status)
+        return cfg, status, self.tick(cfg)
+
+    def test_r1_the_same_line_rewritten_after_an_auto_answer_goes_to_the_owner_with_the_reason(self):
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                self.tg.clear()
+                self.sent.clear()
+                cfg, status, st = self.answered_then_rewritten(restart)
+                self.assertEqual(len(self.answers()), 1)  # no second auto-answer...
+                (ask,) = self.owner_asked()  # ...and the owner is asked, not left with a silent wave
+                self.assertIn("Автоответ по политике не отправлен", ask)
+                self.assertIn("уже получила автоответ", ask)
+                self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
+                self.assertEqual(st["waves"]["W1"]["questions"][-1]["text"], wab.safe_text(status, 300))
+                self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], status)
+                st = self.tick(cfg)  # the same episode: nothing new
+                self.assertEqual(len(self.answers()), 1)
+                self.assertEqual(len(self.owner_asked()), 1)
+                self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
+                self.assertEqual(st["waves"]["W1"]["auto_answers"], 1)
+                shutil.rmtree(cfg["run_dir"])
+
+    def test_r1_the_same_line_rewritten_after_a_refusal_goes_to_the_owner_again(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg, "blocked", index=5)
+        status = self.BC.format(rec="new_run")
+        self.tick(cfg, status)
+        self.assertEqual(len(self.owner_asked()), 1)
+        self.rewrite(cfg, status)  # the wave wrote the line again: a new episode, refused for the same reason
+        self.tick(cfg)
+        self.assertEqual(self.answers(), [])
+        asks = self.owner_asked()
+        self.assertEqual(len(asks), 2)  # a new notice of the new episode, not silence
+        self.assertIn("Автоответ по политике не отправлен", asks[-1])
+        self.assertEqual(self.log(cfg).count("policy answer not sent"), 2)
+        self.tick(cfg)  # one event and one notice per refused episode
+        self.assertEqual(len(self.owner_asked()), 2)
+        self.assertEqual(self.log(cfg).count("policy answer not sent"), 2)
+        cfg["max_auto_answers"] = 0  # the next episode of the same line meets the cap, not the machine check
+        self.rewrite(cfg, status)
+        st = self.tick(cfg)
+        asks = self.owner_asked()
+        self.assertEqual(len(asks), 3)
+        self.assertNotIn("Автоответ по политике", asks[-1])
+        self.assertIn("W1: policy cap reached (0/0)", self.log(cfg))
+        self.assertNotIn("policy_refusal", st["waves"]["W1"])
+        self.tick(cfg)
+        self.assertEqual(len(self.owner_asked()), 3)
+
+    def test_r1_the_same_line_rewritten_at_the_cap_goes_to_the_owner(self):
+        cfg, status, st = self.answered_then_rewritten(max_auto_answers=1)
+        self.assertEqual(len(self.answers()), 1)
+        (ask,) = self.owner_asked()  # the cap stands before the machine check: the usual BLOCKED, no reason
+        self.assertNotIn("Автоответ по политике", ask)
+        self.assertIn("W1: policy cap reached (1/1): class=needs_decision rec=invariant goes to the owner", self.log(cfg))
+        self.assertEqual(st["waves"]["W1"]["questions"][-1]["text"], wab.safe_text(status, 300))
+        self.tick(cfg)
+        self.assertEqual(len(self.owner_asked()), 1)
+        self.assertEqual(self.log(cfg).count("policy cap reached"), 1)
+
+    def test_r1_guard_a_rule_without_answer_keeps_the_1_2_0_dedup_of_the_same_line(self):
+        # the 1.2.0 twin of R1 stays as it was (a known remainder of the wave, not fixed here): the same line
+        # rewritten is answered again within the cap, and AT the cap raises no new notice
+        status = self.ND.format(rec="cut_surface")
+        cfg, _ = self.mandate(policy=[{"class": "needs_decision"}], max_auto_answers=2)
+        self.tick(cfg, status)
+        self.rewrite(cfg, status)
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 2)
+        self.assertEqual(self.owner_asked(), [])
+        self.rewrite(cfg, status)
+        real = wab.drop_notice
+
+        def drop(w, key):
+            self.assertNotEqual(key, "blocked", "the blocked mark is reset without answer")
+            real(w, key)
+        with mock.patch.object(wab, "drop_notice", drop):
+            st = self.tick(cfg)
+        self.assertEqual(len(self.answers()), 2)
+        self.assertIn("W1: policy cap reached (2/2)", self.log(cfg))
+        self.assertEqual(self.owner_asked(), [])
+        self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], status)
+        self.assertNotIn("policy_refusal", st["waves"]["W1"])
+
     def test_f2_corrupt_marks_in_state_json_go_to_the_owner(self):
         for name, junk in [("keys", {"policy_keys": None}), ("pending", {"policy_key_pending": "x"}),
                            ("attempt", {"attempts": [{"policy_keys": [None]}]}), ("refusal", {"policy_refusal": "x"}),
