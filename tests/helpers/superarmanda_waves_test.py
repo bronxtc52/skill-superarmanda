@@ -18603,6 +18603,7 @@ class MetricsScript(unittest.TestCase):
             "policy answer between": ([blocked, f"{t} W1: policy auto-answer: class=needs_decision rec=invariant", blocked], 2),
             "another BLOCKED between": ([blocked, f"{t} W1: BLOCKED: [class=question rec=A red=no] q", blocked], 2),
             "other wave interleaved does not reset": ([blocked, other, blocked, other], 1),
+            "phase status is a truncated prefix": ([blocked, f"{t} W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=blocked_cap rec=new_run red"], 1),
             "bare RUNNING between": ([blocked, f"{t} W1: RUNNING", blocked], 2),
         }
         for name, (lines, want) in cases.items():

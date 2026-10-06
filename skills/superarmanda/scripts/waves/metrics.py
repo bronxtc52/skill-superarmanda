@@ -127,6 +127,9 @@ def blocked_cap_by_wave(events):
         phase = PHASE_STATUS.match(rest)
         if phase:
             status = phase.group(1)
+            prev = current.get(wave)
+            if prev and BLOCKED_CAP.match(prev) and (prev.startswith(status) or status.startswith(prev)):
+                continue  # phase= несёт обрезанный текст той же строки: тот же статус
         elif rest.startswith("policy auto-answer:") or rest.startswith("launched "):
             status = None  # развилка закрыта ответом / окно запущено заново
         elif rest.startswith("BLOCKED: ") or BARE_STATUS.match(rest):
