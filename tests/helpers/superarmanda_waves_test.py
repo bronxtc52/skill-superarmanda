@@ -11222,38 +11222,154 @@ class W1AcceptedOnPass(GateBase):  # pass verdict carries accepted limitations
 
 
 # ---------------------------------------------------------------- #48 #31 #50 #53: clearing the input line
+def state_suite():
+    """tests/helpers/superarmanda_state_test.py as a module: its PolicyBase makes a manifest version 2 by
+    state.py over a throwaway repository and has review.py write the review reports (the CLI doubles)."""
+    spec = importlib.util.spec_from_file_location("superarmanda_state_suite_for_waves",
+                                                  Path(__file__).with_name("superarmanda_state_test.py"))
+    suite = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(suite)
+    return suite
+
+
 class FixedAnswerPolicy(Base):
     """W5 (#89): a `decision_policy` rule with `answer` — the dispatcher's fixed answer, whatever the wave
     recommended, after a machine check by the current run's manifest and runs.json (never the wave's text).
-    The manifest is the minimal document state.py's own reader accepts (`gate.state.read`); the fields are
-    the ones state.py writes (tasks/status/fix_cycles/decision_required_for/results/run)."""
-    HEAD_A, HEAD_B = "a" * 40, "b" * 40
+    The manifests and runs.json are ISSUED BY state.py itself (the review reports by review.py), once per
+    class (`forge`); a test takes a copy (`fork`) and edits by hand only what state.py does not issue —
+    every such edit is named where it is made."""
+    HEAD_B = "b" * 40
     ND = "BLOCKED: [class=needs_decision rec={rec} red=no] needs_decision T1: гонка; варианты: invariant | cut_surface"
     BC = "BLOCKED: [class=blocked_cap rec={rec} red=no] T1 blocked: три круга; варианты: new_run | accept_limitation"
     BOTH = [{"class": "needs_decision", "answer": "invariant"}, {"class": "blocked_cap", "answer": "invariant"}]
     mandate, tick, answers = DecisionPolicy.mandate, DecisionPolicy.tick, DecisionPolicy.answers
     log, decisions, owner_asked = DecisionPolicy.log, DecisionPolicy.decisions, DecisionPolicy.owner_asked
 
-    def task(self, status="needs_decision", fix_cycles=2, source="tester", **results):
-        res = {role: dict({"session_id": uuid.uuid4().hex, "status": "pass", "head": self.HEAD_A}, **over)
-               for role, over in dict({"coder": {}, "tester": {"status": "findings"}}, **results).items()}
-        return {"status": status, "fix_cycles": fix_cycles, "results": res, "session_roles": {},
-                "fix_sources": {"tester": fix_cycles}, "decisions": [], "decision_required_for": source,
-                "deferrals": [], "acceptances": []}
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with mock.patch.dict(os.environ):  # PolicyBase.setUp drops WAB_* of the process: only while forging
+            cls.bases = cls.forge()
 
-    def fork(self, cfg, index=1, tasks=None, runs="ok", manifest="ok", run_index=None, **task):
-        """runs.json with `index` runs and the manifest of the last one, as `state.py init --from-plan` lays them."""
-        S = wab.gate.state
+    @classmethod
+    def forge(cls):
+        """{name: (manifest text, runs.json text)} — each written by `state.py` alone: `init --from-plan` of
+        the high wave W1 (review policy 1.2.4, the run counter in runs.json), `task-result`, `fix-loop`,
+        `resume`. A result of a role is recorded BEFORE the fork: on a needs_decision/blocked task state.py
+        refuses task-result."""
+        suite = state_suite()
+
+        class Forge(suite.PolicyBase):  # its helpers over one throwaway repository, none of its tests
+            TASK = "T1"
+
+            def runTest(self):
+                pass
+
+        f = Forge()
+        f.setUp()
+        cls.addClassCleanup(f.doCleanups)
+        plan = f.root / "waves.json"
+        plan.write_text(json.dumps(suite.plan_doc([suite.wave("W1", risk="high")])), encoding="utf-8")
+        bases = {}
+
+        def start(name):
+            f.manifest = f.root / name / "manifest.json"
+            f.manifest.parent.mkdir()
+            f.init("--from-plan", f"{plan}#W1", "--runs-file", f.manifest.with_name("runs.json"),
+                   "--max-runs", 5, risk="")
+
+        def failed(times=2):  # unsuccessful fix cycles of ONE source: the second asks for a decision
+            for _ in range(times):
+                f.ok("fix-loop", "--task", "T1", "--outcome", "failed", "--source", "tester")
+
+        def keep(name):
+            wab.gate.state.read(f.manifest)  # the issued bytes pass the reader the dispatcher uses
+            bases[name] = (f.manifest.read_text(encoding="utf-8"),
+                           f.manifest.with_name("runs.json").read_text(encoding="utf-8"))
+
+        def one_more():  # after two rounds: the decision «one more» and the third round — state.py blocks the task
+            f.ok("fix-loop", "--task", "T1", "--decision", "invariant", "--source", "tester", "--note", "ещё круг")
+            failed(1)
+
+        start("nd")
+        f.record("coder", model="fable")
+        f.record("tester", "findings", model="fable")
+        failed()
+        keep("nd")
+        one_more()
+        keep("blocked")
+        start("coder_unavailable")
+        f.record("coder", "unavailable", model="fable")
+        f.record("tester", "findings", model="fable")
+        failed()
+        keep("coder_unavailable")
+        start("tester_error")
+        f.record("coder", model="fable")
+        f.record("tester", "error", model="fable")
+        failed()
+        keep("tester_error")
+        start("final_check_unavailable")
+        f.code_and_test()
+        f.record("final_check", "unavailable", model="fable")
+        failed()
+        one_more()
+        keep("final_check_unavailable")
+        # the Fable review ran out of quota: review.py's own report of profile codex-host (error_category quota)
+        start("quota")
+        f.code_and_test()
+        quota = f.report("codex-host", "quota_failure")
+        f.record("second_reviewer", "unavailable", **f.review_flags(quota))
+        failed()
+        keep("quota")
+        # the same, then the counted fallback: a codex-host-opus report with that quota evidence
+        start("opus")
+        f.code_and_test()
+        f.record("second_reviewer", "unavailable", **f.review_flags(quota))
+        f.record("second_reviewer", **f.review_flags(f.report("codex-host-opus"), quota_evidence=str(quota)))
+        failed()
+        keep("opus")
+        # an unavailable coder of the PREVIOUS head: `resume` on a new commit drops the results of the old one
+        start("resumed")
+        f.record("coder", "unavailable", model="fable")
+        f.change("again\n")
+        f.resume()
+        failed()
+        keep("resumed")
+        return bases
+
+    @staticmethod
+    def task_edit(**fields):
+        """A hand edit of the fork's task entry (a state state.py does not issue; the row says which)."""
+        return lambda doc: doc["tasks"]["T1"].update(fields)
+
+    @staticmethod
+    def two(doc):
+        """By hand: a second task in the same status — a copy of the first under its own session ids (one
+        session id never serves two tasks: state.py's reader refuses that)."""
+        text = json.dumps(doc["tasks"]["T1"])
+        for sid in {r["session_id"] for r in doc["tasks"]["T1"]["results"].values()}:
+            text = text.replace(json.dumps(sid), json.dumps(sid + "-t2"))
+        doc["tasks"]["T2"] = json.loads(text)
+
+    def fork(self, cfg, base="nd", index=1, edit=None, runs="ok", manifest="ok", run_index=None):
+        """The wave directory of `cfg` with a COPY of a base issued by state.py (`forge`): runs.json with
+        `index` runs and the manifest of the last one. By hand, always: the place (the manifest paths of
+        runs.json move into this wave directory, where the dispatcher requires them) and, for index > 1,
+        the run number (state.py's record of runs.json repeated, `run.index` of the manifest — instead of
+        `index` real `init --from-plan`). By hand, when asked: `edit(doc)`, `run_index`, and a damaged
+        `manifest` / `runs`."""
+        text, issued = self.bases[base]
         wdir = cfg["run_dir"] / "W1"
         wdir.mkdir(parents=True, exist_ok=True)
         path = wdir / f"run{index}" / "manifest.json"
         path.parent.mkdir(exist_ok=True)
-        doc = {"version": 2, "review_policy": {"version": S.POLICY_VERSION, "level": "medium"}, "run_id": "r",
-               "head": self.HEAD_A, "tree_fingerprint": "fp", "tasks": tasks or {"T1": self.task(**task)},
-               "run": {"index": index if run_index is None else run_index, "max": 5}}
+        doc = json.loads(text)
+        doc["run"]["index"] = index if run_index is None else run_index
+        if edit:
+            edit(doc)
         if manifest == "ok":
             path.write_text(json.dumps(doc), encoding="utf-8")
-            S.read(path)  # the fixture is a manifest state.py itself reads
+            wab.gate.state.read(path)  # still a manifest state.py itself reads
         elif manifest == "missing":
             path.unlink(missing_ok=True)
         else:
@@ -11262,9 +11378,11 @@ class FixedAnswerPolicy(Base):
         if runs == "missing":
             rj.unlink(missing_ok=True)
         elif runs == "ok":
-            rj.write_text(json.dumps({"version": 1, "wave": "W1", "runs": [
-                {"index": i, "manifest": str(wdir / f"run{i}" / "manifest.json")} for i in range(1, index + 1)]}),
-                encoding="utf-8")
+            record = json.loads(issued)
+            (first,) = record["runs"]
+            record["runs"] = [dict(first, index=i, manifest=str(wdir / f"run{i}" / "manifest.json"))
+                              for i in range(1, index + 1)]
+            rj.write_text(json.dumps(record), encoding="utf-8")
         else:
             rj.write_text(runs if isinstance(runs, str) else json.dumps(runs), encoding="utf-8")
 
@@ -11273,31 +11391,76 @@ class FixedAnswerPolicy(Base):
         return wab.fixed_answer(cfg, "W1", {} if w is None else w, wab.parse_blocked_label(status),
                                 {"class": cls, "rec": None, "answer": answer}, status)
 
+    # ----- the bases: what state.py really wrote, read back by the fields the deciding function reads -----
+    def test_bases_are_issued_by_state_py_and_the_third_failed_cycle_blocks(self):
+        docs = {name: json.loads(text) for name, (text, _) in self.bases.items()}
+        seen = {}
+        for name, doc in docs.items():
+            (task, entry), = doc["tasks"].items()
+            self.assertEqual((doc["version"], doc["review_policy"], doc["run"], task),
+                             (2, {"version": wab.gate.state.POLICY_VERSION, "level": "high"}, {"index": 1, "max": 5}, "T1"))
+            (run,) = json.loads(self.bases[name][1])["runs"]
+            self.assertEqual((run["index"], json.loads(self.bases[name][1])["wave"]), (1, "W1"))
+            seen[name] = (entry["status"], entry["fix_cycles"], entry["decision_required_for"],
+                          {role: (r["status"], r["head"] == doc["head"]) for role, r in entry["results"].items()
+                           if r["status"] in ("unavailable", "error")})
+        nd, un = ("needs_decision", 2, "tester"), ("unavailable", True)
+        self.assertEqual(seen, {
+            "nd": (*nd, {}), "blocked": ("blocked", 3, None, {}),
+            "coder_unavailable": (*nd, {"coder": un}), "tester_error": (*nd, {"tester": ("error", True)}),
+            "final_check_unavailable": ("blocked", 3, None, {"final_check": un}),
+            "quota": (*nd, {"second_reviewer": un}), "opus": (*nd, {}), "resumed": (*nd, {})})
+        # the guard of wab.FIX_CYCLE_CAP (a literal in state.py): the round before the cap still asks for a
+        # decision, the round that reaches it blocks the task
+        self.assertEqual((seen["nd"][1], seen["blocked"][1]), (wab.FIX_CYCLE_CAP - 1, wab.FIX_CYCLE_CAP))
+        self.assertEqual(docs["blocked"]["tasks"]["T1"]["fix_sources"], {"tester": wab.FIX_CYCLE_CAP})
+        self.assertIn("tester", wab.gate.state.FIX_SOURCES)
+        # the roles the deciding function looks up are keys of `results` state.py writes
+        self.assertLessEqual(set(wab.READINESS_ROLES), set(wab.gate.state.ROLES))
+        # acc12 as state.py writes it: the CURRENT second_reviewer is the counted codex-host-opus result with
+        # the quota evidence; the unavailable Fable attempt is in review_history only
+        opus = docs["opus"]["tasks"]["T1"]
+        second = opus["results"]["second_reviewer"]
+        self.assertEqual((second["status"], second["profile"], second["fallback_for"], second["head"]),
+                         ("pass", "codex-host-opus", "codex-host", docs["opus"]["head"]))
+        evidence = Path(second["quota_evidence"]["artifact"])  # review.py's report of the failed Fable attempt
+        self.assertEqual(second["quota_evidence"],
+                         {"artifact": str(evidence), "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()})
+        report = json.loads(evidence.read_text(encoding="utf-8"))
+        self.assertEqual((report["profile"], report["status"], report["error_category"]), ("codex-host", "error", "quota"))
+        self.assertEqual([(h["role"], h["status"], h.get("profile")) for h in opus["review_history"]],
+                         [("second_reviewer", "unavailable", None), ("second_reviewer", "pass", "codex-host-opus")])
+        self.assertEqual(docs["resumed"]["tasks"]["T1"]["results"], {})  # resume dropped the old head's results
+
     # ----- ONE table over the deciding function: class × answer × rec × manifest × runs.json × repeat -----
     def test_fixed_answer_table(self):
         cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
-        un, bad = {"status": "unavailable"}, "{not json"
-        quota = {"status": "findings", "profile": "codex-host-opus", "quota_evidence": {"kind": "quota"}}
-        two = {"T1": self.task(), "T2": self.task()}
-        ND, BC, bl = "needs_decision", "blocked_cap", {"status": "blocked", "fix_cycles": 3, "source": None}
+        bad, edit = "{not json", self.task_edit
+        ND, BC, bl = "needs_decision", "blocked_cap", {"base": "blocked"}
+        # by hand: state.py blocks a task on its third failed round, so needs_decision never carries 3/3
+        capped = edit(fix_cycles=wab.FIX_CYCLE_CAP)
+
+        def older(doc):  # by hand: `resume` drops the results of an older head (the row «resumed» is the real shape)
+            doc["tasks"]["T1"]["results"]["second_reviewer"]["head"] = self.HEAD_B
         rows = [  # name, class, answer, rec, fork kwargs, expected: (True, in-text, not-in-text) | (False, reason part)
             ("acc03 round possible", ND, "invariant", "accept_limitation", {}, (True, ["вариант invariant.", "ещё один круг", "не латай", "fix-loop --defer", "--decision invariant", "(рекомендация волны: accept_limitation)", "RUNNING"], ["новый прогон", "своей рекомендации"])),
             ("rec equals the answer is not repeated", ND, "invariant", "invariant", {}, (True, ["вариант invariant."], ["рекомендация волны"])),
             ("round possible on the last run: the cap is not asked", ND, "invariant", "x", {"index": 5}, (True, ["ещё один круг"], ["новый прогон"])),
-            ("acc07 fix-loop 3/3, runs left: a new run", ND, "invariant", "x", {"index": 2, "fix_cycles": 3}, (True, ["не латай", "новый прогон", "init --from-plan", "прогон 3 из 5"], ["ещё один круг"])),
-            ("acc07 fix-loop 3/3 on the last run", ND, "invariant", "x", {"index": 5, "fix_cycles": 3}, (False, "потолок прогонов исчерпан (5/5)")),
+            ("acc07 fix-loop 3/3, runs left: a new run", ND, "invariant", "x", {"index": 2, "edit": capped}, (True, ["не латай", "новый прогон", "init --from-plan", "прогон 3 из 5"], ["ещё один круг"])),
+            ("acc07 fix-loop 3/3 on the last run", ND, "invariant", "x", {"index": 5, "edit": capped}, (False, "потолок прогонов исчерпан (5/5)")),
             ("cut_surface", ND, "cut_surface", "invariant", {}, (True, ["вариант cut_surface.", "--decision cut_surface", "result.md"], ["новый прогон"])),
             ("accept_limitation", ND, "accept_limitation", "invariant", {}, (True, ["--decision accept_limitation", "Принятые ограничения"], ["новый прогон"])),
-            ("acc02 blocked_cap invariant over rec new_run", BC, "invariant", "new_run", dict(bl, index=1), (True, ["вариант invariant.", "не латай", "новый прогон", "прогон 2 из 5", "(рекомендация волны: new_run)"], ["своей рекомендации", "ещё один круг"])),
+            ("acc02 blocked_cap invariant over rec new_run", BC, "invariant", "new_run", bl, (True, ["вариант invariant.", "не латай", "новый прогон", "прогон 2 из 5", "(рекомендация волны: new_run)"], ["своей рекомендации", "ещё один круг"])),
             ("acc06 run 4 of 5 is answered", BC, "invariant", "new_run", dict(bl, index=4), (True, ["прогон 5 из 5"], [])),
             ("acc06 acc16 run 5 of 5 is not", BC, "invariant", "new_run", dict(bl, index=5), (False, "потолок прогонов исчерпан (5/5)")),
-            ("blocked_cap new_run", BC, "new_run", "accept_limitation", dict(bl, index=1), (True, ["вариант new_run.", "новый прогон"], [])),
-            ("blocked_cap accept_limitation", BC, "accept_limitation", "new_run", dict(bl, index=1), (True, ["--decision accept_limitation", "новый прогон"], [])),
+            ("blocked_cap new_run", BC, "new_run", "accept_limitation", bl, (True, ["вариант new_run.", "новый прогон"], [])),
+            ("blocked_cap accept_limitation", BC, "accept_limitation", "new_run", bl, (True, ["--decision accept_limitation", "новый прогон"], [])),
             ("blocked_cap accept_limitation on the last run", BC, "accept_limitation", "new_run", dict(bl, index=5), (False, "потолок")),
-            ("acc08 two candidates", ND, "invariant", "x", {"tasks": two}, (False, "задач в статусе needs_decision: 2")),
+            ("acc08 two candidates", ND, "invariant", "x", {"edit": self.two}, (False, "задач в статусе needs_decision: 2")),
             ("acc08 no candidate", BC, "invariant", "x", {}, (False, "задач в статусе blocked: 0")),
-            ("acc08 needs_decision without a fix-loop source", ND, "invariant", "x", {"source": None}, (False, "нет источника fix-loop")),
-            ("acc08 a source fix-loop does not know", ND, "invariant", "x", {"source": "owner"}, (False, "нет источника fix-loop")),
+            # by hand (both): state.py always names the source of a needs_decision, and only one of FIX_SOURCES
+            ("acc08 needs_decision without a fix-loop source", ND, "invariant", "x", {"edit": edit(decision_required_for=None)}, (False, "нет источника fix-loop")),
+            ("acc08 a source fix-loop does not know", ND, "invariant", "x", {"edit": edit(decision_required_for="owner")}, (False, "нет источника fix-loop")),
             ("acc10 no runs.json", ND, "invariant", "x", {"runs": "missing"}, (False, "runs.json")),
             ("acc10 broken runs.json", ND, "invariant", "x", {"runs": bad}, (False, "runs.json")),
             ("acc10 runs.json of another wave", ND, "invariant", "x", {"runs": {"version": 1, "wave": "W9", "runs": []}}, (False, "runs.json")),
@@ -11306,23 +11469,19 @@ class FixedAnswerPolicy(Base):
             ("acc10 broken manifest", ND, "invariant", "x", {"manifest": bad}, (False, "manifest текущего прогона не читается")),
             ("acc10 manifest of an unknown schema", ND, "invariant", "x", {"manifest": {"version": 99}}, (False, "manifest текущего прогона не читается")),
             ("acc10 manifest of another run index", ND, "invariant", "x", {"index": 2, "run_index": 1}, (False, "не совпадает с runs.json")),
-            ("acc11 Fable review unavailable (quota)", ND, "invariant", "x", {"second_reviewer": un}, (False, "роль second_reviewer")),
-            ("acc11 coder unavailable", ND, "invariant", "x", {"coder": un}, (False, "роль coder")),
-            ("acc11 tester error", ND, "invariant", "x", {"tester": {"status": "error"}}, (False, "роль tester")),
-            ("acc11 blocked_cap with an unavailable role", BC, "invariant", "x", dict(bl, final_check=un), (False, "роль final_check")),
-            ("an unavailable result of an older head is history", ND, "invariant", "x", {"second_reviewer": dict(un, head=self.HEAD_B)}, (True, ["ещё один круг"], [])),
-            ("acc12 quota evidence with a counted codex-host-opus", ND, "invariant", "x", {"second_reviewer": quota}, (True, ["ещё один круг"], [])),
+            # acc11: the results are state.py's own, recorded before the fork (no hand edit)
+            ("acc11 Fable review unavailable (quota)", ND, "invariant", "x", {"base": "quota"}, (False, "роль second_reviewer")),
+            ("acc11 coder unavailable", ND, "invariant", "x", {"base": "coder_unavailable"}, (False, "роль coder")),
+            ("acc11 tester error", ND, "invariant", "x", {"base": "tester_error"}, (False, "роль tester")),
+            ("acc11 blocked_cap with an unavailable role", BC, "invariant", "x", {"base": "final_check_unavailable"}, (False, "роль final_check")),
+            ("an unavailable result of an older head is history", ND, "invariant", "x", {"base": "quota", "edit": older}, (True, ["ещё один круг"], [])),
+            ("an unavailable coder of the previous head, dropped by resume", ND, "invariant", "x", {"base": "resumed"}, (True, ["ещё один круг"], [])),
+            ("acc12 quota evidence with a counted codex-host-opus", ND, "invariant", "x", {"base": "opus"}, (True, ["ещё один круг"], [])),
         ]
         for name, cls, answer, rec, kw, want in rows:
             with self.subTest(name):
                 shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)
                 self.fork(cfg, **kw)
-                if name.startswith("acc12"):  # the unavailable Fable attempt lives on in review_history only
-                    p = cfg["run_dir"] / "W1" / "run1" / "manifest.json"
-                    d = json.loads(p.read_text(encoding="utf-8"))
-                    d["tasks"]["T1"]["review_history"] = [{"role": "second_reviewer", "status": "unavailable",
-                                                           "head": self.HEAD_A, "result_sha256": "0" * 64}]
-                    p.write_text(json.dumps(d), encoding="utf-8")
                 got = self.decide(cfg, cls, answer, rec)
                 self.assertEqual(got["ok"], want[0], got)
                 if want[0]:
@@ -11382,7 +11541,7 @@ class FixedAnswerPolicy(Base):
     # ----- end to end through the tick -----
     def test_acc02_blocked_cap_recommended_new_run_gets_invariant(self):
         cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
-        self.fork(cfg, status="blocked", fix_cycles=3, source=None)
+        self.fork(cfg, "blocked")
         self.tick(cfg, self.BC.format(rec="new_run"))
         (text,) = self.answers()
         self.assertIn("вариант invariant.", text)
@@ -11459,9 +11618,9 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(wab.auto_answers_used(st["waves"]["W1"]), 1)
 
     def test_acc08_acc10_acc11_refusal_reaches_the_owner_with_the_reason(self):
-        for name, kw, part in [("two", {"tasks": {"T1": self.task(), "T2": self.task()}}, "задач в статусе needs_decision: 2"),
+        for name, kw, part in [("two", {"edit": self.two}, "задач в статусе needs_decision: 2"),
                                ("runs", {"runs": "missing"}, "runs.json"),
-                               ("quota", {"second_reviewer": {"status": "unavailable"}}, "роль second_reviewer")]:
+                               ("quota", {"base": "quota"}, "роль second_reviewer")]:
             with self.subTest(name):
                 self.tg.clear()
                 cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
@@ -11490,7 +11649,7 @@ class FixedAnswerPolicy(Base):
 
     def test_acc16_blocked_cap_on_the_last_run_one_event_and_the_owner(self):
         cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
-        self.fork(cfg, index=5, status="blocked", fix_cycles=3, source=None)
+        self.fork(cfg, "blocked", index=5)
         self.tick(cfg, self.BC.format(rec="new_run"))
         self.tick(cfg)
         self.assertEqual(self.answers(), [])
