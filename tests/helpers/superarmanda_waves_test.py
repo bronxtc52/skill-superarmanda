@@ -11663,7 +11663,7 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(w["policy_key_pending"]["key"], ["W1", cfg["run_id"], 1, "T1", "needs_decision", "tester"])
         self.assertEqual(w["policy_pending"], self.ND.format(rec="invariant"))
         self.assertNotIn("policy_keys", w)
-        self.tick(cfg, "RUNNING")  # the wave took the typed answer (or not): charged, the key stays in flight
+        self.tick(cfg, "RUNNING")  # the wave took the typed answer (or not): charged, the key counts as answered
         st = self.tick(cfg, self.ND.format(rec="cut_surface"))  # the same fork, a new episode
         self.assertEqual(len(self.answers()), 1)
         (ask,) = self.owner_asked()

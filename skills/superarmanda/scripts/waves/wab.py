@@ -2513,6 +2513,34 @@ def _fork_keys(rec):
     return keys, pend
 
 
+def _keep_fork_key(w):
+    """A typed fixed answer (#89) is given up and may have been submitted: its fork key leaves the flight
+    and counts as answered (`policy_keys`) — never just dropped. A corrupt mark stays as it is:
+    fixed_answer refuses on it."""
+    try:
+        keys, pend = _fork_keys(w)
+    except ValueError:
+        return
+    if pend:
+        w["policy_keys"] = keys if pend["key"] in keys else [*keys, pend["key"]]
+        w.pop("policy_key_pending")
+
+
+def _forget_fork_key(w, fixed):
+    """Nothing of THIS fixed answer reached the window: its own key (and only its own) leaves the flight."""
+    pend = w.get("policy_key_pending")
+    if isinstance(pend, dict) and pend.get("key") == fixed["key"]:
+        w.pop("policy_key_pending")
+
+
+def _refusal_ok(refusal):
+    """Is it a `policy_refusal` mark as _policy_answer writes it. Anything else under that name is corrupt
+    and reads as a refusal for as long as the wave is BLOCKED (fail closed), never as «decide anew»."""
+    return (isinstance(refusal, dict) and isinstance(refusal.get("status"), str)
+            and isinstance(refusal.get("reason"), str)
+            and (refusal.get("stamp") is None or isinstance(refusal.get("stamp"), list)))
+
+
 def fixed_answer(cfg, wave, w, label, rule, status):
     """THE decision of a rule with `answer` (#89), by the dispatcher's files only — runs.json, the manifest
     of the current run (current_manifest, read by state.py's own reader), state.json — never by the wave's
@@ -2521,8 +2549,8 @@ def fixed_answer(cfg, wave, w, label, rule, status):
     or the manifest missing/broken/of another run; not exactly one task in the status of the class, or a
     needs_decision without a fix-loop source; a readiness role unavailable/error on the manifest's HEAD (an
     external failure is not fixed by another run); a new run needed above `max_runs`; the same fork (key)
-    answered before; a corrupt mark of the answered keys in state.json (this try or an archived one).
-    Never raises."""
+    answered before; a corrupt mark of the answered keys in state.json (this try or an archived one), a
+    corrupt `attempts` container included. Never raises."""
     try:
         return _fixed_answer(cfg, wave, w, label, rule, status)
     except Exception:  # noqa: BLE001 - fail closed: no automatic answer, a fixed reason
@@ -2531,6 +2559,9 @@ def fixed_answer(cfg, wave, w, label, rule, status):
 
 def _fixed_answer(cfg, wave, w, label, rule, status):
     cls, answer = label["class"], rule["answer"]
+    attempts = w.get("attempts", [])  # wave_attempts() skips a corrupt container: here it would hide archived keys
+    if not isinstance(attempts, list) or not all(isinstance(a, dict) for a in attempts):
+        return _refuse(FORK_MARKS_CORRUPT)
     try:  # before anything else, the Enter-only retry included: a corrupt mark of ANY record of the wave
         marks = [_fork_keys(rec) for rec in [w, *wave_attempts(w)]]
     except ValueError:
@@ -3364,6 +3395,8 @@ def _abandon_input(cfg, st, wave, w, why, locked=False, target=None):
     into this window (_deliver, `say`). `locked`: the caller already holds the window's input lock."""
     what = w.get("pending_enter")
     if what:
+        if what == "policy answer" and "policy_key_pending" in w:
+            _keep_fork_key(w)  # a fixed answer (#89) given up, possibly submitted: its fork counts as answered
         w["pending_clear"] = {"what": what, "why": why}
         w.pop("pending_enter", None)
         w.pop("pending_text_head", None)
@@ -5219,10 +5252,15 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     owner's notice, the cap untouched. THE refusal is final for its episode — the same status line AND the
     same stamp of the status file, kept in `policy_refusal` of state.json (it outlives the watch): the owner
     was asked and may be answering in the window, so later ticks neither re-check nor answer, even when the
-    reason is gone; a rewritten or another line is a new episode. A corrupt `policy_refusal` reads as a
-    refusal (fail closed). `_tick` drops the mark when the episode ends. An answered fork key is kept in `policy_keys`,
-    one in flight in `policy_key_pending` (left in place when the answer may have been submitted: it then
-    counts as answered). A rule without `answer` reads and writes none of this."""
+    reason is gone; a rewritten or another line is a new episode — rewritten means the file READS as this
+    line under another stamp (an empty or unreadable file mid-rewrite, decided on last_status, is still the
+    refused episode). A corrupt `policy_refusal` (not an object, or an object with corrupt fields) reads as
+    a refusal (fail closed). `_tick` drops the mark when the episode ends. An answered fork key is kept in
+    `policy_keys`, one in flight in `policy_key_pending`. THE key in flight lives only inside its episode
+    and is never lost: when its typed answer is given up (_abandon_input — it may have been submitted) it
+    MOVES to `policy_keys` and counts as answered; it is dropped unanswered only by its own decision and
+    only when nothing reached the window. The path of a rule without `answer` in this function neither
+    reads nor writes `policy_key_pending` / `policy_keys`."""
     stamp = _status_stamp(cfg, wave)
     if _answered(w) == status:
         if w.get("policy_answered_stamp") in (None, stamp):
@@ -5233,8 +5271,11 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         w.pop("policy_answered_stamp", None)
     refusal = w.get("policy_refusal")
     if refusal is not None:
-        if not isinstance(refusal, dict) or (refusal.get("status") == status and refusal.get("stamp") == stamp):
-            return False  # one decision per episode: this one was refused and stays with the owner
+        if not _refusal_ok(refusal) or (refusal["status"] == status and (
+                refusal.get("stamp") == stamp or read(wave_dir(cfg, wave) / "status", on_error=None) != status)):
+            # one decision per episode: this one was refused and stays with the owner. Another stamp alone
+            # is not a new episode: the file must read as this very line again (not empty or unreadable)
+            return False
         w.pop("policy_refusal")  # the same line written anew: another episode, decided anew
     label = parse_blocked_label(status)
     if label is None or label["red"] or label["class"] == "merge_gate":
@@ -5310,8 +5351,8 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
                     precheck=still)  # re-read again UNDER the input lock: `say` may have answered meanwhile
     if sent is None:
         w.pop("policy_pending", None)
-        if not retry:
-            w.pop("policy_key_pending", None)  # nothing was typed: the fork key is not in flight
+        if fixed and not retry:
+            _forget_fork_key(w, fixed)  # nothing was typed: this fork key is not in flight
         if retry:  # the typed answer was given up, possibly already submitted: charged to the cap
             w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
         save_state(cfg, st)
@@ -5323,7 +5364,8 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     if not sent:
         if w.get("pending_enter") != "policy answer":
             w.pop("policy_pending", None)  # nothing reached the window: the next tick starts afresh
-            w.pop("policy_key_pending", None)
+            if fixed:
+                _forget_fork_key(w, fixed)
         save_state(cfg, st)
         return False
     w.pop("policy_pending", None)
@@ -5431,7 +5473,7 @@ def _tick(cfg, st):
     now = time.time()
     attach = f"{attach_cmd(name)}  (выйти: Ctrl-b d)"
     refusal = w.get("policy_refusal")
-    if refusal is not None and (refusal.get("status") != status if isinstance(refusal, dict)
+    if refusal is not None and (refusal["status"] != status if _refusal_ok(refusal)
                                 else not status.startswith("BLOCKED")):
         w.pop("policy_refusal")  # the refused episode is over (whatever comes next, DONE included): its mark goes with it
         save_state(cfg, st)
@@ -5550,7 +5592,7 @@ def _tick(cfg, st):
         if fresh:
             if not status.startswith("BLOCKED: merge gate:"):  # the wave fixes a gate failure itself
                 note_question(w, status, now)
-            refusal = w.get("policy_refusal") if isinstance(w.get("policy_refusal"), dict) else {}
+            refusal = w.get("policy_refusal") if _refusal_ok(w.get("policy_refusal")) else {}
             put_notice(w, "blocked", status, blocked_notice(
                 cfg, wave, status, attach, refusal.get("reason") if refusal.get("status") == status else None))
         save_state(cfg, st)
