@@ -11850,13 +11850,45 @@ class FixedAnswerPolicy(Base):
                 st = wab.load_state(cfg)
                 st["waves"]["W1"].update(junk)
                 self.put_state(cfg, st)
-                self.tick(cfg, "RUNNING")
+                self.assertTrue(self.decide(cfg)["ok"])  # the fork itself is answerable: only the mark stands in the way
+                before = self.log(cfg).count("policy answer not sent")  # the subtests share one events.log
                 st = self.tick(cfg, self.ND.format(rec="invariant") + f" {name}")
+                self.tick(cfg)
                 self.assertEqual(self.answers(), [])
                 (ask,) = self.owner_asked()
                 if name != "refusal":
                     self.assertIn("отметки автоответов в state.json испорчены", ask)
+                    self.assertEqual(self.log(cfg).count("policy answer not sent"), before + 1)
                     self.assertNotIn(None, st["waves"]["W1"].get("policy_keys") or [])
+                else:  # a corrupt refusal mark reads as a refusal while the wave is BLOCKED and goes with the episode
+                    self.assertNotIn("policy_refusal", self.tick(cfg, "RUNNING")["waves"]["W1"])
+
+    def test_f2_a_mark_corrupted_under_a_typed_answer_clears_the_input_and_goes_to_the_owner(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg)
+        status = self.ND.format(rec="invariant")
+
+        def typed_then_watch_dies(name, text, on_typed=None, **kw):
+            self.sent.append(("text", name, text))
+            on_typed()
+            raise KeyboardInterrupt
+        with mock.patch.object(wab, "send_text", typed_then_watch_dies):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick(cfg, status)
+        st = wab.load_state(cfg)
+        st["waves"]["W1"]["policy_key_pending"] = {"status": status, "text": "чужой текст"}  # by hand: the key is lost
+        self.put_state(cfg, st)
+        w = self.tick(cfg)["waves"]["W1"]
+        self.tick(cfg)
+        self.assertEqual(len(self.answers()), 1)  # nothing typed again, the Enter of the typed text is never pressed
+        self.assertNotIn("чужой текст", [t for _, _, t in self.sent])
+        self.assertNotIn("pending_enter", w)
+        self.assertNotIn("policy_pending", w)
+        self.assertEqual(w.get("auto_answers"), 1)  # the typed answer may have gone out: charged
+        self.assertNotIn("policy_keys", w)  # L3: no null key is carried over
+        (ask,) = self.owner_asked()
+        self.assertIn("отметки автоответов в state.json испорчены", ask)
+        self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
 
     def test_l2_owner_say_over_a_typed_answer_the_real_marker(self):
         """acc20 without a mock: the answer is typed and waits for its Enter, the owner answers with `say`
