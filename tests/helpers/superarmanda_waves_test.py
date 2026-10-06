@@ -18590,6 +18590,25 @@ class MetricsScript(unittest.TestCase):
             "2026-10-04 14:00:00Z W2: BLOCKED: [class=blocked_cap rec=new_run red=no] вопрос"])
         self.assertEqual(self.metrics.blocked_cap_by_wave(events), {"W1": 2, "W2": 1})
 
+    def test_episode_is_a_stretch_of_current_status(self):
+        cap = "[class=blocked_cap rec=new_run red=no] вопрос"
+        t = "2026-10-04 12:00:00Z"
+        blocked = f"{t} W1: BLOCKED: {cap}"
+        other = f"{t} W2: BLOCKED: [class=question rec=A red=no] q"
+        cases = {
+            "repeat of the same line": ([blocked, blocked], 1),
+            "phase status repeat, same text": ([blocked, f"{t} W1: phase=running ctx=1k restarts=0 status=BLOCKED: {cap}"], 1),
+            "RUNNING between": ([blocked, f"{t} W1: phase=running ctx=1k restarts=0 status=RUNNING", blocked], 2),
+            "DONE between": ([blocked, f"{t} W1: DONE", blocked], 2),
+            "policy answer between": ([blocked, f"{t} W1: policy auto-answer: class=needs_decision rec=invariant", blocked], 2),
+            "another BLOCKED between": ([blocked, f"{t} W1: BLOCKED: [class=question rec=A red=no] q", blocked], 2),
+            "other wave interleaved does not reset": ([blocked, other, blocked, other], 1),
+            "bare RUNNING between": ([blocked, f"{t} W1: RUNNING", blocked], 2),
+        }
+        for name, (lines, want) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.metrics.blocked_cap_by_wave("\n".join(lines)).get("W1", 0), want)
+
     def make(self, mutate):
         base = Path(tempfile.mkdtemp(prefix="wab-metrics-"))
         self.addCleanup(shutil.rmtree, base, True)

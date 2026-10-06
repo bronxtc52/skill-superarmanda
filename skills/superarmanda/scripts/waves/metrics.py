@@ -13,8 +13,9 @@
 По волне:
   * прогонов  — число прогонов (manifest);
   * фикс-круги — сумма `tasks.<id>.fix_cycles` по всем manifest волны;
-  * blocked_cap — число развилок. Одна развилка — один эпизод: строки `<волна>: BLOCKED: [class=blocked_cap …`
-    журнала; подряд идущая такая же строка той же волны (повтор той же записи) не считается.
+  * blocked_cap — число развилок. Одна развилка — один эпизод: непрерывный период, когда текущий статус волны (строки `BLOCKED…`,
+    `DONE`/`RUNNING`, `phase=… status=`, ответ политики) — одна и та же строка `BLOCKED: [class=blocked_cap …`;
+    повтор той же строки без смены статуса не считается, тот же текст после иного статуса — новая развилка.
 
 Отсутствующий или испорченный файл молча не пропускается: волна получает пометку «нет данных» с причиной
 (в таблице — под ней, в `--json` — поле `problems`), числа, которые не из чего посчитать, — `null`, в итог они
@@ -29,7 +30,10 @@ import sys
 from pathlib import Path
 
 WAVE_DIR = re.compile(r"W(\d+)\Z")
-BLOCKED_CAP = re.compile(r"^\S+ \S+ (W\d+): BLOCKED: (\[class=blocked_cap\b.*)$")
+STATUS_LINE = re.compile(r"^\S+ \S+ (W\d+): (.*)$")
+PHASE_STATUS = re.compile(r"phase=\S+ .*?\bstatus=(.*)$")
+BARE_STATUS = re.compile(r"[A-Z][A-Z_]*\Z")
+BLOCKED_CAP = re.compile(r"BLOCKED: \[class=blocked_cap\b")
 NO_DATA = "нет данных"
 
 
@@ -109,16 +113,29 @@ def _fix_cycles(path, problems):
 
 
 def blocked_cap_by_wave(events):
-    """{волна: число развилок} по тексту events.log; одна развилка — один эпизод (подряд повтор строки не считается)."""
-    counts, last = {}, {}
+    """{волна: число развилок} по тексту events.log.
+
+    Эпизод — непрерывный период, когда ТЕКУЩИЙ статус волны — именно эта строка blocked_cap. Статус волны меняют
+    строки `<волна>: BLOCKED: …`, `<волна>: DONE|RUNNING|…`, `phase=… status=<…>`, ответ политики и запуск окна;
+    остальные (say, alarm, merge gate…) его не сообщают и эпизод не рвут. Строки других волн не влияют."""
+    counts, current = {}, {}
     for line in events.splitlines():
-        m = BLOCKED_CAP.match(line)
+        m = STATUS_LINE.match(line)
         if not m:
             continue
-        wave, text = m.groups()
-        if last.get(wave) != text:
+        wave, rest = m.groups()
+        phase = PHASE_STATUS.match(rest)
+        if phase:
+            status = phase.group(1)
+        elif rest.startswith("policy auto-answer:") or rest.startswith("launched "):
+            status = None  # развилка закрыта ответом / окно запущено заново
+        elif rest.startswith("BLOCKED: ") or BARE_STATUS.match(rest):
+            status = rest
+        else:
+            continue
+        if status is not None and BLOCKED_CAP.match(status) and current.get(wave) != status:
             counts[wave] = counts.get(wave, 0) + 1
-        last[wave] = text
+        current[wave] = status
     return counts
 
 
