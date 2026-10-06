@@ -2431,6 +2431,7 @@ FIXED_MEANING["needs_decision", "accept_limitation", True] = (
     FIXED_MEANING["needs_decision", "accept_limitation", False] + FIXED_NEW_RUN)
 FIXED_MEANING["blocked_cap", "new_run", True] = FIXED_MEANING["blocked_cap", "invariant", True]
 FORK_MARKS_CORRUPT = "отметки автоответов в state.json испорчены (policy_keys / policy_key_pending)"
+FORK_CHANGED = "состояние развилки изменилось после ввода ответа: "  # + the reason of the check as it reads now
 FIXED_TAIL = " Затем запиши RUNNING в status."
 MAX_AUTO_ANSWERS = 3  # chain.json `max_auto_answers` default: automatic answers per wave
 MAX_RUNS = 2  # chain.json `max_runs` default: superarmanda runs (`init --from-plan`) per wave
@@ -2550,7 +2551,10 @@ def fixed_answer(cfg, wave, w, label, rule, status):
     needs_decision without a fix-loop source; a readiness role unavailable/error on the manifest's HEAD (an
     external failure is not fixed by another run); a new run needed above `max_runs`; the same fork (key)
     answered before; a corrupt mark of the answered keys in state.json (this try or an archived one), a
-    corrupt `attempts` container included. Never raises."""
+    corrupt `attempts` container included. The Enter-only retry of a typed answer is the whole check again
+    (only its own key in flight is not «answered before»): the Enter goes out only when the check passes NOW
+    and gives the very decision that was typed (the same key and text) — otherwise a refusal (FORK_CHANGED).
+    Never raises."""
     try:
         return _fixed_answer(cfg, wave, w, label, rule, status)
     except Exception:  # noqa: BLE001 - fail closed: no automatic answer, a fixed reason
@@ -2558,7 +2562,6 @@ def fixed_answer(cfg, wave, w, label, rule, status):
 
 
 def _fixed_answer(cfg, wave, w, label, rule, status):
-    cls, answer = label["class"], rule["answer"]
     attempts = w.get("attempts", [])  # wave_attempts() skips a corrupt container: here it would hide archived keys
     if not isinstance(attempts, list) or not all(isinstance(a, dict) for a in attempts):
         return _refuse(FORK_MARKS_CORRUPT)
@@ -2567,10 +2570,22 @@ def _fixed_answer(cfg, wave, w, label, rule, status):
     except ValueError:
         return _refuse(FORK_MARKS_CORRUPT)
     pend = marks[0][1]
-    if (pend and pend.get("status") == status and w.get("pending_enter") == "policy answer"
-            and w.get("policy_pending") == status and isinstance(pend.get("text"), str)):
-        # the Enter-only retry of THIS episode: the decision was made and typed, only its Enter is owed
-        return {"ok": True, "text": pend["text"], "key": pend.get("key"), "answer": answer, "rec": label["rec"]}
+    # the Enter-only retry of THIS episode: the answer is typed, its Enter is owed — and is pressed only when
+    # the check below passes now and gives the same decision (a role may have failed, the run or `max_runs`
+    # changed since the text was typed)
+    retry = bool(pend and pend.get("status") == status and w.get("pending_enter") == "policy answer"
+                 and w.get("policy_pending") == status)
+    got = _fork_decision(cfg, wave, label, rule, marks, pend if retry else None)
+    if retry and not (got["ok"] and got["key"] == pend["key"] and got["text"] == pend.get("text")):
+        return _refuse(FORK_CHANGED + ("пересчитанный ответ не совпадает с напечатанным" if got["ok"]
+                                       else got["reason"]))
+    return got
+
+
+def _fork_decision(cfg, wave, label, rule, marks, own):
+    """The machine check of fixed_answer by the files as they are now. `own`: the key in flight of the
+    Enter-only retry — the one mark that does not read as «answered before»."""
+    cls, answer = label["class"], rule["answer"]
     path, why = current_manifest(cfg, wave)
     if path is None:
         return _refuse(why)
@@ -2616,7 +2631,7 @@ def _fixed_answer(cfg, wave, w, label, rule, status):
         return _refuse(f"потолок прогонов исчерпан ({index}/{cap}), новый прогон открыть нельзя")
     key = [wave, cfg["run_id"], index, task, cls, source]
     for keys, pend in marks:
-        if key in keys or (pend and pend.get("key") == key):
+        if key in keys or (pend and pend is not own and pend.get("key") == key):
             return _refuse(f"развилка задачи {task} уже получила автоответ в прогоне {index}")
     text = FIXED_HEAD.format(answer=answer) + FIXED_MEANING[cls, answer, new_run].format(n=index + 1, max=cap)
     if label["rec"] != answer:
@@ -5335,8 +5350,9 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
             # `blocked` mark the text of the line already carries (once per episode: later ticks return above)
             drop_notice(w, "blocked")
             if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
-                # only with a corrupt mark: a typed answer waits for its Enter — never leave its text in the
-                # input line of an episode the owner now answers (it may have gone out already: charged)
+                # a typed answer waits for its Enter, and the check no longer gives it (a corrupt mark, or the
+                # fork changed since the typing: FORK_CHANGED) — the Enter is not pressed, and its text never
+                # stays in the input line of an episode the owner now answers (it may have gone out: charged)
                 w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
                 w.pop("policy_pending", None)
                 _abandon_input(cfg, st, wave, w, "policy answer: refused by the machine check")
