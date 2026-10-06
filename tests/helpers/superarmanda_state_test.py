@@ -7366,6 +7366,193 @@ class W4GateRoles(W4Base):
                 self.assert_reason(self.problems(HIGH_PLAN, value), "manifest", "t1", "task_epoch не число")
                 self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
 
+    # ----- the credit of a role = HEAD + tree + epoch (Codex PR #97: threads 4192505756, 4193124544) -----
+    RESET_EVENTS = ("dirty_tree", "new_commit", "fix_failed", "fix_pass", "defer", "accept", "decision",
+                    "role_record", "risk_raised")
+
+    def dirty(self):
+        """An edit of the tree without a commit, and resume onto it: the same HEAD, another tree."""
+        (self.repo / "tracked.txt").write_text(f"dirty {next(self.serial)}\n", encoding="utf-8")
+        return self.resume()
+
+    def clean(self):
+        """The edit reverted, and resume onto the clean tree of the same HEAD (review.py wants it clean)."""
+        self.git("checkout", "--", "tracked.txt")
+        return self.resume()
+
+    def findings_review(self):
+        return self.record("cross_provider_reviewer", "findings",
+                           **self.review_flags(self.report("codex-host", "findings")))
+
+    def apply_event(self, event, role):
+        """The event between the credit of `role` and the moment it is judged."""
+        if event == "dirty_tree":
+            self.dirty()
+            self.assertEqual(self.entry()["results"], {})
+            self.clean()
+        elif event == "new_commit":
+            self.next_head()
+        elif event == "fix_failed":
+            self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        elif event == "fix_pass":
+            self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+            self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        elif event in ("defer", "accept"):
+            severity = ["--severity", "low"] if event == "accept" else []
+            self.ok("fix-loop", "--task", "t1", f"--{event}", "--source", "cross_provider_reviewer",
+                    *severity, "--note", "known limitation")
+        elif event == "decision":
+            self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+            self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+            self.ok("fix-loop", "--task", "t1", "--decision", "invariant", "--note", "the invariant holds")
+        elif event == "role_record":
+            self.record("tester", model="fable")
+        elif event == "risk_raised":
+            self.ok("task-risk", "--task", "t1", "--risk", "high")
+
+    def assert_not_credited(self, role, *needles):
+        self.assertNotEqual(self.entry()["status"], "ready_for_pr_review")
+        where = self.where()
+        self.assertNotIn("done", where["next_action"])
+        for needle in needles:
+            self.assertIn(needle, where["next_action"])
+        problems = self.problems(HIGH_PLAN)
+        self.assertTrue(problems, "the gate passes a task whose credit was reset")
+        if needles:
+            self.assert_reason(problems, "t1", role)
+        self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
+        return where
+
+    def test_internal_review_credit_is_bound_to_the_tree_and_epoch_of_the_first_packet(self):
+        """Codex thread 4193124544: the credit compared only the HEAD with the first packet's HEAD, so an
+        internal review of a dirty tree counted for the packet of the clean tree of the same SHA — and any
+        record or fix-loop between the two went unseen. Now the credit carries tree_fingerprint and epoch
+        and both must equal the marker's: anything between the internal review and the first external
+        record resets it, with the reason naming what differs; the way out is a new run."""
+        for event in ("dirty_tree", "new_commit", "fix_failed", "fix_pass", "decision", "role_record",
+                      "risk_raised"):
+            with self.subTest(event=event):
+                self.init(risk="medium" if event == "risk_raised" else "high")
+                if event == "dirty_tree":
+                    # the Codex scenario: the internal review of a DIRTY tree, the edit reverted, the
+                    # packet of the clean tree of the same SHA
+                    self.dirty()
+                    self.built()
+                    credit = self.internal()["internal_review"]
+                    self.clean()
+                    self.assertEqual(self.entry()["results"], {})
+                    self.built()
+                else:
+                    self.built()
+                    credit = self.internal()["internal_review"]
+                    self.apply_event(event, "internal_reviewer")
+                self.reviews()  # the first external packet: the marker binds the credit
+                marker = self.entry()["external_review"]
+                field = {"dirty_tree": "tree_fingerprint", "new_commit": "head"}.get(event, "epoch")
+                differs = {"tree_fingerprint": "tree", "head": "HEAD", "epoch": "epoch"}[field]
+                where = self.assert_not_credited("internal_reviewer", "internal_reviewer", "new run", differs)
+                self.assertNotEqual(credit[field], marker[field])
+                self.assertTrue(where["next_action"].startswith("BLOCKED: internal_reviewer"), where["next_action"])
+                self.final()
+                self.assert_not_credited("internal_reviewer", "internal_reviewer", "new run")
+                # the honest repeat: a new run, the internal review of the clean tree that goes out
+                self.init()
+                self.complete()
+                self.assertEqual(self.problems(HIGH_PLAN), [])
+                self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
+
+    def test_internal_review_before_the_packet_counts_only_as_a_current_result_of_this_tree(self):
+        """Before the packet the requirement is still open: the credit of a dirty tree does not count on
+        the clean one (or the other way round) — record the internal review again, no new run needed."""
+        self.built()
+        self.internal()
+        self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+        self.dirty()
+        self.assertEqual(self.entry()["results"], {})
+        self.built()
+        action = self.assert_not_ready("internal_reviewer", "task-result --role internal_reviewer")
+        self.assertFalse(action.startswith("BLOCKED"), action)
+        self.assertEqual(self.position(), (5, "internal_reviewer"))
+        self.internal()
+        self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assertEqual(self.problems(HIGH_PLAN), [])
+
+    def test_internal_review_credit_without_tree_and_epoch_is_not_counted(self):
+        """A credit or marker written before the fields existed is a hand edit now: not counted, with the
+        reason (no live manifest carries one honestly — the fields were born in the same wave)."""
+        self.complete()
+        self.assertEqual(self.problems(HIGH_PLAN), [])
+        cases = {
+            "credit without tree": lambda t: t["internal_review"].pop("tree_fingerprint"),
+            "credit without epoch": lambda t: t["internal_review"].pop("epoch"),
+            "marker without tree": lambda t: t["external_review"].pop("tree_fingerprint"),
+            "marker without epoch": lambda t: t["external_review"].pop("epoch"),
+            "credit epoch is a bool": lambda t: t["internal_review"].update(epoch=True),
+        }
+        for case, edit in cases.items():
+            with self.subTest(case=case):
+                value = self.forged(edit)
+                problems = self.problems(HIGH_PLAN, value)
+                self.assert_reason(problems, "t1", "internal_reviewer", "новый прогон")
+                self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
+
+    def test_every_credit_of_a_high_task_is_reset_by_the_events_after_it(self):
+        """One sweep over the roles whose credit the readiness reads and the events that change what they
+        judged: the task is not ready, where names a role and a reason, the gate fails; the honest repeat
+        of the role on the new state makes it ready and the gate pass."""
+        cases = [
+            ("final_check", "dirty_tree"), ("final_check", "new_commit"), ("final_check", "fix_failed"),
+            ("final_check", "fix_pass"), ("final_check", "defer"), ("final_check", "accept"),
+            ("final_check", "decision"), ("final_check", "role_record"),
+            ("cross_provider_reviewer", "dirty_tree"), ("cross_provider_reviewer", "new_commit"),
+            ("cross_provider_reviewer", "fix_failed"), ("cross_provider_reviewer", "fix_pass"),
+            ("cross_provider_reviewer", "role_record"),
+            ("second_reviewer", "dirty_tree"), ("second_reviewer", "new_commit"),
+            ("second_reviewer", "fix_failed"), ("second_reviewer", "fix_pass"), ("second_reviewer", "role_record"),
+        ]
+        for role, event in cases:
+            with self.subTest(role=role, event=event):
+                self.init()
+                self.built()
+                self.internal()
+                if event in ("defer", "accept"):
+                    self.findings_review()
+                    self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+                    self.assertEqual(self.final()["status"], "in_progress")  # findings not disposed of
+                else:
+                    self.reviews()
+                    self.assertEqual(self.final()["status"], "ready_for_pr_review")
+                    self.assertEqual(self.problems(HIGH_PLAN), [])
+                self.apply_event(event, role)
+                if event in ("dirty_tree", "new_commit"):
+                    # the results of the old tree are gone with resume: the credit of a result is bound
+                    # to the tree it was recorded on
+                    self.assertNotIn(role, self.entry()["results"])
+                    self.assert_not_credited(role)
+                    self.built()
+                    if role != "final_check":
+                        self.assert_not_credited(role)
+                        self.assert_reason(self.problems(HIGH_PLAN), "t1", role)
+                    self.reviews()
+                    self.assert_not_credited("final_check", "final_check")
+                elif self.entry()["status"] == "needs_fix":
+                    # an open fix cycle: the task waits for the coder; the credit question comes after
+                    self.assertIn(role, self.entry()["results"])
+                    self.assertEqual(self.assert_not_credited(role)["role"], "coder")
+                    self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+                    self.assert_not_credited("final_check", "final_check")
+                elif role == "final_check":
+                    self.assertIn(role, self.entry()["results"])
+                    self.assert_not_credited(role, "final_check", "task-result --role final_check")
+                else:
+                    self.assertIn(role, self.entry()["results"])  # the review saw this tree: its credit stays
+                    self.assert_not_credited(role)
+                self.assertEqual(self.final()["status"], "ready_for_pr_review")
+                self.assertEqual(self.problems(HIGH_PLAN), [])
+                self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
+
     def test_marker_null_fails_the_gate_as_malformed(self):
         self.complete()
         value = self.forged(lambda t: t.update(external_review=None))
