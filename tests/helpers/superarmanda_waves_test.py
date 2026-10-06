@@ -11222,6 +11222,329 @@ class W1AcceptedOnPass(GateBase):  # pass verdict carries accepted limitations
 
 
 # ---------------------------------------------------------------- #48 #31 #50 #53: clearing the input line
+class FixedAnswerPolicy(Base):
+    """W5 (#89): a `decision_policy` rule with `answer` — the dispatcher's fixed answer, whatever the wave
+    recommended, after a machine check by the current run's manifest and runs.json (never the wave's text).
+    The manifest is the minimal document state.py's own reader accepts (`gate.state.read`); the fields are
+    the ones state.py writes (tasks/status/fix_cycles/decision_required_for/results/run)."""
+    HEAD_A, HEAD_B = "a" * 40, "b" * 40
+    ND = "BLOCKED: [class=needs_decision rec={rec} red=no] needs_decision T1: гонка; варианты: invariant | cut_surface"
+    BC = "BLOCKED: [class=blocked_cap rec={rec} red=no] T1 blocked: три круга; варианты: new_run | accept_limitation"
+    BOTH = [{"class": "needs_decision", "answer": "invariant"}, {"class": "blocked_cap", "answer": "invariant"}]
+    mandate, tick, answers = DecisionPolicy.mandate, DecisionPolicy.tick, DecisionPolicy.answers
+    log, decisions, owner_asked = DecisionPolicy.log, DecisionPolicy.decisions, DecisionPolicy.owner_asked
+
+    def task(self, status="needs_decision", fix_cycles=2, source="tester", **results):
+        res = {role: dict({"session_id": f"s-{role}", "status": "pass", "head": self.HEAD_A}, **over)
+               for role, over in dict({"coder": {}, "tester": {"status": "findings"}}, **results).items()}
+        return {"status": status, "fix_cycles": fix_cycles, "results": res, "session_roles": {},
+                "fix_sources": {"tester": fix_cycles}, "decisions": [], "decision_required_for": source,
+                "deferrals": [], "acceptances": []}
+
+    def fork(self, cfg, index=1, tasks=None, runs="ok", manifest="ok", run_index=None, **task):
+        """runs.json with `index` runs and the manifest of the last one, as `state.py init --from-plan` lays them."""
+        S = wab.gate.state
+        wdir = cfg["run_dir"] / "W1"
+        wdir.mkdir(parents=True, exist_ok=True)
+        path = wdir / f"run{index}" / "manifest.json"
+        path.parent.mkdir(exist_ok=True)
+        doc = {"version": 2, "review_policy": {"version": S.POLICY_VERSION, "level": "standard"}, "run_id": "r",
+               "head": self.HEAD_A, "tree_fingerprint": "fp", "tasks": tasks or {"T1": self.task(**task)},
+               "run": {"index": index if run_index is None else run_index, "max": 5}}
+        if manifest == "ok":
+            path.write_text(json.dumps(doc), encoding="utf-8")
+            S.read(path)  # the fixture is a manifest state.py itself reads
+        elif manifest == "missing":
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(manifest if isinstance(manifest, str) else json.dumps(dict(doc, **manifest)), encoding="utf-8")
+        rj = wdir / "runs.json"
+        if runs == "missing":
+            rj.unlink(missing_ok=True)
+        elif runs == "ok":
+            rj.write_text(json.dumps({"version": 1, "wave": "W1", "runs": [
+                {"index": i, "manifest": str(wdir / f"run{i}" / "manifest.json")} for i in range(1, index + 1)]}),
+                encoding="utf-8")
+        else:
+            rj.write_text(runs if isinstance(runs, str) else json.dumps(runs), encoding="utf-8")
+
+    def decide(self, cfg, cls="needs_decision", answer="invariant", rec="cut_surface", w=None, status=None):
+        status = status or (self.ND if cls == "needs_decision" else self.BC).format(rec=rec)
+        return wab.fixed_answer(cfg, "W1", {} if w is None else w, wab.parse_blocked_label(status),
+                                {"class": cls, "rec": None, "answer": answer}, status)
+
+    # ----- ONE table over the deciding function: class × answer × rec × manifest × runs.json × repeat -----
+    def test_fixed_answer_table(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        un, bad = {"status": "unavailable"}, "{not json"
+        quota = {"status": "findings", "profile": "codex-host-opus", "quota_evidence": {"kind": "quota"}}
+        two = {"T1": self.task(), "T2": self.task()}
+        ND, BC, bl = "needs_decision", "blocked_cap", {"status": "blocked", "fix_cycles": 3, "source": None}
+        rows = [  # name, class, answer, rec, fork kwargs, expected: (True, in-text, not-in-text) | (False, reason part)
+            ("acc03 round possible", ND, "invariant", "accept_limitation", {}, (True, ["вариант invariant.", "ещё один круг", "не латай", "fix-loop --defer", "--decision invariant", "(рекомендация волны: accept_limitation)", "RUNNING"], ["новый прогон", "своей рекомендации"])),
+            ("rec equals the answer is not repeated", ND, "invariant", "invariant", {}, (True, ["вариант invariant."], ["рекомендация волны"])),
+            ("round possible on the last run: the cap is not asked", ND, "invariant", "x", {"index": 5}, (True, ["ещё один круг"], ["новый прогон"])),
+            ("acc07 fix-loop 3/3, runs left: a new run", ND, "invariant", "x", {"index": 2, "fix_cycles": 3}, (True, ["не латай", "новый прогон", "init --from-plan", "прогон 3 из 5"], ["ещё один круг"])),
+            ("acc07 fix-loop 3/3 on the last run", ND, "invariant", "x", {"index": 5, "fix_cycles": 3}, (False, "потолок прогонов исчерпан (5/5)")),
+            ("cut_surface", ND, "cut_surface", "invariant", {}, (True, ["вариант cut_surface.", "--decision cut_surface", "result.md"], ["новый прогон"])),
+            ("accept_limitation", ND, "accept_limitation", "invariant", {}, (True, ["--decision accept_limitation", "Принятые ограничения"], ["новый прогон"])),
+            ("acc02 blocked_cap invariant over rec new_run", BC, "invariant", "new_run", dict(bl, index=1), (True, ["вариант invariant.", "не латай", "новый прогон", "прогон 2 из 5", "(рекомендация волны: new_run)"], ["своей рекомендации", "ещё один круг"])),
+            ("acc06 run 4 of 5 is answered", BC, "invariant", "new_run", dict(bl, index=4), (True, ["прогон 5 из 5"], [])),
+            ("acc06 acc16 run 5 of 5 is not", BC, "invariant", "new_run", dict(bl, index=5), (False, "потолок прогонов исчерпан (5/5)")),
+            ("blocked_cap new_run", BC, "new_run", "accept_limitation", dict(bl, index=1), (True, ["вариант new_run.", "новый прогон"], [])),
+            ("blocked_cap accept_limitation", BC, "accept_limitation", "new_run", dict(bl, index=1), (True, ["--decision accept_limitation", "новый прогон"], [])),
+            ("blocked_cap accept_limitation on the last run", BC, "accept_limitation", "new_run", dict(bl, index=5), (False, "потолок")),
+            ("acc08 two candidates", ND, "invariant", "x", {"tasks": two}, (False, "задач в статусе needs_decision: 2")),
+            ("acc08 no candidate", BC, "invariant", "x", {}, (False, "задач в статусе blocked: 0")),
+            ("acc08 needs_decision without a fix-loop source", ND, "invariant", "x", {"source": None}, (False, "нет источника fix-loop")),
+            ("acc08 a source fix-loop does not know", ND, "invariant", "x", {"source": "owner"}, (False, "нет источника fix-loop")),
+            ("acc10 no runs.json", ND, "invariant", "x", {"runs": "missing"}, (False, "runs.json")),
+            ("acc10 broken runs.json", ND, "invariant", "x", {"runs": bad}, (False, "runs.json")),
+            ("acc10 runs.json of another wave", ND, "invariant", "x", {"runs": {"version": 1, "wave": "W9", "runs": []}}, (False, "runs.json")),
+            ("acc10 runs.json without runs", ND, "invariant", "x", {"runs": {"version": 1, "wave": "W1", "runs": []}}, (False, "runs.json")),
+            ("acc10 no manifest", ND, "invariant", "x", {"manifest": "missing"}, (False, "несуществующий файл")),
+            ("acc10 broken manifest", ND, "invariant", "x", {"manifest": bad}, (False, "manifest текущего прогона не читается")),
+            ("acc10 manifest of an unknown schema", ND, "invariant", "x", {"manifest": {"version": 99}}, (False, "manifest текущего прогона не читается")),
+            ("acc10 manifest of another run index", ND, "invariant", "x", {"index": 2, "run_index": 1}, (False, "не совпадает с runs.json")),
+            ("acc11 Fable review unavailable (quota)", ND, "invariant", "x", {"second_reviewer": un}, (False, "роль second_reviewer")),
+            ("acc11 coder unavailable", ND, "invariant", "x", {"coder": un}, (False, "роль coder")),
+            ("acc11 tester error", ND, "invariant", "x", {"tester": {"status": "error"}}, (False, "роль tester")),
+            ("acc11 blocked_cap with an unavailable role", BC, "invariant", "x", dict(bl, final_check=un), (False, "роль final_check")),
+            ("an unavailable result of an older head is history", ND, "invariant", "x", {"second_reviewer": dict(un, head=self.HEAD_B)}, (True, ["ещё один круг"], [])),
+            ("acc12 quota evidence with a counted codex-host-opus", ND, "invariant", "x", {"second_reviewer": quota}, (True, ["ещё один круг"], [])),
+        ]
+        for name, cls, answer, rec, kw, want in rows:
+            with self.subTest(name):
+                shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)
+                self.fork(cfg, **kw)
+                if name.startswith("acc12"):  # the unavailable Fable attempt lives on in review_history only
+                    p = cfg["run_dir"] / "W1" / "run1" / "manifest.json"
+                    d = json.loads(p.read_text(encoding="utf-8"))
+                    d["tasks"]["T1"]["review_history"] = [{"role": "second_reviewer", "status": "unavailable",
+                                                           "head": self.HEAD_A, "result_sha256": "0" * 64}]
+                    p.write_text(json.dumps(d), encoding="utf-8")
+                got = self.decide(cfg, cls, answer, rec)
+                self.assertEqual(got["ok"], want[0], got)
+                if want[0]:
+                    self.assertTrue(got["text"].startswith("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант "), got)
+                    self.assertNotIn("\n", got["text"])
+                    self.assertNotIn("`", got["text"])
+                    for part in want[1]:
+                        self.assertIn(part, got["text"])
+                    for part in want[2]:
+                        self.assertNotIn(part, got["text"])
+                else:
+                    self.assertIn(want[1], got["reason"])
+                    self.assertNotIn("гонка", got["reason"])  # never the wave's text
+        # ----- the repeat of a fork: the key (wave, run_id, run index, task, class, source) -----
+        shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)
+        self.fork(cfg, index=2)
+        status = self.ND.format(rec="x")
+        key = self.decide(cfg)["key"]
+        self.assertEqual(key, ["W1", cfg["run_id"], 2, "T1", "needs_decision", "tester"])
+        pend = {"key": key, "status": status, "text": "t"}
+        for name, w, ok in [
+                ("acc07 the key is answered", {"policy_keys": [key]}, False),
+                ("acc09 answered in an archived attempt (the wave restarted)", {"attempts": [{"policy_keys": [key]}]}, False),
+                ("another run index is another fork", {"policy_keys": [key[:2] + [1] + key[3:]]}, True),
+                ("in flight, a new episode", {"policy_key_pending": dict(pend, status="BLOCKED: other")}, False),
+                ("in flight, watch died before Enter was recorded", {"policy_key_pending": pend, "policy_pending": status}, False),
+                ("in flight in an archived attempt", {"attempts": [{"policy_key_pending": pend}]}, False),
+                ("the Enter-only retry of the same episode", {"policy_key_pending": pend, "policy_pending": status, "pending_enter": "policy answer"}, True)]:
+            with self.subTest(name):
+                got = self.decide(cfg, w=w, status=status)
+                self.assertEqual(got["ok"], ok, got)
+                if not ok:
+                    self.assertIn("уже получила автоответ", got["reason"])
+
+    # ----- the schema (load_chain) -----
+    def test_acc04_acc17_load_chain_refuses_a_bad_answer(self):
+        for rule, part in [({"class": "question", "answer": "invariant"}, "question"),
+                           ({"class": "needs_decision", "answer": "new_run"}, "new_run"),
+                           ({"class": "blocked_cap", "answer": "cut_surface"}, "cut_surface"),
+                           ({"class": "needs_decision", "answer": "patch"}, "patch"),
+                           ({"class": "needs_decision", "answer": None}, "None"),
+                           ({"class": "needs_decision", "answer": ["invariant"]}, "answer"),
+                           ({"class": "needs_decision", "answer": 1}, "answer"),
+                           ({"class": "needs_decision", "answer": True}, "answer"),
+                           ({"class": "needs_decision", "answer": "invariant", "note": "x"}, "note")]:
+            with self.subTest(rule=rule):
+                with self.assertRaises(SystemExit) as e:
+                    self.chain(decision_policy=[rule])
+                self.assertIn("chain.json: decision_policy [0]", str(e.exception))
+                self.assertIn(part, str(e.exception))
+        cfg, _ = self.chain(decision_policy=[{"class": "needs_decision", "rec": "x", "answer": "invariant"},
+                                             {"class": "blocked_cap", "answer": "new_run"}, {"class": "question"}])
+        self.assertEqual(wab.decision_policy(cfg), [{"class": "needs_decision", "rec": "x", "answer": "invariant"},
+                                                    {"class": "blocked_cap", "rec": None, "answer": "new_run"},
+                                                    {"class": "question", "rec": None, "answer": None}])
+
+    # ----- end to end through the tick -----
+    def test_acc02_blocked_cap_recommended_new_run_gets_invariant(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg, status="blocked", fix_cycles=3, source=None)
+        self.tick(cfg, self.BC.format(rec="new_run"))
+        (text,) = self.answers()
+        self.assertIn("вариант invariant.", text)
+        self.assertIn("не латай", text)
+        self.assertIn("прогон 2 из 5", text)
+        self.assertEqual(self.owner_asked(), [])
+
+    def test_acc03_acc05_needs_decision_answer_log_event_and_notice_name_answer_and_rec(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg)
+        st = self.tick(cfg, self.ND.format(rec="accept_limitation"))
+        (text,) = self.answers()
+        self.assertIn("вариант invariant.", text)
+        (line,) = self.decisions(cfg)
+        self.assertRegex(line, r"^\S+ class=needs_decision answer=invariant rec=accept_limitation needs_decision T1")
+        self.assertIn("W1: policy auto-answer: class=needs_decision answer=invariant rec=accept_limitation", self.log(cfg))
+        (note,) = [t for t in self.tg if "по политике" in t]
+        self.assertIn("вариант invariant", note)
+        self.assertIn("рекомендация волны: accept_limitation", note)
+        self.assertEqual(st["waves"]["W1"]["auto_answers"], 1)
+
+    def test_acc05_rule_with_rec_and_answer_fires_only_on_that_rec(self):
+        cfg, _ = self.mandate(policy=[{"class": "needs_decision", "rec": "cut_surface", "answer": "invariant"}], max_runs=5)
+        self.fork(cfg)
+        self.tick(cfg, self.ND.format(rec="accept_limitation"))
+        self.assertEqual(self.answers(), [])
+        self.assertEqual(len(self.owner_asked()), 1)
+        self.tick(cfg, "RUNNING")
+        self.tick(cfg, self.ND.format(rec="cut_surface"))
+        (text,) = self.answers()
+        self.assertIn("вариант invariant.", text)
+
+    def test_acc07_acc09_repeat_in_the_same_run_and_after_a_watch_restart_goes_to_the_owner(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg)
+        self.tick(cfg, self.ND.format(rec="invariant"))
+        self.assertEqual(len(self.answers()), 1)
+        self.tick(cfg, "RUNNING")
+        st = self.tick(cfg, self.ND.format(rec="cut_surface"))  # the same fork again, a new episode; state.json reloaded
+        self.assertEqual(len(self.answers()), 1)
+        (ask,) = self.owner_asked()
+        self.assertIn("уже получила автоответ", ask)
+        self.assertEqual(self.log(cfg).count("policy answer not sent: развилка"), 1)
+        self.assertEqual(st["waves"]["W1"]["auto_answers"], 1)  # a machine refusal does not spend the cap
+        self.tick(cfg)  # one event per episode
+        self.assertEqual(self.log(cfg).count("policy answer not sent: развилка"), 1)
+        st = wab.load_state(cfg)  # the wave is restarted: the record goes to `attempts`, the key survives
+        st["waves"]["W1"] = dict(self.wave_rec("W1"), attempts=[st["waves"]["W1"]])
+        self.put_state(cfg, st)
+        self.tick(cfg, "RUNNING")
+        self.tick(cfg, self.ND.format(rec="invariant") + " ещё раз")
+        self.assertEqual(len(self.answers()), 1)
+
+    def test_acc08_acc10_acc11_refusal_reaches_the_owner_with_the_reason(self):
+        for name, kw, part in [("two", {"tasks": {"T1": self.task(), "T2": self.task()}}, "задач в статусе needs_decision: 2"),
+                               ("runs", {"runs": "missing"}, "runs.json"),
+                               ("quota", {"second_reviewer": {"status": "unavailable"}}, "роль second_reviewer")]:
+            with self.subTest(name):
+                self.tg.clear()
+                cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+                shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+                self.fork(cfg, **kw)
+                self.tick(cfg, "RUNNING")
+                self.tick(cfg, self.ND.format(rec="invariant") + f" {name}")
+                self.assertEqual(self.answers(), [])
+                (ask,) = self.owner_asked()
+                self.assertIn("Автоответ по политике не отправлен", ask)
+                self.assertIn(part, ask)
+
+    def test_acc15_red_zone_is_never_answered_with_an_answer_rule(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg)
+        for i, status in enumerate(["BLOCKED: [class=needs_decision rec=invariant red=yes] T1: прод",
+                                    "BLOCKED: [class=merge_gate rec=invariant red=no] T1",
+                                    "BLOCKED: [class=plan_mismatch rec=invariant red=no] T1",
+                                    "BLOCKED: needs_decision T1 без метки"]):
+            with self.subTest(status):
+                self.tick(cfg, "RUNNING")
+                self.tick(cfg, status)
+                self.assertEqual(self.answers(), [])
+                self.assertEqual(len(self.owner_asked()), i + 1)
+                self.assertNotIn("Автоответ по политике", self.owner_asked()[-1])
+
+    def test_acc16_blocked_cap_on_the_last_run_one_event_and_the_owner(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg, index=5, status="blocked", fix_cycles=3, source=None)
+        self.tick(cfg, self.BC.format(rec="new_run"))
+        self.tick(cfg)
+        self.assertEqual(self.answers(), [])
+        (ask,) = self.owner_asked()
+        self.assertIn("потолок прогонов исчерпан (5/5)", ask)
+        self.assertEqual(self.log(cfg).count("W1: policy answer not sent: потолок прогонов исчерпан (5/5)"), 1)
+
+    def test_acc13_identity_of_a_chain_without_answer_is_bytewise_1_2_0(self):
+        # the literal: sha256 of json.dumps(_pinned_identity(cfg), sort_keys=True, ensure_ascii=False) computed
+        # ONCE by wab.py of 1.2.0 (commit 75ea9f2) over tests/fixtures/waves/gate-redact-run/chain.json, the
+        # directory of chain.json replaced by @ROOT@ (381 characters)
+        root = self.tmp / "live"
+        root.mkdir()
+        shutil.copy(GATE_REDACT_RUN / "chain.json", root / "chain.json")
+        cfg = wab.load_chain(root / "chain.json")
+        self.assertNotIn("answer", json.dumps(cfg["decision_policy"]))
+        text = json.dumps(wab._pinned_identity(cfg), sort_keys=True, ensure_ascii=False).replace(str(root), "@ROOT@")
+        self.assertEqual(len(text), 381)
+        self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                         "f8aff71d156a8980296306162e27f3d140d4eadf8517cfa2393103b53101f90f")
+        st = json.loads((GATE_REDACT_RUN / "state.json").read_text(encoding="utf-8")
+                        .replace("@RUN_DIR@", str(cfg["run_dir"])).replace("@REPO@", self.cwd))
+        self.assertFalse(wab.check_identity(cfg, st, "watch"))  # the run started on 1.2.0 goes on
+
+    def test_acc18_answer_edited_between_launch_and_watch_is_refused(self):
+        cfg, path = self.mandate(policy=[{"class": "needs_decision"}])
+        st = wab.load_state(cfg)
+        wab.check_identity(cfg, st, "launch")
+        for edited in ([{"class": "needs_decision", "answer": "invariant"}],):
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            doc["decision_policy"] = edited
+            path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaises(SystemExit) as e:
+                wab.check_identity(wab.load_chain(path), st, "watch")
+            self.assertIn("decision_policy", str(e.exception) + self.log(cfg))
+        st2 = {}
+        cfg2 = wab.load_chain(path)
+        wab.check_identity(cfg2, st2, "launch")
+        doc["decision_policy"] = [{"class": "needs_decision", "answer": "cut_surface"}]
+        path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            wab.check_identity(wab.load_chain(path), st2, "watch")
+
+    def test_acc19_rule_without_answer_answers_and_logs_as_1_2_0(self):
+        cfg, _ = self.mandate(policy=json.loads((GATE_REDACT_RUN / "chain.json").read_text(encoding="utf-8"))["decision_policy"])
+        with mock.patch.object(wab, "current_manifest", side_effect=AssertionError("no manifest reading without answer")):
+            self.tick(cfg, self.ND.format(rec="cut_surface"))  # no runs.json, no manifest: 1.2.0 never read them
+        self.assertEqual(self.answers(), ["[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант cut_surface. Действуй по своей "
+                                          "рекомендации, затем запиши RUNNING в status. Находки low/P3 — fix-loop --defer в остаток."])
+        (line,) = self.decisions(cfg)
+        self.assertRegex(line, r"^\S+ class=needs_decision rec=cut_surface needs_decision T1")
+        self.assertIn("W1: policy auto-answer: class=needs_decision rec=cut_surface\n", self.log(cfg) + "\n")
+        self.assertNotIn("answer=", line + self.log(cfg))
+        (note,) = [t for t in self.tg if "по политике" in t]
+        self.assertIn("(class=needs_decision, вариант cut_surface), ответ не нужен.", note)
+        self.assertNotIn("policy_keys", wab.load_state(cfg)["waves"]["W1"])
+
+    def test_acc20_cap_and_owner_answered_work_with_answer_as_with_rec(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5, max_auto_answers=1)
+        self.fork(cfg)
+        with mock.patch.object(wab, "owner_answered", return_value=True):
+            self.tick(cfg, self.ND.format(rec="invariant"))
+        self.assertEqual(self.answers(), [])
+        self.assertEqual(self.owner_asked(), [])
+        self.assertIn("the owner answered this episode (say)", self.log(cfg))
+        self.tick(cfg, "RUNNING")
+        self.tick(cfg, self.ND.format(rec="invariant"))
+        self.assertEqual(len(self.answers()), 1)
+        self.fork(cfg, index=2)  # a new run: a new fork key, only the cap stands in the way
+        self.tick(cfg, "RUNNING")
+        self.tick(cfg, self.ND.format(rec="invariant") + " снова")
+        self.assertEqual(len(self.answers()), 1)
+        self.assertIn("W1: policy cap reached (1/1): class=needs_decision rec=invariant goes to the owner", self.log(cfg))
+        self.assertNotIn("Автоответ по политике", self.owner_asked()[-1])
+
+
 class InputEmpty(unittest.TestCase):
     """`input_empty_reason` on REAL Claude Code screens (tests/fixtures/screens): the placeholder of an
     empty input is dim text, the typed text is not."""
