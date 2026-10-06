@@ -11454,7 +11454,9 @@ class FixedAnswerPolicy(Base):
             ("acc06 run 4 of 5 is answered", BC, "invariant", "new_run", dict(bl, index=4), (True, ["прогон 5 из 5"], [])),
             ("acc06 acc16 run 5 of 5 is not", BC, "invariant", "new_run", dict(bl, index=5), (False, "потолок прогонов исчерпан (5/5)")),
             ("blocked_cap new_run", BC, "new_run", "accept_limitation", bl, (True, ["вариант new_run.", "новый прогон"], [])),
-            ("blocked_cap accept_limitation", BC, "accept_limitation", "new_run", bl, (True, ["--decision accept_limitation", "новый прогон"], [])),
+            # M1: state.py takes `fix-loop --decision` only at a needs_decision task — never at a blocked one, nor in
+            # the new run (its task is not needs_decision): the limitation is accepted there with `fix-loop --accept`
+            ("blocked_cap accept_limitation", BC, "accept_limitation", "new_run", bl, (True, ["вариант accept_limitation.", "Прими ограничение: открой новый прогон", "init --from-plan", "прогон 2 из 5", "не чини", "fix-loop --accept", "Принятые ограничения", "(рекомендация волны: new_run)"], ["--decision", "не латай"])),
             ("blocked_cap accept_limitation on the last run", BC, "accept_limitation", "new_run", dict(bl, index=5), (False, "потолок")),
             ("acc08 two candidates", ND, "invariant", "x", {"edit": self.two}, (False, "задач в статусе needs_decision: 2")),
             ("acc08 no candidate", BC, "invariant", "x", {}, (False, "задач в статусе blocked: 0")),
@@ -11515,6 +11517,57 @@ class FixedAnswerPolicy(Base):
                 self.assertEqual(got["ok"], ok, got)
                 if not ok:
                     self.assertIn("уже получила автоответ", got["reason"])
+        # ----- corrupt marks of state.json: a refusal with a fixed reason, never «nothing was answered» (F2) -----
+        retry = {"policy_pending": status, "pending_enter": "policy answer"}
+        for name, w in [
+                ("policy_keys is not a list", {"policy_keys": "x"}),
+                ("policy_keys is null", {"policy_keys": None}),
+                ("policy_keys is an object", {"policy_keys": {"0": key}}),
+                ("an element of policy_keys is not a list", {"policy_keys": [key[:2] + [1] + key[3:], None]}),
+                ("policy_key_pending is not an object", {"policy_key_pending": [key]}),
+                ("policy_key_pending without a key", {"policy_key_pending": {"status": "BLOCKED: other", "text": "t"}}),
+                ("policy_key_pending whose key is not a list", {"policy_key_pending": dict(pend, key="k")}),
+                ("corrupt in an archived attempt", {"attempts": [{"policy_keys": 7}]}),
+                ("corrupt pending in an archived attempt", {"attempts": [{}, {"policy_key_pending": "x"}]}),
+                # L3: the Enter-only retry never hands out a key that is not one (no null in `policy_keys`)
+                ("the Enter-only retry of a pending without a key", dict(retry, policy_key_pending={"status": status, "text": "t"}))]:
+            with self.subTest(name):
+                got = self.decide(cfg, w=w, status=status)
+                self.assertFalse(got["ok"], got)
+                self.assertIn("отметки автоответов в state.json испорчены", got["reason"])
+
+    def test_m1_the_text_names_only_what_the_wave_can_execute(self):
+        """Every allowed (class × answer × «a new run is needed»): one line, one decision. `fix-loop --decision`
+        is named exactly for a needs_decision task (state.py refuses it anywhere else), a blocked_cap answer
+        always opens a new run, and no answer falls back to the wave's own recommendation."""
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        capped = self.task_edit(fix_cycles=wab.FIX_CYCLE_CAP)  # by hand: see test_fixed_answer_table
+        seen = set()
+        for cls, forks in (("needs_decision", ((False, {}), (True, {"edit": capped}))),
+                           ("blocked_cap", ((True, {"base": "blocked"}),))):
+            for answer in wab.POLICY_ANSWERS[cls]:
+                for new_run, kw in forks:
+                    with self.subTest(cls=cls, answer=answer, new_run=new_run):
+                        shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)
+                        self.fork(cfg, index=2, **kw)
+                        got = self.decide(cfg, cls, answer, "x")
+                        self.assertTrue(got["ok"], got)
+                        text = got["text"]
+                        seen.add(text)
+                        self.assertNotIn("\n", text)
+                        self.assertTrue(text.startswith(f"[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант {answer}. "), text)
+                        self.assertTrue(text.endswith(" Затем запиши RUNNING в status."), text)
+                        self.assertNotIn("Действуй по своей рекомендации", text)
+                        self.assertEqual("--decision" in text, cls == "needs_decision", text)
+                        if cls == "needs_decision":
+                            self.assertEqual(text.count("--decision"), 1, text)
+                            self.assertIn(f"fix-loop --decision {answer}", text)
+                        self.assertEqual("новый прогон" in text, new_run, text)
+                        self.assertEqual("прогон 3 из 5" in text, new_run, text)
+                        self.assertEqual(text.count("init --from-plan"), int(new_run), text)
+                        if cls == "blocked_cap":
+                            self.assertEqual("fix-loop --accept" in text, answer == "accept_limitation", text)
+        self.assertEqual(len(seen), 9)  # nine forks, nine wordings: no pair silently shares another's text
 
     # ----- the schema (load_chain) -----
     def test_acc04_acc17_load_chain_refuses_a_bad_answer(self):
@@ -11724,6 +11777,117 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(len(self.answers()), 1)
         self.assertIn("W1: policy cap reached (1/1): class=needs_decision rec=invariant goes to the owner", self.log(cfg))
         self.assertNotIn("Автоответ по политике", self.owner_asked()[-1])
+
+    # ----- M3: a machine refusal is final for its episode (the same status line AND the same file stamp) -----
+    def rewrite(self, cfg, text):
+        """The wave writes the same line again: another stamp of the status file — a new episode."""
+        path = cfg["run_dir"] / "W1" / "status"
+        old = os.stat(path)
+        path.write_text(text, encoding="utf-8")
+        os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns + 7_000_000))
+
+    def test_m3_a_refused_episode_is_never_rechecked_a_rewritten_line_is_decided_anew(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg, "blocked", index=5)
+        status = self.BC.format(rec="new_run")
+        st = self.tick(cfg, status)
+        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], status)
+        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["stamp"], wab._status_stamp(cfg, "W1"))
+        cfg["max_runs"] = 6  # the owner raised the ceiling: the reason of the refusal is gone...
+        self.assertTrue(self.decide(cfg, "blocked_cap", rec="new_run")["ok"])
+        for _ in range(2):  # ...but the owner was asked and may be answering in the window: no answer, no re-check
+            with mock.patch.object(wab, "fixed_answer", side_effect=AssertionError("a refused episode re-checked")):
+                st = self.tick(cfg)  # state.json is read anew every tick: the mark outlives a watch restart
+            self.assertEqual(self.answers(), [])
+        self.assertEqual(len(self.owner_asked()), 1)
+        self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
+        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], status)
+        self.assertNotIn("auto_answers", st["waves"]["W1"])
+        self.rewrite(cfg, status)  # the wave wrote the line again: a new episode, decided anew
+        st = self.tick(cfg)
+        (text,) = self.answers()
+        self.assertIn("прогон 6 из 6", text)
+        self.assertNotIn("policy_refusal", st["waves"]["W1"])
+
+    def test_m3_the_refusal_mark_survives_a_watch_restart_and_ends_with_the_episode(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg, runs="missing")
+        status = self.ND.format(rec="invariant")
+        self.tick(cfg, status)
+        self.assertEqual(self.log(cfg).count("policy answer not sent: runs.json"), 1)
+        self.fork(cfg)  # runs.json appeared: a fresh check would answer
+        self.assertTrue(self.decide(cfg, status=status)["ok"])
+        st = json.loads(json.dumps(wab.load_state(cfg)))  # a new watch: only what state.json holds
+        self.put_state(cfg, st)
+        st = self.tick(cfg)
+        self.assertEqual(self.answers(), [])
+        self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
+        self.assertIn("policy_refusal", st["waves"]["W1"])
+        st = self.tick(cfg, "RUNNING")  # the episode is over: the mark does not outlive it (L3)
+        self.assertNotIn("policy_refusal", st["waves"]["W1"])
+        self.assertNotIn("policy_refused", st["waves"]["W1"].get("notified", {}))
+        self.tick(cfg, status + " снова")  # another line: another episode, answered
+        self.assertEqual(len(self.answers()), 1)
+
+    def test_m3_another_line_after_a_refusal_is_another_episode(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg, runs="missing")
+        self.tick(cfg, self.ND.format(rec="invariant"))
+        self.fork(cfg)
+        st = self.tick(cfg, self.ND.format(rec="cut_surface"))  # BLOCKED -> BLOCKED, no RUNNING in between
+        self.assertEqual(len(self.answers()), 1)
+        self.assertNotIn("policy_refusal", st["waves"]["W1"])
+
+    def test_f2_corrupt_marks_in_state_json_go_to_the_owner(self):
+        for name, junk in [("keys", {"policy_keys": None}), ("pending", {"policy_key_pending": "x"}),
+                           ("attempt", {"attempts": [{"policy_keys": [None]}]}), ("refusal", {"policy_refusal": "x"})]:
+            with self.subTest(name):
+                self.tg.clear()
+                self.sent.clear()
+                cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+                shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+                self.fork(cfg)
+                st = wab.load_state(cfg)
+                st["waves"]["W1"].update(junk)
+                self.put_state(cfg, st)
+                self.tick(cfg, "RUNNING")
+                st = self.tick(cfg, self.ND.format(rec="invariant") + f" {name}")
+                self.assertEqual(self.answers(), [])
+                (ask,) = self.owner_asked()
+                if name != "refusal":
+                    self.assertIn("отметки автоответов в state.json испорчены", ask)
+                    self.assertNotIn(None, st["waves"]["W1"].get("policy_keys") or [])
+
+    def test_l2_owner_say_over_a_typed_answer_the_real_marker(self):
+        """acc20 without a mock: the answer is typed and waits for its Enter, the owner answers with `say`
+        (the real marker): the input is cleared, the answer is charged, the fork key counts as answered."""
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg)
+        status = self.ND.format(rec="invariant")
+
+        def typed_then_watch_dies(name, text, on_typed=None, **kw):
+            self.sent.append(("text", name, text))
+            on_typed()
+            raise KeyboardInterrupt
+        with mock.patch.object(wab, "send_text", typed_then_watch_dies):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick(cfg, status)
+        self.assertEqual(wab.load_state(cfg)["waves"]["W1"]["pending_enter"], "policy answer")
+        wab.write_owner_answered(cfg, "W1")  # what `say` writes under the input lock
+        self.assertTrue(wab.owner_answered(cfg, "W1", status))
+        st = self.tick(cfg)
+        w = st["waves"]["W1"]
+        self.assertEqual(len(self.answers()), 1)  # nothing typed again
+        self.assertNotIn("pending_enter", w)
+        self.assertNotIn("policy_pending", w)
+        self.assertEqual(wab.auto_answers_used(w), 1)
+        self.assertIn("the owner answered this episode (say)", self.log(cfg))
+        self.assertEqual(self.owner_asked(), [])
+        self.tick(cfg, "RUNNING")
+        self.tick(cfg, self.ND.format(rec="cut_surface"))  # the same fork again: its key counts as answered
+        self.assertEqual(len(self.answers()), 1)
+        (ask,) = self.owner_asked()
+        self.assertIn("уже получила автоответ", ask)
 
 
 class InputEmpty(unittest.TestCase):
