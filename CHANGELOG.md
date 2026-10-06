@@ -11,17 +11,20 @@
   сверка (`final_check`) теперь проверяются машинно: для задачи с эффективным риском `high` (больший из
   `review_policy.level` и `risk` задачи) `state.py task_ready`, `where`/`derive_step` и гейт мерджа требуют, кроме
   двух ревью, двух зачётов. Правило одно — `fable_role_gaps` в `state.py`; гейт его вызывает, а не копирует.
-  - Внутреннее ревью засчитывается только до первого внешнего пакета задачи и на его HEAD: зачёт — новый
-    долговечный ключ задачи `internal_review` (`{status, head, result_sha256, recorded_at}`, в `TASK_KEYS`,
-    `resume` сохраняет), который пишет `task-result --role internal_reviewer`, пока у задачи нет маркера
-    `external_review`; засчитана ПОСЛЕДНЯЯ такая запись со статусом `pass` или `findings` на HEAD первого
-    внешнего пакета (`external_review.head`). `unavailable`, `error`, `incomplete`, отсутствие записи, запись на
+  - Внутреннее ревью засчитывается только до первого внешнего пакета задачи (первая запись любой роли из
+    `cross_provider_reviewer`, `second_reviewer`, `github_codex_review`, `coderabbit` при любом статусе) и на
+    его HEAD: зачёт — новый долговечный ключ задачи `internal_review` (`{status, head, model, recorded_at}`,
+    в `TASK_KEYS`, `resume` сохраняет), который пишет `task-result --role internal_reviewer`, пока внешнее ревью
+    задачи не началось (`external_review_started`: маркер `external_review`, за ним история сессий задачи);
+    засчитана ПОСЛЕДНЯЯ такая запись со статусом `pass` или `findings` и моделью Fable на HEAD первого
+    внешнего пакета (`external_review.head`). Маркер, удалённый руками, ничего не открывает заново;
+    `external_review: null` — malformed manifest. `unavailable`, `error`, `incomplete`, отсутствие записи, запись на
     другом HEAD или после маркера — не засчитано. До маркера `where` после tester ведёт к `internal_reviewer`;
     после маркера без зачёта задача в этом прогоне готовой не станет: `next_action` —
     `BLOCKED: internal_reviewer: new run required …` с действием «новый прогон» (в волне —
     `state.py init --from-plan` на новом пути).
-  - Финальная сверка засчитывается как текущий результат `final_check` со статусом `pass` на финальном HEAD и
-    дереве, записанный после последних результатов обоих ревью задачи: `task-result --role final_check` пишет
+  - Финальная сверка засчитывается как текущий результат `final_check` с моделью Fable и статусом `pass` на
+    финальном HEAD и дереве, записанный после последних результатов обоих ревью задачи: `task-result --role final_check` пишет
     в результат `after_reviews` (`result_id` текущих `cross_provider_reviewer` и `second_reviewer`), зачёт
     требует совпадения с текущими результатами. PR-гейт (`github_codex_review`, `coderabbit`) в сравнение не
     входит. `findings`, `unavailable`, `error`, `incomplete`, запись на прошлом HEAD или раньше последнего ревью —

@@ -753,10 +753,17 @@ def run_scenario(mode="normal", limit=90 * 60):
         run.env_seen = {"wab_tmux": sorted(k for k in os.environ if k.startswith(("WAB_", "TMUX"))),
                         "home": str(Path.home()), "path": os.environ["PATH"]}
         run.resolved = {t: shutil.which(t) for t in EXPECTED_TOOLS + TOOLS_THAT_MUST_NOT_RESOLVE}
-        run.codes["launch"] = call("launch", str(world.chain_file), "W1", str(world.root / "w1-prompt.md"))
-        run.codes["watch"] = call("watch", str(world.chain_file))
-        run.codes["done"] = call("done", str(world.chain_file))
-        actor.step()  # what was typed after the last sleep (the final /exit) is read too
+        try:
+            run.codes["launch"] = call("launch", str(world.chain_file), "W1", str(world.root / "w1-prompt.md"))
+            run.codes["watch"] = call("watch", str(world.chain_file))
+            run.codes["done"] = call("done", str(world.chain_file))
+            actor.step()  # what was typed after the last sleep (the final /exit) is read too
+        except Stalled as stalled:
+            # a stalled mutant keeps its run on the exception: the test reads WHY the chain stopped
+            events = world.run_dir / "events.log"
+            run.events_log = events.read_text(encoding="utf-8") if events.exists() else ""
+            stalled.run = run
+            raise
     run.state = json.loads((world.run_dir / "state.json").read_text(encoding="utf-8"))
     run.events_log = (world.run_dir / "events.log").read_text(encoding="utf-8")
     return run

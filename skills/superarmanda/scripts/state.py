@@ -198,9 +198,11 @@ def check_schema(value):
             for item in rounds
         ):
             fail(f"task {name} internal_rounds is malformed")
-        marker = entry.get("external_review") if isinstance(entry, dict) else None
-        if marker is not None and not (
-            isinstance(marker, dict) and isinstance(marker.get("role"), str)
+        # the marker is absent (no external review yet, or a manifest of 1.2.2) or an object:
+        # state.py never writes `null`, so a null is a hand edit, not «no packet yet»
+        if isinstance(entry, dict) and "external_review" in entry and not (
+            isinstance(entry["external_review"], dict)
+            and isinstance(entry["external_review"].get("role"), str)
         ):
             fail(f"task {name} external_review is malformed")
         credit = entry.get("internal_review") if isinstance(entry, dict) else None
@@ -1054,43 +1056,63 @@ def internal_review_gap(entry, head):
 
     The credit is the durable task record `internal_review`: the LAST task-result of
     internal_reviewer recorded before the first external packet of the task in this run
-    (`external_review`); `resume` keeps both. Counted: status pass or findings, and its HEAD is the
-    HEAD of the first external packet, so the internal review read exactly the diff that went
-    out. Before the packet the requirement is open: the record must be of the current `head`,
+    (external_review_started: the marker `external_review`, behind it the session history);
+    `resume` keeps both. Counted: status pass or findings, model Fable, and its HEAD is the
+    HEAD of the first external packet (`external_review.head`), so the internal review read
+    exactly the diff that went out. Before the packet the requirement is open: the record must be of the current `head`,
     the one the packet will be built from. After the packet a missing credit cannot be earned in
     this run: the reason starts with NEW_RUN_REQUIRED."""
     record = entry.get("internal_review")
-    marker = entry.get("external_review")
-    status = record.get("status") if isinstance(record, dict) else None
+    record = record if isinstance(record, dict) else {}
+    status = record.get("status")
+    model = record.get("model")
     recorded = f"task-result --role {INTERNAL_SOURCE} --status <pass|findings> --model fable"
-    if not isinstance(marker, dict):
-        if status in INTERNAL_COUNTED and record.get("head") == head:
+    # one rule of «the packet already went out» (external_review_started): the marker, and
+    # behind it the session history of the task — a removed marker reopens nothing
+    started = external_review_started(entry)
+    if started is None:
+        if status in INTERNAL_COUNTED and record.get("head") == head and model == FABLE_MODEL:
             return None
         if status is None:
             what = f"no {INTERNAL_SOURCE} result is recorded"
         elif record.get("head") != head:
             what = f"the {INTERNAL_SOURCE} result is of another HEAD ({str(record.get('head'))[:12]})"
-        else:
+        elif status not in INTERNAL_COUNTED:
             what = f"the last {INTERNAL_SOURCE} result is {status}"
+        else:
+            what = f"the {INTERNAL_SOURCE} record carries model {model or 'not recorded'}"
         return (
-            f"{what}; a high-risk task requires the internal Fable review of this HEAD before "
-            f"the first external review packet: record {recorded} (Fable unavailable: retry or "
-            "escalate to the owner, no weaker model, and do not start the external review)"
+            f"{what}; a high-risk task requires the internal Fable review ({FABLE_MODEL}) of this "
+            f"HEAD before the first external review packet: record {recorded} (Fable unavailable: "
+            "retry or escalate to the owner, no weaker model, and do not start the external review)"
         )
-    if status in INTERNAL_COUNTED and record.get("head") == marker.get("head"):
+    marker = entry.get("external_review")
+    packet = marker.get("head") if isinstance(marker, dict) else None
+    if not isinstance(packet, str):
+        # the packet went out (session history) but the marker that binds the credit to its HEAD
+        # is gone or has no HEAD: nothing to count the credit against
+        what = (
+            f"the first external packet of the task is known ({started}), but the marker "
+            "external_review that names its HEAD is missing or has no head"
+        )
+    elif status in INTERNAL_COUNTED and record.get("head") == packet and model == FABLE_MODEL:
         return None
-    packet = str(marker.get("head"))[:12]
-    if status is None:
+    elif status is None:
         what = f"no {INTERNAL_SOURCE} result was recorded before the first external packet"
     elif status not in INTERNAL_COUNTED:
         what = f"the last {INTERNAL_SOURCE} result before the first external packet is {status}"
-    else:
+    elif record.get("head") != packet:
         what = (
             f"the {INTERNAL_SOURCE} result is of HEAD {str(record.get('head'))[:12]}, the first "
-            f"external packet of HEAD {packet}"
+            f"external packet of HEAD {packet[:12]}"
+        )
+    else:
+        what = (
+            f"the {INTERNAL_SOURCE} record carries model {model or 'not recorded'}, "
+            f"required {FABLE_MODEL}"
         )
     return (
-        f"{NEW_RUN_REQUIRED}: {what} ({marker.get('role')}); the internal review counts only "
+        f"{NEW_RUN_REQUIRED}: {what} ({started}); the internal review counts only "
         "before the first external packet of the task and on its HEAD, so this run cannot make "
         "the task ready: start a new run of the task (state.py init on a new manifest path; in "
         "a wave: state.py init --from-plan, a new run of the wave)"
@@ -1101,7 +1123,8 @@ def final_check_gap(entry, results):
     """Why the final check of a high-risk task is not counted, or None (policy 1.2.4).
 
     `results` are the task's results on the current head and tree. Counted: a current
-    final_check with status pass recorded after the current results of both task reviews:
+    final_check with model Fable and status pass recorded after the current results of both
+    task reviews:
     `after_reviews` of the record names the result_id of each review it was recorded after, so
     a review recorded later (or again) asks for a new final check. The PR reviews
     (github_codex_review, coderabbit) are no part of the comparison."""
@@ -1113,6 +1136,11 @@ def final_check_gap(entry, results):
             f"check after the last task review: record {recorded}"
         )
     status = result.get("status")
+    if result.get("model") != FABLE_MODEL:
+        return (
+            f"final_check result has model {result.get('model') or 'not recorded'}; a high-risk "
+            f"task requires the final check by {FABLE_MODEL}: record {recorded}"
+        )
     if status != "pass":
         if status == "findings":
             advice = (
@@ -1731,15 +1759,13 @@ def result(args):
             and entry["results"][role].get("result_id") is not None
         }
     entry["results"][args.role] = record
-    if mandatory and args.role == INTERNAL_SOURCE and not isinstance(
-        entry.get("external_review"), dict
-    ):
+    if mandatory and args.role == INTERNAL_SOURCE and external_review_started(entry) is None:
         # the credit of the internal review (internal_review_gap): the last record before the
         # first external packet; kept through resume, at any risk (a task may be raised to high)
         entry["internal_review"] = {
             "status": args.status,
             "head": args.head,
-            "result_sha256": result_digest(record),
+            "model": model,
             "recorded_at": record["recorded_at"],
         }
     if risk == "high" and args.role in REVIEW_ROLES:
