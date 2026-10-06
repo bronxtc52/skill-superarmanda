@@ -72,7 +72,7 @@ sys.path.insert(0, str(WAVES))
 sys.path.insert(0, str(ROOT / "skills" / "superarmanda" / "scripts"))
 
 # the host's session may export these (a wave of the live chain does): none of them may leak
-for _var in [k for k in os.environ if k.startswith(("WAB_", "TMUX"))]:
+for _var in ["SUPERARMANDA_TZ", *(k for k in os.environ if k.startswith(("WAB_", "TMUX")))]:  # SUPERARMANDA_TZ: #88
     os.environ.pop(_var, None)
 
 import wab  # noqa: E402

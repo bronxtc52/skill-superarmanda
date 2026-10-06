@@ -47,6 +47,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 if str(HERE) not in sys.path:  # gate.py lies next to this file, also when it is loaded by path
     sys.path.insert(0, str(HERE))
 import gate  # noqa: E402  (stdlib only, like this module)
+import humantime  # noqa: E402  (the one function that shows a time to a human, #88)
 
 PROTOCOL = HERE / "PROTOCOL.md"
 MIN_TMUX = (3, 2)
@@ -135,6 +136,12 @@ def load_chain(path, create=True):
     if "titles" in cfg and cfg["titles"] is None:
         del cfg["titles"]  # no titles, like leaving it out (dash reads cfg.get("titles", {}))
     _check_types(cfg)
+    if "timezone" in cfg and cfg["timezone"] is None:
+        del cfg["timezone"]  # null = the default, like the other optional fields
+    try:  # the owner's zone: chain.json -> $SUPERARMANDA_TZ -> Asia/Dubai; a refusal at the entry, never a silent UTC
+        cfg["timezone"] = humantime.resolve(cfg.get("timezone"))[0]
+    except humantime.TzError as e:
+        raise SystemExit(f"chain.json: {e.reason}")
     cfg.setdefault("ctx_limit", 300_000)
     cfg.setdefault("idle_minutes", 12)
     cfg.setdefault("handoff_timeout_minutes", 25)
@@ -342,6 +349,23 @@ def save_state(cfg, st):
             pass
         raise
     sync_attention(cfg, st)
+
+
+def hum(cfg, ts, **kw):
+    """THE way a time is shown to a human: the owner's zone of this chain with a signature (humantime.human, which
+    never raises: a broken zone gives the UTC time with a note, so a notice is not lost). Machine logs do not use it."""
+    return humantime.human(ts, (cfg or {}).get("timezone"), **kw)
+
+
+def notice_stamp(cfg, ts):
+    """The line with the time that a notice (Telegram, display-message) carries."""
+    return f"Время: {hum(cfg, ts)}"
+
+
+def idle_notice_text(cfg, wave, quoted_status, since, attach=""):
+    """The «wave is silent» notice: how long and since when, in the owner's zone."""
+    return (f"{SIGN}волна {wave} молчит {cfg['idle_minutes']}+ мин (с {hum(cfg, since)}; "
+            f"статус {quoted_status}). Возможно, ждёт тебя: {attach}")
 
 
 def event(cfg, text):
@@ -1624,6 +1648,22 @@ OUTPUT_PATHS = {
     "dash_manifest": "dash.manifest_lines(): the superarmanda block of the current wave",
 }
 
+# The registry of EVERY path that shows a TIME to a human (#88): `id -> module.function`. Each of them goes through the
+# one function hum() -> humantime.human() and formats nothing itself: tests/…/superarmanda_waves_test.py (W6OwnerTime)
+# checks it statically by ast, and goes through THIS registry with a zone, a night and a failure of formatting. A new
+# path of output is added here in the same change as its driver in that test. Machine logs (events.log, state.json,
+# manifest, policy-decisions.log) are UTC on purpose and are not here.
+TIME_PATHS = {
+    "human_time": "wab.hum",
+    "notice_stamp": "wab.notice_stamp",
+    "attention": "wab.attention_text",
+    "chain_result": "wab.write_chain_result",
+    "status_cmd": "wab.status_cmd",
+    "idle_notice": "wab.idle_notice_text",
+    "dash_header": "dash.header",
+    "dash_events": "dash.events_panel",
+}
+
 
 def quote(text, limit=TG_LIMIT):
     """The wave's (or any outside) text for a notice: control characters (and so the quote markers) are
@@ -1781,15 +1821,17 @@ def notify(cfg, text, wave=None):
         label = chain_label(cfg)
         if body.startswith(f"{label}: "):
             body = body[len(label) + 2:]
+        stamp = notice_stamp(cfg, time.time())
         short = _clip(_join_masked([label, " " + wave if wave else "", ": ", _first_line(body, DISPLAY_LIMIT)]),
-                      DISPLAY_LIMIT)
+                      DISPLAY_LIMIT - len(stamp) - 3) + f" · {stamp}"
         try:
             display_all(short)
         except (subprocess.CalledProcessError, OSError) as e:
             event(cfg, f"display-message failed ({type(e).__name__}): {_clip(first, 80)}")
         return True  # Telegram is not configured: there is nothing to repeat
     try:
-        _send_telegram(cfg, render_notice(text, TG_MESSAGE_LIMIT))
+        stamp = notice_stamp(cfg, time.time())
+        _send_telegram(cfg, f"{render_notice(text, TG_MESSAGE_LIMIT - len(stamp) - 2)}\n{stamp}")
         event(cfg, f"telegram: {first}")
         return True
     except Exception as e:  # notification must never stop supervision
@@ -2099,7 +2141,7 @@ def attention_path(cfg):
     return cfg["run_dir"] / "ATTENTION"
 
 
-def attention_text(st):
+def attention_text(st, cfg=None):
     """ATTENTION for the open signals of the state: the latest one, or None when none is open."""
     latest, total = None, 0
     for wave, w in (st.get("waves") or {}).items():
@@ -2114,7 +2156,7 @@ def attention_text(st):
     if latest is None:
         return None
     wave, w, item = latest
-    text = (f"time: {_utc(item.get('at'))}\nwave: {wave}\n"
+    text = (f"time: {hum(cfg, num(item.get('at')))}\nwave: {wave}\n"
             f"signal: {safe_text(item.get('line', ''), 300, owner_paths=True)}\n"
             f"attach: {attach_cmd(str(w.get('tmux') or ''))}\n")
     if total > 1:
@@ -2127,7 +2169,7 @@ def sync_attention(cfg, st):
     latest one, removed when none is left. Called by save_state, so an episode that ends with a save
     (RUNNING after BLOCKED, an ack, the next launch) takes the file with it."""
     path = attention_path(cfg)
-    text = attention_text(st)
+    text = attention_text(st, cfg)
     if text is None:
         try:
             path.unlink()
@@ -5149,13 +5191,13 @@ def write_chain_result(cfg, st):
             f"### {wave}\n\n- итог: {w.get('phase') or '?'}\n- PR: {pr_text}\n- мердж: {merge_text}\n"
             f"- перезапуски: свежих голов {heads}, перезапусков волны {retries}\n"
             f"- вопросов владельцу: {len(qs)}\n- Время: {_human_dur(dur)}\n")
-    span = f"{_utc(min(starts))} - {_utc(max(ends))}" if starts and ends else "?"
+    span = f"{hum(cfg, min(starts), date=True)} - {hum(cfg, max(ends), date=True)}" if starts and ends else "?"
     lines = [f"# Итог цепочки {cfg.get('chain')}\n", f"- run: {cfg.get('run_id')}",
-             f"- начало / конец (UTC): {span}", f"- Время общее: {_human_dur(total)}",
+             f"- начало / конец: {span}", f"- Время общее: {_human_dur(total)}",
              f"- волн: {len(cfg['waves'])}, PR: {prs}, перезапусков голов: {restarts_heads}, "
              f"перезапусков волн: {restarts_waves}, вопросов: {len(questions)}\n", "## Волны\n", *rows,
              "## Вопросы к владельцу\n"]
-    lines += ([f"- {_utc(q.get('at'))} {wave}: {safe_text(q.get('text') or '', 300)}"
+    lines += ([f"- {hum(cfg, num(q.get('at')), date=True)} {wave}: {safe_text(q.get('text') or '', 300)}"
                for wave, q in questions] or ["нет"])
     path = cfg["run_dir"] / "chain-result.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -5721,8 +5763,7 @@ def _tick(cfg, st):
     if now - active > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
             put_notice(w, "idle", digest,
-                       f"{SIGN}волна {wave} молчит {cfg['idle_minutes']}+ мин "
-                       f"(статус {quote(status)}). Возможно, ждёт тебя: {attach}")
+                       idle_notice_text(cfg, wave, quote(status), active, attach))
             save_state(cfg, st)
             event(cfg, f"{wave}: pane idle {cfg['idle_minutes']}+ min, status={status}")
             flush_notices(cfg, st, w)
@@ -6231,7 +6272,8 @@ def _state_or_event(cfg):
 
 
 TUNABLE = ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds", "telegram",
-           "titles", "model", "plan_sha256", "max_auto_answers", "max_runs", "idle_nudge_minutes")
+           "titles", "model", "plan_sha256", "max_auto_answers", "max_runs", "idle_nudge_minutes",
+           "timezone")  # timezone only changes how a time is shown: never part of whose run this is (#88)
 
 
 def _identity(cfg):
@@ -6509,6 +6551,7 @@ def status_cmd(cfg):
         ctx = tokens // 1000 if isinstance(tokens, int) and not isinstance(tokens, bool) else "?"
         print(f"{safe_text(wave, 200)}: tmux={safe_text(w.get('tmux'), 200)} phase={safe_text(w.get('phase'), 200)} ctx={ctx}k "
               f"restarts={safe_text(w.get('restarts', 0), 50)} sessions={len(w.get('sessions') or [])} "
+              f"started={hum(cfg, num(w.get('started')))} "
               f"status={safe_text(read(cfg['run_dir'] / wave / 'status'), 10 ** 6)}")
         line = manifest_status_line(cfg, wave)
         if line:
