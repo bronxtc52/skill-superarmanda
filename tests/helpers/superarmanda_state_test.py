@@ -6540,6 +6540,56 @@ class W4MandatoryFableRoles(W4Base):
         self.assertEqual(self.final()["status"], "in_progress")
         self.assert_not_ready("internal_reviewer", "new run")
 
+    def strip_packet_witnesses(self, *roles):
+        """The hand edit of the scenarios of internal review 3: the marker and the sessions of `roles` gone."""
+        value = self.data()
+        task = value["tasks"]["t1"]
+        task.pop("external_review", None)
+        task["session_roles"] = {sid: role for sid, role in task["session_roles"].items() if role not in roles}
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        return value
+
+    def test_deferral_or_acceptance_of_the_first_packet_is_a_witness_too(self):
+        """Internal review 3, F8: a first packet of github_codex_review leaves no review_history; after resume
+        its results are gone; with the marker and the sessions removed the deferral still says it went out."""
+        for cover in ("--defer", "--accept"):
+            with self.subTest(cover=cover):
+                self.init()
+                self.built()
+                self.record("github_codex_review", "findings")
+                severity = ["--severity", "low"] if cover == "--accept" else []
+                self.ok("fix-loop", "--task", "t1", cover, "--source", "github_codex_review", *severity,
+                        "--note", "wording only")
+                self.next_head()
+                self.strip_packet_witnesses("github_codex_review")
+                self.assertEqual(self.entry()["results"], {})
+                action = self.where()["next_action"]
+                self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+                self.assertIn("new run", action)
+                self.assertNotIn("internal_review", self.internal())
+
+    def test_a_missing_marker_is_not_recreated_while_a_witness_says_the_packet_went_out(self):
+        """tester 3, F9 (scenario D): the marker and the review sessions removed, a credit forged on the
+        current HEAD; the reviews recorded again must not recreate the marker on this HEAD — the HEAD of
+        the first packet is unknown, so this run cannot make the task ready."""
+        self.built()
+        self.reviews()
+        value = self.strip_packet_witnesses("cross_provider_reviewer", "second_reviewer")
+        value["tasks"]["t1"]["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        again = self.edited(self.report("claude-host"), session_id="astra-again")
+        self.record("cross_provider_reviewer", **self.review_flags(again))
+        again = self.edited(self.report("codex-host"), session_id="fable-again")
+        self.record("second_reviewer", **self.review_flags(again))
+        self.assertNotIn("external_review", self.entry())
+        self.assertEqual(self.final()["status"], "in_progress")
+        action = self.assert_not_ready("internal_reviewer", "new run")
+        self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+        # the honest path is untouched: a fresh task gets its marker with the first external record
+        entry = self.record("coderabbit", "unavailable", task="t2")
+        self.assertEqual(entry["external_review"]["role"], "coderabbit")
+
     def test_records_of_the_mandatory_roles_count_only_with_the_fable_model(self):
         """Internal review F2: like coder/tester of a high-risk task, a final_check and the internal review
         credit count only with `model` claude-fable-5-1 (state.py never records them otherwise)."""
@@ -6747,6 +6797,60 @@ class W4GateRoles(W4Base):
         del task["results"]["cross_provider_reviewer"]
         del task["results"]["second_reviewer"]
         self.assert_reason(self.problems(HIGH_PLAN, value), "t1", "internal_reviewer", "новый прогон волны")
+
+    def test_results_of_a_pr_review_first_packet_are_a_witness_for_the_gate(self):
+        """tester 3, F8 (scenario C): the first packet is github_codex_review (no review_history); with the
+        marker and its session removed the current result alone must make the gate name the role and the
+        action, not «internal review still open»."""
+        self.built()
+        self.record("github_codex_review", "unavailable")
+        value = self.data()
+        task = value["tasks"]["t1"]
+        del task["external_review"]
+        task["session_roles"] = {sid: role for sid, role in task["session_roles"].items()
+                                 if role != "github_codex_review"}
+        task["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        self.assertIn("github_codex_review", task["results"])
+        self.assertFalse(task.get("review_history"))
+        for plan in (HIGH_PLAN, MEDIUM_PLAN, None):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan, value)
+                self.assert_reason(problems, "t1", "internal_reviewer", "новый прогон волны")
+        # the same first packet, deferred and then resumed away: the deferral is the witness (F8 of review 3)
+        self.init()
+        self.built()
+        self.record("github_codex_review", "findings")
+        self.ok("fix-loop", "--task", "t1", "--defer", "--source", "github_codex_review", "--note", "wording")
+        self.next_head()
+        value = self.data()
+        task = value["tasks"]["t1"]
+        del task["external_review"]
+        task["session_roles"] = {}
+        task["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        self.assertEqual((task["results"], task["fix_sources"]), ({}, {}))
+        self.assert_reason(self.problems(HIGH_PLAN, value), "t1", "internal_reviewer", "новый прогон волны")
+
+    def test_a_forged_credit_and_rerecorded_reviews_do_not_pass_the_gate(self):
+        """tester 3, F9 (scenario D) at the gate."""
+        self.built()
+        self.reviews()
+        value = self.data()
+        task = value["tasks"]["t1"]
+        del task["external_review"]
+        task["session_roles"] = {sid: role for sid, role in task["session_roles"].items()
+                                 if role not in ("cross_provider_reviewer", "second_reviewer")}
+        task["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        for role, profile, sid in (("cross_provider_reviewer", "claude-host", "astra-again"),
+                                   ("second_reviewer", "codex-host", "fable-again")):
+            self.record(role, **self.review_flags(self.edited(self.report(profile), session_id=sid)))
+        self.final()
+        problems = self.problems(HIGH_PLAN)
+        self.assert_reason(problems, "t1", "internal_reviewer", "новый прогон волны")
+        self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
 
     def test_marker_null_fails_the_gate_as_malformed(self):
         self.complete()
