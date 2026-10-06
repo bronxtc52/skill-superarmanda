@@ -6503,10 +6503,10 @@ class W4MandatoryFableRoles(W4Base):
                 self.assertEqual(entry["results"]["final_check"]["after_fix_cycles"], 1)
                 self.assert_ready()
 
-    def test_defer_or_accept_out_of_needs_fix_without_a_final_check_leaves_the_task_unready(self):
-        """No final_check at all: the cover does not make the task ready, so it closes no cycle and
-        needs_fix stays (as settle_after_cover always did); the way out is fix-loop --outcome pass, which
-        closes the cycle, then the final check — never a deadlock."""
+    def test_defer_or_accept_out_of_needs_fix_without_a_final_check_closes_the_cycle(self):
+        """No final_check at all: the cover makes every role pass or covered, so it leaves needs_fix and
+        closes the cycle (the final check is no part of that question: it must FOLLOW the closing); on high
+        1.2.4 the task waits in needs_verification for its final check — never a deadlock."""
         self.built()
         self.internal()
         self.record("cross_provider_reviewer", "findings",
@@ -6514,10 +6514,7 @@ class W4MandatoryFableRoles(W4Base):
         self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
         self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "cross_provider_reviewer")
         covered = self.cover("--defer")
-        self.assertEqual((covered["status"], covered.get("fix_cycles_closed", 0)), ("needs_fix", 0))
-        self.assertEqual(self.position(), (6, "coder"))
-        verified = self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
-        self.assertEqual((verified["status"], verified["fix_cycles_closed"]), ("needs_verification", 1))
+        self.assertEqual((covered["status"], covered["fix_cycles_closed"]), ("needs_verification", 1))
         self.assertEqual(self.position(), (7, "final_check"))
         self.assertEqual(self.final()["status"], "ready_for_pr_review")
         self.assert_ready()
@@ -6565,6 +6562,117 @@ class W4MandatoryFableRoles(W4Base):
                     self.assertEqual(failed["status"], "needs_fix")
                     covered = self.cover(flag)
                     self.assertEqual((covered["status"], covered.get("fix_cycles_closed", 0)), ("needs_fix", 0))
+
+    # ----- the final check is the last word of the task (task_epoch) -----
+    EPOCH_REASON = "the final check is the last record of the task"
+
+    def test_a_role_pass_out_of_needs_fix_closes_the_cycle_and_asks_for_a_new_final_check(self):
+        """Door 4: a result of coder/tester/PR gate recorded in needs_fix that makes every role pass leaves
+        needs_fix — that closes the fix cycle (fix_cycles_closed), and on high 1.2.4 the final check recorded
+        before is stale: needs_verification, a new final check makes the task ready. Below high and under
+        1.2.1 the task is ready_for_pr_review, as in 1.2.3; a result that does not make it ready still
+        gives in_progress, as in 1.2.3."""
+        self.built()
+        self.internal()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.assertEqual(failed["status"], "needs_fix")
+        entry = self.record("tester", model="fable")
+        self.assertEqual(entry["status"], "needs_verification")  # the defect: ready_for_pr_review
+        self.assertEqual(entry["fix_cycles_closed"], 1)
+        self.assert_not_ready("final_check", "task-result --role final_check")
+        self.assertEqual(self.position(), (7, "final_check"))
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assert_ready()
+        for risk, policy in (("medium", "1.2.4"), ("high", "1.2.1")):
+            with self.subTest(risk=risk, policy=policy):
+                self.init(risk=risk)
+                self.policy(policy)
+                if risk == "high":
+                    self.built()
+                    self.reviews()
+                else:
+                    self.record("coder")
+                    self.record("tester")
+                    self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+                self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+                self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+                entry = self.record("tester", "findings", model="fable" if risk == "high" else None)
+                self.assertEqual((entry["status"], entry.get("fix_cycles_closed", 0)), ("in_progress", 0))
+                self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "coder")
+                entry = self.record("tester", model="fable" if risk == "high" else None)
+                self.assertEqual((entry["status"], entry["fix_cycles_closed"]), ("ready_for_pr_review", 1))
+
+    def test_any_later_record_of_the_task_asks_for_a_new_final_check(self):
+        """The final check is the last word: every change of the task after it (a result of another role,
+        a fix-loop record, task-risk) is a new epoch of the task, and a final check of an older epoch is
+        not counted — whatever after_reviews and after_fix_cycles say. `resume` keeps the counter."""
+        self.built()
+        self.internal()
+        self.reviews()
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        epoch = entry["task_epoch"]
+        self.assertEqual(entry["results"]["final_check"]["after_epoch"], epoch)
+        cases = {
+            "tester pass again": lambda: self.record("tester", model="fable"),
+            "coder pass again": lambda: self.record("coder", model="fable"),
+            "triage record": lambda: self.record("triage", model="fable"),
+            "internal_reviewer again": lambda: self.internal(),
+            "github_codex_review pass": lambda: self.record(
+                "github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1"),
+            "coderabbit unavailable": lambda: self.record("coderabbit", "unavailable"),
+            "task-risk repeated": lambda: self.ok("task-risk", "--task", "t1", "--risk", "high"),
+        }
+        for case, change in cases.items():
+            with self.subTest(case=case):
+                entry = change()
+                self.assertEqual(entry["status"], "in_progress")
+                self.assertEqual(entry["task_epoch"], epoch + 1)
+                self.assert_not_ready("final_check", self.EPOCH_REASON, "task-result --role final_check")
+                self.assertEqual(self.position(), (7, "final_check"))
+                entry = self.final()
+                self.assertEqual((entry["status"], entry["results"]["final_check"]["after_epoch"]),
+                                 ("ready_for_pr_review", epoch + 1))
+                self.assert_ready()
+                epoch += 1
+        # the PR gate recorded before the final check does not ask for another one
+        self.assertIn("done", self.where()["next_action"])
+        self.assertEqual(self.next_head()["invalidated_tasks"], ["t1"])
+        self.assertEqual(self.entry()["task_epoch"], epoch)
+        self.built()
+        self.reviews()
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(entry["results"]["final_check"]["after_epoch"], epoch + 4)
+        self.assert_ready()
+
+    def test_final_check_without_after_epoch_or_with_a_bool_counter_is_not_counted(self):
+        """No compatibility for a record without `after_epoch`: the field was born in the same wave as the
+        whole rule, so a live record without it is a hand edit — not counted. A counter that is a bool is
+        no number either (True would otherwise pass as 1)."""
+        self.built()
+        self.internal()
+        self.reviews()
+        self.fix_cycle()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        good = self.data()
+        for case, edit in {
+            "no after_epoch": lambda t: t["results"]["final_check"].pop("after_epoch"),
+            "task_epoch is a bool": lambda t: t.update(task_epoch=True),
+            "fix_cycles_closed is a bool": lambda t: t.update(fix_cycles_closed=True),
+        }.items():
+            with self.subTest(case=case):
+                value = json.loads(json.dumps(good))
+                edit(value["tasks"]["t1"])
+                self.manifest.write_text(json.dumps(value), encoding="utf-8")
+                where = self.where()
+                self.assertEqual((where["step"], where["role"]), (7, "final_check"))
+                self.assertIn("final_check", where["next_action"])
+        self.manifest.write_text(json.dumps(good), encoding="utf-8")
+        self.assert_ready()
 
     def test_fable_roles_below_high_do_not_close_an_open_fix_cycle(self):
         """Astra round 1: below high the records of internal_reviewer and final_check are records, as in
@@ -6631,10 +6739,14 @@ class W4MandatoryFableRoles(W4Base):
         self.assertEqual(entry["status"], "in_progress")
         self.assert_not_ready("final_check", "recorded before")
         self.assertEqual(self.final()["status"], "ready_for_pr_review")
-        # the PR reviews are no part of the comparison
+        # the PR reviews are no part of the after_reviews comparison, but like every later record of the
+        # task they ask for the final word (task_epoch): the final check recorded before them is stale
         self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
         self.record("coderabbit", "unavailable")
-        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertEqual(self.entry()["status"], "in_progress")
+        action = self.assert_not_ready("final_check", self.EPOCH_REASON)
+        self.assertNotIn("recorded before the current", action)
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
         self.assertIn("done", self.where()["next_action"])
 
     def test_internal_review_after_the_first_external_packet_is_not_counted(self):
@@ -7155,6 +7267,54 @@ class W4GateRoles(W4Base):
         value = self.forged(lambda t: t.update(fix_cycles_closed="1"))
         self.assert_reason(self.problems(HIGH_PLAN, value), "manifest", "t1", "fix_cycles_closed не число")
         self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
+
+    def test_final_check_recorded_before_a_cover_of_the_findings_fails_the_gate(self):
+        """Door 5 (Codex P2, thread 4192505756): the task review has findings, the task is in_progress, the
+        coordinator records final_check pass, then --defer/--accept covers the findings — the final check
+        never saw the accepted limitation. The task is not ready (in_progress: update_task_status from
+        in_progress, the final check of the older epoch is stale), where and the gate name the reason, a new
+        final check makes it ready. A record whose epoch disagrees with the task is refused the same way."""
+        for flag in ("--defer", "--accept"):
+            with self.subTest(cover=flag):
+                self.init()
+                self.built()
+                self.internal()
+                self.record("cross_provider_reviewer", "findings",
+                            **self.review_flags(self.report("codex-host", "findings")))
+                entry = self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+                self.assertEqual(entry["status"], "in_progress")
+                entry = self.final()
+                self.assertEqual(entry["status"], "in_progress")  # the findings are not disposed of
+                severity = ["--severity", "low"] if flag == "--accept" else []
+                covered = self.ok("fix-loop", "--task", "t1", flag, "--source", "cross_provider_reviewer",
+                                  *severity, "--note", "known limitation")
+                self.assertEqual(covered["status"], "in_progress")  # the defect: ready_for_pr_review
+                self.assertNotIn("fix_cycles_closed", covered)  # no fix cycle was open
+                self.assert_not_ready("final_check", W4MandatoryFableRoles.EPOCH_REASON,
+                                      "task-result --role final_check")
+                self.assertEqual(self.position(), (7, "final_check"))
+                problems = self.problems(HIGH_PLAN)
+                self.assert_reason(problems, "t1", "final_check", "волна high", W4MandatoryFableRoles.EPOCH_REASON,
+                                   "task-result --role final_check")
+                self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
+                self.assertEqual(self.final()["status"], "ready_for_pr_review")
+                self.assertEqual(self.problems(HIGH_PLAN), [])
+                self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
+                for case, edit in {
+                    "record of an earlier epoch": lambda t: t["results"]["final_check"].update(
+                        after_epoch=t["task_epoch"] - 1),
+                    "record without the epoch": lambda t: t["results"]["final_check"].pop("after_epoch"),
+                    "a change after the record": lambda t: t.update(task_epoch=t["task_epoch"] + 1),
+                }.items():
+                    with self.subTest(cover=flag, case=case):
+                        value = self.forged(edit)
+                        problems = self.problems(HIGH_PLAN, value)
+                        self.assert_reason(problems, "t1", "final_check", W4MandatoryFableRoles.EPOCH_REASON,
+                                           "task-result --role final_check")
+                        self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
+                value = self.forged(lambda t: t.update(task_epoch="7"))
+                self.assert_reason(self.problems(HIGH_PLAN, value), "manifest", "t1", "task_epoch не число")
+                self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
 
     def test_marker_null_fails_the_gate_as_malformed(self):
         self.complete()
