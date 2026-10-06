@@ -17937,6 +17937,25 @@ class W6OwnerTime(Base):
             self.assertEqual(r.returncode, 2)
             self.assertIn("Mars/Olympus", r.stderr)
 
+    def test_iso_time_without_offset_is_utc_whatever_the_host_zone(self):
+        script = str((WAVES / "humantime.py").resolve())
+        run = lambda arg: subprocess.run([sys.executable, script, arg], capture_output=True, text=True,
+                                         env={**os.environ, "TZ": "America/New_York", "SUPERARMANDA_TZ": "Asia/Dubai"})
+        naive, aware = run("2026-10-05T06:20:42"), run("2026-10-05T06:20:42Z")
+        self.assertEqual((naive.returncode, aware.returncode), (0, 0), (naive, aware))
+        self.assertEqual(naive.stdout, aware.stdout)
+        self.assertIn("10:20 Дубай", naive.stdout)
+
+    def test_handoff_template_and_docs_have_no_utc_only_time_placeholder(self):
+        skill = (WAVES / ".." / "..").resolve()
+        proto = (WAVES / "PROTOCOL.md").read_text(encoding="utf-8")
+        self.assertNotIn("<UTC время>", proto)
+        line = next(l for l in proto.splitlines() if l.startswith("# Handoff"))
+        self.assertIn("время владельца", line)
+        self.assertIn("UTC", line)
+        for rel in ("references/waves.md", "references/workflow.md", "SKILL.md"):
+            self.assertNotIn("<UTC время>", (skill / rel).read_text(encoding="utf-8"), rel)
+
     def test_no_tzdata_is_an_explicit_refusal_at_the_entry(self):
         missing = mock.patch.object(humantime, "ZoneInfo", side_effect=zoneinfo.ZoneInfoNotFoundError("no tzdata"))
         with missing:

@@ -95,7 +95,10 @@ def _parse(arg):
     try:
         return float(arg)
     except ValueError:
-        return datetime.datetime.fromisoformat(arg.replace("Z", "+00:00")).timestamp()
+        moment = datetime.datetime.fromisoformat(arg.replace("Z", "+00:00"))
+        if moment.tzinfo is None:  # no offset = UTC, like the machine logs, not the zone of the host
+            moment = moment.replace(tzinfo=datetime.timezone.utc)
+        return moment.timestamp()
 
 
 def main(argv):
