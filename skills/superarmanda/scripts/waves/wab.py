@@ -9,7 +9,7 @@ Commands:
   wab.py cleanup <chain.json>                       close the tmux sessions/panes of a FINISHED chain (chain-result.md)
   wab.py owner-merge <chain.json> <wave> <run_id> <sha>  gated merge by the owner (run by the generated script)
   wab.py owner-handover <chain.json> <wave> <run_id>  the owner merged the wave's PR himself: hand the chain on
-  wab.py notify <chain.json> <text>                 Telegram message to the owner
+  wab.py notify <chain.json> <text>                 the owner's own message (typed by him) to Telegram
   wab.py attention <chain.json>                     print $RUN_DIR/ATTENTION; exit 1 while a signal is open
   wab.py say <chain.json> <wave> <text-file>        type a reply into the wave's window and check it was sent
   wab.py current-tmux <chain.json>                  tmux session name of the current wave
@@ -34,6 +34,7 @@ import pathlib
 import re
 import stat
 import shlex
+import string
 import subprocess
 import sys
 import tempfile
@@ -109,6 +110,8 @@ def _check_types(cfg):
     tg = cfg.get("telegram")
     if not (tg is None or tg is False or isinstance(tg, dict)):  # "", 0 and [] are typos, not «off»
         bad("telegram", "an object, false or null")
+    if "telegram_quote" in cfg and not isinstance(cfg["telegram_quote"], bool):  # "true", 1 and null are typos (#83)
+        bad("telegram_quote", "true or false (the first line of a wave's question in a notice, off by default)")
     titles = cfg.get("titles")
     if titles is not None and not (isinstance(titles, dict) and all(isinstance(v, str) for v in titles.values())):
         bad("titles", "an object of wave id -> string")
@@ -136,6 +139,8 @@ def load_chain(path, create=True):
     if "titles" in cfg and cfg["titles"] is None:
         del cfg["titles"]  # no titles, like leaving it out (dash reads cfg.get("titles", {}))
     _check_types(cfg)
+    if cfg.get("telegram_quote") is False:
+        del cfg["telegram_quote"]  # «false» is the default: it is no field, and so not a part of the run's identity (#83)
     if "timezone" in cfg and cfg["timezone"] is None:
         del cfg["timezone"]  # null = the default, like the other optional fields
     try:  # the owner's zone: chain.json -> $SUPERARMANDA_TZ -> Asia/Dubai; a refusal at the entry, never a silent UTC
@@ -360,12 +365,6 @@ def hum(cfg, ts, **kw):
 def notice_stamp(cfg, ts):
     """The line with the time that a notice (Telegram, display-message) carries."""
     return f"Время: {hum(cfg, ts)}"
-
-
-def idle_notice_text(cfg, wave, quoted_status, since, attach=""):
-    """The «wave is silent» notice: how long and since when, in the owner's zone."""
-    return (f"{SIGN}волна {wave} молчит {cfg['idle_minutes']}+ мин (с {hum(cfg, since)}; "
-            f"статус {quoted_status}). Возможно, ждёт тебя: {attach}")
 
 
 def event(cfg, text):
@@ -1635,7 +1634,7 @@ OUTPUT_PATHS = {
     "chain_result": "write_chain_result(): chain-result.md",
     "policy_question": "_policy_question(): the question in policy-decisions.log",
     "say_echo": "_say_first(): the text of `say` in its events",
-    "blocked_notice": "blocked_notice(): the BLOCKED notice that needs the owner",
+    "blocked_notice": "blocked_fields() + notice_text(): the BLOCKED notice that needs the owner (the first line of the question, telegram_quote only)",
     "status_cmd": "status_cmd(): `wab.py status`",
     "owner_merge_regate": "owner_merge(): the exit text of the second gate after the threads were closed",
     "resolve_why": "_resolve_why(): the errors (a nested structure) of a thread that owner-merge could not resolve",
@@ -1659,7 +1658,7 @@ TIME_PATHS = {
     "attention": "wab.attention_text",
     "chain_result": "wab.write_chain_result",
     "status_cmd": "wab.status_cmd",
-    "idle_notice": "wab.idle_notice_text",
+    "idle_notice": "wab.notice_text",
     "dash_header": "dash.header",
     "dash_events": "dash.events_panel",
 }
@@ -1781,57 +1780,324 @@ def display_all(text):
         tmux("display-message", "-d", "0", "-c", client, safe)
 
 
-SIGN = "{chain}: "  # the signature slot every notice text starts with; sign() fills it
-_LEGACY_SIGN = "wave-autobot: "  # what notices queued in an outbox by an older dispatcher start with
-SIGN_LIMIT = 40
+class Notice(str):
+    """The text of an external notice (Telegram, display-message, ATTENTION): made ONLY by notice_text() from a
+    template and the fields of the registry (#83), or by manual_notice() for the owner's own `wab.py notify`.
+    notify() takes nothing else: a free text of a wave cannot reach the transport by a call that forgot the
+    template. The wave's quote, when chain.json allows it (`telegram_quote: true`), is inside in its markers."""
+    __slots__ = ()
 
 
-def chain_label(cfg):
-    """The chain name as the signature of a notice: one line, no control characters, short. The name
-    is chain.json data: it is cleaned like any outside text (display-message escapes `#` itself)."""
-    name = re.sub(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+", " ", str(cfg.get("chain") or "")).strip()
-    return _clip(name, SIGN_LIMIT) if name else "wave-autobot"
+# ---------- the external notices: one registry of fields, one table of templates, one function (#83) ----------
+#
+# THE invariant of every text that leaves the machine (Telegram, display-message, ATTENTION): it is the product of a
+# template of NOTICE_TEMPLATES filled with fields of NOTICE_FIELDS and nothing else. A value that fails its check is
+# «?» (names, numbers, time) or a neutral phrase (the vocabularies below), never the raw value. The free text of a
+# wave (status, result.md, a question, a reason, a command, a path) is not in it, unless chain.json has
+# `telegram_quote: true`: then the FIRST line of the wave's question is added through quote(). The local outputs
+# (dashboard, `wab.py status`, chain-result.md, events.log) show the wave's text through safe_text, as before.
+NOTICE_ACTION = "Нужно: "  # the one action line of a notice that needs a human
+NOTICE_HEAD_LIMIT = 120
+COUNT_LIMIT = 10 ** 9
+
+# the vocabularies: a closed set -> words for a human; an unknown value is a neutral phrase, never the raw key
+CLASS_WORDS = {"needs_decision": "нужно решение", "blocked_cap": "кончились попытки исправить",
+               "plan_mismatch": "расхождение с планом", "question": "вопрос волны",
+               "merge_gate": "гейт мерджа"}
+CLASS_OTHER = "другой вопрос"
+ANSWER_WORDS = {"invariant": "исправить целиком", "new_run": "ещё одна попытка",
+                "accept_limitation": "принять как есть", "cut_surface": "вырезать поверхность находки",
+                "owner": "решает владелец"}
+VARIANT_OTHER = "другой вариант"
+STATUS_WORDS = {"STARTING": "запускается", "RUNNING": "работает", "HANDOFF_READY": "готова передать контекст",
+                "BLOCKED": "ждёт ответа", "DONE": "завершена"}
+STATUS_OTHER = "другой статус"
+SEVERITY_WORDS = {"low": "низкая важность", "medium": "средняя важность", "high": "высокая важность",
+                  "P0": "критично (P0)", "P1": "очень важно (P1)", "P2": "важно (P2)", "P3": "не срочно (P3)"}
+SEVERITY_OTHER = "замечания"
+REASON_WORDS = {
+    # why a notice is sent (the dispatcher's own codes, never a text of a wave)
+    "plan_pin": "план waves.json изменился после одобрения",
+    "window_not_ready": "окно Claude не стало готовым за 90 секунд",
+    "no_next_absent": "нет файла next-prompt.md",
+    "no_next_unusable": "next-prompt.md непригоден",
+    "merge_refused": "мердж отклонён",
+    "ready_refused": "перевод PR в ready отклонён",
+    "still_draft": "PR остался draft после перевода в ready",
+    "no_gate_record": "в записи волны нет номера PR или коммита гейта",
+    "wrong_base": "PR смержен не в ту ветку",
+    "other_head": "PR смержен с другим коммитом, чем проверял гейт",
+    "closed": "PR закрыт без мерджа",
+    "policy_refused": "автоответ по политике не отправлен: проверка отказала",
+    "gate_pass": "гейт мерджа пройден",
+    "gate_threads": "гейт мерджа пройден, но есть незакрытые треды ревью",
+    "gate_wait": "гейт мерджа ждёт",
+    "gate_fail": "гейт мерджа не пройден",
+    "gate_unchecked": "гейт мерджа не проверен",
+    "gate_none": "гейт мерджа не включён",
+    "result_written": "chain-result.md записан в каталоге прогона",
+    "result_not_written": "chain-result.md не записан",
+    # the action of the dispatcher in the window (the label of _deliver / _act)
+    "first_prompt": "отправка первой задачи",
+    "checkpoint_request": "запрос передачи контекста",
+    "clear": "очистка контекста командой /clear",
+    "resume": "передача продолжения /superarmanda --resume",
+    "policy_answer": "автоответ по политике",
+    "gate_failure": "сообщение о непройденном гейте",
+    "idle_nudge": "толчок молчащей волны",
+    "alarm": "будильник волны",
+}
+REASON_OTHER = "причина записана в журнале событий"
+# the labels of _deliver / _act -> the code of REASON_WORDS (a prefix of the label, « (Enter)» cut)
+ACTION_REASONS = (("first prompt", "first_prompt"), ("checkpoint request", "checkpoint_request"),
+                  ("/clear", "clear"), ("/superarmanda --resume", "resume"), ("policy answer", "policy_answer"),
+                  ("gate failure", "gate_failure"), ("idle nudge", "idle_nudge"), ("alarm", "alarm"))
 
 
-def _unsigned(text):
-    for mark in (SIGN, _LEGACY_SIGN):
-        if text.startswith(mark):
-            return text[len(mark):]
-    return text
+def action_reason(what):
+    """The code of REASON_WORDS of a label of a tmux action (`_deliver`/`_act`); `other` when it is not a known one."""
+    what = str(what)
+    for prefix, code in ACTION_REASONS:
+        if what.startswith(prefix):
+            return code
+    return "other"
 
 
-def sign(cfg, text):
-    """A notice text under the chain's name (`<chain>: ...`): the one place that signs everything
-    that leaves (Telegram, display-message, ATTENTION). Texts are written with the SIGN slot; an
-    old outbox entry (the former fixed prefix) and an unsigned text are signed the same way."""
-    head = f"{chain_label(cfg)}: "
-    body = _unsigned(text)
-    return text if text.startswith(head) else head + body
+def _word(table, other):
+    """The formatter of a vocabulary field: a key of the closed table -> its words, anything else -> `other`."""
+    def fmt(cfg, value):
+        return table.get(value, other) if isinstance(value, str) else other
+    return fmt
 
 
-def notify(cfg, text, wave=None):
-    body = _unsigned(text)
-    text = sign(cfg, text)
-    first = _first_line(text, 120)
+def _name_field(rx):
+    def fmt(cfg, value):
+        return value if isinstance(value, str) and rx.fullmatch(value) and set(value) != {"."} else "?"
+    return fmt
+
+
+def _count_field(low=0):
+    def fmt(cfg, value):
+        ok = isinstance(value, int) and not isinstance(value, bool) and low <= value < COUNT_LIMIT
+        return str(value) if ok else "?"
+    return fmt
+
+
+def _time_field(cfg, value):
+    ts = num(value)
+    return hum(cfg, ts) if ts is not None and 0 < ts < 4_102_444_800 else "?"
+
+
+def _duration_field(cfg, value):
+    return "?" if isinstance(value, bool) else _human_dur(value)
+
+
+def _status_field(cfg, value):
+    """A status of the wave (or its line `BLOCKED: ...`): only the word before the colon, only from the table."""
+    word = str(value).split(":", 1)[0].strip() if isinstance(value, str) else ""
+    return STATUS_WORDS.get(word, STATUS_OTHER)
+
+
+def severity_word(value):
+    """A severity (a finding's `severity|priority`, dash.finding_counts keeps the raw key) for an external text."""
+    return SEVERITY_WORDS.get(value, SEVERITY_OTHER) if isinstance(value, str) else SEVERITY_OTHER
+
+
+def _variant_field(cfg, value):
+    """The variant of an answer: the closed words of ANSWER_WORDS, or a one-letter recommendation (A, B, ...)."""
+    if isinstance(value, str):
+        if value in ANSWER_WORDS:
+            return ANSWER_WORDS[value]
+        if re.fullmatch(r"[A-Z]", value):
+            return f"вариант {value}"
+    return VARIANT_OTHER
+
+
+def _yes_no_field(cfg, value):
+    return {True: "да", False: "нет"}.get(value, "?") if isinstance(value, bool) else "?"
+
+
+def _question_field(cfg, value):
+    """The FIRST line of the wave's question as a quote, and only with `telegram_quote: true`; else nothing."""
+    if cfg.get("telegram_quote") is not True or not isinstance(value, str):
+        return ""
+    lines = [l for l in safe_text(value, 10 ** 9, False).splitlines() if l.strip()]
+    return quote(lines[0], TG_LIMIT) if lines else ""
+
+
+# field -> (what it is, the check/formatter: (cfg, value) -> the text that goes in). The ONLY things a template may use.
+NOTICE_FIELDS = {
+    "chain": ("имя цепочки как в chain.json", _name_field(NAME)),
+    "wave": ("id волны как в chain.json", _name_field(WAVE_NAME)),
+    "next_wave": ("id следующей волны как в chain.json", _name_field(WAVE_NAME)),
+    "tmux": ("имя tmux-сессии волны (tmux_prefix + id волны)", _name_field(PREFIX)),
+    "event": ("ключ уведомления из таблицы эпизодов",
+              lambda cfg, v: v if isinstance(v, str) and v in NOTICE_EPISODE_ENDS else "?"),
+    "pr": ("номер PR", _count_field(1)),
+    "n": ("счётчик или число минут", _count_field()),
+    "threads": ("число незакрытых тредов ревью", _count_field()),
+    "p01": ("число из них с P0/P1 из прошлых коммитов", _count_field()),
+    "attempts": ("число попыток", _count_field()),
+    "runs": ("число прогонов superarmanda", _count_field()),
+    "waves": ("число волн цепочки", _count_field()),
+    "prs": ("число PR цепочки", _count_field()),
+    "restarts": ("число перезапусков", _count_field()),
+    "questions": ("число вопросов к владельцу", _count_field()),
+    "time": ("момент времени, показывается по поясу владельца", _time_field),
+    "duration": ("длительность", _duration_field),
+    "cls": ("класс вопроса волны, словарь CLASS_WORDS", _word(CLASS_WORDS, CLASS_OTHER)),
+    "variant": ("вариант ответа, словарь ANSWER_WORDS или буква", _variant_field),
+    "wave_status": ("статус волны, словарь STATUS_WORDS", _status_field),
+    "severity": ("важность находки, словарь SEVERITY_WORDS", lambda cfg, v: severity_word(v)),
+    "reason": ("причина, словарь REASON_WORDS", _word(REASON_WORDS, REASON_OTHER)),
+    "red": ("красная зона: да или нет", _yes_no_field),
+    "question": ("первая строка вопроса волны, только с telegram_quote", _question_field),
+}
+
+
+def _tpl(head, notes=(), action=None, fields=()):
+    names = ("chain", "wave", "tmux", *fields) if action else ("chain", "wave", *fields)
+    return {"head": head, "notes": tuple(notes), "action": action, "fields": names}
+
+
+_ASK = ("question",)  # a template that shows the wave's question when telegram_quote allows it
+NOTICE_TEMPLATES = {
+    "started": _tpl("🚀 {chain}: стартовала волна {wave}"),
+    "not_ready": _tpl("⛔ {chain}: волна {wave} не запущена", ("Причина: {reason}. Цепочка стоит.",),
+                      "устрани причину и запусти волну заново (wab.py launch).", ("reason", *_ASK)),
+    "no_prompt": _tpl("❗ {chain}: волна {wave} запущена, но задачи для неё нет",
+                      ("Файла с задачей уже нет, задачу не отправил.",),
+                      "посмотри окно волны и пришли задачу сам."),
+    "sending": _tpl("❗ {chain}: после перезапуска диспетчера неизвестно, дошла ли задача волне {wave}",
+                    ("Повторно задачу не слал.",), "проверь окно волны."),
+    "updating": _tpl("❗ {chain}: после перезапуска диспетчера неизвестно, дошло ли продолжение волне {wave}",
+                     ("Команду /superarmanda --resume повторно не слал.",), "проверь окно волны."),
+    "checkpoint_timeout": _tpl("❗ {chain}: волна {wave} не записала handoff вовремя",
+                               ("Прошло {n} мин после запроса.",), "посмотри окно волны.", ("n",)),
+    "tmux_failed": _tpl("❗ {chain}: волна {wave}: не удалось выполнить действие в окне",
+                        ("Что не вышло: {reason}. Окно живо.",), "посмотри окно волны, диспетчер повторит попытку.",
+                        ("reason",)),
+    "unverified_enter": _tpl("❗ {chain}: волна {wave}: Enter нажат без проверки отправки",
+                             ("Действие: {reason}. Состояние старой версии без начала текста.",),
+                             "проверь в окне волны, дошёл ли текст.", ("reason",)),
+    "dead": _tpl("⛔ {chain}: окно волны {wave} закрылось", ("Статус волны: {wave_status}. Цепочка стоит.",),
+                 "узнай, что случилось, и перезапусти волну.", ("wave_status", *_ASK)),
+    "blocked": _tpl("⏸ {chain}: волна {wave} ждёт тебя",
+                    ("Тип вопроса: {cls}; красная зона: {red}; рекомендация волны: {variant}.",
+                     "Автоответ по политике не отправлен: {reason}."),
+                    "ответь волне в её окне или текстом командой say.", ("cls", "red", "variant", "reason", *_ASK)),
+    "policy_answer": _tpl("🤖 {chain}: волна {wave}: развилка закрыта по политике",
+                          ("Тип вопроса: {cls}; выбрано: {variant}. Ответ не нужен.",),
+                          None, ("cls", "variant", *_ASK)),
+    "permission": _tpl("🔐 {chain}: волна {wave} ждёт подтверждения на экране", (),
+                       "подтверди или отклони запрос в окне волны."),
+    "idle": _tpl("💤 {chain}: волна {wave} молчит {n}+ мин",
+                 ("Молчит с {time}; статус волны: {wave_status}. Возможно, ждёт тебя.",),
+                 "посмотри окно волны.", ("n", "time", "wave_status", *_ASK)),
+    "auto_off": _tpl("❗ {chain}: волна {wave} вышла из режима auto", ("Теперь она будет спрашивать подтверждения.",),
+                     "верни режим: в окне Shift+Tab до «auto mode on»."),
+    "handoff": _tpl("📬 {chain}: волна {wave} сдала PR", ("Гейт: {reason}.", "Мердж и следующий шаг — за координатором."),
+                    "смержи PR и запусти следующую волну (или заверши цепочку командой done).", ("reason", *_ASK)),
+    "merge_owner": _tpl("🔀 {chain}: волна {wave}: гейт пройден, но есть незакрытые треды",
+                        ("PR #{pr}, незакрытых тредов: {threads}, из прошлых коммитов с P0/P1: {p01}. Сам не мержу.",
+                         "Скрипт заново проверит гейт; draft PR переведёт в ready и остановится — запусти его ещё раз."),
+                        "выполни скрипт мерджа (путь к нему — в events.log и в wab.py status).",
+                        ("pr", "threads", "p01")),
+    "merge_refused": _tpl("❗ {chain}: волна {wave}: гейт пройден, но мердж не выполнен",
+                          ("PR #{pr}: {reason}.",), "выполни скрипт мерджа (путь к нему — в events.log и в wab.py status).",
+                          ("pr", "reason", *_ASK)),
+    "merge_unknown": _tpl("❗ {chain}: волна {wave}: результат мерджа неизвестен",
+                          ("PR #{pr}: диспетчер прерывался, сам повторно не мержу.",),
+                          "проверь PR и при необходимости выполни скрипт мерджа (путь — в events.log).", ("pr",)),
+    "merge_stopped": _tpl("⛔ {chain}: волна {wave}: мердж остановлен", ("Причина: {reason}. Следующую волну не запускаю.",),
+                          "проверь PR и реши сам.", ("reason", *_ASK)),
+    "done": _tpl("✅ {chain}: волна {wave} завершена", (), None, _ASK),
+    "no_next": _tpl("⛔ {chain}: волна {wave} готова, следующую не запускаю", ("Причина: {reason}.",),
+                    "реши, что делать со следующей волной.", ("reason", *_ASK)),
+    "launch_refused": _tpl("⛔ {chain}: волна {wave} готова, {next_wave} не запущена",
+                           ("Цепочка стоит; причина записана в журнале событий.",),
+                           "устрани причину и запусти следующую волну командой launch.", ("next_wave", *_ASK)),
+    "chain_done": _tpl("🏁 {chain}: цепочка завершена, последняя волна {wave}",
+                       ("Волн: {waves}, PR: {prs}, перезапусков: {restarts}, вопросов к владельцу: {questions}, "
+                        "время: {duration}.", "Итог: {reason}."),
+                       None, ("waves", "prs", "restarts", "questions", "duration", "reason")),
+}
+
+
+def external_attach(name):
+    """`tmux attach -t <name>` for a human, or "?" when the name is not of the registry's format. A socket is shown
+    only as a plain `-L <name>`: a path of a socket (`-S`) never goes out of the machine."""
+    if _name_field(PREFIX)(None, name) == "?":
+        return "?"
+    sock = TMUX_SOCKET or os.environ.get("WAB_TMUX_SOCKET")
+    flags = f" -L {sock}" if sock and NAME.fullmatch(sock) and set(sock) != {"."} else ""
+    return f"tmux{flags} attach -t {name}"
+
+
+def _notice_values(cfg, wave, tpl, fields):
+    given = dict(fields, chain=cfg.get("chain"), wave=wave)
+    if "tmux" in tpl["fields"] and given.get("tmux") is None:
+        given["tmux"] = f"{cfg.get('tmux_prefix') or 'wab-'}{str(wave).lower()}"
+    return {n: NOTICE_FIELDS[n][1](cfg, given.get(n)) for n in tpl["fields"]}, given
+
+
+def notice_text(cfg, wave, key, now=None, **fields):
+    """THE one maker of an external text: the template of `key` filled with `fields` of NOTICE_FIELDS (a name outside
+    the registry, or outside this template's field list, is a ValueError: a programming error), every value checked
+    by its formatter. Lines: the first (emoji, what happened, chain and wave, <= 120), 0-2 explanations, the wave's
+    first question line (telegram_quote only), `Время: ...` of the owner's zone, and for a notice that needs a human
+    exactly one action line and, LAST, `tmux attach -t <session>`. A note whose fields were not given is left out."""
+    tpl = NOTICE_TEMPLATES.get(key)
+    if tpl is None:
+        raise ValueError(f"notice_text: key {key!r} has no template in NOTICE_TEMPLATES")
+    for name in fields:
+        if name not in NOTICE_FIELDS:
+            raise ValueError(f"notice_text: field {name!r} is not in NOTICE_FIELDS")
+        if name not in tpl["fields"]:
+            raise ValueError(f"notice_text: field {name!r} is not a field of the template {key!r}")
+    values, given = _notice_values(cfg, wave, tpl, fields)
+    head = _clip(safe_text(tpl["head"].format(**values), 10 ** 9, True), NOTICE_HEAD_LIMIT)
+    lines = [str(head)]
+    for note in tpl["notes"]:
+        used = {f for _, f, _, _ in string.Formatter().parse(note) if f}
+        if all(given.get(n) is not None for n in used - {"chain", "wave"}):
+            lines.append(note.format(**values))
+    if values.get("question"):
+        lines.append(values["question"])
+    lines.append(notice_stamp(cfg, time.time() if now is None else now))
+    if tpl["action"]:
+        lines.append(NOTICE_ACTION + tpl["action"].format(**values))
+        lines.append(external_attach(values["tmux"]))
+    return Notice("\n".join(lines))
+
+
+def manual_notice(cfg, text):
+    """`wab.py notify <chain.json> <text>`: the owner's OWN text typed in the command line (the one place where a
+    notice is not a template; text that does not come from the owner never takes this way). Masked by safe_text."""
+    head = _clip(safe_text(f"📣 {cfg.get('chain') or 'wave-autobot'}: {text}", 10 ** 9, False), TG_LIMIT)
+    return Notice(f"{head}\n{notice_stamp(cfg, time.time())}")
+
+
+def notify(cfg, notice, wave=None):
+    """The transport of a notice (Telegram, else display-message in tmux). Takes a Notice only: the text is the
+    product of a template (notice_text), not a string somebody composed."""
+    if not isinstance(notice, Notice):
+        raise TypeError("notify() takes a Notice made by notice_text(): an external text is a template's product")
+    first = _first_line(notice, 120)
     if not telegram_configured(cfg):
         event(cfg, f"notify(skipped): {first}")
         # no transport: a local signal on the waves' tmux server instead (ATTENTION is written by
         # flush_notices, which knows the episode). One call per notice, so a failure is one event
         # per episode; it never stops the tick.
-        label = chain_label(cfg)
-        if body.startswith(f"{label}: "):
-            body = body[len(label) + 2:]
         stamp = notice_stamp(cfg, time.time())
-        short = _clip(_join_masked([label, " " + wave if wave else "", ": ", _first_line(body, DISPLAY_LIMIT)]),
-                      DISPLAY_LIMIT - len(stamp) - 3) + f" · {stamp}"
+        short = _clip(_first_line(notice, DISPLAY_LIMIT), DISPLAY_LIMIT - len(stamp) - 3) + f" · {stamp}"
         try:
             display_all(short)
         except (subprocess.CalledProcessError, OSError) as e:
             event(cfg, f"display-message failed ({type(e).__name__}): {_clip(first, 80)}")
         return True  # Telegram is not configured: there is nothing to repeat
     try:
-        stamp = notice_stamp(cfg, time.time())
-        _send_telegram(cfg, f"{render_notice(text, TG_MESSAGE_LIMIT - len(stamp) - 2)}\n{stamp}")
+        _send_telegram(cfg, render_notice(notice, TG_MESSAGE_LIMIT))
         event(cfg, f"telegram: {first}")
         return True
     except Exception as e:  # notification must never stop supervision
@@ -1842,8 +2108,17 @@ def notify(cfg, text, wave=None):
 NOTIFY_RETRY_SECONDS = 300  # a standing notice that failed is repeated no more often than this
 
 
-def put_notice(w, key, value, text):
+def _stored_fields(fields):
+    """The fields as the outbox keeps them: JSON scalars only (a value of a registry field is one)."""
+    return {k: v for k, v in fields.items() if v is None or isinstance(v, (str, int, float, bool))}
+
+
+def put_notice(cfg, w, wave, key, value, **fields):
     """Put a notice about a standing episode (`key`, `value`) into the wave's outbox, IN MEMORY only.
+    What is kept is the template's key and the registry's FIELDS (notice_text builds the text from them when it is
+    sent, with the time of the sending); the wave's own question is kept only when chain.json has
+    `telegram_quote: true`, otherwise it is not put anywhere. A key outside NOTICE_EPISODE_ENDS /
+    NOTICE_TEMPLATES, or a field outside the registry or the template, is a ValueError.
     `key` is a literal with a row in NOTICE_EPISODE_ENDS (the end of its episode): once the
     episode is over the notice is stale and leaves the outbox undelivered (key -> end:
     started/tmux_failed -> window gone; permission/idle/auto_off -> window gone or their screen
@@ -1851,7 +2126,6 @@ def put_notice(w, key, value, text):
     checkpoint_timeout, dead, handoff -> their phase is left; sending -> the wave wrote a status;
     updating -> the new session is bound; blocked -> status not BLOCKED; done/no_next/
     launch_refused -> ack only (`done` is information: it opens no ATTENTION, INFO_NOTICES);
-    the wave's own text in the notice is wrapped by quote() (see render_notice);
     chain_done -> never).
     The caller saves it with the SAME save_state as the change it reports (the phase, the
     once_per mark), then calls flush_notices: a process killed right after that save still owes
@@ -1861,10 +2135,33 @@ def put_notice(w, key, value, text):
     not exactly once: a crash or a lost transport reply after the actual delivery sends it again."""
     if key not in NOTICE_EPISODE_ENDS:  # a programming error: the notice would never become stale
         raise ValueError(f"put_notice: key {key!r} has no row in NOTICE_EPISODE_ENDS")
+    tpl = NOTICE_TEMPLATES.get(key)
+    if tpl is None:
+        raise ValueError(f"put_notice: key {key!r} has no template in NOTICE_TEMPLATES")
+    if "tmux" in tpl["fields"] and "tmux" not in fields and isinstance(w.get("tmux"), str):
+        fields["tmux"] = w["tmux"]
+    if cfg.get("telegram_quote") is not True:
+        fields.pop("question", None)  # no flag: the wave's text is not put into the outbox at all
+    stored = _stored_fields(fields)
+    text = str(notice_text(cfg, wave, key, **stored))  # also refuses a field outside the registry / the template
     box = w.setdefault("outbox", {})
     cur = box.get(key)
     if cur is None or cur.get("value") != value:
-        box[key] = {"value": value, "text": text, "next_at": 0}
+        box[key] = {"value": value, "fields": stored, "text": text, "next_at": 0}
+
+
+def outbox_notice(cfg, wave, w, key, item):
+    """The notice of an outbox entry as it is sent now: its template + its stored fields. An entry of an older
+    dispatcher (no `fields`; its text has the wave's quote) is made again by the template of its key from the fields
+    of the registry that are still known (chain, wave, session): its free text is dropped."""
+    stored = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+    tpl = NOTICE_TEMPLATES[key]
+    fields = {k: v for k, v in stored.items() if k in tpl["fields"] and k in NOTICE_FIELDS}
+    if "tmux" in tpl["fields"] and isinstance(w.get("tmux"), str):
+        fields["tmux"] = w["tmux"]
+    if cfg.get("telegram_quote") is not True:
+        fields.pop("question", None)
+    return notice_text(cfg, wave, key, **fields)
 
 
 def drop_notice(w, key):
@@ -2131,34 +2428,45 @@ def ack_wave_notices(w):
 INFO_NOTICES = ("started", "chain_done", "policy_answer", "done")  # policy_answer: told, nothing to answer
 
 
-def note_attention(w, key, text, now):
+def note_attention(w, key, notice, now):
     """A notice went out only locally (no Telegram): an open signal of its episode, IN MEMORY; the
-    caller's save writes ATTENTION (sync_attention). drop_notice and ack_wave_notices close it."""
-    w.setdefault("attention", {})[key] = {"at": now, "line": _first_line(text, 300)}
+    caller's save writes ATTENTION (sync_attention). drop_notice and ack_wave_notices close it. What is kept is the
+    first line of the TEMPLATE's text; attention_text() makes the signal again from the notice's key, so a line of
+    an older dispatcher (with a wave's quote) is never shown."""
+    w.setdefault("attention", {})[key] = {"at": now, "line": _first_line(notice, 300)}
 
 
 def attention_path(cfg):
     return cfg["run_dir"] / "ATTENTION"
 
 
+def attention_signal(cfg, wave, key):
+    """The signal of ATTENTION: the first line of the notice's template (chain, wave and a key of the table only)."""
+    if key in NOTICE_TEMPLATES:
+        return _first_line(notice_text(cfg or {}, wave, key, 0), 300)
+    return "❗ волне требуется внимание"
+
+
 def attention_text(st, cfg=None):
-    """ATTENTION for the open signals of the state: the latest one, or None when none is open."""
+    """ATTENTION for the open signals of the state: the latest one, or None when none is open. Every name in it
+    (wave, session) is shown only in the format of the registry, else «?»; the wave's question is never in it."""
     latest, total = None, 0
     for wave, w in (st.get("waves") or {}).items():
         att = w.get("attention") if isinstance(w, dict) else None
         if not isinstance(att, dict):
             continue
-        for item in att.values():
+        for key, item in att.items():
             if isinstance(item, dict):
                 total += 1
-                if latest is None or (num(item.get("at")) or 0) > (num(latest[2].get("at")) or 0):
-                    latest = (wave, w, item)
+                if latest is None or (num(item.get("at")) or 0) > (num(latest[3].get("at")) or 0):
+                    latest = (wave, w, key, item)
     if latest is None:
         return None
-    wave, w, item = latest
-    text = (f"time: {hum(cfg, num(item.get('at')))}\nwave: {wave}\n"
-            f"signal: {safe_text(item.get('line', ''), 300, owner_paths=True)}\n"
-            f"attach: {attach_cmd(str(w.get('tmux') or ''))}\n")
+    wave, w, key, item = latest
+    shown = NOTICE_FIELDS["wave"][1](cfg, wave)
+    text = (f"time: {hum(cfg, num(item.get('at')))}\nwave: {shown}\n"
+            f"signal: {attention_signal(cfg, shown, key)}\n"
+            f"attach: {external_attach(w.get('tmux'))}\n")
     if total > 1:
         text += f"open signals: {total} (wab.py status, events.log)\n"
     return text
@@ -2210,13 +2518,18 @@ def flush_notices(cfg, st, w, force=False):
     local = not telegram_configured(cfg)
     wave = next((k for k, v in st.get("waves", {}).items() if v is w), None)
     for key, item in list(box.items()):
+        if key not in NOTICE_TEMPLATES:  # a key of no template cannot be told in words: it leaves unsent
+            box.pop(key, None)
+            event(cfg, f"{wave}: outbox entry {safe_text(key, 40)} has no template; dropped")
+            continue
         if item.get("next_at", 0) > now and not force:
             continue
         tried = True
-        if notify(cfg, item["text"], wave):
+        notice = outbox_notice(cfg, wave, w, key, item)
+        if notify(cfg, notice, wave):
             box.pop(key, None)
             if local and key not in INFO_NOTICES:
-                note_attention(w, key, sign(cfg, item["text"]), now)
+                note_attention(w, key, notice, now)
         else:
             item["next_at"] = now + NOTIFY_RETRY_SECONDS
     if not box:
@@ -3239,8 +3552,7 @@ def _plan_pin_refused(cfg, st, wave, drop_pending=False):
                 w.pop("pending_text_head", None)
         extra = f" ({closed or left})" if closed or left else ""
         if once_per(w, "not_ready", "plan_pin"):
-            put_notice(w, "not_ready", "plan_pin",
-                       f"{SIGN}волна {wave} не запущена: {quote(why)}{extra}. Цепочка стоит.")
+            put_notice(cfg, w, wave, "not_ready", "plan_pin", reason="plan_pin", question=why)
         save_state(cfg, st)
         event(cfg, f"{wave}: {why}; session/prompt NOT started"
                    + (f"; session closed" if closed else f"; {left}" if left else ""))
@@ -3308,7 +3620,7 @@ def _mark_dead(cfg, st, wave, status=""):
     fresh = once_per(w, "dead", "1")
     w["phase"] = "dead"
     if fresh:
-        put_notice(w, "dead", "1", f"{SIGN}окно волны {wave} закрылось, статус {quote(status)}. Цепочка стоит.")
+        put_notice(cfg, w, wave, "dead", "1", wave_status=status, question=status)
     save_state(cfg, st)  # the phase, the mark and the notice together
     if fresh:
         event(cfg, f"{wave}: tmux session {w['tmux']} is gone (status={status})")
@@ -3328,9 +3640,7 @@ def _act(cfg, st, wave, what, fn, *args, **kw):
             raise _WindowGone() from e
         fresh = once_per(w, "tmux_failed", what)
         if fresh:
-            put_notice(w, "tmux_failed", what,
-                       f"{SIGN}не удалось выполнить «{what}» в окне волны {wave} "
-                       f"({type(e).__name__}). Окно живо: {attach_cmd(w['tmux'])}")
+            put_notice(cfg, w, wave, "tmux_failed", what, reason=action_reason(what))
         save_state(cfg, st)
         event(cfg, f"{wave}: tmux action '{what}' failed ({type(e).__name__}); the window is alive")
         flush_notices(cfg, st, w)
@@ -3425,9 +3735,7 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None):
                 if not check and once_per(w, "unverified_enter", what):
                     # state of an older version: nothing to compare with — the Enter is pressed as
                     # before, and the owner is told that this delivery is NOT verified
-                    put_notice(w, "unverified_enter", what,
-                               f"{SIGN}{wave}: «{what}» дожат Enter без проверки отправки "
-                               f"(state старой версии без начала текста). Проверь окно: {attach_cmd(name)}")
+                    put_notice(cfg, w, wave, "unverified_enter", what, reason=action_reason(what))
                     event(cfg, f"{wave}: {what} (Enter): delivery NOT verified (no saved text head)")
                 ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, check)
             else:
@@ -3511,9 +3819,7 @@ def deliver_first_prompt(cfg, st, wave):
         blocked = "BLOCKED: окно Claude не стало готовым, задача не отправлена\n"
         (wdir / "status").write_text(blocked, encoding="utf-8")
         w["phase"] = "not_ready"
-        put_notice(w, "not_ready", "1",
-                   f"{SIGN}окно волны {wave} не стало готовым за 90 с, задачу не отправил. "
-                   f"Цепочка стоит. Посмотри: {attach_cmd(name)}")
+        put_notice(cfg, w, wave, "not_ready", "1", reason="window_not_ready")
         save_state(cfg, st)
         event(cfg, f"{wave}: Claude TUI not ready in {name}, prompt NOT sent")
         flush_notices(cfg, st, w)
@@ -3546,8 +3852,7 @@ def _started(cfg, st, wave):
     w = st["waves"][wave]
     w["phase"] = "running"
     if once_per(w, "started", "1"):
-        put_notice(w, "started", "1",
-                   f"{SIGN}стартовала волна {wave}.\nСмотреть: {attach_cmd(w['tmux'])}\n(выйти: Ctrl-b d)")
+        put_notice(cfg, w, wave, "started", "1")
     save_state(cfg, st)
     event(cfg, f"{wave}: launched in tmux {w['tmux']}, cwd {w['cwd']}")
     flush_notices(cfg, st, w)
@@ -3766,9 +4071,7 @@ def advance_pending(cfg, st):
         else:
             event(cfg, f"{wave}: prompt file is gone, task NOT sent")
             if once_per(w, "no_prompt", "1"):
-                put_notice(w, "no_prompt", "1",
-                           f"{SIGN}волна {wave} запущена, но файла с задачей уже нет, "
-                           f"задачу не отправил. Посмотри: {attach_cmd(name)}")
+                put_notice(cfg, w, wave, "no_prompt", "1")
             save_state(cfg, st)
             flush_notices(cfg, st, w)
     elif phase == "sending" and w.get("pending_enter") == "first prompt":
@@ -3782,9 +4085,7 @@ def advance_pending(cfg, st):
                    f"NOT resent")
         w["phase"] = "running"
         if once_per(w, "sending", "1"):
-            put_notice(w, "sending", "1",
-                       f"{SIGN}диспетчер перезапустился при отправке задачи волне {wave}; "
-                       f"неизвестно, дошла ли она, повторно не слал. Проверь окно: {attach_cmd(name)}")
+            put_notice(cfg, w, wave, "sending", "1")
         save_state(cfg, st)
         flush_notices(cfg, st, w)
     elif phase == "updating":
@@ -3859,9 +4160,7 @@ def recover_update(cfg, st, wave):
     event(cfg, f"{wave}: resumed in phase 'updating': "
                f"{'resume evidently arrived' if arrived else 'unknown whether resume arrived'}, NOT resent")
     if fresh and not arrived and not informed:  # keyed by the restart count BEFORE finish_update
-        put_notice(w, "updating", str(w.get("restarts", 0)),
-                   f"{SIGN}диспетчер перезапустился при передаче /superarmanda --resume волне {wave}; "
-                   f"неизвестно, дошла ли команда, повторно не слал. Проверь окно: {attach_cmd(w['tmux'])}")
+        put_notice(cfg, w, wave, "updating", str(w.get("restarts", 0)))
     finish_update(cfg, st, wave)  # saves the phase, the mark and the notice together
     flush_notices(cfg, st, w)
 
@@ -3887,10 +4186,8 @@ def _stop_without_next(cfg, st, w, wave, now, why=None):
     st["stopped"] = f"{wave}: DONE with an unusable next-prompt.md" if why else f"{wave}: DONE without next-prompt.md"
     fresh_stop = once_per(w, "no_next", "1")
     if fresh_stop:
-        put_notice(w, "no_next", "1",
-                   f"{SIGN}{wave} готова, но next-prompt.md непригоден ({quote(why)}) — "
-                   f"следующую волну не запускаю." if why else
-                   f"{SIGN}{wave} готова, но нет next-prompt.md — следующую волну не запускаю.")
+        put_notice(cfg, w, wave, "no_next", "1", reason="no_next_unusable" if why else "no_next_absent",
+                   question=why or None)
     save_state(cfg, st)
     if fresh_stop:
         event(cfg, f"{wave}: DONE with an unusable next-prompt.md ({why}); chain stopped" if why else
@@ -3912,9 +4209,7 @@ def _launch_refused(cfg, st, wave, nxt, why):
     st["stopped"] = f"{wave}: launch of {nxt} refused"
     first = once_per(w, "launch_refused", why)
     if first:
-        put_notice(w, "launch_refused", why,
-                   f"{SIGN}{wave} готова, но следующую волну {nxt} не запустил: {quote(why)}. "
-                   f"Цепочка стоит; устрани причину и запусти {nxt} (wab.py launch).")
+        put_notice(cfg, w, wave, "launch_refused", why, next_wave=nxt, question=why)
     save_state(cfg, st)
     event(cfg, f"{wave}: launch of {nxt} refused: {why}")
     flush_notices(cfg, st, w)
@@ -4312,28 +4607,30 @@ def _remember_pr(cfg, w):
 
 
 def handoff_gate_line(cfg, wave, w):
-    """One line for the hand-off notice of `merge_gate: external`: the verdict and, when the gate
-    passed, the command (or the owner's script). Best effort: nothing here may stop the hand-off."""
+    """The verdict for the hand-off notice of `merge_gate: external`: (code of REASON_WORDS, one line for events.log).
+    The code is all a notice says (the template's words); the line (the reasons, and when the gate passed, the owner's
+    script) is for the machine's own log. Best effort: nothing here may stop the hand-off."""
     try:
         v = gate_check(cfg, wave, w)
         _note_pr(w, v.get("number"))  # whatever the verdict: the hand-off carries the PR number (#34)
         reasons = _masked_line("; ".join(v["reasons"]), 300)
         if v["verdict"] == "wait" and reasons.startswith("сбор фактов"):
-            return f"Гейт мерджа не проверен: {quote(reasons)}"
+            return "gate_unchecked", f"Гейт мерджа не проверен: {reasons}"
         if v["verdict"] != "pass":
-            return f"Гейт мерджа {'ждёт' if v['verdict'] == 'wait' else 'не пройден'}: {quote(reasons)}"
+            return ("gate_wait" if v["verdict"] == "wait" else "gate_fail",
+                    f"Гейт мерджа {'ждёт' if v['verdict'] == 'wait' else 'не пройден'}: {reasons}")
         number, sha = v["number"], v["head"]
         w["pr"] = number
         w["gate_sha"], w["gate_pr"] = sha, number  # saved with the hand-off: `owner-merge` gates against them
         if v["unresolved"]:
             path = write_owner_script(cfg, wave, sha)
-            return (f"Гейт мерджа пройден, но есть незакрытые треды ({len(v['unresolved'])}"
+            return ("gate_threads", f"Гейт мерджа пройден, но есть незакрытые треды ({len(v['unresolved'])}"
                     f"{gate.threads_note(v['old_p01'])}). "
                     f"Выполни: {home_form(path)}")
         path = write_owner_script(cfg, wave, sha)  # never the raw `gh pr merge`: the script gates again
-        return f"Гейт мерджа пройден. Выполни: {home_form(path)} (заново проверит гейт на этом HEAD; draft PR сперва переведёт в ready и остановится, потом запусти ещё раз, чтобы смержить)"
+        return "gate_pass", f"Гейт мерджа пройден. Выполни: {home_form(path)} (заново проверит гейт на этом HEAD; draft PR сперва переведёт в ready и остановится, потом запусти ещё раз, чтобы смержить)"
     except Exception as e:  # noqa: BLE001
-        return f"Гейт мерджа не проверен: {type(e).__name__}: {quote(e, 200)}"
+        return "gate_unchecked", f"Гейт мерджа не проверен: {type(e).__name__}: {_masked_line(e, 200)}"
 
 
 def _gate_tick(cfg, st, wave, w, wdir, now):
@@ -4456,10 +4753,8 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
         w["last_status"] = _write_status(
             wdir, f"BLOCKED: merge gate passed; {len(unresolved)} unresolved review threads; owner runs {home_form(path)}")
         note_question(w, w["last_status"], time.time())
-        put_notice(w, "merge_owner", sha,
-                   f"{SIGN}волна {wave}: гейт мерджа пройден (PR #{number}, {sha[:12]}), но есть "
-                   f"незакрытые треды ревью: {len(unresolved)}{gate.threads_note(v['old_p01'])}. Сам не мержу.\nВыполни: {home_form(path)}\n"
-                   f"Скрипт заново проверит гейт на этом HEAD и закроет треды; если PR draft, переведёт его в ready и остановится: дождись проверок и запусти скрипт ещё раз, он смержит.")
+        put_notice(cfg, w, wave, "merge_owner", sha, pr=number, threads=len(unresolved), p01=v["old_p01"])
+        event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}")
         save_state(cfg, st)
         event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}")
         flush_notices(cfg, st, w)
@@ -4475,8 +4770,8 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
         save_state(cfg, st)
         event(cfg, f"{wave}: merge gate passed, merge of PR #{number} requested at {sha[:12]}")
         return True
-    return _hand_to_owner(cfg, st, wave, w, wdir, number, sha, f"гейт пройден, мердж отклонён: {quote(refused)}",
-                          f"merge refused: {refused}")
+    return _hand_to_owner(cfg, st, wave, w, wdir, number, sha, "merge_refused", f"merge refused: {refused}",
+                          question=refused)
 
 
 def _run_gh_step(argv):
@@ -4497,16 +4792,15 @@ def _gate_ready(cfg, st, wave, w, wdir, number, sha):
     if w.get("ready_called") == sha:
         w["phase"] = "merging"
         w["merge_poll_at"] = time.time()
-        return _hand_to_owner(cfg, st, wave, w, wdir, number, sha,
-                              f"PR #{number} после gh pr ready всё ещё draft", "PR still draft after ready")
+        return _hand_to_owner(cfg, st, wave, w, wdir, number, sha, "still_draft", "PR still draft after ready")
     w["ready_called"] = sha  # saved BEFORE the call: ready is asked once per sha
     save_state(cfg, st)
     refused = _run_gh_step(["gh", "pr", "ready", str(number), "--repo", cfg["repo"]])
     if refused is not None:
         w["phase"] = "merging"
         w["merge_poll_at"] = time.time()
-        return _hand_to_owner(cfg, st, wave, w, wdir, number, sha,
-                              f"гейт пройден, перевод в ready отклонён: {quote(refused)}", f"ready refused: {refused}")
+        return _hand_to_owner(cfg, st, wave, w, wdir, number, sha, "ready_refused", f"ready refused: {refused}",
+                              question=refused)
     w["phase"] = "gate"  # the new checks must register before the next collection
     w["gate_at"] = time.time()
     save_state(cfg, st)
@@ -4514,21 +4808,21 @@ def _gate_ready(cfg, st, wave, w, wdir, number, sha):
     return True
 
 
-def _hand_to_owner(cfg, st, wave, w, wdir, number, sha, text, log_text):
+def _hand_to_owner(cfg, st, wave, w, wdir, number, sha, reason, log_text, question=None):
     try:  # the owner gets the script (it gates again, readies a draft and stops, then merges pinned to the sha), not the raw command
         command = home_form(write_owner_script(cfg, wave, sha))
     except (OSError, ValueError) as e:
         command = f"(скрипт владельца не записан: {_masked_line(e, 100)}; проверь PR #{number} вручную)"
-    w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate passed; {log_text}")
+    w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate passed; {log_text}; owner runs {command}")
     note_question(w, w["last_status"], time.time())
-    put_notice(w, "merge_refused", sha, f"{SIGN}волна {wave}: {text}. Выполни: {command}")
+    put_notice(cfg, w, wave, "merge_refused", sha, pr=number, reason=reason, question=question)
     save_state(cfg, st)
-    event(cfg, f"{wave}: merge gate passed, {log_text}")
+    event(cfg, f"{wave}: merge gate passed, {log_text}; owner runs {command}")
     flush_notices(cfg, st, w)
     return True
 
 
-def _merge_stopped(cfg, st, wave, w, wdir, why, now):
+def _merge_stopped(cfg, st, wave, w, wdir, why, now, reason="other"):
     """The PR was merged with another head or closed: the next wave is not launched by the
     dispatcher; the coordinator takes over (awaiting_merge) and decides."""
     w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate: {why}")
@@ -4537,8 +4831,7 @@ def _merge_stopped(cfg, st, wave, w, wdir, why, now):
     w["finished"] = now
     w["pending_exit"] = True
     if once_per(w, "merge_stopped", why):
-        put_notice(w, "merge_stopped", why,
-                   f"{SIGN}волна {wave}: {quote(why)}. Следующую волну не запускаю: проверь PR и реши сам.")
+        put_notice(cfg, w, wave, "merge_stopped", why, reason=reason, question=why)
     save_state(cfg, st)
     event(cfg, f"{wave}: {why}; next wave NOT launched")
     flush_notices(cfg, st, w)
@@ -4748,7 +5041,7 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
     w["merge_poll_at"] = now
     number, sha = w.get("gate_pr"), w.get("gate_sha")
     if not (isinstance(number, int) and isinstance(sha, str)):
-        return _merge_stopped(cfg, st, wave, w, wdir, "в записи волны нет gate_pr/gate_sha", now)
+        return _merge_stopped(cfg, st, wave, w, wdir, "в записи волны нет gate_pr/gate_sha", now, "no_gate_record")
     try:
         info = _json(_gh("pr", "view", str(number), "--repo", str(cfg["repo"]), "--json",
                          "state,mergeCommit,headRefOid,baseRefName"), "gh pr view")
@@ -4773,16 +5066,17 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
     if state == "MERGED":
         if got_base != want_base:
             return _merge_stopped(cfg, st, wave, w, wdir,
-                                  f"PR #{number} смержен в {got_base}, цепочка ждёт {want_base}", now)
+                                  f"PR #{number} смержен в {got_base}, цепочка ждёт {want_base}", now, "wrong_base")
         head = info.get("headRefOid")
         if head != sha:
             return _merge_stopped(cfg, st, wave, w, wdir,
-                                  f"PR #{number} смержен с HEAD {str(head)[:12]}, а гейт проверял {sha[:12]}", now)
+                                  f"PR #{number} смержен с HEAD {str(head)[:12]}, а гейт проверял {sha[:12]}", now,
+                                  "other_head")
         w["merged"] = {"pr": number, "sha": sha, "commit": (info.get("mergeCommit") or {}).get("oid"),
                        "at": now}
         return _complete_wave(cfg, st, wave, w, wdir, now)
     if state == "CLOSED":
-        return _merge_stopped(cfg, st, wave, w, wdir, f"PR #{number} закрыт без мерджа", now)
+        return _merge_stopped(cfg, st, wave, w, wdir, f"PR #{number} закрыт без мерджа", now, "closed")
     if state == "OPEN" and info.get("headRefOid") != sha:
         return _regate(cfg, st, wave, w, wdir, sha, info.get("headRefOid"))
     if state == "OPEN" and got_base != want_base:
@@ -4800,9 +5094,7 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         w["last_status"] = _write_status(
             wdir, f"BLOCKED: merge gate passed; merge result unknown; owner runs {command}")
         note_question(w, w["last_status"], now)
-        put_notice(w, "merge_unknown", sha,
-                   f"{SIGN}волна {wave}: гейт пройден, но результат вызова мерджа PR #{number} "
-                   f"неизвестен (диспетчер прерывался). Сам повторно не мержу. Выполни: {command}")
+        put_notice(cfg, w, wave, "merge_unknown", sha, pr=number)
         save_state(cfg, st)
         event(cfg, f"{wave}: PR #{number} merge result unknown; handed to the owner: {command}")
         flush_notices(cfg, st, w)
@@ -5215,18 +5507,25 @@ def write_chain_result(cfg, st):
         raise
     summary = (f"волн {len(cfg['waves'])}, PR {prs}, перезапусков {restarts_heads}+{restarts_waves}, "
                f"вопросов {len(questions)}, время {_human_dur(total)}")
-    return path, summary
+    counts = {"waves": len(cfg["waves"]), "prs": prs, "restarts": restarts_heads + restarts_waves,
+              "questions": len(questions), "duration": total}
+    return path, summary, counts
 
 
-def chain_done_text(cfg, st):
-    """The end-of-chain message: the short summary and the path of chain-result.md. A failed write
+def _put_chain_done(cfg, st, w, wave):
+    """The end-of-chain notice: the counts of the summary and whether chain-result.md was written. A failed write
     costs the file, never the message or the watch."""
     try:
-        path, summary = write_chain_result(cfg, st)
+        _path, _summary, counts = write_chain_result(cfg, st)
+        reason = "result_written"
     except Exception as e:  # noqa: BLE001 - the end of the chain is always reported and saved
-        return f"{SIGN}цепочка завершена, все волны готовы (chain-result.md не записан: {_masked_line(e, 100)})."
-    return (f"{SIGN}цепочка завершена, все волны готовы.\n{summary}\n"
-            f"Итог: chain-result.md в каталоге прогона {home_form(path.parent)}")
+        event(cfg, f"chain-result.md not written: {_masked_line(e, 100)}")
+        counts, reason = {}, "result_not_written"
+    put_notice(cfg, w, wave, "chain_done", "1", waves=counts.get("waves"), prs=counts.get("prs"),
+               restarts=counts.get("restarts"), questions=counts.get("questions"),
+               duration=counts.get("duration"), reason=reason)
+    if reason == "result_written":
+        event(cfg, f"chain-result.md: {home_form(_path.parent)}")
 
 
 def _complete_wave(cfg, st, wave, w, wdir, now):
@@ -5244,14 +5543,12 @@ def _complete_wave(cfg, st, wave, w, wdir, now):
     if fresh:
         w["finished"] = now
         w["pending_exit"] = True  # the intent to close the window, in the same save as the mark
-        put_notice(w, "done", "1",
-                   f"{SIGN}волна {wave} завершена.\n\n{quote(read(wdir / 'result.md'))}\n\n"
-                   f"Целиком: {wdir}/result.md")
+        put_notice(cfg, w, wave, "done", "1", question=read(wdir / "result.md"))
     w["phase"] = "done"
     last = idx + 1 >= len(waves)
     if last:  # the end of the chain goes into the same save as the mark
         st["current"] = None
-        put_notice(w, "chain_done", "1", chain_done_text(cfg, st))
+        _put_chain_done(cfg, st, w, wave)
     save_state(cfg, st)
     if fresh:
         event(cfg, f"{wave}: DONE")
@@ -5447,7 +5744,6 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         w.pop("policy_key_pending", None)
         w["policy_keys"] = [*_fork_keys(w)[0], fixed["key"]]
     tokens = f"class={label['class']} " + (f"answer={fixed['answer']} " if fixed else "") + f"rec={label['rec']}"
-    variant = f"вариант {fixed['answer']}; рекомендация волны: {label['rec']}" if fixed else f"вариант {label['rec']}"
     w.setdefault("notified", {})["policy_answer"] = status
     # the stamp of the status the answer was for, taken BEFORE typing: a fast wave may already have
     # rewritten the same line by now, and that rewrite must read as a new episode
@@ -5461,10 +5757,8 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
             f.write(f"{_utc(now)} {tokens} {question}\n")
     except OSError as e:
         event(cfg, f"{wave}: policy-decisions.log not written ({e.strerror or e})")
-    put_notice(w, "policy_answer", status,
-               f"{SIGN}волна {wave}: развилка закрыта по политике chain.json "
-               f"(class={label['class']}, {variant}), ответ не нужен.\n\n"
-               f"{quote(status)}\n\nСмотреть: {attach}")
+    put_notice(cfg, w, wave, "policy_answer", status, cls=label["class"],
+               variant=fixed["answer"] if fixed else label["rec"], question=status)
     save_state(cfg, st)  # the mark, the counter and the notice together
     event(cfg, f"{wave}: policy auto-answer: {tokens}")
     return True
@@ -5474,40 +5768,30 @@ _OPTIONS = re.compile(r"(?i)\b(?:варианты|variants)[ \t]*:[ \t]*")
 BLOCKED_PART_LIMIT = 220  # quoted question / options of the BLOCKED notice, each: the notice must keep its tail
 
 
-def blocked_notice(cfg, wave, status, attach, refusal=None):
-    """The BLOCKED notice that needs the owner. A labelled line (`[class=… rec=… red=…]`, see
-    parse_blocked_label) is shown as the decision it is: class, red zone, the wave's recommendation,
-    the first line of the question and its options, where to answer. The class/red/rec are the
-    parser's validated tokens (trusted wording); the question and the options are the wave's text and
-    go through quote() (cleaned, redacted, marked, capped). No label, a broken label and the dispatcher's
-    own `BLOCKED: merge gate:` keep the whole-line quote. `refusal`: why a rule with `answer` did not
-    answer this episode (fixed_answer's reason: the dispatcher's wording, through the same safe_text)."""
-    plain = (f"{SIGN}волна {wave} ждёт тебя.\n\n{quote(status)}\n\nОтветить: {attach}")
+def blocked_fields(status, refusal=None):
+    """The fields of the `blocked` notice from a BLOCKED line: {cls, red, variant, reason, question}; None = «not
+    known», the template leaves that note out. A labelled line (`[class=… rec=… red=…], see parse_blocked_label) gives
+    the class, the red zone and the wave's recommendation (the parser's validated tokens: the notice shows them
+    only as the words of the registry's vocabularies); the question is the FIRST line of the wave's question (the
+    options after `variants:` are cut off), shown only with chain.json `telegram_quote: true`. No label, a broken
+    label and the dispatcher's own `BLOCKED: merge gate:` keep the whole line as the question. `refusal`: the
+    dispatcher's automatic answer was not sent (its reason stays in events.log)."""
     label = parse_blocked_label(status)
+    reason = "policy_refused" if refusal else None
     if label is None or label["class"] == "merge_gate":
-        return plain
+        return {"cls": None, "red": None, "variant": None, "reason": reason, "question": status}
     # the WHOLE question takes the quote's own path (safe_text, the W3 invariant) before any split:
     # a separator inside a secret's value (`password=variants:…`) would cut the value away from its key,
     # an invisible character inside the key (`password<U+200B>=…`) hides the key from redact(), and a
     # line separator (U+2028, NEL) would cut a token in two for splitlines(); a token that holds an
-    # invisible character is masked whole first. quote() below masks each part again (idempotent).
-    question, options = safe_text(label["question"], 10 ** 9, False), ""
+    # invisible character is masked whole first.
+    question = safe_text(label["question"], 10 ** 9, False)
     m = _OPTIONS.search(question)
     if m:
-        question, options = question[:m.start()], question[m.end():]
+        question = question[:m.start()]
     question = ((question.strip().splitlines() or [""])[0]).rstrip(" ;,")
-    options = (options.strip().splitlines() or [""])[0].strip()
-    wab_py = home_form(pathlib.Path(__file__).resolve())
-    lines = [f"{SIGN}волна {wave} ждёт тебя. Класс: {label['class']}, красная зона: "
-             f"{'да' if label['red'] else 'нет'}, рекомендация волны: {label['rec']}.",
-             f"Вопрос: {quote(question or '(пусто)', BLOCKED_PART_LIMIT)}"]
-    if options:
-        lines.append(f"Варианты: {quote(options, BLOCKED_PART_LIMIT)}")
-    if refusal:
-        lines.append(f"Автоответ по политике не отправлен: {safe_text(refusal, BLOCKED_PART_LIMIT)}")
-    lines.append(f"Ответить: {attach}")
-    lines.append(f"Или текстом: python3 {wab_py} say {home_form(cfg['chain_file'])} {wave} <файл-ответа>")
-    return "\n".join(lines)
+    return {"cls": label["class"], "red": label["red"], "variant": label["rec"], "reason": reason,
+            "question": question or None}
 
 
 def tick(cfg, st):
@@ -5584,7 +5868,7 @@ def _tick(cfg, st):
         why = None if is_last else next_prompt_problem(nxt)
         if why:  # present but refused by the same check as the launch: not handed over either
             return _stop_without_next(cfg, st, w, wave, now, why)
-        gate_line = f"{handoff_gate_line(cfg, wave, w)}\n\n" if external else ""
+        gate_code, gate_text = handoff_gate_line(cfg, wave, w) if external else ("gate_none", "")
         if external and not _still_done(cfg, st, wave, w, wdir, "hand-off gate collected"):
             return True  # the gate reading is slow: a DONE taken back meanwhile is not handed over
         # the phase and its notice in ONE save: a crash after it still owes the notice (at least once),
@@ -5596,10 +5880,9 @@ def _tick(cfg, st):
         w["phase"] = "awaiting_merge"
         w["finished"] = now
         w["pending_exit"] = True  # the intent to close the window, in the same save as the phase
-        put_notice(w, "handoff", "1",
-                   f"{SIGN}волна {wave} сдала PR.\n\n{quote(read(wdir / 'result.md'))}\n\n{gate_line}"
-                   + ("Мердж и запуск следующей волны — за координатором." if not is_last else
-                      f"Мердж последнего PR и завершение цепочки (wab.py done) — за координатором."))
+        put_notice(cfg, w, wave, "handoff", "1", reason=gate_code, question=read(wdir / "result.md"))
+        if gate_text:  # the verdict and the owner's command: for a human at the machine, not for an outside text
+            event(cfg, f"{wave}: hand-off gate: {gate_text}")
         save_state(cfg, st)
         if external:
             event(cfg, f"{wave}: DONE, awaiting merge by the coordinator")
@@ -5667,8 +5950,9 @@ def _tick(cfg, st):
             if not status.startswith("BLOCKED: merge gate:"):  # the wave fixes a gate failure itself
                 note_question(w, status, now)
             refusal = w.get("policy_refusal") if _refusal_ok(w.get("policy_refusal")) else {}
-            put_notice(w, "blocked", status, blocked_notice(
-                cfg, wave, status, attach, refusal.get("reason") if refusal.get("status") == status else None))
+            asked = blocked_fields(status, refusal.get("reason") if refusal.get("status") == status else None)
+            put_notice(cfg, w, wave, "blocked", status, cls=asked["cls"], red=asked["red"],
+                       variant=asked["variant"], reason=asked["reason"], question=asked["question"])
         save_state(cfg, st)
         if fresh:
             event(cfg, f"{wave}: {safe_text(status, 200)}")
@@ -5730,9 +6014,8 @@ def _tick(cfg, st):
         save_state(cfg, st)
     elif w.get("phase") == "checkpoint" and now - (w.get("checkpoint_at") or now) > cfg["handoff_timeout_minutes"] * 60:
         if once_per(w, "checkpoint_timeout", str(w.get("checkpoint_at"))):
-            put_notice(w, "checkpoint_timeout", str(w.get("checkpoint_at")),
-                       f"{SIGN}{wave} не записала handoff за {cfg['handoff_timeout_minutes']} мин "
-                       f"после запроса. Посмотри: {attach}")
+            put_notice(cfg, w, wave, "checkpoint_timeout", str(w.get("checkpoint_at")),
+                       n=int(cfg["handoff_timeout_minutes"]))
             save_state(cfg, st)
             flush_notices(cfg, st, w)
 
@@ -5742,17 +6025,14 @@ def _tick(cfg, st):
             w["auto_off_ticks"] = w.get("auto_off_ticks", 0) + 1
             if w["auto_off_ticks"] >= 2 and not w.get("auto_alerted"):
                 w["auto_alerted"] = True
-                put_notice(w, "auto_off", "1",
-                           f"{SIGN}волна {wave} вышла из режима auto и будет спрашивать "
-                           f"подтверждения. Вернуть: {attach}, Shift+Tab до «auto mode on».")
+                put_notice(cfg, w, wave, "auto_off", "1")
                 save_state(cfg, st)
                 event(cfg, f"{wave}: window is not in auto mode")
                 flush_notices(cfg, st, w)
 
     if any(m in txt for m in PERMISSION_MARKERS):
         if once_per(w, "permission", "visible"):  # one episode while the prompt stays on screen
-            put_notice(w, "permission", "visible",
-                       f"{SIGN}волна {wave} ждёт подтверждения на экране.\n{attach}")
+            put_notice(cfg, w, wave, "permission", "visible")
             save_state(cfg, st)
             event(cfg, f"{wave}: permission prompt on screen")
             flush_notices(cfg, st, w)
@@ -5763,8 +6043,8 @@ def _tick(cfg, st):
     active = max(w.get("pane_changed", now), w.get("activity_at") or 0)
     if now - active > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
-            put_notice(w, "idle", digest,
-                       idle_notice_text(cfg, wave, quote(status), active, attach))
+            put_notice(cfg, w, wave, "idle", digest, n=int(cfg["idle_minutes"]), time=active, wave_status=status,
+                       question=status)
             save_state(cfg, st)
             event(cfg, f"{wave}: pane idle {cfg['idle_minutes']}+ min, status={status}")
             flush_notices(cfg, st, w)
@@ -6446,7 +6726,7 @@ def done_cmd(cfg, wave=None):
             ack_wave_notices(w)  # confirmed by this call; chain_done below must still get through
             if st.get("current") == wave:
                 st["current"] = None
-            put_notice(w, "chain_done", "1", chain_done_text(cfg, st))
+            _put_chain_done(cfg, st, w, wave)
             save_state(cfg, st)  # the phase and the notice together: a repeated `done` still owes it
             event(cfg, "chain finished")
             flush_notices(cfg, st, w)
@@ -6594,7 +6874,8 @@ def main(argv):
     elif cmd == "owner-handover" and len(argv) == 5:
         owner_handover(load_chain(path, create=False), argv[3], argv[4])
     elif cmd == "notify":
-        notify(load_chain(path), " ".join(argv[3:]))
+        cfg = load_chain(path)
+        notify(cfg, manual_notice(cfg, " ".join(argv[3:])))
     elif cmd == "attention":
         sys.exit(attention_cmd(load_chain(path, create=False)))
     elif cmd == "say" and len(argv) == 5:

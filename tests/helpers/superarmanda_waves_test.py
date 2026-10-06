@@ -622,7 +622,8 @@ class Supervision(Base):
         for _ in range(3):
             self.assertTrue(wab.tick(cfg, wab.load_state(cfg)))
         self.assertEqual(len(self.tg), 1)
-        self.assertIn("need a decision", self.tg[0])
+        self.assertIn("ждёт тебя", self.tg[0])
+        self.assertNotIn("need a decision", self.tg[0])  # #83: the wave's question is not in the notice (no telegram_quote)
         self.assertIn("need a decision", json.dumps(self.get_state(cfg)["waves"]["W1"]["notified"]))
         # a different question is a new notification
         self.set_status(cfg, "W1", "BLOCKED: another one")
@@ -851,13 +852,13 @@ class Redaction(Base):
 
     def test_notify_redacts_and_caps_the_whole_message(self):
         cfg, _ = self.chain()
-        wab.notify(cfg, "leak password=hunter2hunter2 " + "я" * 3000)
+        wab.notify(cfg, wab.Notice("leak password=hunter2hunter2 " + "я" * 3000))
         self.assertEqual(len(self.tg), 1)
         self.assertNotIn("hunter2hunter2", self.tg[0])
         self.assertLessEqual(len(self.tg[0]), 1200)
 
     def test_quoted_wave_text_is_capped_at_600(self):
-        cfg, _ = self.chain()
+        cfg, _ = self.chain(telegram_quote=True)
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "result.md").write_text("ж" * 5000, encoding="utf-8")
@@ -872,7 +873,7 @@ class Redaction(Base):
                 cfg, _ = self.chain(telegram=value)
                 if value is None:
                     cfg.pop("telegram", None)
-                wab.notify(cfg, "hello world")
+                wab.notify(cfg, wab.Notice("hello world"))
                 log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
                 self.assertIn("notify(skipped)", log)
         self.assertEqual(self.tg, [])
@@ -1142,7 +1143,7 @@ class WaveOwnsStatus(Base):
         self.restart()
         self.assertEqual(self.status(), "BLOCKED: need you")
         self.assertEqual(len(self.tg), 1)
-        self.assertIn("need you", self.tg[0])
+        self.assertIn("ждёт тебя", self.tg[0])
 
     def test_dispatcher_never_writes_status_during_the_transition(self):
         cfg, _ = self.chain()
@@ -1763,7 +1764,7 @@ class Episodes(Base):
         w["pane_digest"] = wab.pane_digest(self.pane)
         w["pane_changed"] = t[0] - 1000  # 0.13.0 raised «молчит» at pane_changed + 60 s
         wab.once_per(w, "idle", w["pane_digest"])
-        wab.put_notice(w, "idle", w["pane_digest"], "wave-autobot: волна W1 молчит 1+ мин")
+        wab.put_notice(self.cfg, w, "W1", "idle", w["pane_digest"], n=1)
         self.put_state(self.cfg, st)
         os.utime(main, (t[0] - 3600, t[0] - 3600))
         os.utime(agent, (t[0] - 10, t[0] - 10))  # the subagent wrote after that notice
@@ -2389,7 +2390,7 @@ class KeysAndRegistry(Base):
         def hang(*args, **kw):
             raise subprocess.TimeoutExpired(args, kw["timeout"])
         with mock.patch.object(orig, "sh", side_effect=hang):
-            orig.notify(cfg, "hello")  # must not raise
+            orig.notify(cfg, orig.Notice("hello"))  # must not raise
         self.assertTrue(any("FAILED (TimeoutExpired)" in e for e in self.events), self.events)
 
     def test_dash_own_session_reads_the_server_and_pane_from_tmux_env(self):
@@ -3208,11 +3209,11 @@ class W4Round23Notices(Base):
         return log.count("telegram FAILED")
 
     def test_notify_reports_whether_it_is_done(self):
-        self.assertFalse(wab.notify(self.cfg, "x"))
+        self.assertFalse(wab.notify(self.cfg, wab.Notice("x")))
         self.down = False
-        self.assertTrue(wab.notify(self.cfg, "x"))
+        self.assertTrue(wab.notify(self.cfg, wab.Notice("x")))
         cfg, _ = self.chain(telegram=False)
-        self.assertTrue(wab.notify(cfg, "x"))  # not configured: nothing to repeat
+        self.assertTrue(wab.notify(cfg, wab.Notice("x")))  # not configured: nothing to repeat
 
     def test_blocked_failed_send_is_retried_then_stops(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
@@ -3872,8 +3873,9 @@ class W4Round27(Base):
             self.assertNotIn("outbox", old)  # an attempt is history, not a second outbox
         self.down = False
         wab.drain_notices(cfg)
-        self.assertEqual(sorted(re.sub(r"\nВремя: [^\n]*$", "", t) for t in self.tg if t.startswith("demo: old")),
-                         ["demo: old chain_done"])
+        # the old entries are made again by the template of their key: only the end of the chain survives the restart
+        self.assertEqual(sorted(t.splitlines()[0] for t in self.tg),  # (the new launch's own «started» goes out too)
+                         sorted(["🏁 demo: цепочка завершена, последняя волна W1", "🚀 demo: стартовала волна W1"]))
 
     # ----- 2: only the confirmed wave is acknowledged; another wave keeps its notices -----
     def test_unconfirmed_waves_keep_their_notices(self):
@@ -4061,7 +4063,7 @@ class W4Round28(Base):
         self.crash_when = lambda st: "blocked" in st["waves"]["W1"].get("notified", {})
         self.crash(wab.watch, cfg, path, max_ticks=1)
         wab.watch(cfg, path, max_ticks=2)
-        self.assertEqual(self.count("need a decision"), 1, self.tg)
+        self.assertEqual(self.count("ждёт тебя"), 1, self.tg)
 
     def test_no_save_between_a_mark_and_its_notice(self):
         """The rule in code: no save_state call sits between once_per/a phase change and the
@@ -4295,7 +4297,7 @@ class W4Round29EpisodeEnds(Base):
     # ----- the table covers every key -----
     def test_every_put_notice_key_has_an_episode_end(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
-        keys = set(re.findall(r'put_notice\(\s*\w+\s*,\s*"([a-z_]+)"', src))
+        keys = set(re.findall(r'put_notice\(\s*\w+\s*,\s*\w+\s*,\s*\w+\s*,\s*"([a-z_]+)"', src))
         self.assertGreaterEqual(len(keys), 16, keys)
         self.assertEqual(keys, set(wab.NOTICE_EPISODE_ENDS), "a new notice key needs an episode end")
         for key in wab.KEEP_ON_ACK:
@@ -4303,8 +4305,8 @@ class W4Round29EpisodeEnds(Base):
 
     def test_a_put_with_a_dynamic_key_is_not_allowed(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
-        calls = re.findall(r"(?<!def )put_notice\(([^,]+),\s*([^,]+),", src)
-        for _, key in calls:
+        calls = re.findall(r"(?<!def )put_notice\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),", src)
+        for *_, key in calls:
             self.assertRegex(key.strip(), r'^"[a-z_]+"$', "put_notice key must be a literal")
 
     # ----- checkpoint_timeout: ends when HANDOFF_READY is taken (clear + update) -----
@@ -4342,14 +4344,14 @@ class W4Round29EpisodeEnds(Base):
         self.tick()
         self.assertFalse(self.get_state(self.cfg)["waves"]["W1"].get("await_session"))
         self.restore()
-        self.assertEqual(self.count("при передаче /superarmanda --resume"), 0, self.tg)
+        self.assertEqual(self.count("дошло ли продолжение"), 0, self.tg)
 
     def test_updating_is_delivered_once_while_unknown(self):
         self.updating()
         self.restore()
         self.tick()
         self.restore()
-        self.assertEqual(self.count("при передаче /superarmanda --resume"), 1, self.tg)
+        self.assertEqual(self.count("дошло ли продолжение"), 1, self.tg)
 
     # ----- sending: ends when the wave writes its own status (the task arrived) -----
     def sending(self):
@@ -4363,14 +4365,14 @@ class W4Round29EpisodeEnds(Base):
         self.set_status(self.cfg, "W1", "RUNNING")
         self.tick()
         self.restore()
-        self.assertEqual(self.count("при отправке задачи"), 0, self.tg)
+        self.assertEqual(self.count("дошла ли задача"), 0, self.tg)
 
     def test_sending_is_delivered_once_while_unknown(self):
         self.sending()
         self.restore()
         self.tick()
         self.restore()
-        self.assertEqual(self.count("при отправке задачи"), 1, self.tg)
+        self.assertEqual(self.count("дошла ли задача"), 1, self.tg)
 
     # ----- no_prompt: ends when the task is sent after all -----
     def no_prompt(self):
@@ -4387,14 +4389,14 @@ class W4Round29EpisodeEnds(Base):
         self.tick()
         self.assertEqual(self.get_state(self.cfg)["waves"]["W1"]["phase"], "running")
         self.restore()
-        self.assertEqual(self.count("файла с задачей уже нет"), 0, self.tg)
+        self.assertEqual(self.count("задачи для неё нет"), 0, self.tg)
 
     def test_no_prompt_is_delivered_once_while_the_file_is_missing(self):
         self.no_prompt()
         self.restore()
         self.tick()
         self.restore()
-        self.assertEqual(self.count("файла с задачей уже нет"), 1, self.tg)
+        self.assertEqual(self.count("задачи для неё нет"), 1, self.tg)
 
     # ----- not_ready: ends with a relaunch of the wave -----
     def not_ready(self):
@@ -4658,8 +4660,9 @@ class W4Round29EpisodeEnds(Base):
         self.put_state(self.cfg, {"current": None, "waves": {"W1": self.wave_rec(phase="done", outbox=box)}})
         self.restore()
         self.restore()
-        self.assertEqual(sorted(re.sub(r"\nВремя: [^\n]*$", "", t) for t in self.tg),
-                         ["demo: old chain_done", "demo: old done", "demo: old no_next"])
+        self.assertEqual(sorted(t.splitlines()[0] for t in self.tg),  # old entries: made again by the template of the key
+                         sorted(["🏁 demo: цепочка завершена, последняя волна W1", "✅ demo: волна W1 завершена",
+                                 "⛔ demo: волна W1 готова, следующую не запускаю"]))
 
 
 class W4Round37DashTerminalPhase(Base):
@@ -5037,7 +5040,7 @@ class W4Round30NoticeGuard(Base):
 
     def test_put_notice_refuses_a_key_without_an_episode_end(self):
         with self.assertRaises(ValueError):
-            wab.put_notice({}, "bogus_key", "1", "text")
+            wab.put_notice({}, {}, "W1", "bogus_key", "1")
 
     def test_outbox_is_touched_only_by_the_notice_functions(self):
         self.assertEqual(_outbox_violations((WAVES / "wab.py").read_text(encoding="utf-8")), [])
@@ -5189,10 +5192,10 @@ class W4Round31TelegramCache(Base):
 
         with mock.patch.object(orig, "sh", side_effect=fake_sh), \
                 mock.patch.object(orig.urllib.request, "urlopen", side_effect=fake_urlopen):
-            self.assertFalse(orig.notify(cfg, "first"))
+            self.assertFalse(orig.notify(cfg, orig.Notice("first")))
             self.assertEqual(orig._tg, {}, "a failed send must drop the cached credentials")
-            self.assertTrue(orig.notify(cfg, "second"))
-            self.assertTrue(orig.notify(cfg, "third"))  # cached again after a success: no new read
+            self.assertTrue(orig.notify(cfg, orig.Notice("second")))
+            self.assertTrue(orig.notify(cfg, orig.Notice("third")))  # cached again after a success: no new read
         self.assertEqual(len(reads), 4)
         self.assertEqual(len(sent), 2)
         self.assertTrue(all("NEW:tok" in u for u in sent))
@@ -5218,7 +5221,7 @@ class W4Round31StatusRead(Base):
         (wab.wave_dir(cfg, "W1") / "status").mkdir()
         self.assertEqual(len(self.run_ticks(cfg)), 1)
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["last_status"], "BLOCKED: q?")
-        self.assertTrue(any("q?" in t for t in self.tg), "the last known status still drives the tick")
+        self.assertTrue(any("ждёт тебя" in t for t in self.tg), "the last known status still drives the tick")
 
     def test_status_is_unreadable(self):
         if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -5979,14 +5982,14 @@ class W4Round34(Base):
         self.assertIn("W1: launch of W2 refused", log)
         self.assertIn("previous wave session wv-w1 is still running", log)
         self.assertIn("watch stopped: W1: launch of W2 refused", log)
-        refused = [t for t in self.tg if "не запустил" in t]
+        refused = [t for t in self.tg if "не запущена" in t]
         self.assertEqual(len(refused), 1, self.tg)
         self.assertIn("W2", refused[0])
         self.assertIn("launch_refused", wab.NOTICE_EPISODE_ENDS)
         # a second watch on the same refusal does not notify again
         with mock.patch.object(wab, "drop_stale_btab"):
             self.assertIs(wab.watch(cfg, path, max_ticks=3), False)
-        self.assertEqual(len([t for t in self.tg if "не запустил" in t]), 1)
+        self.assertEqual(len([t for t in self.tg if "не запущена" in t]), 1)
         # the window goes: the coordinator's launch goes through and clears the stop
         self.exit_closes = True
         with mock.patch.object(wab, "refresh_workdir"):
@@ -7178,7 +7181,9 @@ class PlanPin(Base):
         self.assertIn("BLOCKED: plan changed since approval", log)
         self.assertIn("BLOCKED: plan changed since approval",
                       (wab.wave_dir(cfg, "W1") / "status").read_text(encoding="utf-8"))
-        self.assertTrue([t for t in self.tg if "plan changed since approval" in t], self.tg)
+        told = [t for t in self.tg if "план waves.json изменился после одобрения" in t]  # #83: the reason in words
+        self.assertTrue(told, self.tg)
+        self.assertNotIn("plan changed since approval", told[0])
 
     def test_recover_launch_refuses_changed_plan(self):
         cfg, path = self.pinned()
@@ -7278,7 +7283,7 @@ class PlanPin(Base):
         self.assertEqual(self.enters, [])
         w = self.get_state(cfg)["waves"]["W1"]
         self.assertEqual(w["phase"], "not_ready")
-        self.assertTrue([t for t in self.tg if "закрыта" in t], self.tg)
+        self.assertTrue([t for t in self.tg if "не запущена" in t], self.tg)  # #83: the details are in events.log
         self.assertIn("closed", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
         # the corrected plan: a repeated launch of the same wave is allowed (no session left)
         (cfg["run_dir"] / "waves.json").write_bytes(self.plan_bytes)
@@ -7292,7 +7297,8 @@ class PlanPin(Base):
         self.kill_closes = False
         self.recover(cfg, path, alive=True)
         self.assertEqual(len(self.kills()), 1)
-        self.assertTrue([t for t in self.tg if "tmux kill-session -t" in t], self.tg)
+        self.assertTrue([t for t in self.tg if "не запущена" in t], self.tg)
+        self.assertFalse([t for t in self.tg if "kill-session" in t], self.tg)  # #83: a command is not in an outside text
         self.assertIn("tmux kill-session -t", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
     def test_pin_refusal_in_deliver_first_prompt_kills_live_session(self):
@@ -8352,9 +8358,10 @@ class MergeGate(GateBase):
                 self.tick()
         self.assertEqual(self.merges(), [])  # never a second automatic merge
         self.assertEqual(self.status(), f"BLOCKED: merge gate passed; merge result unknown; owner runs {shown}")
-        said = [t for t in self.tg if "неизвестен (диспетчер" in t]
+        said = [t for t in self.tg if "результат мерджа неизвестен" in t]
         self.assertEqual(len(said), 1)
-        self.assertIn(f"Выполни: {shown}", said[0])
+        self.assertNotIn("~/.cache", said[0])  # #83: the owner's script is in events.log, not in an outside text
+        self.assertIn(shown, self.log())
         self.assertTrue((self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)).is_file())
         self.assertEqual(self.log().count("merge result unknown"), 1)
         self.assertEqual([q["text"] for q in self.rec()["questions"]],
@@ -8382,7 +8389,7 @@ class MergeGate(GateBase):
         self.tick()  # the usual BLOCKED notice: the reason, never a merge command
         blocked = [t for t in self.tg if "ждёт тебя" in t]
         self.assertEqual(len(blocked), 1)
-        self.assertIn("ci (failure)", blocked[0])
+        self.assertNotIn("ci (failure)", blocked[0])  # #83: the reason is the wave's text: not in the notice (no telegram_quote)
         self.assertNotIn("gh pr merge", blocked[0])
 
     def failing_send(self, *, typed):
@@ -8554,7 +8561,8 @@ class MergeGate(GateBase):
                          [f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {shown}"])
         said = [t for t in self.tg if "незакрытые треды" in t]
         self.assertEqual(len(said), 1)
-        self.assertIn(f"Выполни: {shown}", said[0])
+        self.assertNotIn("~/.cache", said[0])  # #83: no path in an outside text; the script is named in events.log
+        self.assertIn(shown, self.log())
         self.assertNotIn("gh pr merge", said[0])
         # the owner runs it: MERGED at the gated head -> the next wave starts
         self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
@@ -8568,7 +8576,7 @@ class MergeGate(GateBase):
         self.tick()
         said = [t for t in self.tg if "незакрытые треды" in t]
         self.assertEqual(len(said), 1)
-        self.assertIn("2 (из них P0/P1 из прошлых коммитов: 1)", said[0])
+        self.assertIn("незакрытых тредов: 2, из прошлых коммитов с P0/P1: 1", said[0])
 
     def test_refused_merge_sends_the_ready_command(self):  # acceptance 5
         self.start()
@@ -8580,10 +8588,12 @@ class MergeGate(GateBase):
         sent = [t for t in self.tg if "мердж отклонён" in t]
         self.assertEqual(len(sent), 1)
         shown = "~/.cache/wab/" + wab.owner_script_name(self.cfg, "W1", HEAD)
-        self.assertIn(f"Выполни: {shown}", sent[0])
+        self.assertNotIn("~/.cache", sent[0])  # #83: the owner's script and the reason are in events.log, not outside
+        self.assertIn(shown, self.log())
         self.assertNotIn("gh pr merge", sent[0])  # never the raw command: the owner script gates again
         self.assertTrue((self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)).is_file())
-        self.assertIn("not mergeable", sent[0])
+        self.assertNotIn("not mergeable", sent[0])
+        self.assertIn("not mergeable", self.log())
         for _ in range(2):
             self.tick()
         self.assertEqual(len(self.merges()), 1)
@@ -8635,7 +8645,8 @@ class MergeGate(GateBase):
         self.assertEqual(self.merges(), [])
         sent = [t for t in self.tg if "draft" in t]
         self.assertEqual(len(sent), 1)
-        self.assertIn("Выполни: ~/.cache/wab/", sent[0])
+        self.assertNotIn("~/.cache", sent[0])
+        self.assertIn("~/.cache/wab/", self.log())
         self.assertEqual(self.rec()["phase"], "merging")
 
     def test_a_failed_ready_goes_to_the_owner_script(self):
@@ -8645,11 +8656,12 @@ class MergeGate(GateBase):
         self.ready_rc = 1
         self.tick()
         self.assertEqual(self.merges(), [])
-        sent = [t for t in self.tg if "перевод в ready отклонён" in t]
+        sent = [t for t in self.tg if "в ready отклонён" in t]
         self.assertEqual(len(sent), 1)
         self.assertNotIn("gh pr merge", sent[0])
         self.assertNotIn("gh pr ready", sent[0])
-        self.assertIn("Выполни: ~/.cache/wab/", sent[0])
+        self.assertNotIn("~/.cache", sent[0])
+        self.assertIn("~/.cache/wab/", self.log())
 
     def test_merged_with_another_head_blocks_and_launches_nothing(self):  # acceptance 1c
         self.start()
@@ -8659,7 +8671,7 @@ class MergeGate(GateBase):
         self.launch.assert_not_called()
         self.assertTrue(self.status().startswith("BLOCKED: merge gate: PR #7 смержен с HEAD"))
         self.assertEqual(self.rec()["phase"], "awaiting_merge")
-        self.assertEqual(len([t for t in self.tg if "смержен с HEAD" in t]), 1)
+        self.assertEqual(len([t for t in self.tg if "смержен с другим коммитом" in t]), 1)
         self.assertIn("next wave NOT launched", self.log())
 
     def test_merged_into_another_base_blocks_and_launches_nothing(self):
@@ -8671,7 +8683,7 @@ class MergeGate(GateBase):
         self.launch.assert_not_called()
         self.assertEqual(self.rec()["phase"], "awaiting_merge")
         self.assertIn("смержен в release, цепочка ждёт main", self.status())
-        self.assertEqual(len([t for t in self.tg if "смержен в release" in t]), 1)
+        self.assertEqual(len([t for t in self.tg if "смержен не в ту ветку" in t]), 1)
 
     def test_the_last_wave_merged_into_another_base_does_not_end_the_chain(self):
         cfg = self.start(waves=["W1"])
@@ -9351,6 +9363,9 @@ class ExternalHandoffVerdict(GateBase):
         self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "awaiting_merge")
         return self.tg[0]
 
+    def handoff_log(self):
+        return (self.handoff_cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+
     def test_done_taken_back_while_the_handoff_gate_collects_is_not_handed_over(self):  # Codex P1 on 6c34840
         for back in ("RUNNING", ""):
             with self.subTest(back=back):
@@ -9374,25 +9389,32 @@ class ExternalHandoffVerdict(GateBase):
 
     def test_pass_carries_the_merge_command(self):
         text = self.handoff()
-        self.assertIn("Гейт мерджа пройден", text)
+        self.assertIn("гейт мерджа пройден", text)
         self.assertNotIn("gh pr merge", text)  # P1-b: only the owner script, which gates again
-        self.assertIn("Выполни: ~/.cache/wab/" + wab.owner_script_name(self.handoff_cfg, "W1", HEAD), text)
+        self.assertNotIn("~/.cache", text)  # #83: the script is for the owner at the machine: events.log
+        self.assertIn("Выполни: ~/.cache/wab/" + wab.owner_script_name(self.handoff_cfg, "W1", HEAD), self.handoff_log())
         self.assertEqual(self.merges(), [])  # external never merges
 
     def test_pass_with_open_threads_carries_the_owner_script(self):
         self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
         text = self.handoff()
-        self.assertIn("Выполни: ~/.cache/wab/" + wab.owner_script_name(self.handoff_cfg, "W1", HEAD), text)
+        self.assertIn("незакрытые треды", text)
+        self.assertNotIn("~/.cache", text)
+        self.assertIn("Выполни: ~/.cache/wab/" + wab.owner_script_name(self.handoff_cfg, "W1", HEAD), self.handoff_log())
 
     def test_fail_and_wait_and_error_are_said_plainly(self):
         self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
-        self.assertIn("Гейт мерджа не пройден: «цитата волны: проверки неуспешны: ci (failure)»", self.handoff())
+        text = self.handoff()
+        self.assertIn("гейт мерджа не пройден", text)
+        self.assertNotIn("ci (failure)", text)  # #83: the reasons of the gate are in events.log
+        self.assertIn("Гейт мерджа не пройден: проверки неуспешны: ci (failure)", self.handoff_log())
 
     def test_unreadable_facts_never_stop_the_handoff(self):
         self.pr = gate.CollectError("gh: boom")
         text = self.handoff()
-        self.assertIn("Гейт мерджа не проверен", text)
-        self.assertIn("boom", text)
+        self.assertIn("гейт мерджа не проверен", text)
+        self.assertNotIn("boom", text)
+        self.assertIn("boom", self.handoff_log())
 
 
 class Alarm(GateBase):
@@ -10150,7 +10172,8 @@ class ChainResult(Base):
         old = self.wave_rec(questions=[{"at": 1000.0, "text": "BLOCKED: old question"}])
         cur = self.wave_rec(phase="done", questions=[{"at": 2000.0, "text": "BLOCKED: new question"}],
                             attempts=[old])
-        path, summary = wab.write_chain_result(cfg, {"waves": {"W1": cur}})
+        path, summary, counts = wab.write_chain_result(cfg, {"waves": {"W1": cur}})
+        self.assertEqual(counts["questions"], 2)
         text = path.read_text(encoding="utf-8")
         self.assertLess(text.index("old question"), text.index("new question"))
         self.assertIn("вопросов 2", summary)
@@ -10178,11 +10201,16 @@ class ChainResult(Base):
         cfg, _ = self.chain(waves=["W1"])
         fake = Path("/var/folders/7x/k2j3h4l5m6n7p8q9r0s1t2v3w4x5y6z7/T/runs/chain/r1")
         self.assertNotIn("r1", wab.redact(str(fake), wab.TG_MESSAGE_LIMIT))  # the premise: it is masked
-        with mock.patch.object(wab, "write_chain_result", return_value=(fake / "chain-result.md", "сводка")):
-            text = wab.chain_done_text(cfg, {"waves": {}})
-        sent = wab.redact(text, wab.TG_MESSAGE_LIMIT)
+        counts = {"waves": 1, "prs": 0, "restarts": 0, "questions": 0, "duration": 5}
+        w = {}
+        with mock.patch.object(wab, "write_chain_result", return_value=(fake / "chain-result.md", "сводка", counts)):
+            wab._put_chain_done(cfg, {"waves": {}}, w, "W1")
+        # #83: the notice says THAT chain-result.md was written, in words; the directory is in events.log only
+        sent = wab.redact(w["outbox"]["chain_done"]["text"], wab.TG_MESSAGE_LIMIT)
         self.assertIn("chain-result.md", sent)
         self.assertIn("цепочка завершена", sent)
+        self.assertNotIn("/var/folders", sent)
+        self.assertIn("chain-result.md", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
     def test_unrepresentable_times_do_not_stop_the_chain(self):
         for how in ("watch", "done"):
@@ -10203,10 +10231,13 @@ class ChainResult(Base):
             self.assertEqual(len([t for t in self.tg if "цепочка завершена" in t]), 1, (how, self.tg))
             self.assertIsNone(self.get_state(cfg)["current"])
 
-    def test_chain_done_text_survives_any_failure(self):
+    def test_chain_done_notice_survives_any_failure(self):
         cfg, _ = self.chain(waves=["W1"])
+        w = {}
         with mock.patch.object(wab, "write_chain_result", side_effect=RuntimeError("boom")):
-            self.assertIn("цепочка завершена", wab.chain_done_text(cfg, {"waves": {}}))
+            wab._put_chain_done(cfg, {"waves": {}}, w, "W1")
+        self.assertIn("цепочка завершена", w["outbox"]["chain_done"]["text"])
+        self.assertIn("chain-result.md не записан", w["outbox"]["chain_done"]["text"])
 
     def test_pure_helpers_live_in_wab(self):
         w = self.wave_rec(restarts=1, attempts=[self.wave_rec(restarts=2)])
@@ -10435,7 +10466,7 @@ class LocalAttention(Base):
         self.put_state(cfg, st)
         st = wab.load_state(cfg)
         w = st["waves"]["W2"]
-        wab.put_notice(w, "blocked", "q1", f"wave-autobot: волна W2 BLOCKED: {self.SECRET}\nподробности")
+        wab.put_notice(cfg, w, "W2", "blocked", "q1", cls="question", question=f"{self.SECRET}\nподробности")
         wab.save_state(cfg, st)
         wab.flush_notices(cfg, st, w)
         return cfg, st, w
@@ -10486,7 +10517,7 @@ class LocalAttention(Base):
 
     def test_attention_is_rewritten_with_the_remaining_signal(self):
         cfg, st, w = self.blocked()
-        wab.put_notice(w, "idle", "d1", "wave-autobot: волна W2 молчит 30 мин")
+        wab.put_notice(cfg, w, "W2", "idle", "d1", n=30)
         wab.save_state(cfg, st)
         wab.flush_notices(cfg, st, w)
         att = cfg["run_dir"] / "ATTENTION"
@@ -11639,8 +11670,9 @@ class FixedAnswerPolicy(Base):
         self.assertRegex(line, r"^[0-9-]+ [0-9:]+Z class=needs_decision answer=invariant rec=accept_limitation needs_decision T1")
         self.assertIn("W1: policy auto-answer: class=needs_decision answer=invariant rec=accept_limitation", self.log(cfg))
         (note,) = [t for t in self.tg if "по политике" in t]
-        self.assertIn("вариант invariant", note)
-        self.assertIn("рекомендация волны: accept_limitation", note)
+        self.assertIn("выбрано: исправить целиком", note)  # #83: the words of the vocabulary, no class=/rec= tokens
+        self.assertNotIn("class=", note)
+        self.assertNotIn("rec=", note)
         self.assertEqual(st["waves"]["W1"]["auto_answers"], 1)
 
     def test_acc05_rule_with_rec_and_answer_fires_only_on_that_rec(self):
@@ -11663,7 +11695,7 @@ class FixedAnswerPolicy(Base):
         st = self.tick(cfg, self.ND.format(rec="cut_surface"))  # the same fork again, a new episode; state.json reloaded
         self.assertEqual(len(self.answers()), 1)
         (ask,) = self.owner_asked()
-        self.assertIn("уже получила автоответ", ask)
+        self.assertIn("уже получила автоответ", self.log(cfg))  # #83: the reason is in events.log, not in the notice
         self.assertEqual(self.log(cfg).count("policy answer not sent: развилка"), 1)
         self.assertEqual(st["waves"]["W1"]["auto_answers"], 1)  # a machine refusal does not spend the cap
         self.tick(cfg)  # one event per episode
@@ -11694,7 +11726,7 @@ class FixedAnswerPolicy(Base):
         st = self.tick(cfg, self.ND.format(rec="cut_surface"))  # the same fork, a new episode
         self.assertEqual(len(self.answers()), 1)
         (ask,) = self.owner_asked()
-        self.assertIn("уже получила автоответ", ask)
+        self.assertIn("уже получила автоответ", self.log(cfg))  # #83: the reason is in events.log, not in the notice
         self.assertEqual(wab.auto_answers_used(st["waves"]["W1"]), 1)
 
     # ----- Codex P1 on #99: a typed answer waiting for its Enter is re-checked before the Enter -----
@@ -11732,7 +11764,8 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(self.decisions(cfg), [])
         (ask,) = self.owner_asked()
         for part in ("состояние развилки изменилось после ввода ответа", *parts):
-            self.assertIn(part, ask)
+            self.assertIn(part, self.log(cfg))  # #83: the reason is in events.log, not in the notice
+        self.assertIn("Автоответ по политике не отправлен", ask)
         self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
 
     def test_p1_a_role_unavailable_after_typing_gets_no_enter_and_goes_to_the_owner(self):
@@ -11773,7 +11806,7 @@ class FixedAnswerPolicy(Base):
                 self.assertEqual(self.answers(), [])
                 (ask,) = self.owner_asked()
                 self.assertIn("Автоответ по политике не отправлен", ask)
-                self.assertIn(part, ask)
+                self.assertIn(part, self.log(cfg))  # #83: the reason is in events.log, not in the notice
 
     def test_acc15_red_zone_is_never_answered_with_an_answer_rule(self):
         cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
@@ -11796,7 +11829,7 @@ class FixedAnswerPolicy(Base):
         self.tick(cfg)
         self.assertEqual(self.answers(), [])
         (ask,) = self.owner_asked()
-        self.assertIn("потолок прогонов исчерпан (5/5)", ask)
+        self.assertIn("Автоответ по политике не отправлен", ask)
         self.assertEqual(self.log(cfg).count("W1: policy answer not sent: потолок прогонов исчерпан (5/5)"), 1)
 
     def test_acc13_identity_of_a_chain_without_answer_is_bytewise_1_2_0(self):
@@ -11847,7 +11880,8 @@ class FixedAnswerPolicy(Base):
         self.assertIn("W1: policy auto-answer: class=needs_decision rec=cut_surface\n", self.log(cfg) + "\n")
         self.assertNotIn("answer=", line + self.log(cfg))
         (note,) = [t for t in self.tg if "по политике" in t]
-        self.assertIn("(class=needs_decision, вариант cut_surface), ответ не нужен.", note)
+        self.assertIn("выбрано: вырезать поверхность находки", note)
+        self.assertNotIn("class=", note)
         self.assertNotIn("policy_keys", wab.load_state(cfg)["waves"]["W1"])
 
     def test_acc20_cap_and_owner_answered_work_with_answer_as_with_rec(self):
@@ -11952,7 +11986,7 @@ class FixedAnswerPolicy(Base):
                 self.assertEqual(len(self.answers()), 1)  # no second auto-answer...
                 (ask,) = self.owner_asked()  # ...and the owner is asked, not left with a silent wave
                 self.assertIn("Автоответ по политике не отправлен", ask)
-                self.assertIn("уже получила автоответ", ask)
+                self.assertIn("уже получила автоответ", self.log(cfg))  # #83: the reason is in events.log, not in the notice
                 self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
                 self.assertEqual(st["waves"]["W1"]["questions"][-1]["text"], wab.safe_text(status, 300))
                 self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], status)
@@ -12058,7 +12092,7 @@ class FixedAnswerPolicy(Base):
                 self.assertEqual(self.answers(), [])
                 (ask,) = self.owner_asked()
                 if not name.startswith("refusal"):
-                    self.assertIn("отметки автоответов в state.json испорчены", ask)
+                    self.assertIn("отметки автоответов в state.json испорчены", self.log(cfg))
                     self.assertEqual(self.log(cfg).count("policy answer not sent"), before + 1)
                     self.assertNotIn(None, st["waves"]["W1"].get("policy_keys") or [])
                 else:  # a corrupt refusal mark reads as a refusal while the wave is BLOCKED and goes with the episode
@@ -12088,7 +12122,7 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(w.get("auto_answers"), 1)  # the typed answer may have gone out: charged
         self.assertNotIn("policy_keys", w)  # L3: no null key is carried over
         (ask,) = self.owner_asked()
-        self.assertIn("отметки автоответов в state.json испорчены", ask)
+        self.assertIn("отметки автоответов в state.json испорчены", self.log(cfg))
         self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
 
     # ----- round 2 of the internal review (N1, N4) -----
@@ -12118,7 +12152,7 @@ class FixedAnswerPolicy(Base):
                 self.tick(cfg, "RUNNING")
                 w = self.tick(cfg, self.ND.format(rec="cut_surface"))["waves"]["W1"]  # the same fork in the same run
                 self.assertEqual(len(self.answers()), 1)  # only the abandoned one: no second automatic answer
-                self.assertIn("уже получила автоответ", self.owner_asked()[-1])
+                self.assertIn("уже получила автоответ", self.log(cfg))
                 for rec in (given_up, w):  # the key moved out of flight when its input was given up: answered
                     self.assertEqual(rec["policy_keys"], [self.KEY])
                     self.assertNotIn("policy_key_pending", rec)
@@ -12193,7 +12227,7 @@ class FixedAnswerPolicy(Base):
         self.tick(cfg, self.ND.format(rec="cut_surface"))  # the same fork again: its key counts as answered
         self.assertEqual(len(self.answers()), 1)
         (ask,) = self.owner_asked()
-        self.assertIn("уже получила автоответ", ask)
+        self.assertIn("уже получила автоответ", self.log(cfg))  # #83: the reason is in events.log, not in the notice
 
 
 class InputEmpty(unittest.TestCase):
@@ -12930,7 +12964,7 @@ class W3DoneAttention(GateBase):
         self.assertTrue(self.tick())  # merged: «волна W1 завершена», W2 is launched by the dispatcher
         self.launch.assert_called_once()
         self.assertTrue(self.launch.call_args[1]["by_dispatcher"])
-        self.assertIn("notify(skipped): demo: волна W1 завершена", self.log())
+        self.assertIn("notify(skipped): ✅ demo: волна W1 завершена", self.log())
         self.assertEqual(_attention_exit(cfg), 0)
         self.assertFalse((cfg["run_dir"] / "ATTENTION").exists())
         self.assertNotIn("done", self.rec().get("attention") or {})
@@ -13079,7 +13113,7 @@ class W3PrNumber(GateBase):
         self.assertFalse(self.tick())
         self.assertEqual(self.rec()["phase"], "awaiting_merge")
         self.assertEqual(self.rec().get("pr"), 7)
-        self.assertTrue(any("Гейт мерджа ждёт" in t for t in self.tg), self.tg)
+        self.assertTrue(any("гейт мерджа ждёт" in t for t in self.tg), self.tg)
         self.alive = False  # the window of the handed-over wave is closed
         wab.main(["wab.py", "done", str(self.path)])
         text = (cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8")
@@ -13121,8 +13155,8 @@ class W3PrNumber(GateBase):
         self.assertNotIn("PR: нет", text)
 
     def test_a_long_multiline_result_does_not_push_the_trusted_tail_out(self):
-        cfg = self.start(merge_gate="external")
-        (wab.wave_dir(cfg, "W1") / "result.md").write_text("\n".join(f"п{i}" for i in range(400)) + "\n",
+        cfg = self.start(merge_gate="external", telegram_quote=True)
+        (wab.wave_dir(cfg, "W1") / "result.md").write_text("п" * 5000 + "\n" + "\n".join(f"п{i}" for i in range(400)) + "\n",
                                                           encoding="utf-8")
         sha = "7" * 40
         verdict = {"verdict": "pass", "reasons": [], "number": 7, "head": sha, "unresolved": [],
@@ -13131,8 +13165,9 @@ class W3PrNumber(GateBase):
             self.assertFalse(self.tick())
         [msg] = [t for t in self.tg if "сдала PR" in t]
         script = "~/.cache/wab/" + wab.owner_script_name(cfg, "W1", sha)
-        self.assertIn(script, msg)
-        self.assertIn("Гейт мерджа пройден", msg)
+        self.assertIn(script, (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))  # #83: not in the notice
+        self.assertNotIn(script, msg)
+        self.assertIn("гейт мерджа пройден", msg)
         self.assertIn("за координатором", msg)
         self.assertLessEqual(len(msg), wab.TG_MESSAGE_LIMIT)
         self.assertIn("…", msg)  # the quote was cut, not the dispatcher's own words
@@ -13360,6 +13395,7 @@ class W3Quote(Base):
     def chain_for(self, telegram, **over):
         self.n += 1
         over.setdefault("chain", f"c{self.n}")
+        over.setdefault("telegram_quote", True)  # #83: a wave's text goes out only with the flag; these tests are about it
         if not telegram:
             over["telegram"] = None
         return self.chain(**over)
@@ -13456,30 +13492,35 @@ class W3Quote(Base):
                     sent = self.tg if telegram else self.shown
                     self.assertTrue(sent, (name, telegram))
                     for text in sent:
-                        self.assertTrue(text.startswith(chain), text)
+                        self.assertIn(chain, text.splitlines()[0], text)  # the name is in the template's first line (#83)
                         self.assertNotIn("wave-autobot", text)
                     if not telegram:
                         path = cfg["run_dir"] / "ATTENTION"
                         att = path.read_text(encoding="utf-8") if path.exists() else ""
                         if "signal:" in att:
-                            self.assertRegex(att, r"signal: " + re.escape(chain))
+                            self.assertRegex(att, r"signal: \S+ " + re.escape(chain))
 
-    def test_notify_signs_unsigned_and_legacy_outbox_texts_once(self):
+    def test_notify_takes_only_a_notice_and_a_legacy_entry_is_made_again_by_its_template(self):
         cfg, _ = self.chain_for(True)
         chain = cfg["chain"]
-        wab.notify(cfg, "просто текст")
-        wab.notify(cfg, "wave-autobot: старая запись outbox")
-        wab.notify(cfg, f"{chain}: уже подписано")
-        self.assertEqual([re.sub(r"\nВремя: [^\n]*$", "", t) for t in self.tg[-3:]],  # the owner's time line (#88)
-                         [f"{chain}: просто текст", f"{chain}: старая запись outbox", f"{chain}: уже подписано"])
+        for text in ("просто текст", "wave-autobot: старая запись outbox"):
+            with self.assertRaises(TypeError):
+                wab.notify(cfg, text)  # a string somebody composed is not a notice (#83)
+        self.assertEqual(self.tg, [])
+        st = {"waves": {"W1": self.wave_rec("W1", outbox={"started": {"value": "1", "next_at": 0,
+                                                                       "text": "wave-autobot: старая запись outbox"}})}}
+        self.put_state(cfg, st)
+        wab.flush_notices(cfg, st, st["waves"]["W1"], force=True)
+        self.assertEqual(len(self.tg), 1)
+        self.assertEqual(self.tg[0].splitlines()[0], f"🚀 {chain}: стартовала волна W1")
+        self.assertNotIn("старая запись", self.tg[0])
 
-    def test_a_hostile_chain_name_cannot_break_the_signature(self):
+    def test_a_hostile_chain_name_cannot_break_the_first_line(self):
         cfg, _ = self.chain_for(True)
         cfg["chain"] = "x\n#(touch /tmp/p)\x02y"
-        signed = wab.sign(cfg, "тело")
-        self.assertEqual(len(signed.splitlines()), 1)
-        self.assertNotIn("\x02", signed)
-        self.assertTrue(signed.endswith(": тело"))
+        text = wab.notice_text(cfg, "W1", "started")
+        self.assertEqual(text.splitlines()[0], "🚀 ?: стартовала волна W1")
+        self.assertNotIn("\x02", text)
 
     def test_no_notice_text_carries_a_hardcoded_wave_autobot_prefix(self):
         import ast
@@ -13512,13 +13553,17 @@ class W3Quote(Base):
         question = "кап 2/2 на задаче T3, ключ ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8 и token=hunter2hunter2"
         cfg, sent = self.blocked_text(self.LABELLED.format(question=question))
         [msg] = [t for t in sent if "ждёт тебя" in t]
-        for part in ("blocked_cap", "красная зона: нет", "рекомендация волны: owner", "кап 2/2 на задаче T3", "A поднять кап",
-                     "B принять как есть", "attach -t", " say "):
+        # the class, the red zone and the recommendation in the words of the vocabularies; the question's first line
+        # (the options after `Варианты:` are cut off); where to answer (#83)
+        for part in ("кончились попытки исправить", "красная зона: нет", "рекомендация волны: решает владелец",
+                     "кап 2/2 на задаче T3", "attach -t", "say"):
             self.assertIn(part, msg)
+        for part in ("blocked_cap", "class=", "A поднять кап", "B принять как есть"):
+            self.assertNotIn(part, msg)
         self.assertNotIn("a1B2c3D4e5F6g7H8", msg)
         self.assertNotIn("hunter2hunter2", msg)
         self.assertLessEqual(len(msg), wab.TG_MESSAGE_LIMIT)
-        self.assertTrue(msg.startswith(cfg["chain"]))
+        self.assertIn(cfg["chain"], msg.splitlines()[0])
 
     def test_blocked_notice_masks_a_secret_that_contains_the_options_separator(self):  # Astra r2
         # the split into question/options must not cut a secret away from its key before redact()
@@ -13528,7 +13573,7 @@ class W3Quote(Base):
                 _cfg, sent = self.blocked_text(status)
                 [msg] = [t for t in sent if "ждёт тебя" in t]
                 self.assertNotIn("hunter2hunter2", msg)
-                self.assertIn("рекомендация волны: A", msg)
+                self.assertIn("рекомендация волны: вариант A", msg)
 
     # one character of every invisible class _INVISIBLE covers (W3 invariant): Cc, C1, Cf (zero width,
     # bidi, soft hyphen, word joiner, BOM), Zl, Zp, variation selector, CGJ, Hangul filler, unassigned
@@ -13545,7 +13590,7 @@ class W3Quote(Base):
                     _cfg, sent = self.blocked_text(f"BLOCKED: [class=question rec=A red=yes] {line}")
                     [msg] = [t for t in sent if "ждёт тебя" in t]
                     self.assertNotIn("s3cr3t", msg)
-                    self.assertIn("рекомендация волны: A", msg)
+                    self.assertIn("рекомендация волны: вариант A", msg)
 
     def test_blocked_notice_never_shows_what_the_plain_quote_masks(self):  # the class, not the case
         # whatever quote() hides in the whole question stays hidden after the split into question/options
@@ -13579,9 +13624,9 @@ class W3Quote(Base):
         cfg, sent = self.blocked_text(self.LABELLED.format(question="очень длинный вопрос " * 400))
         [msg] = [t for t in sent if "ждёт тебя" in t]
         self.assertLessEqual(len(msg), wab.TG_MESSAGE_LIMIT)
-        self.assertIn("attach -t", msg)
-        self.assertIn(" say ", msg)
-        self.assertIn("A поднять кап", msg)
+        self.assertIn("attach -t", msg)  # the quote is capped; the action and where to answer survive it
+        self.assertIn("say", msg)
+        self.assertEqual(msg.splitlines()[-1], "tmux attach -t wv-w1")
 
     def test_blocked_notice_first_line_only_of_a_multiline_question(self):
         status = self.LABELLED.format(question="первая строка\nвторая строка с подробностями")
@@ -13610,7 +13655,7 @@ class W3Quote(Base):
         wab.tick(cfg, wab.load_state(cfg))
         [msg] = [t for t in self.tg if "волна W1 завершена" in t]
         self.assertLessEqual(len(msg), wab.TG_MESSAGE_LIMIT)
-        self.assertIn("Целиком:", msg)  # the framing after the quote survives
+        self.assertIn("Время:", msg)  # the template's line after the quote survives
         self.assertIn("Цитата волны", msg)
         self.assertIn("> ", msg)
 
@@ -13810,22 +13855,21 @@ class W3Quote(Base):
     def test_the_second_redaction_inside_notify_ignores_the_owner_exemption(self):
         cfg, _ = self.chain_for(True)
         raw = f"wave-autobot: цитата\n\x02{self.hostile}\x03\nконец"  # an entry that skipped quote()
-        wab.notify(cfg, raw)
+        wab.notify(cfg, wab.Notice(raw))
         self.assertNotIn(self.SECRET, self.tg[-1])
 
     def test_old_entries_without_markers_are_handled_as_before(self):
         cfg, _ = self.chain_for(True)
-        wab.notify(cfg, "wave-autobot: password=hunter2hunter2 тест")
+        wab.notify(cfg, wab.Notice("wave-autobot: password=hunter2hunter2 тест"))
         self.assertNotIn("hunter2hunter2", self.tg[-1])
-        self.assertTrue(self.tg[-1].startswith(cfg["chain"] + ": "), self.tg[-1])  # signed by the chain, #56
         self.assertNotIn("Цитата", self.tg[-1])
 
     def test_the_dispatchers_own_script_path_stays_whole(self):
         cfg, _ = self.chain_for(True)
         sha = "7" * 40
         path = wab.write_owner_script(cfg, "W1", sha)
-        wab.notify(cfg, f"wave-autobot: Гейт мерджа пройден. Выполни: {wab.home_form(path)}\n"
-                        f"{wab.quote('результат волны')}")
+        wab.notify(cfg, wab.Notice(f"wave-autobot: Гейт мерджа пройден. Выполни: {wab.home_form(path)}\n"
+                                   f"{wab.quote('результат волны')}"))
         self.assertIn(wab.home_form(path), self.tg[-1])
         self.assertIn("результат волны", self.tg[-1])
 
@@ -13840,7 +13884,10 @@ class W3Quote(Base):
             (wab.wave_dir(cfg, "W1") / "result.md").write_text(f"Итог: {self.hostile}\n", encoding="utf-8")
             wab.tick(cfg, wab.load_state(cfg))
         [msg] = [t for t in self.tg if "сдала PR" in t]
-        self.assertIn("~/.cache/wab/" + wab.owner_script_name(cfg, "W1", HEAD), msg)
+        self.assertNotIn("~/.cache/wab", msg)  # #83: a path is not in an external text; the owner's script is in events.log
+        self.assertIn("гейт мерджа пройден", msg)
+        self.assertIn("~/.cache/wab/" + wab.owner_script_name(cfg, "W1", HEAD),
+                      (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
         self.assertNotIn(self.SECRET, msg)
 
 
@@ -15840,7 +15887,7 @@ def redact_uses_outside(waves_dir, allowed=("safe_text",)):
 
 
 SINK_CALLS = {"safe_text", "_safe", "_safe_screen", "_masked_line", "event", "notify", "quote", "put_notice",
-              "blocked_notice", "render_notice", "_first_line"}
+              "notice_text", "render_notice", "_first_line"}
 CUTTERS = {"_clip", "_one_line"}
 # a slice of THESE is no outside text: git object ids (12 hex of a sha) and `first`, which is the already masked
 # first line of a notice (_first_line). Anything else cut before it reaches a sink is the #81 hole.
@@ -15949,7 +15996,7 @@ _allow("wab.py", "_alarm_tick", _SHA, "head[:12]")
 _allow("wab.py", "_pending_alarm_enter", _DEDUP, "_exc_text(e)[:150]")
 _allow("wab.py", "note_question", _LIST, "qs[:-QUESTIONS_CAP]")
 _allow("wab.py", "write_chain_result", _SHA, "str(sha)[:12]")
-_allow("wab.py", "blocked_notice", "the question was masked by safe_text above; it is split at `Варианты:`", "question[:m.start()]")
+_allow("wab.py", "blocked_fields", "the question was masked by safe_text above; it is split at `Варианты:`", "question[:m.start()]")
 _allow("dash.py", "fold_events", "the time of an events.log line `HH:MM:SS`", "line[11:19]", "ts[:5]")
 _allow("gate.py", "manifest_problems", _SHA, "str(manifest.get('head'))[:12]", "head[:12]")
 _allow("gate.py", "evaluate", _SHA, "str(pr.get('head'))[:12]", "head[:12]", "str(work.get('head'))[:12]")
@@ -16079,9 +16126,9 @@ def joined_into_helpers(waves_dir):
 OUTPUT_FUNCS = {
     "wab.py": {"quote", "_render_quote", "render_notice", "_first_line", "notify", "note_attention", "attention_text",
                "event", "_short_command", "note_question", "write_chain_result", "_policy_question", "_say_first",
-               "blocked_notice", "status_cmd", "manifest_status_line", "_write_status", "_gate_failed",
+               "blocked_fields", "_question_field", "status_cmd", "manifest_status_line", "_write_status", "_gate_failed",
                "handoff_gate_line", "manifest_where_of", "_resolve_why", "say_cmd", "_masked_line", "_one_line",
-               "_gh", "chain_label", "owner_merge", "owner_handover", "_hand_to_owner"},
+               "_gh", "owner_merge", "owner_handover", "_hand_to_owner"},
     "dash.py": {"humanize_event", "current_panel", "manifest_lines", "_blocked_phrase", "_pulse_phrase", "_masked",
                 "_safe", "_safe_screen", "_clip", "fold_events", "events_panel", "waves_table", "pipeline"},
 }
@@ -16441,7 +16488,7 @@ class W2EveryCut(Base):
         self.assertTrue([j for j in joined_into_helpers(tmp) if j[1] == "render_notice"])
         cfg, _ = self.chain()
         path = wab.write_owner_script(cfg, "W1", "71234567890a" + "0" * 28)
-        notice = f"{wab.SIGN}Выполни: {wab.home_form(path)}"
+        notice = f"demo: Выполни: {wab.home_form(path)}"
         spec = importlib.util.spec_from_file_location("wab_mutant2", tmp / "wab.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -16541,27 +16588,28 @@ class W2OwnerScriptPath(Base):
         self.cfg, _ = self.chain()
         path = wab.write_owner_script(self.cfg, "W1", "71234567890a" + "0" * 28)  # sha12 looks like a phone number
         self.path, self.shown = path, wab.home_form(path)
-        self.notice = f"{wab.SIGN}волна W1 сдала PR. Выполни: {self.shown} (заново проверит гейт)\n\nещё строка"
+        self.notice = f"demo: волна W1 сдала PR. Выполни: {self.shown} (заново проверит гейт)\n\nещё строка"
 
     def test_the_path_is_whole_in_every_path_of_a_notice(self):
         self.assertIn(self.shown, wab.render_notice(self.notice))
         self.assertIn(self.shown, wab._first_line(self.notice, 300))
-        self.assertIn(self.shown, wab._first_line(f"{wab.SIGN}Выполни: {self.shown}", 300))
+        self.assertIn(self.shown, wab._first_line(f"demo: Выполни: {self.shown}", 300))
         att = wab.attention_text({"waves": {"W1": {"tmux": "wv-w1", "attention": {}}}})
         w = {}
-        wab.note_attention(w, "blocked", f"{wab.SIGN}Выполни: {self.shown}", 1.0)
-        self.assertIn(self.shown, wab.attention_text({"waves": {"W1": {"tmux": "wv-w1", "attention": w["attention"]}}}))
+        wab.note_attention(w, "blocked", wab.Notice(f"demo: Выполни: {self.shown}"), 1.0)
+        # #83: ATTENTION is the template's first line, the session and the wave of the registry: no path in it
+        self.assertNotIn(self.shown, wab.attention_text({"waves": {"W1": {"tmux": "wv-w1", "attention": w["attention"]}}}))
         self.assertIsNone(att)
 
     def test_the_path_is_whole_in_telegram_and_in_display_message(self):
         self.tg.clear()
         with contextlib.redirect_stdout(io.StringIO()):
-            wab.notify(self.cfg, f"{wab.SIGN}Выполни: {self.shown}")
+            wab.notify(self.cfg, wab.Notice(f"demo: Выполни: {self.shown}"))
         self.assertIn(self.shown, "\n".join(self.tg))
         cfg, _ = self.chain(telegram=None)
         shown = []
         with mock.patch.object(wab, "display_all", side_effect=shown.append), contextlib.redirect_stdout(io.StringIO()):
-            wab.notify(cfg, f"{wab.SIGN}Выполни: {self.shown}", "W1")
+            wab.notify(cfg, wab.Notice(f"demo: Выполни: {self.shown}"), "W1")
         self.assertIn(self.shown, "\n".join(shown))
 
     def test_the_path_inside_a_quote_of_the_wave_is_masked(self):
@@ -16673,7 +16721,7 @@ class W2OutputPaths(Base):
         cfg, _ = self.chain()
         self.tg.clear()
         with contextlib.redirect_stdout(io.StringIO()):
-            wab.notify(cfg, raw)
+            wab.notify(cfg, wab.Notice(raw))
         return "\n".join(self.tg)
 
     def out_notify_display(self, raw):
@@ -16681,13 +16729,13 @@ class W2OutputPaths(Base):
         shown = []
         with mock.patch.object(wab, "display_all", side_effect=shown.append), \
                 contextlib.redirect_stdout(io.StringIO()):
-            wab.notify(cfg, raw)
+            wab.notify(cfg, wab.Notice(raw))
         return "\n".join(shown)
 
     def out_attention(self, raw):
         st = {"waves": {"W1": {"tmux": "wv-w1", "attention": {"blocked": {"at": 1.0, "line": raw}}}}}
         w = {}
-        wab.note_attention(w, "blocked", raw, 1.0)
+        wab.note_attention(w, "blocked", wab.Notice(raw), 1.0)
         return wab.attention_text(st) + wab.attention_text({"waves": {"W1": {"tmux": "wv-w1", "attention": w["attention"]}}})
 
     def out_event_line(self, raw):
@@ -16724,9 +16772,11 @@ class W2OutputPaths(Base):
         return fn(raw)
 
     def out_blocked_notice(self, raw):
-        status = f"BLOCKED: [class=needs_decision rec=owner red=no] {raw}"
-        return wab.blocked_notice(self.chain()[0], "W1", status, "attach") + wab.blocked_notice(
-            self.chain()[0], "W1", f"BLOCKED: {raw}", "attach")
+        cfg = self.chain(telegram_quote=True)[0]  # the first line of a wave's question goes out only with the flag (#83)
+        out = []
+        for status in (f"BLOCKED: [class=needs_decision rec=owner red=no] {raw}", f"BLOCKED: {raw}"):
+            out.append(wab.render_notice(wab.notice_text(cfg, "W1", "blocked", **wab.blocked_fields(status))))
+        return "".join(out)
 
     def out_status_file(self, raw):
         cfg, _ = self.chain()
@@ -17732,7 +17782,7 @@ class W6OwnerTime(Base):
             shown = []
             with mock.patch("time.time", return_value=ts), mock.patch.object(wab, "display_all", side_effect=shown.append), \
                     contextlib.redirect_stdout(io.StringIO()):
-                wab.notify(cfg, "{chain}: волна W1 ждёт тебя", wave="W1")
+                wab.notify(cfg, wab.notice_text(cfg, "W1", "blocked", ts), wave="W1")
             out += self.tg + shown
         return "\n".join(out)
 
@@ -17755,7 +17805,7 @@ class W6OwnerTime(Base):
 
     def drv_idle(self, zone, ts):
         cfg = self.cfg_for(zone)
-        return wab.idle_notice_text(cfg, "W1", wab.quote("RUNNING"), ts)
+        return wab.notice_text(cfg, "W1", "idle", ts, n=15, time=ts, wave_status="RUNNING")
 
     # ----- the zone reaches the processes outside the watch loop (round 3) -----
     def _session_env(self, **over):
@@ -18012,7 +18062,7 @@ class W6OwnerTime(Base):
     # ----- docs -----
     def test_release_docs_and_agent_docs(self):
         skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.2\.6"\s*$')
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.2\.\d+"\s*$')  # the version itself is pinned by the newest release's test
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         m = re.search(r"(?ms)^## 1\.2\.6 — 2026-10-06\n(.*?)(?=^## )", log)
         self.assertTrue(m, "CHANGELOG.md: the section `## 1.2.6 — 2026-10-06`")
@@ -18025,6 +18075,474 @@ class W6OwnerTime(Base):
             text = (ROOT / rel).read_text(encoding="utf-8")
             self.assertRegex(text, r"(?is)врем[^\n]*пояс[^\n]*владельц|пояс[^\n]*владельц[^\n]*врем", rel)
             self.assertIn("SUPERARMANDA_TZ", text, rel)
+
+
+# ---------------------------------------------------------------- W7 (#83): external notices are made of templates
+class W7NoticeTemplates(Base):
+    """ONE invariant for the whole external surface (#83): Telegram, display-message and the ATTENTION file get a
+    text that is a PRODUCT of a template (wab.NOTICE_TEMPLATES) filled only with the fields of the registry
+    (wab.NOTICE_FIELDS); the free text of a wave (status, result.md, a question, a reason, a command, a path) is not
+    in it, unless chain.json says `telegram_quote: true`. Sources of the data: tests/fixtures/waves/w7-notices/.
+    ONE loop (key x flag x path x new/old outbox entry) checks it for every key of NOTICE_EPISODE_ENDS."""
+
+    FIX = ROOT / "tests" / "fixtures" / "waves" / "w7-notices"
+    MARK = "МАРКЕР-ВОЛНЫ-СЕМЬ"
+    SECRET = "password=hunter2hunter2"
+    # the free text of a wave as the data of a task holds it: a marker, a path, a sha, a function, the machine label, a secret
+    POISON = (f"{MARK} /home/owner/secret/dir/file.py deadbeefcafe1234 class=needs_decision rec=A red=no "
+              f"run_tick() {SECRET}\nВТОРАЯ-СТРОКА-ВОЛНЫ")
+    WAVE = "W3"
+    TMUX = "fp-w3"
+    NOW = calendar.timegm((2026, 10, 5, 6, 20, 42))
+    NUMBERS = {"pr": 7, "n": 3, "threads": 2, "p01": 1, "attempts": 2, "runs": 2, "waves": 8, "prs": 8,
+               "restarts": 1, "questions": 2}
+    FORBIDDEN = [
+        (re.compile(r"class=|rec=|red="), "machine label"),
+        (re.compile(r"(?:^|[\s(])(?:~|/)[\w.-]*/[\w./-]*"), "path"),
+        (re.compile(r"\b\w+\(\)"), "function name"),
+        (re.compile(r"\b[0-9a-fA-F]{7,}\b"), "hex"),
+        (re.compile(r"hunter2"), "secret"),
+    ]
+
+    def setUp(self):
+        super().setUp()
+        for name in [n for n in os.environ if n.startswith("WAB_")]:
+            os.environ.pop(name)
+        self.fixture = json.loads((self.FIX / "chain.json").read_text(encoding="utf-8"))
+        self.fixture_state = json.loads((self.FIX / "state.json").read_text(encoding="utf-8"))
+
+    def fx_cfg(self, quote=None, telegram=True):
+        doc = dict(self.fixture)
+        doc.pop("run_dir", None)
+        if not telegram:
+            doc.pop("telegram")
+        if quote is not None:
+            doc["telegram_quote"] = quote
+        cfgdir = self.tmp / "fx"
+        cfgdir.mkdir(exist_ok=True)
+        path = cfgdir / "chain.json"
+        path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        return wab.load_chain(path)
+
+    def fx_state(self, cfg):
+        waves = {}
+        for name, rec in self.fixture_state["waves"].items():
+            waves[name] = dict(rec, cwd=self.cwd, started=self.NOW - 60, sessions=[])
+        waves[self.WAVE]["phase"] = "running"
+        return {"current": self.WAVE, "waves": waves}
+
+    def fields_for(self, key, poison):
+        """The fields of the template of `key`: valid values, or the poisoned ones for the registry's vocabularies."""
+        out = {}
+        for name in wab.NOTICE_TEMPLATES[key]["fields"]:
+            if name in ("chain", "wave", "tmux"):
+                continue
+            if name == "question":
+                out[name] = self.POISON
+            elif name in self.NUMBERS:
+                out[name] = self.NUMBERS[name] if not poison else self.POISON
+            elif name == "time":
+                out[name] = self.NOW - 300
+            elif name == "duration":
+                out[name] = 3700
+            elif name == "severity":
+                out[name] = self.POISON if poison else "P1"
+            elif name == "cls":
+                out[name] = self.POISON if poison else "needs_decision"
+            elif name == "variant":
+                out[name] = self.POISON if poison else "invariant"
+            elif name == "next_wave":
+                out[name] = self.POISON if poison else "W4"
+            elif name == "wave_status":
+                out[name] = self.POISON if poison else "BLOCKED"
+            elif name == "red":
+                out[name] = self.POISON if poison else True
+            elif name == "reason":
+                out[name] = self.POISON if poison else sorted(wab.REASON_WORDS)[0]
+            else:
+                self.fail(f"the test has no value for the field {name!r} of {key}")
+        return out
+
+    @staticmethod
+    def strip_quote(text):
+        """Without the wave's quote (the only place where free text may be, and only with telegram_quote)."""
+        text = re.sub("\x02.*?(?:\x03|$)", "", text, flags=re.S)
+        out, skip = [], False
+        for line in text.splitlines():
+            if line.strip() == "Цитата волны:":
+                skip = True
+                continue
+            if skip and line.startswith("> "):
+                continue
+            skip = False
+            out.append(re.sub(r"«цитата волны: .*?»", "", line))
+        return "\n".join(out)
+
+    def check_text(self, key, text, quote, *, full, where):
+        """The invariant of ONE notice text. full: Telegram / the template itself (action, time, attach); False: the
+        first line only (display-message, ATTENTION)."""
+        label = f"{key} quote={quote} {where}"
+        lines = [l for l in text.splitlines() if l.strip()]
+        self.assertTrue(lines, label)
+        head = lines[0]
+        self.assertLessEqual(len(head), 120 if full else wab.DISPLAY_LIMIT, label)
+        self.assertEqual(unicodedata_category(head[0]), "So", f"{label}: the first line starts with an emoji: {head!r}")
+        if full:
+            self.assertIn(self.fixture["chain"], head, label)
+            self.assertIn(self.WAVE, head, label)
+        bare = self.strip_quote(text)
+        for rx, what in self.FORBIDDEN:
+            self.assertIsNone(rx.search(bare), f"{label}: {what} in {bare!r}")
+        if not quote:
+            self.assertNotIn(self.MARK, text, label)
+            self.assertNotIn("ВТОРАЯ-СТРОКА", text, label)
+            self.assertNotIn("Цитата волны", text, label)
+        if not full:
+            return
+        human = key not in wab.INFO_NOTICES
+        actions = [l for l in lines if l.startswith("Нужно:")]
+        self.assertEqual(len(actions), 1 if human else 0, f"{label}: action lines {actions}")
+        self.assertTrue(any(l.startswith("Время:") for l in lines), label)
+        if human:
+            self.assertEqual(lines[-1], f"tmux attach -t {self.TMUX}", label)
+            self.assertLess([i for i, l in enumerate(lines) if l.startswith("Время:")][0],
+                            lines.index(actions[0]), label)
+        else:
+            self.assertNotIn("tmux attach", text, label)
+
+    # ----- the loop: every key of the episode table x flag x path x (a fresh entry, an entry of 1.2.6) -----
+    def test_every_key_every_flag_every_path_is_a_template(self):
+        self.assertEqual(set(wab.NOTICE_TEMPLATES), set(wab.NOTICE_EPISODE_ENDS))
+        self.assertEqual(len(wab.NOTICE_TEMPLATES), 23)
+        for quote in (False, True):
+            tcfg, lcfg = self.fx_cfg(quote or None), self.fx_cfg(quote or None, telegram=False)
+            for key in sorted(wab.NOTICE_TEMPLATES):
+                for poison in (False, True):
+                    fields = self.fields_for(key, poison)
+                    for legacy in (False, True):
+                        where = f"poison={poison} legacy={legacy}"
+                        # Telegram
+                        st = self.fx_state(tcfg)
+                        w = st["waves"][self.WAVE]
+                        self.put_state(tcfg, st)
+                        self.fill(tcfg, w, key, fields, legacy)
+                        self.tg.clear()
+                        with mock.patch("time.time", return_value=self.NOW), contextlib.redirect_stdout(io.StringIO()), \
+                                mock.patch.object(wab, "drop_ended_episodes", return_value=False):  # its own tests
+                            wab.flush_notices(tcfg, st, w, force=True)
+                        self.assertEqual(len(self.tg), 1, f"{key} {where}")
+                        self.check_text(key, self.tg[0], quote, full=True, where="telegram " + where)
+                        if quote and not legacy and "question" in fields:
+                            self.assertIn(self.MARK, self.tg[0], f"{key}: the question is quoted")
+                            self.assertNotIn("hunter2", self.tg[0])
+                            self.assertNotIn("ВТОРАЯ-СТРОКА", self.tg[0], "the first line of the question only")
+                        # display-message and ATTENTION (no Telegram)
+                        st = self.fx_state(lcfg)
+                        w = st["waves"][self.WAVE]
+                        self.put_state(lcfg, st)
+                        self.fill(lcfg, w, key, fields, legacy)
+                        shown = []
+                        with mock.patch("time.time", return_value=self.NOW), \
+                                mock.patch.object(wab, "drop_ended_episodes", return_value=False), \
+                                mock.patch.object(wab, "display_all", side_effect=shown.append), \
+                                contextlib.redirect_stdout(io.StringIO()):
+                            wab.flush_notices(lcfg, st, w, force=True)
+                        self.assertEqual(len(shown), 1, f"{key} {where}")
+                        self.check_text(key, shown[0], quote, full=False, where="display " + where)
+                        self.assertIn("Время:", shown[0])
+                        att = wab.attention_text(st, lcfg)
+                        if key in wab.INFO_NOTICES:
+                            self.assertIsNone(att, key)
+                            continue
+                        att_lines = dict(l.split(": ", 1) for l in att.splitlines() if ": " in l)
+                        self.assertEqual(att_lines["wave"], self.WAVE, key)
+                        self.assertEqual(att_lines["attach"], f"tmux attach -t {self.TMUX}", key)
+                        self.check_text(key, att_lines["signal"], quote, full=False, where="attention " + where)
+                        self.assertNotIn(self.MARK, att, f"{key}: the question is not in ATTENTION, flag or not")
+
+    def fill(self, cfg, w, key, fields, legacy):
+        if legacy:  # what a dispatcher 1.2.6 left in the outbox: a signed text with the wave's quote, no template marker
+            w["outbox"] = {key: {"value": "1", "next_at": 0,
+                                 "text": f"wave-autobot: волна {self.WAVE} что-то. {self.POISON}\n\n"
+                                         f"\x02{self.POISON}\x03\n\nВыполни: /home/owner/x.sh"}}
+        else:
+            wab.put_notice(cfg, w, self.WAVE, key, "1", **fields)
+
+    # ----- the old outbox: the live first lines of 1.2.x (tests/fixtures/waves/w7-notices/events-telegram.log) -----
+    def test_the_live_texts_of_1_2_6_are_redone_by_the_template_of_their_key(self):
+        kinds = [("стартовала волна", "started"), ("завершена.", "done"), ("молчит", "idle"), ("ждёт тебя", "blocked"),
+                 ("развилка закрыта", "policy_answer"), ("не записала handoff", "checkpoint_timeout"),
+                 ("окно волны", "dead")]
+        lines = [l.split("Z telegram: ", 1)[1] for l in (self.FIX / "events-telegram.log").read_text(
+            encoding="utf-8").splitlines()]
+        seen = set()
+        for line in lines:
+            hit = [key for part, key in kinds if part in line]
+            if not hit:
+                continue
+            key = hit[0]
+            seen.add(key)
+            cfg = self.fx_cfg()
+            st = self.fx_state(cfg)
+            w = st["waves"][self.WAVE]
+            self.put_state(cfg, st)
+            w["outbox"] = {key: {"value": "1", "next_at": 0, "text": f"{line}\n\n\x02{self.POISON}\x03"}}
+            self.tg.clear()
+            with mock.patch("time.time", return_value=self.NOW), mock.patch.object(wab, "drop_ended_episodes", return_value=False):
+                wab.flush_notices(cfg, st, w, force=True)
+            self.assertEqual(len(self.tg), 1, line)
+            self.check_text(key, self.tg[0], False, full=True, where="old " + line[:30])
+        self.assertEqual(seen, {k for _, k in kinds})
+
+    # ----- the registry -----
+    def test_templates_use_only_the_fields_of_the_registry(self):
+        import string
+        for key, tpl in wab.NOTICE_TEMPLATES.items():
+            self.assertTrue(set(tpl["fields"]) <= set(wab.NOTICE_FIELDS), key)
+            texts = [tpl["head"], *tpl.get("notes", ()), *([tpl["action"]] if tpl.get("action") else [])]
+            for text in texts:
+                names = {f for _, f, _, _ in string.Formatter().parse(text) if f}
+                self.assertTrue(names <= set(tpl["fields"]), f"{key}: {names - set(tpl['fields'])} in {text!r}")
+            self.assertLessEqual(len(tpl["head"]), 110, key)
+            self.assertEqual(bool(tpl.get("action")), key not in wab.INFO_NOTICES, f"{key}: action iff a human is needed")
+
+    def test_notice_text_refuses_a_field_outside_the_registry_or_the_template(self):
+        cfg = self.fx_cfg()
+        with self.assertRaises(ValueError):
+            wab.notice_text(cfg, "W1", "dead", secret="x")  # not in the registry
+        with self.assertRaises(ValueError):
+            wab.notice_text(cfg, "W1", "dead", severity="P1")  # in the registry, not in this template
+        with self.assertRaises(ValueError):
+            wab.notice_text(cfg, "W1", "no_such_key")
+        with self.assertRaises(ValueError):
+            wab.put_notice(cfg, {}, "W1", "bogus_key", "1")
+
+    def test_a_value_that_fails_its_check_is_a_question_mark_never_the_raw_value(self):
+        cfg = self.fx_cfg()
+        bad = ["/etc/passwd", "a b", "", None, -1, True, ["x"], {"a": 1}, "W1\nx", self.POISON]
+        vocab = ("question", "variant", "cls", "wave_status", "reason", "severity")
+        for name, (desc, fmt) in wab.NOTICE_FIELDS.items():
+            self.assertTrue(desc, name)
+            if name in vocab:
+                continue  # the vocabularies: a neutral phrase, see the next test
+            for value in bad if name == "red" else [*bad, 1.5] if name not in ("time", "duration") else bad:
+                if name == "red" and value is True:
+                    continue  # a real boolean is the one valid value of `red`
+                with self.subTest(field=name, value=value):
+                    self.assertEqual(fmt(cfg, value), "?")
+
+    def test_vocabularies_cover_the_closed_sets_and_hide_unknown_values(self):
+        cfg = self.fx_cfg()
+        fmt = {n: wab.NOTICE_FIELDS[n][1] for n in ("cls", "variant", "wave_status", "reason", "severity")}
+        for cls in wab.LABEL_CLASSES:
+            self.assertNotEqual(fmt["cls"](cfg, cls), cls)
+            self.assertIn(cls, wab.CLASS_WORDS)
+        answers = {a for allowed in wab.POLICY_ANSWERS.values() for a in allowed}
+        for answer in answers | {"owner"}:
+            self.assertIn(answer, wab.ANSWER_WORDS)
+            self.assertNotEqual(fmt["variant"](cfg, answer), answer)
+        self.assertEqual(fmt["variant"](cfg, "invariant"), "исправить целиком")
+        self.assertEqual(fmt["variant"](cfg, "new_run"), "ещё одна попытка")
+        self.assertEqual(fmt["variant"](cfg, "accept_limitation"), "принять как есть")
+        self.assertEqual(fmt["cls"](cfg, "blocked_cap"), "кончились попытки исправить")
+        for status in ("STARTING", "RUNNING", "HANDOFF_READY", "BLOCKED", "DONE"):
+            self.assertIn(status, wab.STATUS_WORDS)
+        for sev in ("low", "medium", "high", "P0", "P1", "P2", "P3"):
+            self.assertIn(sev, wab.SEVERITY_WORDS)
+        for code in wab.REASON_WORDS:
+            self.assertNotEqual(fmt["reason"](cfg, code), code)
+        for name, f in fmt.items():
+            for value in (self.POISON, "ключ_которого_нет", 5, None, "deadbeefcafe1234"):
+                with self.subTest(field=name, value=value):
+                    shown = f(cfg, value)
+                    self.assertIsInstance(shown, str)
+                    self.assertTrue(shown)
+                    self.assertNotIn(str(value), shown)
+                    self.assertNotIn("МАРКЕР", shown)
+
+    def test_an_unknown_severity_in_an_external_text_is_a_dictionary_phrase(self):  # dash.finding_counts keeps the raw key
+        # no notice shows a severity today: the field of the registry and its dictionary are what an external text
+        # would use (a template that takes `severity` is checked by the loop above for the same reasons)
+        cfg = self.fx_cfg()
+        raw = "catastrophic /tmp/x deadbeef1234"
+        self.assertEqual(wab.severity_word(raw), wab.SEVERITY_OTHER)
+        self.assertEqual(wab.NOTICE_FIELDS["severity"][1](cfg, raw), wab.SEVERITY_OTHER)
+        self.assertEqual(wab.NOTICE_FIELDS["severity"][1](cfg, "P1"), wab.SEVERITY_WORDS["P1"])
+        for key, tpl in wab.NOTICE_TEMPLATES.items():
+            if "severity" in tpl["fields"]:
+                text = wab.notice_text(cfg, self.WAVE, key, now=self.NOW, severity=raw)
+                self.assertNotIn("catastrophic", text)
+
+    def test_attention_takes_names_only_in_the_format_of_the_registry(self):
+        cfg = self.fx_cfg(telegram=False)
+        for bad in ("evil; reboot", "w 1", "/tmp/x", "", None):
+            st = {"waves": {"W3": {"tmux": bad, "attention": {"blocked": {"at": self.NOW, "line": "x"}}}}}
+            att = wab.attention_text(st, cfg)
+            self.assertIn("attach: ?", att, bad)
+        for bad in ("W 3/../x", "evil; reboot", "/tmp/x"):
+            st = {"waves": {bad: {"tmux": "fp-w3", "attention": {"blocked": {"at": self.NOW, "line": "x"}}}}}
+            att = wab.attention_text(st, cfg)
+            self.assertIn("wave: ?", att, bad)
+            self.assertNotIn(bad, att)
+
+    # ----- the real flows: a wave's free text does not leave without the flag -----
+    def flow(self, quote, setup):
+        cfg, _ = self.chain(**({"telegram_quote": True} if quote else {}))
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        setup(cfg)
+        with mock.patch.object(wab, "launch"), contextlib.redirect_stdout(io.StringIO()):
+            wab.tick(cfg, wab.load_state(cfg))
+        return cfg
+
+    def test_blocked_question_in_a_real_tick(self):
+        status = f"BLOCKED: [class=question rec=A red=no] {self.POISON.splitlines()[0]} variants: A) {self.MARK}-B"
+        for quote in (False, True):
+            self.tg.clear()
+            self.flow(quote, lambda c: self.set_status(c, "W1", status))
+            self.assertEqual(len(self.tg), 1, quote)
+            text = self.tg[0]
+            self.assertNotRegex(self.strip_quote(text), r"class=|rec=|red=|/home/owner|deadbeef|run_tick")
+            self.assertNotIn("hunter2", text)
+            self.assertEqual(self.MARK in text, quote, text)
+            self.assertEqual(unicodedata_category(text[0]), "So", text)
+
+    def test_done_result_and_dead_status_in_a_real_tick(self):
+        def done(cfg):
+            self.set_status(cfg, "W1", "DONE")
+            (wab.wave_dir(cfg, "W1") / "result.md").write_text(self.POISON + "\n", encoding="utf-8")
+            (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("задача\n", encoding="utf-8")
+
+        def dead(cfg):
+            self.alive = False
+            self.set_status(cfg, "W1", f"RUNNING {self.POISON.splitlines()[0]}")
+        for quote in (False, True):
+            for setup in (done, dead):
+                self.tg.clear()
+                self.alive = True
+                self.flow(quote, setup)
+                self.assertTrue(self.tg, (quote, setup.__name__))
+                joined = "\n".join(self.tg)
+                self.assertNotRegex(self.strip_quote(joined), r"class=|rec=|red=|/home/owner|deadbeef|run_tick|hunter2")
+                self.assertNotIn("hunter2", joined)
+                self.assertEqual(self.MARK in joined, quote, (quote, setup.__name__))
+
+    def test_put_notice_without_the_flag_keeps_free_text_out_of_the_outbox(self):
+        cfg = self.fx_cfg()
+        w = {}
+        wab.put_notice(cfg, w, self.WAVE, "blocked", "q", question=self.POISON, cls="question")
+        self.assertNotIn(self.MARK, json.dumps(w, ensure_ascii=False))
+        cfg = self.fx_cfg(quote=True)
+        w = {}
+        wab.put_notice(cfg, w, self.WAVE, "blocked", "q", question=self.POISON, cls="question")
+        self.assertIn(self.MARK, json.dumps(w, ensure_ascii=False))
+
+    # ----- the local outputs keep the question (the owner needs it to answer) -----
+    def test_status_and_dashboard_still_show_the_wave_question(self):
+        cfg, _ = self.chain()
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(last_status="BLOCKED")}})
+        self.set_status(cfg, "W1", f"BLOCKED: [class=question rec=A red=no] {self.MARK} вопрос?")
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            wab.status_cmd(cfg)
+        self.assertIn(self.MARK, printed.getvalue())
+        try:
+            import dash
+        except ImportError:
+            return
+        from rich.console import Console
+        con = Console(width=200, record=True, file=io.StringIO())
+        con.print(dash.current_panel(cfg, wab.load_state(cfg)))
+        self.assertIn(self.MARK, con.export_text())
+
+    # ----- chain.json telegram_quote -----
+    def chain_doc(self, **over):
+        doc = dict(self.fixture)
+        doc.pop("run_dir", None)
+        doc.update(over)
+        path = self.tmp / "q" / "chain.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def test_telegram_quote_is_strictly_a_boolean(self):
+        for bad in ("true", "false", 1, 0, None, [], {}, "yes"):
+            with self.subTest(value=bad):
+                with self.assertRaises(SystemExit) as ctx:
+                    wab.load_chain(self.chain_doc(telegram_quote=bad))
+                self.assertIn("telegram_quote", str(ctx.exception))
+        self.assertIs(wab.load_chain(self.chain_doc(telegram_quote=True))["telegram_quote"], True)
+        self.assertNotIn("telegram_quote", wab.load_chain(self.chain_doc(telegram_quote=False)))
+        self.assertNotIn("telegram_quote", wab.load_chain(self.chain_doc()))
+
+    def test_telegram_quote_true_is_part_of_the_identity_and_false_is_not(self):
+        base = wab.load_chain(self.chain_doc())
+        st = {"waves": {}}
+        wab.check_identity(base, st, "launch")
+        wab.check_identity(wab.load_chain(self.chain_doc(telegram_quote=False)), st, "watch")  # none <-> false passes
+        with self.assertRaises(SystemExit):
+            wab.check_identity(wab.load_chain(self.chain_doc(telegram_quote=True)), st, "watch")
+        stq = {"waves": {}}
+        quoted = wab.load_chain(self.chain_doc(telegram_quote=True))
+        wab.check_identity(quoted, stq, "launch")
+        wab.check_identity(quoted, stq, "watch")
+        with self.assertRaises(SystemExit):
+            wab.check_identity(wab.load_chain(self.chain_doc()), stq, "watch")  # true -> none
+        with self.assertRaises(SystemExit):
+            wab.check_identity(wab.load_chain(self.chain_doc(telegram_quote=False)), stq, "watch")
+        self.assertNotIn("telegram_quote", wab.TUNABLE)
+
+    def test_the_identity_of_a_chain_without_the_field_is_byte_equal_to_1_2_6(self):
+        doc = {"chain": "demo", "run_id": "2026-10-01", "repo": "o/r", "waves": ["W1", "W2"], "tmux_prefix": "wv-",
+               "tick_seconds": 1, "ctx_limit": 300000,
+               "telegram": {"keyvault": "kv-test", "token_secret": "tok", "chat_secret": "chat"}}
+        path = self.tmp / "ident" / "chain.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        ident = wab._pinned_identity(wab.load_chain(path))
+        ident.pop("run_dir")
+        # taken from the dispatcher 1.2.6 before this change (the same file, the same call)
+        self.assertEqual(json.dumps(ident, sort_keys=True),
+                         '{"chain": "demo", "repo": "o/r", "run_id": "2026-10-01", "tmux_prefix": "wv-", '
+                         '"waves": ["W1", "W2"]}')
+
+    # ----- static: every put_notice is a key and registry fields, no text -----
+    def test_every_put_notice_call_passes_only_registry_fields_of_its_template(self):
+        tree = ast.parse((WAVES / "wab.py").read_text(encoding="utf-8"))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "put_notice"]
+        self.assertEqual(len(calls), 24, "the 25 call sites of 1.2.6; chain_done is put by one helper now (23 keys)")
+        self.assertEqual({c.args[3].value for c in calls if len(c.args) == 5}, set(wab.NOTICE_TEMPLATES))
+        for node in calls:
+            self.assertEqual(len(node.args), 5, f"put_notice(cfg, w, wave, key, value, **fields), line {node.lineno}")
+            key = node.args[3]
+            self.assertTrue(isinstance(key, ast.Constant) and isinstance(key.value, str), f"line {node.lineno}")
+            self.assertIn(key.value, wab.NOTICE_TEMPLATES, f"line {node.lineno}")
+            names = {k.arg for k in node.keywords}
+            self.assertNotIn(None, names, f"no **kwargs at line {node.lineno}")
+            self.assertTrue(names <= set(wab.NOTICE_TEMPLATES[key.value]["fields"]), f"line {node.lineno}: {names}")
+
+    # ----- docs -----
+    def test_release_docs_1_2_7(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.2\.7"\s*$')
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        m = re.search(r"(?ms)^## 1\.2\.7 — [0-9-]+\n(.*?)(?=^## )", log)
+        self.assertTrue(m, "CHANGELOG.md: the section `## 1.2.7 — <date>`")
+        self.assertIn("#83", m.group(1))
+        self.assertIn("#103", m.group(1))
+        self.assertRegex(m.group(1), r"(?i)совместимост[^\n]*внешние уведомления шаблонами без цитаты")
+
+    def test_waves_doc_names_the_naming_rule_and_the_notices(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        rule = r"(?is)имя[^\n]{0,80}цепочк[^\n]{0,300}(персональн|данн[^\n]{0,10}задач)"
+        parts = re.split(r"(?m)^#{2,4} ", waves)
+        phase_a = [p for p in parts if re.match(r"(?i)фаза [aа]", p)]
+        checklist = [p for p in parts if re.match(r"(?i)предполётн", p)]
+        self.assertTrue(phase_a, "waves.md: a section of phase A")
+        self.assertTrue(checklist, "waves.md: a section of the pre-flight checklist")
+        for body in (*phase_a, *checklist):
+            self.assertRegex(body, rule)
+        self.assertIn("telegram_quote", waves)
+        self.assertRegex(waves, r"(?m)^\|[^\n]*шаблон[^\n]*реализовано \(1\.2\.7")
 
 
 class Packaging(unittest.TestCase):
