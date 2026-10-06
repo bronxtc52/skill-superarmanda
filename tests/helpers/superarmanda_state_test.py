@@ -6689,10 +6689,22 @@ class W4MandatoryFableRoles(W4Base):
         self.fix_cycle()
         self.assertEqual(self.final()["status"], "ready_for_pr_review")
         good = self.data()
+        self.assertEqual((good["tasks"]["t1"]["fix_cycles_closed"], good["tasks"]["t1"]["task_epoch"]), (1, 7))
+
+        def snapshot(**fields):
+            return lambda t: t["results"]["final_check"].update(fields)
+
         for case, edit in {
             "no after_epoch": lambda t: t["results"]["final_check"].pop("after_epoch"),
             "task_epoch is a bool": lambda t: t.update(task_epoch=True),
             "fix_cycles_closed is a bool": lambda t: t.update(fix_cycles_closed=True),
+            # ir-5: the snapshots of the record are judged by type too — True == 1 is no match
+            "after_fix_cycles is a bool": snapshot(after_fix_cycles=True),
+            "after_epoch is a bool": lambda t: (t.update(task_epoch=1), snapshot(after_epoch=True)(t)),
+            "after_fix_cycles is a string": snapshot(after_fix_cycles="1"),
+            # a record without the snapshot while the task counter is malformed: None != None is False
+            "no after_fix_cycles and fix_cycles_closed is a string": lambda t: (
+                t.update(fix_cycles_closed="1"), t["results"]["final_check"].pop("after_fix_cycles")),
         }.items():
             with self.subTest(case=case):
                 value = json.loads(json.dumps(good))
@@ -6701,6 +6713,14 @@ class W4MandatoryFableRoles(W4Base):
                 where = self.where()
                 self.assertEqual((where["step"], where["role"]), (7, "final_check"))
                 self.assertIn("final_check", where["next_action"])
+                self.assertNotIn("done", where["next_action"])
+        # a final check over a malformed task counter is refused, not recorded with a null snapshot
+        for field in ("fix_cycles_closed", "task_epoch"):
+            with self.subTest(refused=field):
+                value = json.loads(json.dumps(good))
+                value["tasks"]["t1"][field] = True
+                self.manifest.write_text(json.dumps(value), encoding="utf-8")
+                self.record_refused("final_check", model="fable", needle=field)
         self.manifest.write_text(json.dumps(good), encoding="utf-8")
         self.assert_ready()
 

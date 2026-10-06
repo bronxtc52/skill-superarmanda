@@ -1229,21 +1229,22 @@ def final_check_gap(entry, results):
         )
     closed = fix_cycles_closed(entry)
     seen_cycles = result.get("after_fix_cycles", 0 if closed == 0 else None)
-    if seen_cycles != closed:
-        # a malformed counter (None: a bool or another non-number) never matches either
+    if closed is None or type(seen_cycles) is not int or seen_cycles != closed:
+        # judged by type as well as value: a malformed task counter (None) counts nothing, and a
+        # snapshot that is no int (a bool: True == 1, a string, a missing field) matches nothing
         return (
             "final_check was recorded before the fix cycle closed (after_fix_cycles "
-            f"{'none' if seen_cycles is None else seen_cycles} → fix_cycles_closed "
+            f"{'none' if seen_cycles is None else seen_cycles!r} → fix_cycles_closed "
             f"{'not a number' if closed is None else closed}); it counts only after the cycle "
             "closed (fix-loop --outcome pass, --defer/--accept or a role result that makes every "
             f"role pass or covered): run the final check again and record {recorded}"
         )
     epoch = task_epoch(entry)
     seen_epoch = result.get("after_epoch")
-    if seen_epoch is None or seen_epoch != epoch:
+    if epoch is None or type(seen_epoch) is not int or seen_epoch != epoch:
         return (
             "final_check recorded before later changes of the task (epoch "
-            f"{'none' if seen_epoch is None else seen_epoch} at the record, "
+            f"{'none' if seen_epoch is None else seen_epoch!r} at the record, "
             f"{'not a number' if epoch is None else epoch} now): the final check is the last record "
             f"of the task — record {recorded} again"
         )
@@ -1873,6 +1874,10 @@ def result(args):
             if isinstance(entry["results"].get(role), dict)
             and entry["results"][role].get("result_id") is not None
         }
+        for key in ("fix_cycles_closed", "task_epoch"):
+            if task_counter(entry, key) is None:
+                # no null snapshot over a malformed counter: refused, like raise_counter does
+                fail(f"task field {key} is not a number; the manifest was edited by hand")
         record["after_fix_cycles"] = fix_cycles_closed(entry)
         record["after_epoch"] = task_epoch(entry)
     elif args.role in EPOCH_ROLES:
