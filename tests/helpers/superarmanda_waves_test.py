@@ -11235,7 +11235,7 @@ class FixedAnswerPolicy(Base):
     log, decisions, owner_asked = DecisionPolicy.log, DecisionPolicy.decisions, DecisionPolicy.owner_asked
 
     def task(self, status="needs_decision", fix_cycles=2, source="tester", **results):
-        res = {role: dict({"session_id": f"s-{role}", "status": "pass", "head": self.HEAD_A}, **over)
+        res = {role: dict({"session_id": uuid.uuid4().hex, "status": "pass", "head": self.HEAD_A}, **over)
                for role, over in dict({"coder": {}, "tester": {"status": "findings"}}, **results).items()}
         return {"status": status, "fix_cycles": fix_cycles, "results": res, "session_roles": {},
                 "fix_sources": {"tester": fix_cycles}, "decisions": [], "decision_required_for": source,
@@ -11248,7 +11248,7 @@ class FixedAnswerPolicy(Base):
         wdir.mkdir(parents=True, exist_ok=True)
         path = wdir / f"run{index}" / "manifest.json"
         path.parent.mkdir(exist_ok=True)
-        doc = {"version": 2, "review_policy": {"version": S.POLICY_VERSION, "level": "standard"}, "run_id": "r",
+        doc = {"version": 2, "review_policy": {"version": S.POLICY_VERSION, "level": "medium"}, "run_id": "r",
                "head": self.HEAD_A, "tree_fingerprint": "fp", "tasks": tasks or {"T1": self.task(**task)},
                "run": {"index": index if run_index is None else run_index, "max": 5}}
         if manifest == "ok":
@@ -11377,7 +11377,7 @@ class FixedAnswerPolicy(Base):
                                              {"class": "blocked_cap", "answer": "new_run"}, {"class": "question"}])
         self.assertEqual(wab.decision_policy(cfg), [{"class": "needs_decision", "rec": "x", "answer": "invariant"},
                                                     {"class": "blocked_cap", "rec": None, "answer": "new_run"},
-                                                    {"class": "question", "rec": None, "answer": None}])
+                                                    {"class": "question", "rec": None}])
 
     # ----- end to end through the tick -----
     def test_acc02_blocked_cap_recommended_new_run_gets_invariant(self):
@@ -11397,7 +11397,7 @@ class FixedAnswerPolicy(Base):
         (text,) = self.answers()
         self.assertIn("вариант invariant.", text)
         (line,) = self.decisions(cfg)
-        self.assertRegex(line, r"^\S+ class=needs_decision answer=invariant rec=accept_limitation needs_decision T1")
+        self.assertRegex(line, r"^[0-9-]+ [0-9:]+Z class=needs_decision answer=invariant rec=accept_limitation needs_decision T1")
         self.assertIn("W1: policy auto-answer: class=needs_decision answer=invariant rec=accept_limitation", self.log(cfg))
         (note,) = [t for t in self.tg if "по политике" in t]
         self.assertIn("вариант invariant", note)
@@ -11435,6 +11435,28 @@ class FixedAnswerPolicy(Base):
         self.tick(cfg, "RUNNING")
         self.tick(cfg, self.ND.format(rec="invariant") + " ещё раз")
         self.assertEqual(len(self.answers()), 1)
+
+    def test_acc09_watch_died_between_typing_and_the_final_save_no_second_answer(self):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg)
+
+        def typed_then_watch_dies(name, text, on_typed=None, **kw):
+            self.sent.append(("text", name, text))
+            on_typed()  # the save of `pending_enter`: the fork key in flight rides in the same save
+            raise KeyboardInterrupt
+        with mock.patch.object(wab, "send_text", typed_then_watch_dies):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick(cfg, self.ND.format(rec="invariant"))
+        w = wab.load_state(cfg)["waves"]["W1"]  # a new watch reads state.json
+        self.assertEqual(w["policy_key_pending"]["key"], ["W1", cfg["run_id"], 1, "T1", "needs_decision", "tester"])
+        self.assertEqual(w["policy_pending"], self.ND.format(rec="invariant"))
+        self.assertNotIn("policy_keys", w)
+        self.tick(cfg, "RUNNING")  # the wave took the typed answer (or not): charged, the key stays in flight
+        st = self.tick(cfg, self.ND.format(rec="cut_surface"))  # the same fork, a new episode
+        self.assertEqual(len(self.answers()), 1)
+        (ask,) = self.owner_asked()
+        self.assertIn("уже получила автоответ", ask)
+        self.assertEqual(wab.auto_answers_used(st["waves"]["W1"]), 1)
 
     def test_acc08_acc10_acc11_refusal_reaches_the_owner_with_the_reason(self):
         for name, kw, part in [("two", {"tasks": {"T1": self.task(), "T2": self.task()}}, "задач в статусе needs_decision: 2"),
@@ -11519,7 +11541,7 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(self.answers(), ["[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант cut_surface. Действуй по своей "
                                           "рекомендации, затем запиши RUNNING в status. Находки low/P3 — fix-loop --defer в остаток."])
         (line,) = self.decisions(cfg)
-        self.assertRegex(line, r"^\S+ class=needs_decision rec=cut_surface needs_decision T1")
+        self.assertRegex(line, r"^[0-9-]+ [0-9:]+Z class=needs_decision rec=cut_surface needs_decision T1")
         self.assertIn("W1: policy auto-answer: class=needs_decision rec=cut_surface\n", self.log(cfg) + "\n")
         self.assertNotIn("answer=", line + self.log(cfg))
         (note,) = [t for t in self.tg if "по политике" in t]
