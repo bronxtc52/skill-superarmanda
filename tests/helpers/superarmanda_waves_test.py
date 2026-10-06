@@ -11501,9 +11501,10 @@ class FixedAnswerPolicy(Base):
         shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)
         self.fork(cfg, index=2)
         status = self.ND.format(rec="x")
-        key = self.decide(cfg)["key"]
+        first = self.decide(cfg, status=status)
+        key = first["key"]
         self.assertEqual(key, ["W1", cfg["run_id"], 2, "T1", "needs_decision", "tester"])
-        pend = {"key": key, "status": status, "text": "t"}
+        pend = {"key": key, "status": status, "text": first["text"]}  # what the decision typed
         for name, w, ok in [
                 ("acc07 the key is answered", {"policy_keys": [key]}, False),
                 ("acc09 answered in an archived attempt (the wave restarted)", {"attempts": [{"policy_keys": [key]}]}, False),
@@ -11535,6 +11536,25 @@ class FixedAnswerPolicy(Base):
                 got = self.decide(cfg, w=w, status=status)
                 self.assertFalse(got["ok"], got)
                 self.assertIn("отметки автоответов в state.json испорчены", got["reason"])
+        # ----- Codex P1 on #99: the Enter-only retry is the full machine check again, and the SAME decision -----
+        typed = dict(retry, policy_key_pending=pend)
+        self.assertEqual(self.decide(cfg, w=typed, status=status), first)  # nothing changed: the typed answer
+        for name, kw, over, part in [
+                ("a readiness role became unavailable", {"base": "quota", "index": 2}, {}, "роль second_reviewer"),
+                ("the manifest is gone", {"index": 2, "manifest": "missing"}, {}, "несуществующий файл"),
+                ("another run was opened: another key", {"index": 3}, {}, "не совпадает с напечатанным"),
+                ("fix-loop 3/3 on the last run", {"index": 2, "edit": capped}, {"max_runs": 2}, "потолок прогонов исчерпан (2/2)"),
+                ("the typed text is not the decision's", {"index": 2}, {"text": "t"}, "не совпадает с напечатанным"),
+                ("the typed text is not a string", {"index": 2}, {"text": None}, "не совпадает с напечатанным")]:
+            with self.subTest(name):
+                shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)
+                self.fork(cfg, **kw)
+                w = dict(typed, policy_key_pending=dict(pend, **{k: v for k, v in over.items() if k == "text"}))
+                got = self.decide(dict(cfg, **{k: v for k, v in over.items() if k != "text"}), w=w, status=status)
+                self.assertFalse(got["ok"], got)
+                self.assertIn("состояние развилки изменилось после ввода ответа: ", got["reason"])
+                self.assertIn(part, got["reason"])
+                self.assertNotIn("гонка", got["reason"])  # never the wave's text
 
     def test_m1_the_text_names_only_what_the_wave_can_execute(self):
         """Every allowed (class × answer × «a new run is needed»): one line, one decision. `fix-loop --decision`
@@ -11669,6 +11689,68 @@ class FixedAnswerPolicy(Base):
         (ask,) = self.owner_asked()
         self.assertIn("уже получила автоответ", ask)
         self.assertEqual(wab.auto_answers_used(st["waves"]["W1"]), 1)
+
+    # ----- Codex P1 on #99: a typed answer waiting for its Enter is re-checked before the Enter -----
+    def typed_awaiting_enter(self, base="nd", index=1, rec="invariant"):
+        """A fixed answer typed, its Enter not confirmed (the watch died right after the text, as in acc09);
+        the screen still shows the text."""
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg, base=base, index=index)
+        status = (self.BC if base == "blocked" else self.ND).format(rec=rec)
+
+        def typed_then_watch_dies(name, text, on_typed=None, **kw):
+            self.sent.append(("text", name, text))
+            on_typed()
+            raise KeyboardInterrupt
+        with mock.patch.object(wab, "send_text", typed_then_watch_dies):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tick(cfg, status)
+        w = wab.load_state(cfg)["waves"]["W1"]
+        self.assertEqual((w["pending_enter"], w["policy_pending"]), ("policy answer", status))
+        self.ansi = live("19-folded.ansi")
+        return cfg, w["policy_key_pending"]["key"]
+
+    def refused_after_typing(self, cfg, key, *parts):
+        w = self.tick(cfg)["waves"]["W1"]
+        self.tick(cfg)
+        self.assertEqual(self.enters, [])  # the Enter of the typed answer is never pressed
+        self.assertEqual(len(self.answers()), 1)  # and nothing is typed again
+        self.assertEqual(len(self.clear_keys), 1)
+        self.assertIn("input cleared: policy answer", self.log(cfg))
+        self.assertNotIn("pending_enter", w)
+        self.assertNotIn("policy_pending", w)
+        self.assertNotIn("policy_key_pending", w)
+        self.assertEqual(w["policy_keys"], [key])  # it may have gone out: the fork counts as answered
+        self.assertEqual(wab.auto_answers_used(w), 1)  # and is charged
+        self.assertEqual(self.decisions(cfg), [])
+        (ask,) = self.owner_asked()
+        for part in ("состояние развилки изменилось после ввода ответа", *parts):
+            self.assertIn(part, ask)
+        self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
+
+    def test_p1_a_role_unavailable_after_typing_gets_no_enter_and_goes_to_the_owner(self):
+        cfg, key = self.typed_awaiting_enter()
+        self.fork(cfg, base="quota")  # the readiness role wrote `unavailable` on the current HEAD meanwhile
+        self.refused_after_typing(cfg, key, "роль second_reviewer")
+
+    def test_p1_max_runs_lowered_after_typing_gets_no_enter_and_goes_to_the_owner(self):
+        cfg, key = self.typed_awaiting_enter(base="blocked", index=2, rec="new_run")
+        cfg["max_runs"] = 2  # the owner lowered it in chain.json (the watch re-reads it live)
+        self.refused_after_typing(cfg, key, "потолок прогонов исчерпан (2/2)")
+
+    def test_p1_guard_nothing_changed_the_enter_only_retry_goes_through(self):
+        cfg, key = self.typed_awaiting_enter()
+        w = self.tick(cfg)["waves"]["W1"]
+        self.tick(cfg)
+        self.assertEqual(self.enters, ["wv-w1"])
+        self.assertEqual(len(self.answers()), 1)  # typed once, only its Enter was owed
+        self.assertEqual(self.clear_keys, [])
+        self.assertEqual(len(self.decisions(cfg)), 1)
+        self.assertEqual(wab.auto_answers_used(w), 1)
+        self.assertEqual(w["policy_keys"], [key])
+        self.assertNotIn("policy_key_pending", w)
+        self.assertNotIn("pending_enter", w)
+        self.assertEqual(self.owner_asked(), [])
 
     def test_acc08_acc10_acc11_refusal_reaches_the_owner_with_the_reason(self):
         for name, kw, part in [("two", {"edit": self.two}, "задач в статусе needs_decision: 2"),
