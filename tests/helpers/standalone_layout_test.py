@@ -260,14 +260,13 @@ class ReleaseFableRolesDocs(unittest.TestCase):
     RULE = "обязательны в применимых случаях"
     MODEL_COMMANDS = ("`/model`", "`claude --model claude-fable-5-1`")
 
-    def test_release_1_2_3_is_versioned_and_names_the_accepted_limitation(self):
-        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.3"?$')
+    def test_release_1_2_3_names_the_accepted_limitation(self):
+        # the version of SKILL.md and the newest section moved on to 1.2.4 (ReleaseMandatoryFableRolesDocs)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         sections = re.split(r"(?m)^## ", changelog)
         section = next((s for s in sections if s.startswith("1.2.3 — 2026-10-05")), None)
         self.assertIsNotNone(section, "CHANGELOG has no section 1.2.3")
-        self.assertEqual(sections.index(section), 1, "1.2.3 must be the newest section")
-        self.assertTrue(sections[2].startswith("1.2.2 — "), "1.2.2 follows 1.2.3")
+        self.assertTrue(sections[sections.index(section) + 1].startswith("1.2.2 — "), "1.2.2 follows 1.2.3")
         self.assertIn("#86", section)
         items = flat(section).split(" - ")
         limitation = next((l for l in items if "Принятое ограничение" in l), "")
@@ -359,6 +358,73 @@ class ReleaseFableRolesDocs(unittest.TestCase):
         for needle in ("согласованно вычищен", "след", "одним ревью", "под пином", "`version: 2`"):
             with self.subTest(border=needle):
                 self.assertIn(needle, border)
+
+
+class ReleaseMandatoryFableRolesDocs(unittest.TestCase):
+    """1.2.4 (W4, #86): `internal_reviewer` and `final_check` are machine-checked for a high-risk task and in
+    the merge gate of a high wave; the obligation is a version of the review policy in the manifest."""
+
+    def test_release_1_2_4_is_versioned_and_names_the_compatibility_boundary(self):
+        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.4"?$')
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        sections = re.split(r"(?m)^## ", changelog)
+        section = next((s for s in sections if s.startswith("1.2.4 — 2026-10-05")), None)
+        self.assertIsNotNone(section, "CHANGELOG has no section 1.2.4")
+        self.assertEqual(sections.index(section), 1, "1.2.4 must be the newest section")
+        self.assertTrue(sections[2].startswith("1.2.3 — "), "1.2.3 follows 1.2.4")
+        self.assertIn("#86", section)
+        boundary = next((l for l in flat(section).split(" - ") if "Граница совместимости" in l), "")
+        for needle in ("`review_policy.version`", "`1.2.1`", "`1.2.4`", "`internal_reviewer`", "`final_check`",
+                       "`version: 1`", "гейт", "новый прогон"):
+            with self.subTest(boundary=needle):
+                self.assertIn(needle, boundary)
+
+    def test_skill_and_workflow_say_the_two_roles_are_machine_checked(self):
+        skill = flat(doc("SKILL.md"))
+        workflow = flat(doc("references/workflow.md"))
+        for name, text in (("SKILL.md", skill), ("references/workflow.md", workflow)):
+            for needle in ("`internal_reviewer`", "`final_check`", "1.2.4", "до первого внешнего пакета",
+                           "новый прогон"):
+                with self.subTest(doc=name, needle=needle):
+                    self.assertIn(needle, text)
+        # the accepted limitation of 1.2.3 is gone: the obligation is no longer promised for later
+        self.assertNotIn("следующая волна W4", workflow)
+        self.assertNotIn("До неё результаты всех пяти ролей", workflow)
+        for needle in ("`internal_review`", "`after_reviews`", "`review_policy.version`", "`1.2.1`",
+                       "`external_review.head`", "после последнего ревью задачи"):
+            with self.subTest(workflow=needle):
+                self.assertIn(needle, workflow)
+        self.assertNotIn("гейт мерджа эту запись не требует", flat(doc("references/pr-review.md")))
+
+    def test_waves_doc_and_protocol_describe_the_roles_in_the_gate(self):
+        text = doc("references/waves.md")
+        table = text.split("## Что реализовано", 1)[1].split("## Фаза A", 1)[0]
+        row = next((l for l in table.splitlines() if "1.2.4; #86" in l), "")
+        for needle in ("`internal_reviewer`", "`final_check`", "`1.2.1`", "новый прогон"):
+            with self.subTest(row=needle):
+                self.assertIn(needle, row)
+        gate = flat(text.split("### Гейт мерджа: `merge_gate: auto`", 1)[1].split("\n### ", 1)[0])
+        for needle in ("`internal_reviewer`", "`final_check`", "`review_policy.version`", "`1.2.1`",
+                       "новый прогон волны"):
+            with self.subTest(gate=needle):
+                self.assertIn(needle, gate)
+        protocol = flat(doc("scripts/waves/PROTOCOL.md"))
+        for needle in ("`internal_reviewer`", "`final_check`", "гейт", "до первого внешнего"):
+            with self.subTest(protocol=needle):
+                self.assertIn(needle, protocol)
+
+    def test_remainder_of_w3_one_decision_per_result_and_the_architect_report_of_a_wave(self):
+        briefs = flat(doc("references/role-briefs.md"))
+        workflow = flat(doc("references/workflow.md"))
+        waves = flat(doc("references/waves.md"))
+        for name, text in (("role-briefs.md", briefs), ("workflow.md", workflow)):
+            for needle in ("одно решение на результат", "результат целиком", "`--outcome failed`"):
+                with self.subTest(doc=name, needle=needle):
+                    self.assertIn(needle, text)
+        for name, text in (("role-briefs.md", briefs), ("workflow.md", workflow), ("waves.md", waves)):
+            with self.subTest(doc=name, needle="architect.md"):
+                self.assertIn("`<run_dir>/plan-review/architect.md`", text)
+                self.assertRegex(text, r"`task-result`[^.]*не требуется|запись `task-result`[^.]*не требуется")
 
 
 if __name__ == "__main__":

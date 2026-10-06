@@ -297,9 +297,10 @@ def _shape_problems(manifest, tasks):
         for field, kind in _TASK_FIELD_TYPES.items():
             if field in entry and not isinstance(entry[field], kind):
                 out.append(f"manifest: задача {name}: поле {field} не {'список' if kind is list else 'объект'}")
-        cycles = entry.get("fix_cycles")
-        if "fix_cycles" in entry and (isinstance(cycles, bool) or not isinstance(cycles, int)):
-            out.append(f"manifest: задача {name}: поле fix_cycles не число")
+        for field in ("fix_cycles", "fix_cycles_closed", "task_epoch"):
+            cycles = entry.get(field)
+            if field in entry and (isinstance(cycles, bool) or not isinstance(cycles, int)):
+                out.append(f"manifest: задача {name}: поле {field} не число")
     return out
 
 
@@ -392,6 +393,7 @@ def _policy_problems(manifest, tasks, plan_risk):
             source = next(text for text, risk in known.items() if risk == "high")
             problems.append(f"волна high по {source}, а review_policy.level в manifest — {level}: уровень "
                             f"занижен; нужен {NEW_RUN} (`--from-plan` берёт риск волны)")
+        problems += _old_policy_problems(manifest, tasks, wave_risk)
         return problems, 2, wave_risk
     problems = []
     traces = _v2_traces(manifest, tasks)
@@ -404,10 +406,31 @@ def _policy_problems(manifest, tasks, plan_risk):
     return problems, 1, plan_risk
 
 
-def _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk):
+def _old_policy_problems(manifest, tasks, wave_risk):
+    """A manifest of a review policy that does not ask a high-risk task for `internal_reviewer` and
+    `final_check` (1.2.1, written by 1.2.1-1.2.3) where this gate does: the wave is high, or a task has the
+    high policy level in any wave. The version of the policy in the manifest never weakens the gate: such a
+    run was led by the old rules, so the answer is a new run, not the records added afterwards. Below high
+    without high tasks the old policy asks for the same as the new one: judged as before."""
+    version = state.policy_version(manifest)
+    if version in state.MANDATORY_ROLES_POLICIES:
+        return []
+    high = [name for name, entry in sorted(tasks.items())
+            if isinstance(entry, dict) and state.task_risk(manifest, entry) == "high"]
+    if wave_risk != "high" and not high:
+        return []
+    why = "волна high" if wave_risk == "high" else f"задача high ({', '.join(high)})"
+    return [f"manifest: политика ревью {version} (`review_policy.version`) не требует `internal_reviewer` и "
+            f"`final_check`, а {why}: прогон шёл по старым правилам; нужен {NEW_RUN}"]
+
+
+def _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk, policy):
     """A task judged as high (the wave is high by the plan, or the task's own policy is): both task reviews on
     HEAD and the rules of state.py over them (high_risk_gaps: models, verified reports, the pair, the quota
-    evidence of Opus, findings and a Fable review kept by review_history). Never the saved status."""
+    evidence of Opus, findings and a Fable review kept by review_history; fable_role_gaps of the policy 1.2.4:
+    the internal review before the first external packet and the final check as the last word of the task: after
+    the last task review, after the last closed fix cycle and after every other record of the task, task_epoch).
+    Never the saved status."""
     why = "волна high" if wave_risk == "high" else "задача high"
     problems = []
     second = results.get("second_reviewer")
@@ -423,6 +446,9 @@ def _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk):
                                         head, cwd_fingerprint)
         for role, gap in sorted(state.high_risk_gaps(entry, current, head).items()):
             problems.append(f"задача {name}: {role} ({why}): {gap}")
+        for role, gap in sorted(state.fable_role_gaps(entry, current, head, policy).items()):
+            action = f"; нужен {NEW_RUN}" if gap.startswith(state.NEW_RUN_REQUIRED) else ""
+            problems.append(f"задача {name}: {role} ({why}): {gap}{action}")
         history = entry.get("review_history")
         known = {item.get("result_sha256") for item in history if isinstance(item, dict) and item.get("head") == head} \
             if isinstance(history, list) else set()
@@ -464,6 +490,7 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
     problems += policy
     if version is None:
         return problems
+    review_policy = state.policy_version(manifest) if version == 2 else None  # the rules the manifest is judged by
     if not cwd_fingerprint:
         problems.append("отпечаток дерева рабочей копии не получен")
     for name, entry in sorted(tasks.items()):
@@ -477,12 +504,14 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
         risk = None if version == 1 else "high" if wave_risk == "high" else state.task_risk(manifest, entry)
         if status != "ready_for_pr_review" and not _needs_fix_explained(entry, review, head, cwd_fingerprint):
             problems.append(f"задача {name}: статус {status} (цикл исправлений не завершён)")
-        elif version == 2 and status == "ready_for_pr_review" and not _ready_by_state(entry, results, risk, head):
+        elif version == 2 and status == "ready_for_pr_review" and not _ready_by_state(entry, results, risk, head, review_policy):
             problems.append(f"задача {name}: статус ready_for_pr_review не подтверждён пересчётом по правилам "
                             f"state.py (риск {risk}); гейт не верит сохранённому статусу")
         for role, other in sorted(results.items()):  # github_codex_review, coderabbit, ...
             if (role not in ("coder", "tester", "cross_provider_reviewer") and isinstance(other, dict)
-                    # the Fable subagent roles are records in 1.2.3: no part of the gate (their obligation is 1.2.4)
+                    # the Fable subagent roles are records here. `internal_reviewer` and `final_check` of a task
+                    # judged as high are judged below by state.fable_role_gaps (policy 1.2.4), with a reason
+                    # that names the action; a manifest of the policy 1.2.1 there is refused as a whole
                     and role not in state.FABLE_ROLES
                     and other.get("head") == head and other.get("status") != "pass"
                     and not (role == "coderabbit" and other.get("status") == "unavailable")
@@ -492,7 +521,7 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
                     and not _covered(entry, role, other)):
                 problems.append(f"задача {name}: {role} {other.get('status')}")
         if risk == "high":
-            problems += _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk)
+            problems += _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk, review_policy)
         elif version == 2 and _high_traces(name, entry, results):
             problems.append(f"задача {name}: несёт записи политики high ({', '.join(_high_traces(name, entry, results))}), "
                             f"а её риск в manifest — {risk}: риск задачи или review_policy.level понижен вручную; "
@@ -521,12 +550,12 @@ def _as_list(value):
     return value if isinstance(value, list) else []
 
 
-def _ready_by_state(entry, results, risk, head):
+def _ready_by_state(entry, results, risk, head, policy):
     """state.task_ready over the manifest's records: the readiness rule of state.py itself, not a copy.
     Records it cannot read are «not ready»."""
     try:
         return state.task_ready(dict(entry, results={r: v for r, v in results.items() if isinstance(v, dict)}),
-                                risk, head)
+                                risk, head, policy)
     except Exception:  # noqa: BLE001 - fail closed
         return False
 

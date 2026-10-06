@@ -2630,7 +2630,7 @@ class WavesContract(unittest.TestCase):
         )
         # 1.2.1 (#86): new manifests are version 2; the wave's risk is the policy level
         self.assertEqual(data["version"], 2)
-        self.assertEqual(data["review_policy"], {"version": "1.2.1", "level": selected["risk"]})
+        self.assertEqual(data["review_policy"], {"version": "1.2.4", "level": selected["risk"]})
         self.assertEqual(data["base"], self.base)
 
     # T1: init --expect-sha256 pins the approved plan bytes
@@ -4311,9 +4311,29 @@ class PolicyBase(unittest.TestCase):
         report = self.report(profile, mode)
         return self.record(role, status, **self.review_flags(report, **flags)), report
 
-    def code_and_test(self, model="fable"):
+    def code_and_test(self, model="fable", internal=True):
+        """Everything of a task before its external review packet. Since the review policy 1.2.4 that
+        includes the internal Fable review of this HEAD (mandatory for a high-risk task, a mere record
+        below high)."""
         self.record("coder", model=model)
         self.record("tester", model=model)
+        if internal:
+            self.record("internal_reviewer", model="fable")
+
+    def ready_after_final_check(self):
+        """Review policy 1.2.4: with everything else counted a high-risk task is not ready yet and waits
+        for the final check alone (`where` names it); the final check makes it ready. Returns the entry."""
+        self.assertEqual(self.entry()["status"], "in_progress")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (7, "final_check"), where["next_action"])
+        entry = self.final_check()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        return entry
+
+    def final_check(self, status="pass", task=None):
+        """The final Fable check after the task reviews: the last step of readiness of a high-risk task
+        under the review policy 1.2.4."""
+        return self.record("final_check", status, model="fable", task=task)
 
     def edited(self, report, **changes):
         """A copy of a review.py report with the named top-level fields replaced (None removes)."""
@@ -4338,17 +4358,17 @@ class RiskPolicyManifest(PolicyBase):
 
     def test_init_writes_version_2_with_policy_level_and_version(self):
         self.assertEqual(self.data()["version"], 2)
-        self.assertEqual(self.data()["review_policy"], {"version": "1.2.1", "level": "high"})
+        self.assertEqual(self.data()["review_policy"], {"version": "1.2.4", "level": "high"})
         self.manifest.unlink()
         printed = self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head())
-        self.assertEqual(printed["review_policy"], {"version": "1.2.1", "level": "low"})
+        self.assertEqual(printed["review_policy"], {"version": "1.2.4", "level": "low"})
         self.assertEqual(self.data()["version"], 2)
         for risk in ("low", "medium", "high"):
             with self.subTest(wave_risk=risk):
                 self.manifest.unlink()
                 self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head(),
                         "--from-plan", self.write_plan(risk))
-                self.assertEqual(self.data()["review_policy"], {"version": "1.2.1", "level": risk})
+                self.assertEqual(self.data()["review_policy"], {"version": "1.2.4", "level": risk})
                 self.assertEqual(self.data()["version"], 2)
 
     def test_init_refuses_risk_with_from_plan_and_unknown_risk(self):
@@ -4408,7 +4428,7 @@ class RiskPolicyManifest(PolicyBase):
                 with self.subTest(level=level, role=role):
                     answer = self.ok("role-model", "--task", "t1", "--role", role)
                     self.assertEqual(answer, {"task": "t1", "role": role, "risk": level, "model": model,
-                                              "policy_version": "1.2.1"})
+                                              "policy_version": "1.2.4"})
             self.assertEqual(self.manifest.read_bytes(), before, "role-model is read-only")
         # a task raised to high inside a low run gets Fable; its neighbour keeps Sonnet
         self.ok("task-risk", "--task", "t1", "--risk", "high")
@@ -4523,6 +4543,8 @@ class HighRiskModels(PolicyBase):
         self.init(risk="medium")
         self.record("coder", model="sonnet")
         self.record("tester")
+        # 1.2.4: the internal review counts only before the first external packet, at any risk
+        self.record("internal_reviewer", model="fable")
         self.review("cross_provider_reviewer", "claude-host")
         self.assertEqual(self.entry()["status"], "ready_for_pr_review")
         raised = self.ok("task-risk", "--task", "t1", "--risk", "high")
@@ -4531,12 +4553,12 @@ class HighRiskModels(PolicyBase):
         self.assertEqual((where["step"], where["role"]), (4, "coder"))
         self.assertIn(FABLE, where["next_action"])
         self.assertIn(SONNET, where["next_action"])
-        # redoing the roles on Fable and adding both verified reviews makes it ready again
+        # redoing the roles on Fable and adding both verified reviews and the final check makes it ready again
         self.code_and_test()
         self.assertEqual(self.where()["role"], "cross_provider_reviewer")  # recorded without a verified report
         self.review("cross_provider_reviewer", "claude-host")
         self.review("second_reviewer", "codex-host")
-        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.ready_after_final_check()
 
 
 class HighRiskReviews(PolicyBase):
@@ -4549,7 +4571,7 @@ class HighRiskReviews(PolicyBase):
         where = self.where()
         self.assertEqual((where["step"], where["role"]), (5, "second_reviewer"))
         entry, fable = self.review("second_reviewer", "codex-host")
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         for role, profile, report in (("cross_provider_reviewer", "claude-host", astra),
                                       ("second_reviewer", "codex-host", fable)):
             stored = entry["results"][role]
@@ -4560,10 +4582,11 @@ class HighRiskReviews(PolicyBase):
             self.assertEqual(stored["packet_hash"], self.packet_hash)
         where = self.where()
         self.assertEqual((where["step"], where["role"]), (7, "github_codex_review"))
-        self.assertEqual(where["review_policy"], {"version": "1.2.1", "level": "high"})
+        self.assertEqual(where["review_policy"], {"version": "1.2.4", "level": "high"})
         self.assertEqual({a["role"]: a["profile"] for a in where["artifacts"]},
-                         {"coder": None, "tester": None, "cross_provider_reviewer": "claude-host",
-                          "second_reviewer": "codex-host"})
+                         {"coder": None, "tester": None, "internal_reviewer": None,
+                          "cross_provider_reviewer": "claude-host", "second_reviewer": "codex-host",
+                          "final_check": None})
         self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
         self.assertIn("done", self.where()["next_action"])
 
@@ -4571,7 +4594,7 @@ class HighRiskReviews(PolicyBase):
         self.code_and_test()
         self.review("cross_provider_reviewer", "codex-host")
         entry, _ = self.review("second_reviewer", "claude-host")
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
 
     def test_two_astra_reviews_or_fable_without_astra_do_not_pass(self):
         for profile in ("claude-host", "codex-host"):
@@ -4641,7 +4664,7 @@ class HighRiskReviews(PolicyBase):
                          ("codex-host", "error", "quota"))
         opus = self.report("codex-host-opus")
         entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         stored = entry["results"]["second_reviewer"]
         self.assertEqual(stored["profile"], "codex-host-opus")
         self.assertEqual(stored["fallback_for"], "codex-host")
@@ -4691,7 +4714,7 @@ class HighRiskReviews(PolicyBase):
         self.assertNotIn("second_reviewer", self.entry()["results"])
         # a stored Opus result that lost its evidence is not a second review either
         self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
-        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.ready_after_final_check()
         value = self.data()
         del value["tasks"]["t1"]["results"]["second_reviewer"]["quota_evidence"]
         self.manifest.write_text(json.dumps(value), encoding="utf-8")
@@ -4718,7 +4741,7 @@ class HighRiskReviews(PolicyBase):
             with self.subTest(mode=mode):
                 quota = self.report("codex-host", mode)
                 entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
-                self.assertEqual(entry["status"], "ready_for_pr_review")
+                entry = self.ready_after_final_check()
 
     def test_report_must_agree_with_its_profile_and_one_review_cannot_fill_both_roles(self):
         """tester-1 F2: relabelling one field of a report, or reusing one review, is refused."""
@@ -4752,7 +4775,7 @@ class HighRiskReviews(PolicyBase):
                 self.record_refused("second_reviewer", **self.review_flags(report))
         self.assertEqual(self.entry()["status"], "in_progress")
         entry = self.record("second_reviewer", **self.review_flags(fable))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         # readiness names it too, should two results of one review ever sit in a manifest
         value = self.data()
         results = value["tasks"]["t1"]["results"]
@@ -4796,7 +4819,7 @@ class HighRiskReviews(PolicyBase):
         self.review("cross_provider_reviewer", "claude-host")
         self.record("second_reviewer", "error", artifact=str(quota))
         entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
 
     def test_open_findings_of_a_review_are_not_replaced_without_a_disposition(self):
         """A second run of the same profile on the same HEAD cannot wipe findings of a high-risk task."""
@@ -4816,7 +4839,7 @@ class HighRiskReviews(PolicyBase):
         self.ok("fix-loop", "--task", "t1", "--accept", "--source", "second_reviewer",
                 "--severity", "low", "--note", "false positive: context was missing")
         entry = self.record("second_reviewer", **self.review_flags(clean))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         # after a fix the HEAD is new: resume drops the findings and the cycle goes on
         self.review("second_reviewer", "codex-host", "findings", status="findings")
         self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
@@ -4825,8 +4848,8 @@ class HighRiskReviews(PolicyBase):
         self.code_and_test()
         self.packet()
         self.review("cross_provider_reviewer", "claude-host")
-        entry, _ = self.review("second_reviewer", "codex-host")
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.review("second_reviewer", "codex-host")
+        entry = self.ready_after_final_check()
         # below high, and so for 1.2.0 manifests, a rerun replaces findings as before
         self.init(risk="medium")
         self.record("coder")
@@ -4920,7 +4943,7 @@ class HighRiskReviews(PolicyBase):
                                                              **{"claude-haiku-4-5-20251001": {"inputTokens": 1}}))
         self.record("cross_provider_reviewer", **self.review_flags(astra))
         entry = self.record("second_reviewer", **self.review_flags(ancillary))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
 
     def opus_report(self):
         # its own session: the CLI doubles give Fable and Opus one session id
@@ -4963,7 +4986,7 @@ class HighRiskReviews(PolicyBase):
                 quota = self.report("codex-host", "quota_failure")
                 entry = self.record("second_reviewer",
                                     **self.review_flags(self.opus_report(), quota_evidence=str(quota)))
-                self.assertEqual(entry["status"], "ready_for_pr_review")
+                entry = self.ready_after_final_check()
                 self.assertEqual(self.where()["accepted_limitations"], [])
 
     def test_open_findings_survive_resume_there_and_back(self):
@@ -4998,7 +5021,7 @@ class HighRiskReviews(PolicyBase):
                            "--severity", "medium", "--note", "known limitation")
         self.assertEqual(accepted["status"], "in_progress")
         entry = self.record("second_reviewer", **self.review_flags(clean))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         self.assertEqual((entry["fix_cycles"], len(entry["acceptances"])), (0, 1))
         where = self.where()
         self.assertEqual([(a["source"], a["severity"]) for a in where["accepted_limitations"]],
@@ -5019,7 +5042,7 @@ class HighRiskReviews(PolicyBase):
         self.packet()
         self.review("cross_provider_reviewer", "claude-host")
         entry, _ = self.review("second_reviewer", "codex-host")
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         history = entry["review_history"]
         self.assertEqual([(h["role"], h["status"], h["profile"]) for h in history], [
             ("cross_provider_reviewer", "pass", "claude-host"), ("second_reviewer", "incomplete", None),
@@ -5145,13 +5168,15 @@ class HighRiskReviews(PolicyBase):
         self.assertIn("--source second_reviewer", where["next_action"])
         deferred = self.ok("fix-loop", "--task", "t1", "--defer", "--source", "second_reviewer",
                            "--note", "low: wording -> next wave")
-        self.assertEqual(deferred["status"], "ready_for_pr_review")
+        self.assertEqual(deferred["status"], "in_progress")  # 1.2.4: the final check is still owed
+        self.ready_after_final_check()
         # a rerun is another result: the deferral does not cover it
         entry, _ = self.review("second_reviewer", "codex-host", "findings", status="findings")
         self.assertEqual(entry["status"], "in_progress")
         accepted = self.ok("fix-loop", "--task", "t1", "--accept", "--source", "second_reviewer",
                            "--severity", "medium", "--note", "accepted limitation")
-        self.assertEqual(accepted["status"], "ready_for_pr_review")
+        self.assertEqual(accepted["status"], "in_progress")  # the review was recorded again: a new final check
+        self.ready_after_final_check()
         failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
         self.assertEqual((failed["status"], failed["fix_sources"]), ("needs_fix", {"second_reviewer": 1}))
         again = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
@@ -5178,6 +5203,7 @@ class HighRiskReviews(PolicyBase):
         quota = self.report("codex-host", "quota_failure")
         self.record("second_reviewer",
                     **self.review_flags(self.report("codex-host-opus"), quota_evidence=str(quota)))
+        self.final_check()
         self.ok("mark", "--task", "t1", "--step", "7", "--safe-point", "true")
         value = self.data()
         self.assertEqual(len(value["tasks"]["t1"]["review_history"]), 2)
@@ -5258,7 +5284,7 @@ class W2StateRules(PolicyBase):
                 self.assertNotIn("done", where["next_action"])
                 # the way out: the Fable review itself as the second review
                 entry, _ = self.review("second_reviewer", "codex-host")
-                self.assertEqual(entry["status"], "ready_for_pr_review")
+                entry = self.ready_after_final_check()
 
     def test_where_does_not_offer_the_opus_fallback_where_task_result_refuses_it(self):
         offer = "the only fallback is profile codex-host-opus"
@@ -5309,7 +5335,7 @@ class W2StateRules(PolicyBase):
         self.assertIn(offer, where["next_action"])
         entry = self.record("second_reviewer",
                             **self.review_flags(self.opus_report(), quota_evidence=str(quota)))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
 
 
 HIGH_WAVE = {"risk": "high"}
@@ -5337,10 +5363,14 @@ class W2GateRules(PolicyBase):
         return self.edited(self.report("codex-host-opus"), session_id="opus-review-session")
 
     def two_reviews(self, task=None):
+        """A complete high-risk task: since the review policy 1.2.4 the two reviews stand between the
+        internal Fable review and the final check."""
         self.record("coder", model="fable", task=task)
         self.record("tester", model="fable", task=task)
+        self.record("internal_reviewer", model="fable", task=task)
         self.record("cross_provider_reviewer", task=task, **self.review_flags(self.report("claude-host")))
-        return self.record("second_reviewer", task=task, **self.review_flags(self.report("codex-host")))
+        self.record("second_reviewer", task=task, **self.review_flags(self.report("codex-host")))
+        return self.final_check(task=task)
 
     def forge(self, edit):
         """A hand edit of the manifest (what state.py would never write)."""
@@ -5374,7 +5404,7 @@ class W2GateRules(PolicyBase):
         quota = self.report("codex-host", "quota_failure")
         opus = self.opus_report()
         entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(quota)))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
         self.assertEqual(self.problems(HIGH_WAVE), [])
         good = self.data()
         # the same Opus without the evidence
@@ -5448,6 +5478,7 @@ class W2GateRules(PolicyBase):
                 self.assert_reason(problems, "t1", "не подтверждён пересчётом")
         # with the second review it passes
         self.review("second_reviewer", "codex-host")
+        self.final_check()  # 1.2.4: and with the final check after it
         self.assertEqual(self.problems(MEDIUM_WAVE), [])
 
     def test_medium_wave_refuses_a_version_1_manifest_with_a_high_task(self):
@@ -5677,7 +5708,7 @@ class W2FixRound1State(PolicyBase):
         self.record("second_reviewer", "error", artifact=str(fresh))
         self.assertIn(offer, self.where()["next_action"])
         entry = self.record("second_reviewer", **self.review_flags(opus, quota_evidence=str(fresh)))
-        self.assertEqual(entry["status"], "ready_for_pr_review")
+        entry = self.ready_after_final_check()
 
 
 class LiveVersion1Manifests(PolicyBase):
@@ -5773,8 +5804,9 @@ EXTERNAL_REVIEW_ROLES = ("cross_provider_reviewer", "second_reviewer", "github_c
 
 
 class W3FableRoles(PolicyBase):
-    """The five Fable subagent roles: recorded only with the Fable model, and (in W3) without any
-    effect on readiness, `where` or the merge gate."""
+    """The five Fable subagent roles: recorded only with the Fable model. Their records have no effect on
+    readiness, `where` or the merge gate, except `internal_reviewer` and `final_check` of a high-risk task
+    since the review policy 1.2.4 (W4MandatoryFableRoles, W4GateRoles)."""
 
     def way_out(self, role):
         return f"task-result --role {role} --status unavailable --model fable"
@@ -5814,10 +5846,14 @@ class W3FableRoles(PolicyBase):
 
         for risk, plan in (("high", HIGH_WAVE), ("medium", MEDIUM_WAVE)):
             self.init(risk=risk)
+            # 1.2.4: the two mandatory roles of a high-risk task are part of its readiness; the other
+            # three stay records there, and all five stay records below high
+            roles = FABLE_ROLES if risk != "high" else ("architect", "triage", "investigator")
             if risk == "high":
                 self.code_and_test()
                 self.review("cross_provider_reviewer", "claude-host")
                 self.review("second_reviewer", "codex-host")
+                self.final_check()
             else:
                 self.record("coder")
                 self.record("tester")
@@ -5826,7 +5862,7 @@ class W3FableRoles(PolicyBase):
             self.assertEqual(before[0], "ready_for_pr_review")
             self.assertEqual(problems(plan), [])
             for status in ("pass", "findings", "unavailable", "error", "incomplete"):
-                for role in FABLE_ROLES:
+                for role in roles:
                     with self.subTest(risk=risk, role=role, status=status):
                         entry = self.record(role, status, model="fable")
                         self.assertEqual(entry["status"], "ready_for_pr_review")
@@ -6095,6 +6131,7 @@ class W3RemainderOfW2(PolicyBase):
         self.code_and_test()
         self.review("cross_provider_reviewer", "claude-host")
         self.review("second_reviewer", "codex-host")
+        self.final_check()
         value = self.data()
         self.assertEqual(gate.manifest_problems(value, value["head"], value["tree_fingerprint"], plan=HIGH_WAVE), [])
         bot = {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}
@@ -6115,6 +6152,1499 @@ class W3RemainderOfW2(PolicyBase):
                     verdict = gate.evaluate(facts, self.head(), forged, work, "main", plan=plan_risk)
                     self.assertEqual(verdict["verdict"], "fail")
                     self.assertTrue(any("wave.risk" in p for p in verdict["reasons"]), verdict["reasons"])
+
+
+# ---------------------------------------------------------------- 1.2.4 (W4, #86): mandatory Fable roles
+class W4Base(PolicyBase):
+    """A high-risk task of the review policy 1.2.4: the internal review before the first external packet
+    and the final check after the last task review are part of readiness."""
+
+    def built(self, task=None):
+        self.record("coder", model="fable", task=task)
+        return self.record("tester", model="fable", task=task)
+
+    def internal(self, status="pass", **flags):
+        return self.record("internal_reviewer", status, model="fable", **flags)
+
+    def final(self, status="pass", **flags):
+        return self.record("final_check", status, model="fable", **flags)
+
+    def reviews(self, task=None):
+        self.record("cross_provider_reviewer", task=task, **self.review_flags(self.report("claude-host")))
+        return self.record("second_reviewer", task=task, **self.review_flags(self.report("codex-host")))
+
+    def next_head(self):
+        self.change(f"fix {next(self.serial)}\n")
+        answer = self.resume()
+        self.packet()
+        return answer
+
+    def policy(self, version):
+        """The one documented hand edit of these tests: the version of the review policy. A manifest of
+        1.2.1-1.2.3 differs from a fresh `init` of 1.2.4 in this field alone (state.py 1.2.4 writes 1.2.4)."""
+        value = self.data()
+        value["review_policy"]["version"] = version
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+
+    def position(self):
+        where = self.where()
+        return where["step"], where["role"]
+
+    def assert_not_ready(self, *needles):
+        self.assertNotEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertNotEqual(self.ok("status")["tasks"][self.TASK]["status"], "ready_for_pr_review")
+        action = self.where()["next_action"]
+        self.assertNotIn("done", action)
+        for needle in needles:
+            self.assertIn(needle, action)
+        return action
+
+    def assert_ready(self):
+        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertEqual(self.position(), (7, "github_codex_review"))
+
+
+class W4MandatoryFableRoles(W4Base):
+    """Acceptance 2-4: `internal_reviewer` and `final_check` in the readiness of a high-risk task."""
+
+    def test_init_writes_policy_1_2_4_and_older_policy_is_still_read(self):
+        self.assertEqual(self.data()["review_policy"], {"version": "1.2.4", "level": "high"})
+        self.assertEqual(self.where()["review_policy"], {"version": "1.2.4", "level": "high"})
+        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["policy_version"], "1.2.4")
+        self.policy("1.2.1")
+        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["policy_version"], "1.2.1")
+        self.assertEqual(self.where()["review_policy"], {"version": "1.2.1", "level": "high"})
+        for unknown in ("1.2.2", "1.2.3", "1.2.5", "1.2", ""):
+            with self.subTest(version=unknown):
+                self.policy(unknown)
+                self.refused("where", needle="review_policy version")
+
+    # ----- acceptance 2 -----
+    def test_high_task_passes_only_with_internal_review_and_final_check(self):
+        self.built()
+        self.assertEqual(self.position(), (5, "internal_reviewer"))
+        self.assertIn("task-result --role internal_reviewer", self.where()["next_action"])
+        entry = self.internal()
+        self.assertEqual((entry["internal_review"]["status"], entry["internal_review"]["head"]),
+                         ("pass", self.head()))
+        self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+        entry = self.reviews()
+        self.assertEqual(entry["status"], "in_progress")
+        action = self.assert_not_ready("final_check", "task-result --role final_check")
+        self.assertEqual(self.position(), (7, "final_check"))
+        self.assertFalse(action.startswith("BLOCKED"), action)
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assert_ready()
+        self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
+        self.assertIn("done", self.where()["next_action"])
+
+    def test_high_task_without_internal_review_is_not_pass(self):
+        self.built()
+        self.reviews()
+        entry = self.final()
+        self.assertEqual(entry["status"], "in_progress")
+        self.assertNotIn("internal_review", entry)
+        action = self.assert_not_ready("internal_reviewer", "new run", "init")
+        self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+        self.assertEqual(self.where()["role"], "internal_reviewer")
+
+    def test_high_task_without_final_check_is_not_pass(self):
+        self.built()
+        self.internal()
+        self.reviews()
+        self.assert_not_ready("final_check")
+        # nothing but a final check makes it ready: not a repeated internal review, not the PR review
+        self.internal()
+        self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
+        self.assert_not_ready("final_check")
+        self.assertEqual(self.position(), (7, "final_check"))
+
+    def test_unavailable_error_or_incomplete_internal_review_is_not_pass(self):
+        for status in ("unavailable", "error", "incomplete"):
+            with self.subTest(internal_reviewer=status):
+                self.init()
+                self.built()
+                entry = self.internal(status)
+                self.assertEqual(entry["internal_review"]["status"], status)
+                # before the first external packet the requirement is still open, not lost
+                where = self.where()
+                self.assertEqual((where["step"], where["role"]), (5, "internal_reviewer"))
+                self.assertIn(status, where["next_action"])
+                self.assertNotIn("new run", where["next_action"])
+                self.reviews()
+                self.assertEqual(self.final()["status"], "in_progress")
+                action = self.assert_not_ready("internal_reviewer", status, "new run")
+                self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+
+    def test_non_pass_final_check_is_not_pass(self):
+        for status in ("unavailable", "error", "incomplete", "findings"):
+            with self.subTest(final_check=status):
+                self.init()
+                self.built()
+                self.internal()
+                self.reviews()
+                self.assertEqual(self.final(status)["status"], "in_progress")
+                action = self.assert_not_ready("final_check", status)
+                self.assertEqual(self.position(), (7, "final_check"))
+                self.assertEqual(action.startswith("BLOCKED: final_check"), status in ("unavailable", "error"), action)
+                self.assertEqual(self.final()["status"], "ready_for_pr_review")
+                # and back: a later non-pass final check takes the readiness away
+                self.assertEqual(self.final(status)["status"], "in_progress")
+                self.assert_not_ready("final_check", status)
+
+    def test_internal_findings_count_and_the_last_record_before_the_packet_decides(self):
+        # findings count: the coordinator went on with them under its own responsibility
+        self.built()
+        self.internal("unavailable")
+        self.internal("findings")
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        # the last record before the packet is `unavailable`: the earlier pass counts no more
+        self.init()
+        self.built()
+        self.internal("pass")
+        self.internal("unavailable")
+        self.reviews()
+        self.assertEqual(self.final()["status"], "in_progress")
+        self.assert_not_ready("internal_reviewer", "unavailable", "new run")
+
+    def test_medium_or_low_task_outside_high_is_ready_without_the_roles(self):
+        for risk in ("medium", "low"):
+            with self.subTest(risk=risk):
+                self.init(risk=risk)
+                self.assertEqual(self.data()["review_policy"], {"version": "1.2.4", "level": risk})
+                self.record("coder")
+                self.record("tester")
+                self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+                entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+                self.assertEqual(entry["status"], "ready_for_pr_review")
+                self.assertEqual(self.position(), (7, "github_codex_review"))
+                for role in ("internal_reviewer", "final_check"):
+                    for status in ("unavailable", "findings", "pass"):
+                        self.assertEqual(self.record(role, status, model="fable")["status"], "ready_for_pr_review")
+                self.assertEqual(self.position(), (7, "github_codex_review"))
+
+    def test_task_raised_to_high_owes_the_roles(self):
+        self.init(risk="low")
+        self.built()
+        entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(self.ok("task-risk", "--task", "t1", "--risk", "high")["status"], "in_progress")
+        self.assert_not_ready("internal_reviewer", "new run")
+        # the credit is written at any risk: an internal review before the first packet of a low task
+        # counts once the task is raised to high, and only the final check is owed then
+        self.init(risk="low")
+        self.built()
+        entry = self.internal()
+        self.assertEqual((entry["status"], entry["internal_review"]["head"]), ("in_progress", self.head()))
+        entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(self.ok("task-risk", "--task", "t1", "--risk", "high")["status"], "in_progress")
+        self.assertNotIn("new run", self.where()["next_action"])
+        self.reviews()  # the verified reports a high-risk task asks for
+        self.assertEqual(self.position(), (7, "final_check"))
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+
+    def test_fable_roles_on_high_do_not_close_an_open_fix_cycle(self):
+        """Astra round 2 (decision: invariant): on high too, a record of internal_reviewer or final_check
+        never closes an open fix cycle — needs_fix is left by fix-loop --outcome pass, a new HEAD or
+        --defer/--accept only; the honest way out goes through needs_verification."""
+        self.built()
+        self.internal()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        reviewed = self.entry()["internal_review"]["head"]
+        failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.assertEqual(failed["status"], "needs_fix")
+        before = self.where()
+        self.assertEqual((before["step"], before["role"]), (6, "coder"))
+        for role in ("internal_reviewer", "final_check"):
+            for status in ("pass", "findings", "unavailable", "error", "incomplete"):
+                with self.subTest(role=role, status=status):
+                    entry = self.record(role, status, model="fable")
+                    self.assertEqual(entry["status"], "needs_fix")
+                    self.assertEqual(entry["internal_review"]["head"], reviewed)
+                    where = self.where()
+                    self.assertEqual((where["step"], where["role"], where["next_action"], where["task_status"]),
+                                     (before["step"], before["role"], before["next_action"], "needs_fix"))
+                    self.assertEqual(self.ok("status")["tasks"]["t1"]["status"], "needs_fix")
+        # the honest way out: the fix is verified (needs_verification), then the final check closes it
+        self.init()
+        self.built()
+        self.internal()
+        self.reviews()
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        verified = self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        self.assertEqual(verified["status"], "needs_verification")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+
+    def fix_cycle(self, source="tester"):
+        """One fix cycle of t1 on the same HEAD: `source` failed (needs_fix), then fix-loop pass."""
+        failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", source)
+        self.assertEqual(failed["status"], "needs_fix")
+        return self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+
+    def test_final_check_recorded_in_an_open_fix_cycle_is_not_counted_after_it_closes(self):
+        """GitHub Codex P2 on PR #97: a final_check recorded while the fix cycle is open stays needs_fix
+        (settle_mandatory_role), but fix-loop --outcome pass must not count it either — the final check
+        counts only after the last fix cycle of the task closed (`after_fix_cycles` of the record against
+        `fix_cycles_closed` of the task), so the way out of needs_fix is always needs_verification."""
+        self.built()
+        self.internal()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.assertEqual((failed["status"], failed.get("fix_cycles_closed", 0)), ("needs_fix", 0))
+        entry = self.final()
+        self.assertEqual(entry["status"], "needs_fix")
+        verified = self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        self.assertEqual(verified["status"], "needs_verification")  # the defect: ready_for_pr_review
+        self.assertEqual(entry["results"]["final_check"]["after_fix_cycles"], 0)
+        self.assertEqual(verified["fix_cycles_closed"], 1)
+        self.assert_not_ready("final_check", "before the fix cycle closed", "task-result --role final_check")
+        self.assertEqual(self.position(), (7, "final_check"))
+        # a pass recorded again outside needs_fix closes no cycle
+        again = self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        self.assertEqual((again["status"], again["fix_cycles_closed"]), ("needs_verification", 1))
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(entry["results"]["final_check"]["after_fix_cycles"], 1)
+        self.assert_ready()
+
+    def test_final_check_recorded_before_a_fix_cycle_is_not_counted_after_it(self):
+        """The other door: the counted final_check of a ready task (recorded in in_progress, it made the
+        task ready) is older than the fix cycle that followed on the same tree; fix-loop --outcome pass
+        asks for a new one, and so does every later cycle."""
+        self.built()
+        self.internal()
+        entry = self.reviews()
+        self.assertEqual(entry["status"], "in_progress")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        verified = self.fix_cycle()
+        self.assertEqual((verified["status"], verified["fix_cycles_closed"]), ("needs_verification", 1))
+        self.assert_not_ready("final_check", "before the fix cycle closed")
+        self.assertEqual(self.position(), (7, "final_check"))
+        self.assertEqual(self.ok("status")["tasks"]["t1"]["status"], "needs_verification")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+        # the second cycle asks again (another source: two tester rounds would ask for a decision)
+        verified = self.fix_cycle("second_reviewer")
+        self.assertEqual((verified["status"], verified["fix_cycles_closed"]), ("needs_verification", 2))
+        self.assert_not_ready("final_check", "before the fix cycle closed")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+
+    def test_final_check_without_after_fix_cycles_counts_only_while_no_cycle_closed(self):
+        """Compatibility: a final_check written before `after_fix_cycles` existed counts while the task
+        closed no fix cycle (counter 0 or absent) and not after one; `resume` keeps the counter."""
+        self.built()
+        self.internal()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        value = self.data()
+        self.assertNotIn("fix_cycles_closed", value["tasks"]["t1"])  # no cycle: the counter is not written
+        del value["tasks"]["t1"]["results"]["final_check"]["after_fix_cycles"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        self.assert_ready()
+        verified = self.fix_cycle()
+        self.assertEqual((verified["status"], verified["fix_cycles_closed"]), ("needs_verification", 1))
+        self.assert_not_ready("final_check", "before the fix cycle closed")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        value = self.data()
+        del value["tasks"]["t1"]["results"]["final_check"]["after_fix_cycles"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (7, "final_check"))
+        self.assertIn("before the fix cycle closed", where["next_action"])
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+        # resume keeps the counter as it keeps fix_cycles; the next final check snapshots it
+        self.assertEqual(self.next_head()["invalidated_tasks"], ["t1"])
+        entry = self.entry()
+        self.assertEqual((entry["fix_cycles"], entry["fix_cycles_closed"]), (1, 1))
+        self.built()
+        self.reviews()
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(entry["results"]["final_check"]["after_fix_cycles"], 1)
+        self.assert_ready()
+
+    def cover(self, flag, source="cross_provider_reviewer"):
+        severity = ["--severity", "low"] if flag == "--accept" else []
+        return self.ok("fix-loop", "--task", "t1", flag, "--source", source, *severity, "--note", "low: nit")
+
+    def test_a_fix_cycle_closed_by_defer_or_accept_asks_for_a_new_final_check_on_high(self):
+        """The third door (coordinator's decision on run 2): --defer/--accept out of needs_fix close the fix
+        cycle too, so a final_check recorded during the cycle is not counted — a high task leaves needs_fix
+        through needs_verification and a new final check, never straight to ready_for_pr_review."""
+        for flag in ("--defer", "--accept"):
+            with self.subTest(cover=flag):
+                self.init()
+                self.built()
+                self.internal()
+                self.record("cross_provider_reviewer", "findings",
+                            **self.review_flags(self.report("codex-host", "findings")))
+                entry = self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+                self.assertEqual(entry["status"], "in_progress")
+                failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed",
+                                 "--source", "cross_provider_reviewer")
+                self.assertEqual(failed["status"], "needs_fix")
+                entry = self.final()
+                self.assertEqual(entry["status"], "needs_fix")
+                covered = self.cover(flag)
+                self.assertEqual(covered["status"], "needs_verification")  # the defect: ready_for_pr_review
+                self.assertEqual(covered["fix_cycles_closed"], 1)
+                self.assert_not_ready("final_check", "before the fix cycle closed", "task-result --role final_check")
+                self.assertEqual(self.position(), (7, "final_check"))
+                entry = self.final()
+                self.assertEqual(entry["status"], "ready_for_pr_review")
+                self.assertEqual(entry["results"]["final_check"]["after_fix_cycles"], 1)
+                self.assert_ready()
+
+    def test_defer_or_accept_out_of_needs_fix_without_a_final_check_closes_the_cycle(self):
+        """No final_check at all: the cover makes every role pass or covered, so it leaves needs_fix and
+        closes the cycle (the final check is no part of that question: it must FOLLOW the closing); on high
+        1.2.4 the task waits in needs_verification for its final check — never a deadlock."""
+        self.built()
+        self.internal()
+        self.record("cross_provider_reviewer", "findings",
+                    **self.review_flags(self.report("codex-host", "findings")))
+        self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "cross_provider_reviewer")
+        covered = self.cover("--defer")
+        self.assertEqual((covered["status"], covered["fix_cycles_closed"]), ("needs_verification", 1))
+        self.assertEqual(self.position(), (7, "final_check"))
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+
+    def test_defer_or_accept_out_of_needs_fix_stays_ready_below_high_and_under_1_2_1(self):
+        """Below high and under the policy 1.2.1 the cover out of needs_fix gives ready_for_pr_review as
+        before: the roles are no part of readiness there. The counter still grows (a task may be raised)."""
+        for risk, policy in (("medium", "1.2.4"), ("high", "1.2.1")):
+            for flag in ("--defer", "--accept"):
+                with self.subTest(risk=risk, policy=policy, cover=flag):
+                    self.init(risk=risk)
+                    self.policy(policy)
+                    if risk == "high":
+                        self.built()
+                        self.record("cross_provider_reviewer", "findings",
+                                    **self.review_flags(self.report("codex-host", "findings")))
+                        self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+                    else:
+                        self.record("coder")
+                        self.record("tester")
+                        self.record("cross_provider_reviewer", "findings", reviewed_head=self.head(),
+                                    packet_hash="ab12" * 16)
+                    failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed",
+                                     "--source", "cross_provider_reviewer")
+                    self.assertEqual(failed["status"], "needs_fix")
+                    covered = self.cover(flag)
+                    self.assertEqual((covered["status"], covered["fix_cycles_closed"]), ("ready_for_pr_review", 1))
+                    # a cover that does not make the task ready (another role still findings) leaves
+                    # needs_fix and closes nothing
+                    self.init(risk=risk)
+                    self.policy(policy)
+                    if risk == "high":
+                        self.record("coder", model="fable")
+                        self.record("tester", "findings", model="fable")
+                        self.record("cross_provider_reviewer", "findings",
+                                    **self.review_flags(self.report("codex-host", "findings")))
+                        self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+                    else:
+                        self.record("coder")
+                        self.record("tester", "findings")
+                        self.record("cross_provider_reviewer", "findings", reviewed_head=self.head(),
+                                    packet_hash="ab12" * 16)
+                    failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed",
+                                     "--source", "cross_provider_reviewer")
+                    self.assertEqual(failed["status"], "needs_fix")
+                    covered = self.cover(flag)
+                    self.assertEqual((covered["status"], covered.get("fix_cycles_closed", 0)), ("needs_fix", 0))
+
+    # ----- the final check is the last word of the task (task_epoch) -----
+    EPOCH_REASON = "the final check is the last record of the task"
+
+    def test_a_role_pass_out_of_needs_fix_closes_the_cycle_and_asks_for_a_new_final_check(self):
+        """Door 4: a result of coder/tester/PR gate recorded in needs_fix that makes every role pass leaves
+        needs_fix — that closes the fix cycle (fix_cycles_closed), and on high 1.2.4 the final check recorded
+        before is stale: needs_verification, a new final check makes the task ready. Below high and under
+        1.2.1 the task is ready_for_pr_review, as in 1.2.3; a result that does not make it ready still
+        gives in_progress, as in 1.2.3."""
+        self.built()
+        self.internal()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.assertEqual(failed["status"], "needs_fix")
+        entry = self.record("tester", model="fable")
+        self.assertEqual(entry["status"], "needs_verification")  # the defect: ready_for_pr_review
+        self.assertEqual(entry["fix_cycles_closed"], 1)
+        self.assert_not_ready("final_check", "task-result --role final_check")
+        self.assertEqual(self.position(), (7, "final_check"))
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assert_ready()
+        for risk, policy in (("medium", "1.2.4"), ("high", "1.2.1")):
+            with self.subTest(risk=risk, policy=policy):
+                self.init(risk=risk)
+                self.policy(policy)
+                if risk == "high":
+                    self.built()
+                    self.reviews()
+                else:
+                    self.record("coder")
+                    self.record("tester")
+                    self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+                self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+                self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+                entry = self.record("tester", "findings", model="fable" if risk == "high" else None)
+                self.assertEqual((entry["status"], entry.get("fix_cycles_closed", 0)), ("in_progress", 0))
+                self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
+                entry = self.record("tester", model="fable" if risk == "high" else None)
+                self.assertEqual((entry["status"], entry["fix_cycles_closed"]), ("ready_for_pr_review", 1))
+
+    def test_any_later_record_of_the_task_asks_for_a_new_final_check(self):
+        """The final check is the last word: every change of the task after it (a result of another role,
+        a fix-loop record, task-risk) is a new epoch of the task, and a final check of an older epoch is
+        not counted — whatever after_reviews and after_fix_cycles say. `resume` keeps the counter."""
+        self.built()
+        self.internal()
+        self.reviews()
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        epoch = entry["task_epoch"]
+        self.assertEqual(entry["results"]["final_check"]["after_epoch"], epoch)
+        cases = {
+            "tester pass again": lambda: self.record("tester", model="fable"),
+            "coder pass again": lambda: self.record("coder", model="fable"),
+            "internal_reviewer again": lambda: self.internal(),
+            "second_reviewer again": lambda: self.record(
+                "second_reviewer", **self.review_flags(self.edited(self.report("codex-host"),
+                                                                   session_id="fable-again"))),
+        }
+        for case, change in cases.items():
+            with self.subTest(case=case):
+                entry = change()
+                self.assertEqual(entry["status"], "in_progress")
+                self.assertEqual(entry["task_epoch"], epoch + 1)
+                # the specific reason comes first where there is one (after_reviews), the epoch behind it
+                reason = "recorded before the current second_reviewer" if "second_reviewer" in case else self.EPOCH_REASON
+                self.assert_not_ready("final_check", reason, "task-result --role final_check")
+                self.assertEqual(self.position(), (7, "final_check"))
+                entry = self.final()
+                self.assertEqual((entry["status"], entry["results"]["final_check"]["after_epoch"]),
+                                 ("ready_for_pr_review", epoch + 1))
+                where = self.where()  # ready: step 7, the PR gate or done once it is recorded
+                self.assertEqual((where["step"], where["task_status"]), (7, "ready_for_pr_review"))
+                self.assertNotIn("final_check", where["next_action"])
+                epoch += 1
+        # no change of what the final check judges, no new epoch: the PR gate (its findings go through
+        # fix-loop), the informational Fable roles, task-risk that changes nothing (the same risk again)
+        for case, change in {
+            "github_codex_review pass": lambda: self.record(
+                "github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1"),
+            "coderabbit unavailable": lambda: self.record("coderabbit", "unavailable"),
+            "architect": lambda: self.record("architect", model="fable"),
+            "triage": lambda: self.record("triage", "findings", model="fable"),
+            "investigator": lambda: self.record("investigator", model="fable"),
+            "task-risk repeated": lambda: self.ok("task-risk", "--task", "t1", "--risk", "high"),
+        }.items():
+            with self.subTest(no_change=case):
+                entry = change()
+                self.assertEqual((entry["status"], entry["task_epoch"]), ("ready_for_pr_review", epoch))
+                self.assertEqual(self.where()["task_status"], "ready_for_pr_review")
+        self.assertIn("done", self.where()["next_action"])
+        self.assertEqual(self.next_head()["invalidated_tasks"], ["t1"])
+        self.assertEqual(self.entry()["task_epoch"], epoch)
+        self.built()
+        self.reviews()
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(entry["results"]["final_check"]["after_epoch"], epoch + 4)
+        self.assert_ready()
+        # a raise of the risk is a change of the task: the final check recorded below high is stale
+        self.init(risk="medium")
+        self.ok("task-risk", "--task", "t1", "--risk", "medium")
+        self.record("coder", model="fable")
+        self.record("tester", model="fable")
+        self.internal()
+        self.reviews()
+        entry = self.final()
+        self.assertEqual((entry["status"], entry["task_epoch"]), ("ready_for_pr_review", 5))
+        raised = self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.assertEqual((raised["status"], raised["task_epoch"]), ("in_progress", 6))
+        self.assertEqual(raised["results"]["final_check"]["after_epoch"], 5)  # stale: an older epoch
+        gap = _load("superarmanda_state_for_epoch", STATE).final_check_gap(raised, raised["results"])
+        self.assertIn(self.EPOCH_REASON, gap)
+
+    def test_final_check_without_after_epoch_or_with_a_bool_counter_is_not_counted(self):
+        """No compatibility for a record without `after_epoch`: the field was born in the same wave as the
+        whole rule, so a live record without it is a hand edit — not counted. A counter that is a bool is
+        no number either (True would otherwise pass as 1)."""
+        self.built()
+        self.internal()
+        self.reviews()
+        self.fix_cycle()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        good = self.data()
+        self.assertEqual((good["tasks"]["t1"]["fix_cycles_closed"], good["tasks"]["t1"]["task_epoch"]), (1, 7))
+
+        def snapshot(**fields):
+            return lambda t: t["results"]["final_check"].update(fields)
+
+        for case, edit in {
+            "no after_epoch": lambda t: t["results"]["final_check"].pop("after_epoch"),
+            "task_epoch is a bool": lambda t: t.update(task_epoch=True),
+            "fix_cycles_closed is a bool": lambda t: t.update(fix_cycles_closed=True),
+            # ir-5: the snapshots of the record are judged by type too — True == 1 is no match
+            "after_fix_cycles is a bool": snapshot(after_fix_cycles=True),
+            "after_epoch is a bool": lambda t: (t.update(task_epoch=1), snapshot(after_epoch=True)(t)),
+            "after_fix_cycles is a string": snapshot(after_fix_cycles="1"),
+            # a record without the snapshot while the task counter is malformed: None != None is False
+            "no after_fix_cycles and fix_cycles_closed is a string": lambda t: (
+                t.update(fix_cycles_closed="1"), t["results"]["final_check"].pop("after_fix_cycles")),
+        }.items():
+            with self.subTest(case=case):
+                value = json.loads(json.dumps(good))
+                edit(value["tasks"]["t1"])
+                self.manifest.write_text(json.dumps(value), encoding="utf-8")
+                where = self.where()
+                self.assertEqual((where["step"], where["role"]), (7, "final_check"))
+                self.assertIn("final_check", where["next_action"])
+                self.assertNotIn("done", where["next_action"])
+        # a final check over a malformed task counter is refused, not recorded with a null snapshot
+        for field in ("fix_cycles_closed", "task_epoch"):
+            with self.subTest(refused=field):
+                value = json.loads(json.dumps(good))
+                value["tasks"]["t1"][field] = True
+                self.manifest.write_text(json.dumps(value), encoding="utf-8")
+                self.record_refused("final_check", model="fable", needle=field)
+        self.manifest.write_text(json.dumps(good), encoding="utf-8")
+        self.assert_ready()
+
+    def test_fable_roles_below_high_do_not_close_an_open_fix_cycle(self):
+        """Astra round 1: below high the records of internal_reviewer and final_check are records, as in
+        1.2.3 — a task waiting for its fix stays needs_fix whatever status they carry."""
+        for risk, policy in (("medium", "1.2.4"), ("low", "1.2.4"), ("medium", "1.2.1")):
+            with self.subTest(risk=risk, policy=policy):
+                self.init(risk=risk)
+                self.policy(policy)
+                self.record("coder")
+                self.record("tester")
+                entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+                self.assertEqual(entry["status"], "ready_for_pr_review")
+                failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+                self.assertEqual(failed["status"], "needs_fix")
+                before = self.where()
+                self.assertEqual((before["step"], before["role"]), (6, "coder"))
+                for role in ("internal_reviewer", "final_check"):
+                    for status in ("pass", "findings", "unavailable", "error", "incomplete"):
+                        with self.subTest(risk=risk, policy=policy, role=role, status=status):
+                            entry = self.record(role, status, model="fable")
+                            self.assertEqual(entry["status"], "needs_fix")
+                            where = self.where()
+                            self.assertEqual((where["step"], where["role"], where["next_action"], where["task_status"]),
+                                             (before["step"], before["role"], before["next_action"], "needs_fix"))
+                            self.assertEqual(self.ok("status")["tasks"]["t1"]["status"], "needs_fix")
+
+    # ----- acceptance 3 -----
+    def test_final_check_of_a_previous_head_is_not_pass(self):
+        self.built()
+        self.internal()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assertEqual(self.next_head()["invalidated_tasks"], ["t1"])
+        self.assertNotIn("final_check", self.entry()["results"])
+        self.built()
+        entry = self.reviews()
+        self.assertEqual(entry["status"], "in_progress")
+        self.assert_not_ready("final_check")
+        self.assertEqual(self.position(), (7, "final_check"))
+        # a record of the old HEAD put back by hand is not a result of this HEAD
+        value = self.data()
+        old = dict(value["tasks"]["t1"]["results"]["second_reviewer"], status="pass", head=self.base,
+                   reviewed_head=None, packet_hash=None, model=FABLE, session_id="final-check-of-the-old-head")
+        value["tasks"]["t1"]["results"]["final_check"] = old
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        self.assert_not_ready("final_check")
+        self.resume()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+
+    def test_final_check_recorded_before_the_last_task_review_is_not_counted(self):
+        self.built()
+        self.internal()
+        self.record("cross_provider_reviewer", **self.review_flags(self.report("claude-host")))
+        self.assertEqual(self.final()["status"], "in_progress")  # accepted as a record, not counted
+        entry = self.record("second_reviewer", **self.review_flags(self.report("codex-host")))
+        self.assertEqual(entry["status"], "in_progress")
+        self.assert_not_ready("final_check", "recorded before")
+        self.assertEqual(self.position(), (7, "final_check"))
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        # a review recorded again after the final check asks for a new final check
+        again = self.edited(self.report("claude-host"), session_id="astra-again")
+        entry = self.record("cross_provider_reviewer", **self.review_flags(again))
+        self.assertEqual(entry["status"], "in_progress")
+        self.assert_not_ready("final_check", "recorded before")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        # the PR reviews are no part of the comparison (and raise no task_epoch either)
+        self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
+        self.record("coderabbit", "unavailable")
+        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertIn("done", self.where()["next_action"])
+
+    def test_internal_review_after_the_first_external_packet_is_not_counted(self):
+        for first in ("cross_provider_reviewer", "github_codex_review", "coderabbit"):
+            with self.subTest(first_external=first):
+                self.init()
+                self.packet()
+                self.built()
+                if first == "cross_provider_reviewer":
+                    self.record(first, **self.review_flags(self.report("claude-host")))
+                else:
+                    self.record(first, "unavailable")
+                entry = self.internal()
+                self.assertNotIn("internal_review", entry)
+                action = self.assert_not_ready("internal_reviewer", "new run", "init --from-plan")
+                self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+                self.reviews()
+                self.assertEqual(self.final()["status"], "in_progress")
+                self.assert_not_ready("internal_reviewer", "new run")
+                # neither a new HEAD nor another internal review reopens the requirement in this run
+                self.next_head()
+                self.built()
+                self.assertNotIn("internal_review", self.internal())
+                self.reviews()
+                self.assertEqual(self.final()["status"], "in_progress")
+                self.assert_not_ready("internal_reviewer", "new run")
+
+    def test_internal_review_of_another_head_than_the_first_packet_is_not_counted(self):
+        self.built()
+        self.internal()
+        reviewed = self.head()
+        self.next_head()
+        self.built()
+        # the code moved on before the packet: the internal review is owed again, on this HEAD
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (5, "internal_reviewer"))
+        self.assertNotIn("new run", where["next_action"])
+        self.reviews()
+        self.assertEqual(self.entry()["internal_review"]["head"], reviewed)
+        self.assertNotEqual(self.entry()["external_review"]["head"], reviewed)
+        self.assertEqual(self.final()["status"], "in_progress")
+        action = self.assert_not_ready("internal_reviewer", "new run")
+        self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+
+    def test_internal_review_survives_resume_onto_the_head_of_a_fix(self):
+        self.built()
+        self.internal("findings")
+        reviewed = self.head()
+        self.record("cross_provider_reviewer", "findings",
+                    **self.review_flags(self.report("codex-host", "findings")))
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "cross_provider_reviewer")
+        self.assertEqual(self.next_head()["invalidated_tasks"], ["t1"])
+        entry = self.entry()
+        self.assertEqual(entry["results"], {})
+        self.assertEqual((entry["internal_review"]["status"], entry["internal_review"]["head"]),
+                         ("findings", reviewed))
+        self.assertEqual(entry["external_review"]["head"], reviewed)
+        self.built()
+        # after the first packet the internal review is not asked for again
+        self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+        self.reviews()
+        self.assertEqual(self.position(), (7, "final_check"))
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        # a later internal record does not replace the counted one; as a later record of the task it
+        # asks for the final word again (task_epoch)
+        self.assertEqual(self.internal("unavailable")["internal_review"]["head"], reviewed)
+        self.assertEqual(self.entry()["status"], "in_progress")
+        self.assert_not_ready("final_check", self.EPOCH_REASON)
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assertEqual(self.entry()["internal_review"]["head"], reviewed)
+
+    def test_internal_round_leads_to_a_new_internal_review_on_the_new_head(self):
+        self.built()
+        self.internal("findings")
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "internal_reviewer")
+        self.next_head()
+        self.built()
+        self.assertEqual(self.position(), (5, "internal_reviewer"))
+        self.internal()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+
+    def test_draft_pr_review_may_be_recorded_before_the_final_check(self):
+        self.built()
+        self.internal()
+        self.reviews()
+        entry = self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
+        self.assertEqual(entry["status"], "in_progress")
+        self.assertEqual(self.position(), (7, "final_check"))
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assertIn("done", self.where()["next_action"])
+
+    def test_malformed_internal_review_record_is_a_closed_refusal(self):
+        self.built()
+        self.internal()
+        good = self.data()
+        for bad in ("pass", ["pass"], {}, {"status": "pass"}, {"status": 1, "head": self.head()},
+                    {"status": "pass", "head": None}):
+            with self.subTest(internal_review=bad):
+                value = copy.deepcopy(good)
+                value["tasks"]["t1"]["internal_review"] = bad
+                self.manifest.write_text(json.dumps(value), encoding="utf-8")
+                self.refused("where", needle="internal_review")
+                self.refused("status", needle="internal_review")
+        value = copy.deepcopy(good)
+        value["version"] = 1
+        del value["review_policy"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        self.refused("where", needle="require manifest version 2")
+
+    def test_marker_null_is_refused_and_a_removed_marker_opens_no_way_round(self):
+        """Internal review F1: the marker `external_review` is not the only anchor. `null` (state.py never
+        writes it) is malformed; without the key the session history still says the packet went out."""
+        self.built()
+        self.reviews()
+        good = self.data()
+        # A: `external_review: null` — a closed refusal of every reader, not «no packet yet»
+        value = copy.deepcopy(good)
+        value["tasks"]["t1"]["external_review"] = None
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        self.refused("where", needle="external_review")
+        self.refused("status", needle="external_review")
+        self.refused("task-result", *self.result_args("internal_reviewer", model="fable"), needle="external_review")
+        # B: the key removed — the first packet is known from session_roles: no credit, new run
+        value = copy.deepcopy(good)
+        del value["tasks"]["t1"]["external_review"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        entry = self.internal()
+        self.assertNotIn("internal_review", entry)
+        self.assertEqual(self.final()["status"], "in_progress")
+        action = self.assert_not_ready("internal_reviewer", "new run")
+        self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+        # B': a marker without a HEAD cannot bind the credit: no credit, new run
+        value = copy.deepcopy(good)
+        value["tasks"]["t1"]["external_review"] = {"role": "cross_provider_reviewer"}
+        value["tasks"]["t1"]["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        where = self.where()
+        self.assertTrue(where["next_action"].startswith("BLOCKED: internal_reviewer"), where["next_action"])
+        self.assertIn("new run", where["next_action"])
+
+    def test_witnesses_of_the_first_packet_survive_a_hand_edit_of_the_session_history(self):
+        """Internal review 2, F6: the packet went out on H1 without an internal review; after resume the
+        marker and the review sessions are removed by hand — review_history still says the reviews of H1
+        happened, so no credit is written on H2 and the task needs a new run."""
+        self.built()
+        self.reviews()
+        self.next_head()
+        value = self.data()
+        task = value["tasks"]["t1"]
+        del task["external_review"]
+        task["session_roles"] = {sid: role for sid, role in task["session_roles"].items()
+                                 if role not in ("cross_provider_reviewer", "second_reviewer")}
+        self.assertTrue(any(item["role"] in ("cross_provider_reviewer", "second_reviewer")
+                            for item in task["review_history"]))
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        action = self.where()["next_action"]
+        self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+        self.assertIn("new run", action)
+        entry = self.internal()
+        self.assertNotIn("internal_review", entry)
+        self.built()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "in_progress")
+        self.assert_not_ready("internal_reviewer", "new run")
+
+    def strip_packet_witnesses(self, *roles):
+        """The hand edit of the scenarios of internal review 3: the marker and the sessions of `roles` gone."""
+        value = self.data()
+        task = value["tasks"]["t1"]
+        task.pop("external_review", None)
+        task["session_roles"] = {sid: role for sid, role in task["session_roles"].items() if role not in roles}
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        return value
+
+    def test_deferral_or_acceptance_of_the_first_packet_is_a_witness_too(self):
+        """Internal review 3, F8: a first packet of github_codex_review leaves no review_history; after resume
+        its results are gone; with the marker and the sessions removed the deferral still says it went out."""
+        for cover in ("--defer", "--accept"):
+            with self.subTest(cover=cover):
+                self.init()
+                self.built()
+                self.record("github_codex_review", "findings")
+                severity = ["--severity", "low"] if cover == "--accept" else []
+                self.ok("fix-loop", "--task", "t1", cover, "--source", "github_codex_review", *severity,
+                        "--note", "wording only")
+                self.next_head()
+                self.strip_packet_witnesses("github_codex_review")
+                self.assertEqual(self.entry()["results"], {})
+                action = self.where()["next_action"]
+                self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+                self.assertIn("new run", action)
+                self.assertNotIn("internal_review", self.internal())
+
+    def test_a_missing_marker_is_not_recreated_while_a_witness_says_the_packet_went_out(self):
+        """tester 3, F9 (scenario D): the marker and the review sessions removed, a credit forged on the
+        current HEAD; the reviews recorded again must not recreate the marker on this HEAD — the HEAD of
+        the first packet is unknown, so this run cannot make the task ready."""
+        self.built()
+        self.reviews()
+        value = self.strip_packet_witnesses("cross_provider_reviewer", "second_reviewer")
+        value["tasks"]["t1"]["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        again = self.edited(self.report("claude-host"), session_id="astra-again")
+        self.record("cross_provider_reviewer", **self.review_flags(again))
+        again = self.edited(self.report("codex-host"), session_id="fable-again")
+        self.record("second_reviewer", **self.review_flags(again))
+        self.assertNotIn("external_review", self.entry())
+        self.assertEqual(self.final()["status"], "in_progress")
+        action = self.assert_not_ready("internal_reviewer", "new run")
+        self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+        # the honest path is untouched: a fresh task gets its marker with the first external record
+        entry = self.record("coderabbit", "unavailable", task="t2")
+        self.assertEqual(entry["external_review"]["role"], "coderabbit")
+
+    def test_records_of_the_mandatory_roles_count_only_with_the_fable_model(self):
+        """Internal review F2: like coder/tester of a high-risk task, a final_check and the internal review
+        credit count only with `model` claude-fable-5-1 (state.py never records them otherwise)."""
+        self.built()
+        entry = self.internal()
+        self.assertEqual(entry["internal_review"]["model"], FABLE)
+        self.assertNotIn("result_sha256", entry["internal_review"])
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        good = self.data()
+        for label, edit in {
+            "final_check without model": lambda t: t["results"]["final_check"].pop("model"),
+            "final_check on sonnet": lambda t: t["results"]["final_check"].update(model=SONNET),
+            "credit without model": lambda t: t["internal_review"].pop("model"),
+            "credit on sonnet": lambda t: t["internal_review"].update(model=SONNET),
+        }.items():
+            with self.subTest(case=label):
+                value = copy.deepcopy(good)
+                edit(value["tasks"]["t1"])
+                self.manifest.write_text(json.dumps(value), encoding="utf-8")
+                where = self.where()
+                self.assertNotIn("done", where["next_action"])
+                self.assertIn(FABLE, where["next_action"])
+                self.assertEqual(where["role"], "final_check" if "final_check" in label else "internal_reviewer")
+
+    # ----- acceptance 4 -----
+    def test_policy_1_2_1_manifest_is_judged_without_the_roles(self):
+        self.policy("1.2.1")
+        self.built()
+        self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+        entry = self.reviews()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assert_ready()
+        self.assertEqual(self.ok("status")["tasks"]["t1"]["status"], "ready_for_pr_review")
+        before = self.where()
+        for role in ("internal_reviewer", "final_check"):
+            for status in ("unavailable", "error", "incomplete", "findings", "pass"):
+                with self.subTest(role=role, status=status):
+                    entry = self.record(role, status, model="fable")
+                    self.assertEqual(entry["status"], "ready_for_pr_review")
+                    # the records of 1.2.4 are not written into a manifest of the older policy
+                    self.assertNotIn("internal_review", entry)
+                    self.assertNotIn("after_reviews", entry["results"][role])
+                    where = self.where()
+                    self.assertEqual((where["step"], where["role"], where["next_action"]),
+                                     (before["step"], before["role"], before["next_action"]))
+        self.assertEqual(self.resume()["invalidated_tasks"], [])
+        self.assertEqual(self.data()["review_policy"], {"version": "1.2.1", "level": "high"})
+        self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
+        self.assertIn("done", self.where()["next_action"])
+
+
+HIGH_PLAN = {"risk": "high"}
+MEDIUM_PLAN = {"risk": "medium"}
+
+
+class W4GateRoles(W4Base):
+    """Acceptance 5-7: the merge gate asks a high wave (and a high task of any wave) for both roles and
+    refuses a manifest of the review policy 1.2.1 there. The manifests are made by state.py and review.py."""
+
+    def setUp(self):
+        super().setUp()
+        self.gate = _load("superarmanda_gate_for_w4", GATE)
+
+    def problems(self, plan=None, value=None):
+        value = self.data() if value is None else value
+        args = (value, value["head"], value["tree_fingerprint"])
+        return self.gate.manifest_problems(*args) if plan is None else self.gate.manifest_problems(*args, plan=plan)
+
+    def assert_reason(self, problems, *needles):
+        self.assertTrue(any(all(n in p for n in needles) for p in problems), f"{needles} not in {problems}")
+
+    def verdict(self, plan, value=None):
+        bot = {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+        facts = {"pr": {"state": "open", "merged": False, "draft": False, "head": self.head(), "base": "main"},
+                 "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}],
+                 "reviews": [{"user": bot, "commit_id": self.head(), "state": "COMMENTED"}],
+                 "review_comments": [], "issue_comments": [], "resolved": {}, "threads": []}
+        value = self.data() if value is None else value
+        work = {"clean": True, "head": self.head(), "fingerprint": value["tree_fingerprint"]}
+        return self.gate.evaluate(facts, self.head(), value, work, "main", plan=plan)
+
+    def complete(self, task=None):
+        self.built(task=task)
+        self.record("internal_reviewer", model="fable", task=task)
+        self.reviews(task=task)
+        return self.record("final_check", model="fable", task=task)
+
+    def forged(self, edit):
+        value = self.data()
+        edit(value["tasks"]["t1"])
+        return value
+
+    # ----- acceptance 7 -----
+    def test_high_wave_passes_with_two_reviews_and_both_roles_on_their_heads(self):
+        self.assertEqual(self.complete()["status"], "ready_for_pr_review")
+        self.assertEqual(self.complete(task="t2")["status"], "ready_for_pr_review")
+        for plan in (HIGH_PLAN, MEDIUM_PLAN, None):  # level high: a high wave whatever the plan says
+            with self.subTest(plan=plan):
+                self.assertEqual(self.problems(plan), [])
+        v = self.verdict(HIGH_PLAN)
+        self.assertEqual((v["verdict"], v["reasons"]), ("pass", []))
+
+    def test_high_wave_passes_after_a_fix_on_a_new_head(self):
+        """The internal review stays bound to the HEAD of the first packet, the final check to the last HEAD."""
+        self.built()
+        self.internal("findings")
+        self.record("cross_provider_reviewer", "findings",
+                    **self.review_flags(self.report("codex-host", "findings")))
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "cross_provider_reviewer")
+        self.next_head()
+        self.built()
+        self.reviews()
+        self.assert_reason(self.problems(HIGH_PLAN), "t1", "final_check", "task-result --role final_check")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assertEqual(self.problems(HIGH_PLAN), [])
+        self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
+
+    # ----- acceptance 5 -----
+    def test_high_wave_refuses_a_task_with_a_lowered_risk_and_no_roles(self):
+        """The level of the run was lowered to medium: state.py asks the task for one review and no roles
+        and calls it ready; the gate of a high wave judges it as high."""
+        self.init(risk="medium")
+        self.built()
+        entry = self.reviews()
+        self.assertEqual((entry["status"], entry.get("risk", "medium")), ("ready_for_pr_review", "medium"))
+        self.assertEqual(self.problems(MEDIUM_PLAN), [])
+        problems = self.problems(HIGH_PLAN)
+        self.assert_reason(problems, "t1", "internal_reviewer", "волна high", "новый прогон волны")
+        self.assert_reason(problems, "t1", "final_check", "волна high", "task-result --role final_check")
+        self.assert_reason(problems, "t1", "не подтверждён пересчётом")
+        v = self.verdict(HIGH_PLAN)
+        self.assertEqual(v["verdict"], "fail")
+        self.assert_reason(v["reasons"], "t1", "final_check")
+
+    def test_high_wave_refuses_each_missing_or_failed_role_and_names_the_action(self):
+        self.assertEqual(self.complete()["status"], "ready_for_pr_review")
+        good = self.data()
+        self.assertEqual(self.problems(HIGH_PLAN, good), [])
+        other_head = self.base
+        cases = {
+            "no final_check": (lambda t: t["results"].pop("final_check"), "final_check",
+                               "task-result --role final_check"),
+            "final_check of another head": (lambda t: t["results"]["final_check"].update(head=other_head),
+                                            "final_check", "task-result --role final_check"),
+            "final_check of another tree": (lambda t: t["results"]["final_check"].update(tree_fingerprint="0" * 64),
+                                            "final_check", "task-result --role final_check"),
+            "final_check before the reviews": (lambda t: t["results"]["final_check"].update(after_reviews={}),
+                                               "final_check", "recorded before"),
+            "no internal review": (lambda t: t.pop("internal_review"), "internal_reviewer", "новый прогон волны"),
+            "internal review of another head": (lambda t: t["internal_review"].update(head=other_head),
+                                                "internal_reviewer", "новый прогон волны"),
+        }
+        for status in ("unavailable", "error", "incomplete", "findings"):
+            cases[f"final_check {status}"] = (
+                lambda t, status=status: t["results"]["final_check"].update(status=status), "final_check", status)
+        for status in ("unavailable", "error", "incomplete"):
+            cases[f"internal review {status}"] = (
+                lambda t, status=status: t["internal_review"].update(status=status), "internal_reviewer",
+                "новый прогон волны")
+        # internal review F1/F2: the marker is not the only anchor, the model is part of the record
+        cases["external_review removed"] = (lambda t: t.pop("external_review"), "internal_reviewer",
+                                            "новый прогон волны")
+        cases["external_review without head"] = (lambda t: t.update(external_review={"role": "coderabbit"}),
+                                                 "internal_reviewer", "новый прогон волны")
+        cases["final_check without model"] = (lambda t: t["results"]["final_check"].pop("model"), "final_check",
+                                              "claude-fable-5-1")
+        cases["final_check on sonnet"] = (lambda t: t["results"]["final_check"].update(model="claude-sonnet-5-5"),
+                                          "final_check", "claude-fable-5-1")
+        cases["credit without model"] = (lambda t: t["internal_review"].pop("model"), "internal_reviewer",
+                                         "новый прогон волны")
+        for label, (edit, role, action) in cases.items():
+            # the saved status still says ready: the gate recomputes by the rules of state.py
+            value = self.forged(edit)
+            for plan in (HIGH_PLAN, MEDIUM_PLAN, None):
+                with self.subTest(case=label, plan=plan):
+                    problems = self.problems(plan, value)
+                    self.assert_reason(problems, "t1", role, action)
+                    if "another" not in label:
+                        # (a record of another head or tree is not a result of this HEAD for the gate at
+                        # all; state.task_ready reads the results `resume` left, which are all current)
+                        self.assert_reason(problems, "t1", "не подтверждён пересчётом")
+                    self.assertEqual(self.verdict(plan, value)["verdict"], "fail")
+
+    def test_removed_marker_and_review_sessions_with_a_forged_credit_fail_the_gate(self):
+        """Internal review 2, F6 (scenario A): the gate reads the raw manifest, so the witnesses of the first
+        packet must be the records it reads — the results and review_history, not only session_roles."""
+        self.built()
+        self.reviews()
+        self.final()
+        value = self.data()
+        task = value["tasks"]["t1"]
+        del task["external_review"]
+        task["session_roles"] = {sid: role for sid, role in task["session_roles"].items()
+                                 if role not in ("cross_provider_reviewer", "second_reviewer")}
+        task["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        task["status"] = "ready_for_pr_review"
+        for plan in (HIGH_PLAN, MEDIUM_PLAN, None):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan, value)
+                self.assert_reason(problems, "t1", "internal_reviewer", "новый прогон волны")
+                self.assertEqual(self.verdict(plan, value)["verdict"], "fail")
+        # the same with the results of the reviews gone too: review_history alone is a witness
+        del task["results"]["cross_provider_reviewer"]
+        del task["results"]["second_reviewer"]
+        self.assert_reason(self.problems(HIGH_PLAN, value), "t1", "internal_reviewer", "новый прогон волны")
+
+    def test_results_of_a_pr_review_first_packet_are_a_witness_for_the_gate(self):
+        """tester 3, F8 (scenario C): the first packet is github_codex_review (no review_history); with the
+        marker and its session removed the current result alone must make the gate name the role and the
+        action, not «internal review still open»."""
+        self.built()
+        self.record("github_codex_review", "unavailable")
+        value = self.data()
+        task = value["tasks"]["t1"]
+        del task["external_review"]
+        task["session_roles"] = {sid: role for sid, role in task["session_roles"].items()
+                                 if role != "github_codex_review"}
+        task["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        self.assertIn("github_codex_review", task["results"])
+        self.assertFalse(task.get("review_history"))
+        for plan in (HIGH_PLAN, MEDIUM_PLAN, None):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan, value)
+                self.assert_reason(problems, "t1", "internal_reviewer", "новый прогон волны")
+        # the same first packet, deferred and then resumed away: the deferral is the witness (F8 of review 3)
+        self.init()
+        self.built()
+        self.record("github_codex_review", "findings")
+        self.ok("fix-loop", "--task", "t1", "--defer", "--source", "github_codex_review", "--note", "wording")
+        self.next_head()
+        value = self.data()
+        task = value["tasks"]["t1"]
+        del task["external_review"]
+        task["session_roles"] = {}
+        task["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        self.assertEqual((task["results"], task["fix_sources"]), ({}, {}))
+        self.assert_reason(self.problems(HIGH_PLAN, value), "t1", "internal_reviewer", "новый прогон волны")
+
+    def test_a_forged_credit_and_rerecorded_reviews_do_not_pass_the_gate(self):
+        """tester 3, F9 (scenario D) at the gate."""
+        self.built()
+        self.reviews()
+        value = self.data()
+        task = value["tasks"]["t1"]
+        del task["external_review"]
+        task["session_roles"] = {sid: role for sid, role in task["session_roles"].items()
+                                 if role not in ("cross_provider_reviewer", "second_reviewer")}
+        task["internal_review"] = {"status": "pass", "head": self.head(), "model": FABLE,
+                                   "recorded_at": "2026-10-05T00:00:00+00:00"}
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        for role, profile, sid in (("cross_provider_reviewer", "claude-host", "astra-again"),
+                                   ("second_reviewer", "codex-host", "fable-again")):
+            self.record(role, **self.review_flags(self.edited(self.report(profile), session_id=sid)))
+        self.final()
+        problems = self.problems(HIGH_PLAN)
+        self.assert_reason(problems, "t1", "internal_reviewer", "новый прогон волны")
+        self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
+
+    def test_open_fix_cycle_of_a_high_task_is_not_closed_by_a_final_check_at_the_gate(self):
+        """Astra round 2: a high task in needs_fix stays so after `final_check pass`; the gate says the fix
+        cycle is open."""
+        self.complete()
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        entry = self.final()
+        self.assertEqual(entry["status"], "needs_fix")
+        problems = self.problems(HIGH_PLAN)
+        self.assert_reason(problems, "t1", "цикл исправлений не завершён")
+        self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
+
+    def test_final_check_recorded_before_the_fix_cycle_closed_fails_the_gate(self):
+        """GitHub Codex P2 on PR #97: the final_check recorded during the fix cycle (or before it) is no
+        final check of the fixed task; after fix-loop --outcome pass the gate asks for a new one, with the
+        action. A manifest whose record disagrees with the task's closed cycles is refused the same way."""
+        self.complete()
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.assertEqual(self.final()["status"], "needs_fix")
+        verified = self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        self.assertEqual(verified["status"], "needs_verification")
+        problems = self.problems(HIGH_PLAN)
+        self.assert_reason(problems, "t1", "final_check", "волна high", "before the fix cycle closed",
+                           "task-result --role final_check")
+        v = self.verdict(HIGH_PLAN)
+        self.assertEqual(v["verdict"], "fail")
+        self.assert_reason(v["reasons"], "t1", "final_check", "before the fix cycle closed")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assertEqual(self.problems(HIGH_PLAN), [])
+        self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
+        cases = {
+            "record of an earlier cycle": lambda t: t["results"]["final_check"].update(after_fix_cycles=0),
+            "record without the snapshot": lambda t: t["results"]["final_check"].pop("after_fix_cycles"),
+            "a cycle closed after the record": lambda t: t.update(fix_cycles_closed=2),
+        }
+        for case, edit in cases.items():
+            with self.subTest(case=case):
+                value = self.forged(edit)
+                self.assertEqual(value["tasks"]["t1"]["status"], "ready_for_pr_review")
+                problems = self.problems(HIGH_PLAN, value)
+                self.assert_reason(problems, "t1", "final_check", "before the fix cycle closed",
+                                   "task-result --role final_check")
+                self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
+        value = self.forged(lambda t: t.update(fix_cycles_closed="1"))
+        self.assert_reason(self.problems(HIGH_PLAN, value), "manifest", "t1", "fix_cycles_closed не число")
+        self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
+
+    def test_final_check_recorded_before_a_cover_of_the_findings_fails_the_gate(self):
+        """Door 5 (Codex P2, thread 4192505756): the task review has findings, the task is in_progress, the
+        coordinator records final_check pass, then --defer/--accept covers the findings — the final check
+        never saw the accepted limitation. The task is not ready (in_progress: update_task_status from
+        in_progress, the final check of the older epoch is stale), where and the gate name the reason, a new
+        final check makes it ready. A record whose epoch disagrees with the task is refused the same way."""
+        for flag in ("--defer", "--accept"):
+            with self.subTest(cover=flag):
+                self.init()
+                self.built()
+                self.internal()
+                self.record("cross_provider_reviewer", "findings",
+                            **self.review_flags(self.report("codex-host", "findings")))
+                entry = self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+                self.assertEqual(entry["status"], "in_progress")
+                entry = self.final()
+                self.assertEqual(entry["status"], "in_progress")  # the findings are not disposed of
+                severity = ["--severity", "low"] if flag == "--accept" else []
+                covered = self.ok("fix-loop", "--task", "t1", flag, "--source", "cross_provider_reviewer",
+                                  *severity, "--note", "known limitation")
+                self.assertEqual(covered["status"], "in_progress")  # the defect: ready_for_pr_review
+                self.assertNotIn("fix_cycles_closed", covered)  # no fix cycle was open
+                self.assert_not_ready("final_check", W4MandatoryFableRoles.EPOCH_REASON,
+                                      "task-result --role final_check")
+                self.assertEqual(self.position(), (7, "final_check"))
+                problems = self.problems(HIGH_PLAN)
+                self.assert_reason(problems, "t1", "final_check", "волна high", W4MandatoryFableRoles.EPOCH_REASON,
+                                   "task-result --role final_check")
+                self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
+                self.assertEqual(self.final()["status"], "ready_for_pr_review")
+                self.assertEqual(self.problems(HIGH_PLAN), [])
+                self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
+                for case, edit in {
+                    "record of an earlier epoch": lambda t: t["results"]["final_check"].update(
+                        after_epoch=t["task_epoch"] - 1),
+                    "record without the epoch": lambda t: t["results"]["final_check"].pop("after_epoch"),
+                    "a change after the record": lambda t: t.update(task_epoch=t["task_epoch"] + 1),
+                }.items():
+                    with self.subTest(cover=flag, case=case):
+                        value = self.forged(edit)
+                        problems = self.problems(HIGH_PLAN, value)
+                        self.assert_reason(problems, "t1", "final_check", W4MandatoryFableRoles.EPOCH_REASON,
+                                           "task-result --role final_check")
+                        self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
+                value = self.forged(lambda t: t.update(task_epoch="7"))
+                self.assert_reason(self.problems(HIGH_PLAN, value), "manifest", "t1", "task_epoch не число")
+                self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
+
+    # ----- the credit of a role = HEAD + tree + epoch (Codex PR #97: threads 4192505756, 4193124544) -----
+    RESET_EVENTS = ("dirty_tree", "new_commit", "fix_failed", "fix_pass", "defer", "accept", "decision",
+                    "role_record", "risk_raised")
+
+    def dirty(self):
+        """An edit of the tree without a commit, and resume onto it: the same HEAD, another tree."""
+        (self.repo / "tracked.txt").write_text(f"dirty {next(self.serial)}\n", encoding="utf-8")
+        return self.resume()
+
+    def clean(self):
+        """The edit reverted, and resume onto the clean tree of the same HEAD (review.py wants it clean)."""
+        self.git("checkout", "--", "tracked.txt")
+        return self.resume()
+
+    def findings_review(self):
+        return self.record("cross_provider_reviewer", "findings",
+                           **self.review_flags(self.report("codex-host", "findings")))
+
+    def apply_event(self, event, role):
+        """The event between the credit of `role` and the moment it is judged."""
+        if event == "dirty_tree":
+            self.dirty()
+            self.assertEqual(self.entry()["results"], {})
+            self.clean()
+        elif event == "new_commit":
+            self.next_head()
+        elif event == "fix_failed":
+            self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        elif event == "fix_pass":
+            self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+            self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        elif event in ("defer", "accept"):
+            severity = ["--severity", "low"] if event == "accept" else []
+            self.ok("fix-loop", "--task", "t1", f"--{event}", "--source", "cross_provider_reviewer",
+                    *severity, "--note", "known limitation")
+        elif event == "decision":
+            self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+            self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+            self.ok("fix-loop", "--task", "t1", "--decision", "invariant", "--note", "the invariant holds")
+        elif event == "role_record":
+            self.record("tester", model="fable")
+        elif event == "risk_raised":
+            self.ok("task-risk", "--task", "t1", "--risk", "high")
+
+    def assert_not_credited(self, role, *needles):
+        self.assertNotEqual(self.entry()["status"], "ready_for_pr_review")
+        where = self.where()
+        self.assertNotIn("done", where["next_action"])
+        for needle in needles:
+            self.assertIn(needle, where["next_action"])
+        problems = self.problems(HIGH_PLAN)
+        self.assertTrue(problems, "the gate passes a task whose credit was reset")
+        if needles:
+            self.assert_reason(problems, "t1", role)
+        self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
+        return where
+
+    def test_internal_review_credit_is_bound_to_the_tree_and_epoch_of_the_first_packet(self):
+        """Codex thread 4193124544: the credit compared only the HEAD with the first packet's HEAD, so an
+        internal review of a dirty tree counted for the packet of the clean tree of the same SHA — and any
+        record or fix-loop between the two went unseen. Now the credit carries tree_fingerprint and epoch
+        and both must equal the marker's: anything between the internal review and the first external
+        record resets it, with the reason naming what differs; the way out is a new run."""
+        for event in ("dirty_tree", "new_commit", "fix_failed", "fix_pass", "decision", "role_record",
+                      "risk_raised"):
+            with self.subTest(event=event):
+                self.init(risk="medium" if event == "risk_raised" else "high")
+                if event == "dirty_tree":
+                    # the Codex scenario: the internal review of a DIRTY tree, the edit reverted, the
+                    # packet of the clean tree of the same SHA
+                    self.dirty()
+                    self.built()
+                    credit = self.internal()["internal_review"]
+                    self.clean()
+                    self.assertEqual(self.entry()["results"], {})
+                    self.built()
+                else:
+                    self.built()
+                    credit = self.internal()["internal_review"]
+                    self.apply_event(event, "internal_reviewer")
+                self.reviews()  # the first external packet: the marker binds the credit
+                marker = self.entry()["external_review"]
+                field = {"dirty_tree": "tree_fingerprint", "new_commit": "head"}.get(event, "epoch")
+                differs = {"tree_fingerprint": "tree", "head": "HEAD", "epoch": "epoch"}[field]
+                where = self.assert_not_credited("internal_reviewer", "internal_reviewer", "new run", differs)
+                self.assertNotEqual(credit[field], marker[field])
+                self.assertTrue(where["next_action"].startswith("BLOCKED: internal_reviewer"), where["next_action"])
+                self.final()
+                self.assert_not_credited("internal_reviewer", "internal_reviewer", "new run")
+                # the honest repeat: a new run, the internal review of the clean tree that goes out
+                self.init()
+                self.complete()
+                self.assertEqual(self.problems(HIGH_PLAN), [])
+                self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
+
+    def test_internal_review_before_the_packet_counts_only_as_a_current_result_of_this_tree(self):
+        """Before the packet the requirement is still open: the credit of a dirty tree does not count on
+        the clean one (or the other way round) — record the internal review again, no new run needed."""
+        self.built()
+        self.internal()
+        self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+        self.dirty()
+        self.assertEqual(self.entry()["results"], {})
+        self.built()
+        action = self.assert_not_ready("internal_reviewer", "task-result --role internal_reviewer")
+        self.assertFalse(action.startswith("BLOCKED"), action)
+        self.assertEqual(self.position(), (5, "internal_reviewer"))
+        self.internal()
+        self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+        # and back on the clean tree of the same SHA the credit of the dirty one does not count either
+        self.clean()
+        self.built()
+        self.assertEqual(self.position(), (5, "internal_reviewer"))
+        self.internal()
+        self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assertEqual(self.problems(HIGH_PLAN), [])
+
+    def test_internal_review_credit_without_tree_and_epoch_is_not_counted(self):
+        """A credit or marker written before the fields existed is a hand edit now: not counted, with the
+        reason (no live manifest carries one honestly — the fields were born in the same wave)."""
+        self.complete()
+        self.assertEqual(self.problems(HIGH_PLAN), [])
+        cases = {
+            "credit without tree": lambda t: t["internal_review"].pop("tree_fingerprint"),
+            "credit without epoch": lambda t: t["internal_review"].pop("epoch"),
+            "marker without tree": lambda t: t["external_review"].pop("tree_fingerprint"),
+            "marker without epoch": lambda t: t["external_review"].pop("epoch"),
+            "credit epoch is a bool": lambda t: t["internal_review"].update(epoch=True),
+        }
+        for case, edit in cases.items():
+            with self.subTest(case=case):
+                value = self.forged(edit)
+                problems = self.problems(HIGH_PLAN, value)
+                self.assert_reason(problems, "t1", "internal_reviewer", "новый прогон")
+                self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
+
+    def test_every_credit_of_a_high_task_is_reset_by_the_events_after_it(self):
+        """One sweep over the roles whose credit the readiness reads and the events that change what they
+        judged: the task is not ready, where names a role and a reason, the gate fails; the honest repeat
+        of the role on the new state makes it ready and the gate pass."""
+        cases = [
+            ("final_check", "dirty_tree"), ("final_check", "new_commit"), ("final_check", "fix_failed"),
+            ("final_check", "fix_pass"), ("final_check", "defer"), ("final_check", "accept"),
+            ("final_check", "decision"), ("final_check", "role_record"),
+            ("cross_provider_reviewer", "dirty_tree"), ("cross_provider_reviewer", "new_commit"),
+            ("cross_provider_reviewer", "fix_failed"), ("cross_provider_reviewer", "fix_pass"),
+            ("cross_provider_reviewer", "role_record"),
+            ("second_reviewer", "dirty_tree"), ("second_reviewer", "new_commit"),
+            ("second_reviewer", "fix_failed"), ("second_reviewer", "fix_pass"), ("second_reviewer", "role_record"),
+        ]
+        for role, event in cases:
+            with self.subTest(role=role, event=event):
+                self.init()
+                self.built()
+                self.internal()
+                if event in ("defer", "accept"):
+                    self.findings_review()
+                    self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+                    self.assertEqual(self.final()["status"], "in_progress")  # findings not disposed of
+                else:
+                    self.reviews()
+                    self.assertEqual(self.final()["status"], "ready_for_pr_review")
+                    self.assertEqual(self.problems(HIGH_PLAN), [])
+                self.apply_event(event, role)
+                if event in ("dirty_tree", "new_commit"):
+                    # the results of the old tree are gone with resume: the credit of a result is bound
+                    # to the tree it was recorded on
+                    self.assertNotIn(role, self.entry()["results"])
+                    self.assert_not_credited(role)
+                    self.built()
+                    if role != "final_check":
+                        self.assert_not_credited(role)
+                        self.assert_reason(self.problems(HIGH_PLAN), "t1", role)
+                    self.reviews()
+                    self.assert_not_credited("final_check", "final_check")
+                elif self.entry()["status"] == "needs_fix":
+                    # an open fix cycle: the task waits for the coder; the credit question comes after
+                    self.assertIn(role, self.entry()["results"])
+                    self.assertEqual(self.assert_not_credited(role)["role"], "coder")
+                    self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+                    self.assert_not_credited("final_check", "final_check")
+                elif role == "final_check":
+                    self.assertIn(role, self.entry()["results"])
+                    self.assert_not_credited(role, "final_check", "task-result --role final_check")
+                else:
+                    self.assertIn(role, self.entry()["results"])  # the review saw this tree: its credit stays
+                    self.assert_not_credited(role)
+                self.assertEqual(self.final()["status"], "ready_for_pr_review")
+                self.assertEqual(self.problems(HIGH_PLAN), [])
+                self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
+
+    def test_marker_null_fails_the_gate_as_malformed(self):
+        self.complete()
+        value = self.forged(lambda t: t.update(external_review=None))
+        for plan in (HIGH_PLAN, MEDIUM_PLAN, None):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan, value)
+                self.assert_reason(problems, "manifest", "t1", "external_review")
+                self.assertEqual(self.verdict(plan, value)["verdict"], "fail")
+
+    def test_recorded_non_pass_final_check_fails_the_gate(self):
+        self.complete()
+        for status in ("unavailable", "findings"):
+            with self.subTest(status=status):
+                self.final(status)
+                problems = self.problems(HIGH_PLAN)
+                self.assert_reason(problems, "t1", "final_check", status)
+                self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
+        self.final()
+        self.assertEqual(self.problems(HIGH_PLAN), [])
+
+    def test_medium_wave_judges_a_high_task_by_the_roles_and_a_medium_one_without(self):
+        self.init(risk="medium")
+        self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.built()
+        self.internal()
+        self.reviews()
+        self.record("coder", task="t2")
+        self.record("tester", task="t2")
+        entry = self.record("cross_provider_reviewer", task="t2", reviewed_head=self.head(),
+                            packet_hash=self.packet_hash, artifact="astra-report")
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        for plan in (MEDIUM_PLAN, None):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan)
+                self.assert_reason(problems, "t1", "final_check", "задача high", "task-result --role final_check")
+                self.assertFalse(any("t2" in p for p in problems), problems)
+        self.final()
+        for plan in (MEDIUM_PLAN, None):
+            with self.subTest(plan=plan, complete=True):
+                self.assertEqual(self.problems(plan), [])
+
+    # ----- acceptance 6 -----
+    def test_policy_1_2_1_manifest_of_a_high_wave_needs_a_new_run(self):
+        self.policy("1.2.1")
+        self.built()
+        self.assertEqual(self.reviews()["status"], "ready_for_pr_review")  # by the rules of its own policy
+        for plan in (HIGH_PLAN, MEDIUM_PLAN, None):  # the level of the run is high: a high wave under any plan
+            with self.subTest(plan=plan):
+                problems = self.problems(plan)
+                self.assert_reason(problems, "1.2.1", "новый прогон волны", "state.py init")
+                self.assert_reason(problems, "internal_reviewer", "final_check")
+                v = self.verdict(plan)
+                self.assertEqual(v["verdict"], "fail")
+                self.assert_reason(v["reasons"], "1.2.1", "новый прогон волны")
+        # the records of the roles do not buy the old policy a pass
+        self.internal()
+        self.final()
+        self.assert_reason(self.problems(HIGH_PLAN), "1.2.1", "новый прогон волны")
+
+    def test_policy_1_2_1_manifest_with_a_high_task_in_a_medium_wave_needs_a_new_run(self):
+        self.init(risk="medium")
+        self.policy("1.2.1")
+        self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.built()
+        self.assertEqual(self.reviews()["status"], "ready_for_pr_review")
+        for plan in (MEDIUM_PLAN, None):
+            with self.subTest(plan=plan):
+                problems = self.problems(plan)
+                self.assert_reason(problems, "1.2.1", "t1", "новый прогон волны", "state.py init")
+                self.assertEqual(self.verdict(plan)["verdict"], "fail")
+
+    def test_policy_1_2_1_manifest_below_high_without_high_tasks_is_judged_as_before(self):
+        self.init(risk="medium")
+        self.policy("1.2.1")
+        self.record("coder")
+        self.record("tester")
+        entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        for plan in (MEDIUM_PLAN, {"risk": "low"}, None):
+            with self.subTest(plan=plan):
+                self.assertEqual(self.problems(plan), [])
+                self.assertEqual(self.verdict(plan)["verdict"], "pass")
+        # the same manifest under a plan that says the wave is high
+        problems = self.problems(HIGH_PLAN)
+        self.assert_reason(problems, "1.2.1", "новый прогон волны")
+        self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
 
 
 if __name__ == "__main__":

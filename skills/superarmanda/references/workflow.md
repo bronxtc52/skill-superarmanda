@@ -99,11 +99,23 @@ SHA может закрыть gate; неуспешная Opus-попытка о�
 - **Триаж записывается до круга.** Результат `triage` координатор пишет до `fix-loop` этого круга:
   задача в `needs_decision` не принимает `task-result` ни одной роли, а решение там принимает
   владелец.
-- **Принятое ограничение (1.2.3).** Архитектор, триаж и следователь машинно не проверяются:
+- **Одно решение на результат ревьюера.** Правило триажа — одно решение на результат: решения по
+  находкам одного результата внешнего ревью сводятся к одному, `fix-loop --accept` (и `--defer`) покрывает
+  результат целиком, поэтому он допустим, только если ни одна находка результата не нарушает
+  приёмку; иначе — обычный круг `--outcome failed`, который чинит нарушающие находки (остальные
+  принимаются или откладываются уже по новому результату на новом HEAD).
+- **Архитектор в режиме волн.** Шаг 1 волны берётся из одобренного плана, поэтому архитектор
+  работает в фазе A, где manifest ещё нет: его отчёт хранится файлом в каталоге прогона
+  `<run_dir>/plan-review/architect.md`, запись `task-result` для роли `architect` в режиме волн не
+  требуется (в обычном режиме — как описано выше).
+- **Машинная обязательность (1.2.4, W4).** Архитектор, триаж и следователь машинно не проверяются:
   `state.py` хранит их результаты и модель, но ни готовность задачи, ни гейт мерджа их не требуют;
-  применимость держит правило выше и итоговый отчёт. Машинная обязательность `internal_reviewer`
-  и `final_check` для задачи high — следующая волна W4 (1.2.4). До неё результаты всех пяти ролей
-  не меняют ни статус задачи, ни `where.step`/`next_action`, ни гейт мерджа.
+  применимость держит правило выше и итоговый отчёт. `internal_reviewer` и `final_check` для
+  задачи high с 1.2.4 обязательны машинно — правила в «Local state interface» ниже: внутреннее
+  ревью засчитывается только до первого внешнего пакета задачи и на его HEAD, дереве и эпохе, финальная сверка —
+  `pass` на финальном HEAD как последнее слово по задаче (после последнего ревью задачи, закрытия
+  последнего круга исправлений и любой другой записи ролей готовности и `fix-loop` задачи); обязательность задаёт
+  `review_policy.version` manifest (`1.2.4`; manifest политики `1.2.1` судится как раньше).
 
 ## Смена координатора и восстановление
 
@@ -193,15 +205,18 @@ creates one manifest atomically.
   `next_action`.
 
 **Fable-субагенты и внутренний источник (1.2.3, #86).** Только manifest `version: 2`; manifest
-1.2.2 без новых полей читается как раньше.
+1.2.2 без новых полей читается как раньше. Обязательность `internal_reviewer` и `final_check`
+(1.2.4) — следующий блок.
 
 - Роли `architect`, `internal_reviewer`, `triage`, `investigator`, `final_check` — `task-result
   --role <роль> --model <fable|claude-fable-5-1>`: модель обязательна при любом статусе и любом
   риске и обязана означать Fable; пустая или другая модель — отказ, который называет выход
   `task-result --role <роль> --status unavailable --model fable` (запись «Fable запрошена и
-  недоступна», поле `model`). Результат — запись: статус задачи он не меняет, в `required_roles`,
-  `task_ready` и гейт мерджа не входит; `where` показывает его в `verdicts` и в `artifacts` (с
-  `model`), не-pass — в `open_findings`. На задаче `blocked` или `needs_decision` запись отклоняется,
+  недоступна», поле `model`). Результат `architect`, `triage`, `investigator` — запись: статус
+  задачи он не меняет, в `required_roles`, `task_ready` и гейт мерджа не входит; `where`
+  показывает его в `verdicts` и в `artifacts` (с `model`), не-pass — в `open_findings`.
+  `internal_reviewer` и `final_check` задачи high под политикой `1.2.4` входят в готовность
+  (следующий блок). На задаче `blocked` или `needs_decision` запись отклоняется,
   как у любой роли. `--artifact` роли `internal_reviewer`, за которым лежит JSON-отчёт `review.py`
   профиля `claude-host`, `codex-host` или `codex-host-opus`, — отказ: находку внешнего ревью нельзя
   записать под внутренним источником.
@@ -228,6 +243,112 @@ creates one manifest atomically.
 - Проверка артефакта — защита от небрежной подмены, а не доказательство происхождения: артефакт,
   как и manifest, не подписан; находки, переписанные из внешнего отчёта в свой файл, она не
   отличит.
+
+**Обязательные роли задачи high (1.2.4, W4, #86).** Обязательность задаёт версия политики ревью в
+manifest: `state.py init` 1.2.4 пишет `review_policy.version: "1.2.4"`; manifest с политикой
+`1.2.1` (от 1.2.1–1.2.3) `state.py` читает без отказа и судит без этих ролей, как 1.2.3 (их записи
+там — по-прежнему только записи). Под `1.2.4` для задачи с эффективным риском `high` (`task_risk`:
+больший из `review_policy.level` и `risk` задачи) `task_ready`, `where`/`derive_step` и гейт
+мерджа требуют, кроме двух ревью, ещё двух зачётов — одно правило `fable_role_gaps` в `state.py`,
+гейт его вызывает, а не копирует:
+
+- **Внутреннее ревью — до первого внешнего пакета, на его HEAD.** Первый внешний пакет задачи —
+  первая запись `task-result` ЛЮБОЙ роли из `cross_provider_reviewer`, `second_reviewer`,
+  `github_codex_review`, `coderabbit` при любом статусе (включая `unavailable`): после неё
+  внутреннее ревью в этом прогоне не засчитывается. Факт «пакет уже был» `state.py` и гейт берут
+  одним правилом (`external_review_started`) по свидетелям, которые переживают `resume` и лежат в
+  сыром manifest: маркер `external_review`, история сессий `session_roles`, счётчики источников
+  `fix_sources`, записи `deferrals` и `acceptances` (их `source`), текущие результаты `results` и
+  история ревью `review_history` задачи — пока цел хоть один из них, удалённый руками маркер
+  ничего не открывает заново, а следующая внешняя запись маркер не пересоздаёт (HEAD первого пакета
+  неизвестен — до конца прогона «новый прогон»); `external_review: null` (`state.py` его никогда не
+  пишет) — malformed manifest, закрытый отказ. Остаток (manifest не подписан): если первым пакетом
+  была запись `github_codex_review` или `coderabbit` (в `review_history` они не пишутся), после
+  `resume` её результата нет, маркер и `session_roles` стёрты руками, а по этому источнику не было
+  ни круга `fix-loop`, ни `--defer`/`--accept`, — свидетелей не остаётся, и такую правку правило не
+  отличит от прогона без внешнего ревью. И обратное: ошибочный `fix-loop --outcome failed` под
+  внешним источником до результата этой роли делает `fix_sources` свидетелем пакета — задача до
+  конца прогона в «новом прогоне», а причина свидетеля не называет (остаток, issue #95).
+  Зачёт — долговечный ключ задачи `internal_review`
+  (`{status, head, tree_fingerprint, epoch, result_id, model, recorded_at}`): его пишет
+  `task-result --role internal_reviewer` при любом статусе, пока внешнее ревью задачи не
+  началось; каждая новая запись заменяет предыдущую, `resume` ключ сохраняет (входит в
+  `TASK_KEYS`). **Кредит роли = HEAD + дерево + эпоха.** Маркер первого внешнего пакета
+  `external_review` несёт `external_review.head`, `tree_fingerprint` и `epoch` задачи на момент перед
+  первой внешней записью. Засчитано, если ПОСЛЕДНЯЯ запись имеет статус `pass` или `findings`, модель
+  `claude-fable-5-1` и её `head`, `tree_fingerprint` и `epoch` равны маркеру: внутреннее ревью
+  смотрело ровно тот diff и то дерево, которые ушли наружу, и между ним и пакетом ничего не
+  произошло. Что сбрасывает кредит (причина называет, что разошлось — HEAD, дерево или эпоха, и
+  действие «новый прогон»): новый коммит; правка дерева без коммита (в том числе ревью на грязном
+  дереве и откат правок перед пакетом того же SHA — дерево другое); запись роли готовности
+  (coder, tester, оба ревью, повторное внутреннее ревью заменяет кредит); любой `fix-loop`; смена
+  эффективного риска (`task-risk`). Маркер или кредит без `head`/`tree_fingerprint`/`epoch` зачёт не
+  привязывает — «новый прогон» (совместимых живых записей нет: поля появились в этой же волне).
+  До маркера кредит засчитан, только пока его запись — текущий результат `internal_reviewer` этого
+  HEAD и дерева (`result_id`; `resume` на другое дерево его снимает) — тогда просто записать заново. `findings` засчитывается: находки либо чинятся кругом `--source internal_reviewer` (тогда
+  HEAD новый и нужна новая запись на нём), либо координатор идёт дальше с ними под свою
+  ответственность (итоговый отчёт). `unavailable`, `error`, `incomplete`, отсутствие записи, запись
+  на другом HEAD или запись после маркера — не засчитано. До маркера требование открыто: после
+  tester `where` ведёт к `internal_reviewer` на текущем HEAD (`unavailable`/`error` — `BLOCKED`,
+  внешнее ревью не начинать, подмены моделью слабее нет). После маркера без зачёта задача в этом
+  прогоне готовой не станет: `next_action` — `BLOCKED: internal_reviewer: new run required …`,
+  действие — новый прогон задачи (`state.py init` на новом пути; в волне — `init --from-plan`,
+  новый прогон волны). Запись `internal_reviewer` после маркера принимается как запись (в
+  `internal_review` она не попадает).
+- **Финальная сверка — последнее слово по задаче: на финальном HEAD, после последнего ревью
+  задачи, после закрытия последнего круга исправлений и после любой другой записи ролей готовности и `fix-loop` задачи.**
+  Засчитывается текущий результат `final_check` (HEAD и дерево manifest) с моделью
+  `claude-fable-5-1` (как у coder и tester задачи high) и статусом `pass`, после которого в записи
+  задачи ничего не менялось. Три стража, от частного к общему:
+  - `after_reviews` — `result_id` текущих `cross_provider_reviewer` и `second_reviewer` на момент
+    записи сверки; ревью, записанное позже или заново, просит новую сверку.
+  - `after_fix_cycles` — счётчик задачи `fix_cycles_closed` на момент записи: сколько кругов
+    исправлений закрыто выходом из `needs_fix` (через `fix-loop --outcome pass`, через
+    `--defer`/`--accept` или запись роли, после которых все требуемые роли pass или покрыты; растёт
+    при любом риске, переживает `resume`, как `fix_cycles`). Сверка, записанная во время круга или
+    до него, после его закрытия не засчитывается — это не сверка исправленной задачи. Запись без
+    `after_fix_cycles` (сделана до того, как поле появилось) засчитывается, только пока задача не
+    закрыла ни одного круга.
+  - `after_epoch` — счётчик записи задачи `task_epoch` на момент сверки. `task_epoch` растёт
+    ровно на этих событиях: `task-result` роли, от которой зависит готовность, — `coder`, `tester`,
+    `cross_provider_reviewer`, `second_reviewer`, `internal_reviewer`; каждый `fix-loop`
+    (`--outcome failed`/`pass`, `--defer`, `--accept`, `--decision`); `task-risk`, меняющий
+    эффективный риск задачи (повтор того же риска или уровня прогона — не изменение). Переживает
+    `resume`. НЕ растёт на `github_codex_review` и `coderabbit` (PR-гейт в сравнение не входит:
+    CodeRabbit приходит после снятия draft, то есть после сверки; его находки идут через
+    `fix-loop`, который растит счётчик сам), на `architect`, `triage`, `investigator`
+    (информационные роли: не меняют ни готовность, ни шаг) и на самой `final_check`. Сверка с
+    другим `after_epoch` или без него не засчитывается (совместимых живых записей нет — поле
+    появилось в той же волне, что и правило; запись без него — правка руками). Это общий страж: он
+    закрывает и те двери, которых первые два не видят — покрытие находок после сверки, повторную
+    запись роли.
+  PR-гейт в сравнение не входит: draft PR и `github_codex_review` можно делать до сверки и после
+  неё, а новый HEAD по их находкам и так сбрасывает её через `resume`. `findings`, `unavailable`,
+  `error`, `incomplete`, запись на прошлом HEAD, раньше ревью задачи, раньше закрытия круга или
+  раньше другой записи задачи из перечня выше — не pass; такая запись не отклоняется
+  (совместимость записи 1.2.3), она лишь не засчитывается, причина — в `next_action` (`where`
+  после двух ревью ведёт к шагу 7 `final_check`; `unavailable`/`error` — `BLOCKED`). Результат
+  `final_check` и `internal_reviewer` под `1.2.4` меняет статус задачи high: `pass` сверки при
+  полной готовности даёт `ready_for_pr_review` из `in_progress` или `needs_verification`; не-pass
+  сверки после готовности и повторное внутреннее ревью возвращают `in_progress` до новой сверки.
+  Из `needs_fix` запись `internal_reviewer`/`final_check` не повышает. Открытый круг закрывают
+  `fix-loop --outcome pass`, новый HEAD, `--defer`/`--accept` и запись роли (coder, tester, ревью,
+  PR-гейт), после которых все требуемые роли pass или покрыты (`fix_cycle_closable`: сверка в этот
+  вопрос не входит — она обязана ИДТИ ПОСЛЕ закрытия, а на high под `1.2.4` сверка, записанная до
+  закрытия, всегда уже stale по `task_epoch`, и с ней в условии круг задачи high не закрылся бы
+  никогда). Выход из `needs_fix` у задачи high под
+  `1.2.4` — всегда `needs_verification`: прежняя `final_check` (записанная до закрытия круга, в том
+  числе прямо в `needs_fix`) не засчитывается, нужна новая `final_check pass` после закрытия круга —
+  она и даёт `ready_for_pr_review`. Покрытие или запись роли, после которых какая-то требуемая
+  роль не pass и не покрыта, круг не закрывают: покрытие оставляет `needs_fix`, запись роли даёт
+  `in_progress`, как в 1.2.3. Ниже high и под `1.2.1` выход из `needs_fix` даёт
+  `ready_for_pr_review`, как раньше.
+- **Ниже high** обе роли остаются записями: `task_ready` их не требует, `where` их не называет,
+  их запись любого статуса статус задачи не трогает (задача в `needs_fix` остаётся в `needs_fix`).
+  Задача, поднятая до high (`task-risk`) после первого внешнего пакета без зачтённого внутреннего
+  ревью, готовой в этом прогоне не станет — зачёт пишется при любом риске, поэтому внутреннее ревью
+  до пакета стоит делать и на задаче, которая может быть поднята.
+- **`role-model`** отдаёт `policy_version` из manifest (`1.2.4` или `1.2.1`).
 
 Гейт мерджа диспетчера волн с 1.2.2 судит по риску волны из одобренного `waves.json` (пин
 `plan_sha256`): в high-волне каждой задаче нужны оба ревью текущего HEAD, в любой волне — задаче
@@ -302,7 +423,7 @@ A reviewer `findings` result counts as passed for readiness (and for the wave me
 a deferral of the same role recorded no earlier than the result; coder and tester still need `pass`.
 After `resume` new results are not covered by older deferrals. Severity is not parsed: deferring
 only low/P3 findings is coordinator discipline. `where` reports the count as `deferred`.
-Both `--defer` and `--accept` also work from `needs_fix` (the same findings were first sent through `--outcome failed`, then judged acceptable): once every required role is pass or covered the task becomes `ready_for_pr_review`; while another role is still open it stays `needs_fix`.
+Both `--defer` and `--accept` also work from `needs_fix` (the same findings were first sent through `--outcome failed`, then judged acceptable): once every required role is pass or covered the task leaves `needs_fix` and the fix cycle closes (`fix_cycles_closed`) — `ready_for_pr_review` below high and under the policy 1.2.1, `needs_verification` for a high task of 1.2.4 until a new `final_check pass` (the one recorded before the closing is not counted); while another role is still open it stays `needs_fix`.
 `fix-loop --accept --source <source> --severity <low|medium|high> --note <text>` (mutually exclusive
 with `--defer`/`--outcome`/`--decision`; `--severity` only with `--accept`) has the same preconditions
 as `--defer` (reviewer sources, a `findings` result on the current head and tree, task not `blocked`

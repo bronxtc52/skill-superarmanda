@@ -552,14 +552,20 @@ class Actor:
             return self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", "cross_provider_reviewer",
                                  "--status", "pass", "--session-id", f"e2e-{s.wave}-reviewer", "--head", head,
                                  "--reviewed-head", head, "--packet-hash", hashlib.sha256(b"packet").hexdigest())
-        # a high wave: both task reviews of this HEAD, written by the real review.py and verified by state.py
+        # a high wave (policy 1.2.4): the internal Fable review of this HEAD before the external packet, both
+        # task reviews of this HEAD, written by the real review.py and verified by state.py, then the final check
+        self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", "internal_reviewer", "--status",
+                      "pass", "--session-id", f"e2e-{s.wave}-internal", "--head", head, "--model", "fable")
         packet_hash, reports = self.w.review(self.w.workdir, self.w.git("rev-parse", "origin/main"), head,
                                              s.wave_dir / "superarmanda" / "reports", f"задача волны {s.wave}\n")
         for role, profile in (("cross_provider_reviewer", "claude-host"), ("second_reviewer", "codex-host")):
             self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", role, "--status", "pass",
                           "--session-id", f"e2e-{s.wave}-{role}", "--head", head, "--reviewed-head", head,
                           "--packet-hash", packet_hash, "--artifact", reports[profile])
-        self.did(s, "two task reviews recorded")
+        if self.mode != "no_final_check":  # the mutant: a high wave that skips the final check never merges
+            self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", "final_check", "--status",
+                          "pass", "--session-id", f"e2e-{s.wave}-final", "--head", head, "--model", "fable")
+        self.did(s, "internal review, two task reviews and the final check recorded")
 
     def finish(self, s, next_prompt=None):
         (s.wave_dir / "result.md").write_text(f"{s.wave} готова: {s.wave.lower()}.txt добавлен.\n", encoding="utf-8")
@@ -683,7 +689,8 @@ def run_scenario(mode="normal", limit=90 * 60):
     Codex reviewed an older commit) | no_rebind (find_new_session finds nothing) | no_policy (chain.json
     without decision_policy) | stale_base (the next wave starts on the old working copy) | no_checkpoint
     (the context is never measured) | lowered_policy (the high wave W1 builds its manifest with the level
-    lowered to medium and one review) | no_children_check (the nudge ignores the process tree) | no_nudge (no idle
+    lowered to medium and one review) | no_final_check (the high wave W1 records both reviews and no final
+    check) | no_children_check (the nudge ignores the process tree) | no_nudge (no idle
     nudge at all) | rabbit_blocks (a CodeRabbit that is `unavailable` blocks the gate) | kill_any (the cleanup
     does not check whose a pane is)."""
     base = Path(tempfile.mkdtemp(prefix="wabe2e-"))
@@ -746,10 +753,17 @@ def run_scenario(mode="normal", limit=90 * 60):
         run.env_seen = {"wab_tmux": sorted(k for k in os.environ if k.startswith(("WAB_", "TMUX"))),
                         "home": str(Path.home()), "path": os.environ["PATH"]}
         run.resolved = {t: shutil.which(t) for t in EXPECTED_TOOLS + TOOLS_THAT_MUST_NOT_RESOLVE}
-        run.codes["launch"] = call("launch", str(world.chain_file), "W1", str(world.root / "w1-prompt.md"))
-        run.codes["watch"] = call("watch", str(world.chain_file))
-        run.codes["done"] = call("done", str(world.chain_file))
-        actor.step()  # what was typed after the last sleep (the final /exit) is read too
+        try:
+            run.codes["launch"] = call("launch", str(world.chain_file), "W1", str(world.root / "w1-prompt.md"))
+            run.codes["watch"] = call("watch", str(world.chain_file))
+            run.codes["done"] = call("done", str(world.chain_file))
+            actor.step()  # what was typed after the last sleep (the final /exit) is read too
+        except Stalled as stalled:
+            # a stalled mutant keeps its run on the exception: the test reads WHY the chain stopped
+            events = world.run_dir / "events.log"
+            run.events_log = events.read_text(encoding="utf-8") if events.exists() else ""
+            stalled.run = run
+            raise
     run.state = json.loads((world.run_dir / "state.json").read_text(encoding="utf-8"))
     run.events_log = (world.run_dir / "events.log").read_text(encoding="utf-8")
     return run
@@ -825,7 +839,8 @@ def oracle_wave_risk(run):
         runs = json.loads((w.run_dir / wave / "runs.json").read_text(encoding="utf-8"))["runs"]
         manifests[wave] = json.loads(Path(runs[-1]["manifest"]).read_text(encoding="utf-8"))
         m = manifests[wave]
-        must((m["version"], m["review_policy"]["level"], m["plan"]["sha256"]) == (2, WAVE_RISK[wave], w.plan_sha256),
+        must((m["version"], m["review_policy"], m["plan"]["sha256"])
+             == (2, {"version": "1.2.4", "level": WAVE_RISK[wave]}, w.plan_sha256),
              f"{wave}: manifest policy {m.get('version')}/{m.get('review_policy')}")
     results = manifests["W1"]["tasks"]["T1"]["results"]
     reviews = {role: results.get(role) or {} for role in ("cross_provider_reviewer", "second_reviewer")}
@@ -835,6 +850,15 @@ def oracle_wave_risk(run):
         must(r["status"] == "pass" and r["head"] == merged.get(1) and r["artifact_sha256"], f"W1 {role}: {r}")
     must(len({r["packet_hash"] for r in reviews.values()}) == 1, "the two reviews of W1 cover different packets")
     must(all(results[role]["model"] == "claude-fable-5-1" for role in ("coder", "tester")), "W1 coder/tester model")
+    # 1.2.4: the internal review of the HEAD of the first external packet and the final check of the merged HEAD
+    task = manifests["W1"]["tasks"]["T1"]
+    internal = task.get("internal_review") or {}
+    must(internal.get("status") == "pass" and internal.get("head") == task["external_review"]["head"] == merged.get(1),
+         f"W1 internal review: {internal}")
+    final = results.get("final_check") or {}
+    must(final.get("status") == "pass" and final.get("head") == merged.get(1) and final.get("model") == "claude-fable-5-1"
+         and final.get("after_reviews") == {role: reviews[role]["result_id"] for role in reviews},
+         f"W1 final check: {final}")
     must("second_reviewer" not in manifests["W2"]["tasks"]["T1"]["results"], "the medium wave W2 needs one review")
     warnings = [l for l in run.events_log.splitlines() if "chain.json has no `model`" in l]
     must(len(warnings) == 1, f"one warning about the missing model, got {len(warnings)}")
@@ -1046,6 +1070,18 @@ class Mutations(unittest.TestCase):
         """state.py calls the task ready (level medium, one review); the gate knows the wave is high by the plan."""
         with self.assertRaises(Stalled):
             run_scenario("lowered_policy", limit=70 * 60)
+
+    def test_a_high_wave_without_the_final_check_never_passes_the_gate(self):
+        """1.2.4: the two reviews are there, the final check is not; state.py does not call the task ready and the
+        gate of the high wave names the role."""
+        with self.assertRaises(Stalled) as held:
+            run_scenario("no_final_check", limit=70 * 60)
+        failures = [l for l in held.exception.run.events_log.splitlines() if "W1: merge gate failed" in l]
+        self.assertTrue(failures, "the gate of W1 never failed")
+        # the first refusal of the scenario is the red CI the wave then fixes; from then on the gate names the role
+        self.assertIn("final_check", failures[-1])
+        self.assertTrue(any("задача T1: final_check" in l for l in failures), failures)
+        self.assertNotIn("W2: merge gate", held.exception.run.events_log)
 
     def test_a_nudge_that_ignores_the_process_tree_is_a_false_nudge(self):
         run = run_scenario("no_children_check")
