@@ -11911,6 +11911,14 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(len(self.owner_asked()), 1)
         self.assertEqual(self.log(cfg).count("policy cap reached"), 1)
 
+    def test_r1_without_telegram_the_new_episode_opens_attention_as_a_usual_blocked(self):
+        with mock.patch.object(wab, "display_all"):
+            cfg, status, st = self.answered_then_rewritten(telegram=None)
+        self.assertEqual(len(self.answers()), 1)
+        self.assertIn("уже получила автоответ", st["waves"]["W1"]["policy_refusal"]["reason"])
+        self.assertIn("blocked", st["waves"]["W1"].get("attention", {}))  # the local signal of a question
+        self.assertTrue((cfg["run_dir"] / "ATTENTION").exists())
+
     def test_r1_guard_a_rule_without_answer_keeps_the_1_2_0_dedup_of_the_same_line(self):
         # the 1.2.0 twin of R1 stays as it was (a known remainder of the wave, not fixed here): the same line
         # rewritten is answered again within the cap, and AT the cap raises no new notice
