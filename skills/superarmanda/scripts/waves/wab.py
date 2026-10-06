@@ -5255,13 +5255,18 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     reason is gone; a rewritten or another line is a new episode — rewritten means the file READS as this
     line under another stamp (an empty or unreadable file mid-rewrite, decided on last_status, is still the
     refused episode). A corrupt `policy_refusal` (not an object, or an object with corrupt fields) reads as
-    a refusal (fail closed). `_tick` drops the mark when the episode ends. An answered fork key is kept in
+    a refusal (fail closed). `_tick` drops the mark when the episode ends. Under a rule with `answer` the
+    `blocked` mark of the owner's notice belongs to the EPISODE too, not to the text of the line: a new
+    episode of the very line answered or refused before, and the first record of a refusal, reset it, so
+    every outcome without an auto-answer (a machine refusal, the cap) raises BLOCKED to the owner again —
+    one notice per episode; a rule without `answer` keeps the 1.2.0 dedup by text. An answered fork key is kept in
     `policy_keys`, one in flight in `policy_key_pending`. THE key in flight lives only inside its episode
     and is never lost: when its typed answer is given up (_abandon_input — it may have been submitted) it
     MOVES to `policy_keys` and counts as answered; it is dropped unanswered only by its own decision and
     only when nothing reached the window. The path of a rule without `answer` in this function neither
     reads nor writes `policy_key_pending` / `policy_keys`."""
     stamp = _status_stamp(cfg, wave)
+    anew = False  # the very line of the last decision under another stamp: a new episode of the same text
     if _answered(w) == status:
         if w.get("policy_answered_stamp") in (None, stamp):
             return True
@@ -5269,6 +5274,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         # the poll): a NEW episode, not the answered one — otherwise the wave would wait silently
         w.get("notified", {}).pop("policy_answer", None)
         w.pop("policy_answered_stamp", None)
+        anew = True
     refusal = w.get("policy_refusal")
     if refusal is not None:
         if not _refusal_ok(refusal) or (refusal["status"] == status and (
@@ -5277,6 +5283,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
             # is not a new episode: the file must read as this very line again (not empty or unreadable)
             return False
         w.pop("policy_refusal")  # the same line written anew: another episode, decided anew
+        anew = True
     label = parse_blocked_label(status)
     if label is None or label["red"] or label["class"] == "merge_gate":
         return False
@@ -5285,6 +5292,11 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     if rule is None:
         return False
     fixed = None  # a rule with `answer` (#89); without it every line below is the 1.2.0 path
+    if anew and rule.get("answer") is not None:
+        # under a rule with `answer` the `blocked` mark belongs to the EPISODE (the line AND the stamp), not to
+        # the text: the earlier episode of this line left it set (answered or refused), and an outcome of the
+        # new one without an auto-answer (a machine refusal, the cap) must still raise BLOCKED to the owner
+        drop_notice(w, "blocked")
     if owner_answered(cfg, wave, status):  # the owner answered this very episode with `say`
         if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
             # our answer is typed and waits for its Enter, the owner's came after: clear it (it may
@@ -5319,6 +5331,9 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         fixed = fixed_answer(cfg, wave, w, label, rule, status)
         if not fixed["ok"]:  # a machine refusal: the usual BLOCKED path with the reason, the cap untouched
             w["policy_refusal"] = {"status": status, "stamp": stamp, "reason": fixed["reason"]}
+            # the refusal is this episode's decision and always reaches the owner WITH its reason, whatever
+            # `blocked` mark the text of the line already carries (once per episode: later ticks return above)
+            drop_notice(w, "blocked")
             if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
                 # only with a corrupt mark: a typed answer waits for its Enter — never leave its text in the
                 # input line of an episode the owner now answers (it may have gone out already: charged)
