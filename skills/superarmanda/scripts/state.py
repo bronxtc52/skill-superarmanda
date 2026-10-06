@@ -2306,13 +2306,24 @@ def record_fix_outcome(args, entry, data, location, risk, policy):
 def external_review_started(entry):
     """The role of the first external review recorded for the task in this run, or None.
     The marker `external_review` is written by task-result since 1.2.3; a manifest of 1.2.2 has
-    none, so the history that survives `resume` is read as well: the session ownership of the
-    task and its per-source fix counters."""
+    none, so every record that survives `resume` is read as a witness as well: the session
+    ownership of the task, its per-source fix counters, the current results and the review
+    history. The rule is the same for state.py and the merge gate, which reads the raw manifest
+    (without the session_roles that `read` restores from the results), so a marker and sessions
+    removed by hand reopen nothing while any witness is left. Remainder: a first packet of
+    github_codex_review/coderabbit leaves no review_history, so after `resume` the marker and
+    the sessions are the only witnesses of it."""
     marker = entry.get("external_review")
     if isinstance(marker, dict):
         return marker.get("role") or "an external review"
     used = [role for role in (entry.get("session_roles") or {}).values() if isinstance(role, str)]
     used += list(entry.get("fix_sources") or {})
+    used += [role for role in (entry.get("results") or {}) if isinstance(role, str)]
+    used += [
+        item.get("role")
+        for item in (entry.get("review_history") or ())
+        if isinstance(item, dict) and isinstance(item.get("role"), str)
+    ]
     return next((role for role in sorted(used) if role in EXTERNAL_REVIEW_ROLES), None)
 
 

@@ -102,9 +102,9 @@ Fable недоступна: не подменяй моделью слабее. �
 ```
 
 Как координатор записывает решение триажа: `fix` — `fix-loop --outcome failed --source <ревьюер>`;
-`--defer` — `fix-loop --defer --source <ревьюер> --note …`; `accept_limitation` — `fix-loop --accept
---source <ревьюер> --severity … --note …`; `cut_surface` — обычный круг `--outcome failed`, в котором
-coder вырезает поверхность. Если задача уже в `needs_decision`, `accept_limitation` и `cut_surface`
+`--defer` — `fix-loop --defer --source <ревьюер> --note …`; `accept_limitation` —
+`fix-loop --accept --source <ревьюер> --severity … --note …`; `cut_surface` — обычный круг
+`--outcome failed`, в котором coder вырезает поверхность. Если задача уже в `needs_decision`, `accept_limitation` и `cut_surface`
 записываются решением владельца: `fix-loop --decision <…> --note …`.
 
 Правило — одно решение на результат: решения по находкам одного результата ревьюера сводятся к

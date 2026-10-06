@@ -254,10 +254,15 @@ manifest: `state.py init` 1.2.4 пишет `review_policy.version: "1.2.4"`; man
 - **Внутреннее ревью — до первого внешнего пакета, на его HEAD.** Первый внешний пакет задачи —
   первая запись `task-result` ЛЮБОЙ роли из `cross_provider_reviewer`, `second_reviewer`,
   `github_codex_review`, `coderabbit` при любом статусе (включая `unavailable`): после неё
-  внутреннее ревью в этом прогоне не засчитывается. Факт «пакет уже был» `state.py` берёт одним
-  правилом (`external_review_started`): маркер `external_review`, а за ним история сессий и
-  счётчики источников задачи — удалённый руками маркер ничего не открывает заново, а
-  `external_review: null` (`state.py` его никогда не пишет) — malformed manifest, закрытый отказ.
+  внутреннее ревью в этом прогоне не засчитывается. Факт «пакет уже был» `state.py` и гейт берут
+  одним правилом (`external_review_started`) по свидетелям, которые переживают `resume` и лежат в
+  сыром manifest: маркер `external_review`, история сессий `session_roles`, счётчики источников
+  `fix_sources`, текущие результаты `results` и история ревью `review_history` задачи — пока цел
+  хоть один из них, удалённый руками маркер ничего не открывает заново; `external_review: null`
+  (`state.py` его никогда не пишет) — malformed manifest, закрытый отказ. Остаток (manifest не
+  подписан): если первым пакетом была запись `github_codex_review` или `coderabbit` (в
+  `review_history` они не пишутся) и после `resume` стёрты и маркер, и `session_roles`, свидетелей
+  не остаётся — такую правку правило не отличит от прогона без внешнего ревью.
   Зачёт — долговечный ключ задачи `internal_review` (`{status, head, model, recorded_at}`): его
   пишет `task-result --role internal_reviewer` при любом статусе, пока внешнее ревью задачи не
   началось; каждая новая запись заменяет предыдущую, `resume` ключ сохраняет (входит в
