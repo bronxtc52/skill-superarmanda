@@ -297,9 +297,10 @@ def _shape_problems(manifest, tasks):
         for field, kind in _TASK_FIELD_TYPES.items():
             if field in entry and not isinstance(entry[field], kind):
                 out.append(f"manifest: задача {name}: поле {field} не {'список' if kind is list else 'объект'}")
-        cycles = entry.get("fix_cycles")
-        if "fix_cycles" in entry and (isinstance(cycles, bool) or not isinstance(cycles, int)):
-            out.append(f"manifest: задача {name}: поле fix_cycles не число")
+        for field in ("fix_cycles", "fix_cycles_closed"):
+            cycles = entry.get(field)
+            if field in entry and (isinstance(cycles, bool) or not isinstance(cycles, int)):
+                out.append(f"manifest: задача {name}: поле {field} не число")
     return out
 
 
@@ -427,7 +428,8 @@ def _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk, polic
     """A task judged as high (the wave is high by the plan, or the task's own policy is): both task reviews on
     HEAD and the rules of state.py over them (high_risk_gaps: models, verified reports, the pair, the quota
     evidence of Opus, findings and a Fable review kept by review_history; fable_role_gaps of the policy 1.2.4:
-    the internal review before the first external packet and the final check after the last task review).
+    the internal review before the first external packet and the final check after the last task review and
+    after the last closed fix cycle of the task).
     Never the saved status."""
     why = "волна high" if wave_risk == "high" else "задача high"
     problems = []

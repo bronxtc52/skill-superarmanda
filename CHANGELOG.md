@@ -29,15 +29,22 @@
     `BLOCKED: internal_reviewer: new run required …` с действием «новый прогон» (в волне —
     `state.py init --from-plan` на новом пути).
   - Финальная сверка засчитывается как текущий результат `final_check` с моделью Fable и статусом `pass` на
-    финальном HEAD и дереве, записанный после последних результатов обоих ревью задачи: `task-result --role final_check` пишет
-    в результат `after_reviews` (`result_id` текущих `cross_provider_reviewer` и `second_reviewer`), зачёт
-    требует совпадения с текущими результатами. PR-гейт (`github_codex_review`, `coderabbit`) в сравнение не
-    входит. `findings`, `unavailable`, `error`, `incomplete`, запись на прошлом HEAD или раньше последнего ревью —
+    финальном HEAD и дереве, записанный после последних результатов обоих ревью задачи и после закрытия
+    последнего круга исправлений: `task-result --role final_check` пишет
+    в результат `after_reviews` (`result_id` текущих `cross_provider_reviewer` и `second_reviewer`) и
+    `after_fix_cycles` (счётчик задачи `fix_cycles_closed` — сколько кругов закрыл `fix-loop --outcome pass` из
+    `needs_fix`; новый ключ в `TASK_KEYS`, растёт при любом риске, `resume` сохраняет), зачёт
+    требует совпадения того и другого с текущим состоянием задачи; запись без `after_fix_cycles` засчитывается,
+    только пока задача не закрыла ни одного круга. PR-гейт (`github_codex_review`, `coderabbit`) в сравнение не
+    входит. `findings`, `unavailable`, `error`, `incomplete`, запись на прошлом HEAD, раньше последнего ревью или
+    раньше закрытия круга —
     не pass; такая запись не отклоняется, а не засчитывается, причина — в `next_action` (шаг 7 `final_check`).
     Результат обеих ролей меняет статус задачи high: `pass` сверки при полной готовности даёт
     `ready_for_pr_review` из `in_progress`/`needs_verification`, не-pass после готовности возвращает `in_progress`;
     из `needs_fix` запись роли не повышает (открытый круг закрывают только `fix-loop --outcome pass`, новый HEAD или
-    `--defer`/`--accept`), ниже high запись статус не трогает.
+    `--defer`/`--accept`), и выход через `fix-loop --outcome pass` у задачи high — всегда `needs_verification`:
+    сверка, записанная во время круга или до него, после него не засчитывается (находка GitHub Codex P2 на PR #97),
+    нужна новая `final_check pass`; ниже high запись статус не трогает.
 - Гейт мерджа (`waves/gate.py`): в high-волне (по плану, копии волны или уровню) у каждой задачи, какой бы `risk`
   у неё ни стоял, и в любой волне у задачи политики `high` требуются оба зачёта на нужных HEAD; причина отказа
   называет роль, что с ней не так и действие — команду записи (`state.py task-result --role final_check …`) либо

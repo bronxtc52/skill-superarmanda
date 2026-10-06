@@ -59,8 +59,8 @@ MANIFEST_KEYS = {
     "created_at", "updated_at", "plan", "wave", "position", "run", "review_policy",
 }
 TASK_KEYS = {
-    "status", "fix_cycles", "results", "session_roles", "fix_sources", "decisions",
-    "decision_required_for", "deferrals", "acceptances", "blocked_reason", "risk",
+    "status", "fix_cycles", "fix_cycles_closed", "results", "session_roles", "fix_sources",
+    "decisions", "decision_required_for", "deferrals", "acceptances", "blocked_reason", "risk",
     "review_history", "internal_rounds", "external_review", "internal_review",
 }
 # Task keys only manifest version 2 carries.
@@ -1119,14 +1119,24 @@ def internal_review_gap(entry, head):
     )
 
 
+def fix_cycles_closed(entry):
+    """How many fix cycles of the task fix-loop --outcome pass closed (left needs_fix) in this run;
+    the counter survives resume like fix_cycles and is absent (0) until the first one closes."""
+    return entry.get("fix_cycles_closed", 0)
+
+
 def final_check_gap(entry, results):
     """Why the final check of a high-risk task is not counted, or None (policy 1.2.4).
 
     `results` are the task's results on the current head and tree. Counted: a current
     final_check with model Fable and status pass recorded after the current results of both
-    task reviews:
+    task reviews AND after the last fix cycle of the task closed:
     `after_reviews` of the record names the result_id of each review it was recorded after, so
-    a review recorded later (or again) asks for a new final check. The PR reviews
+    a review recorded later (or again) asks for a new final check; `after_fix_cycles` is the
+    task's fix_cycles_closed at the record, so a cycle closed later (fix-loop --outcome pass out of
+    needs_fix, on the same tree) asks for a new one too — a final check recorded during the cycle
+    or before it is no check of the fixed task. A record without `after_fix_cycles` (written
+    before 1.2.4 knew the field) counts only while the task closed no cycle. The PR reviews
     (github_codex_review, coderabbit) are no part of the comparison."""
     recorded = "task-result --role final_check --status pass --model fable"
     result = results.get("final_check")
@@ -1169,6 +1179,16 @@ def final_check_gap(entry, results):
             f"final_check was recorded before the current {' and '.join(late)} result of this "
             "HEAD; it counts only after the last task review: run the final check again and "
             f"record {recorded}"
+        )
+    closed = fix_cycles_closed(entry)
+    seen_cycles = result.get("after_fix_cycles", 0 if closed == 0 else None)
+    if seen_cycles != closed:
+        # a malformed counter (not a number) never matches either: the check is not counted
+        return (
+            "final_check was recorded before the fix cycle closed (after_fix_cycles "
+            f"{'none' if seen_cycles is None else seen_cycles} → fix_cycles_closed {closed}); it "
+            "counts only after the last fix-loop --outcome pass of the task: run the final check "
+            f"again and record {recorded}"
         )
     return None
 
@@ -1225,8 +1245,10 @@ def settle_mandatory_role(entry, risk, head, policy):
     needs_verification (every other record counted, the final check the last one), and it takes
     the readiness of a ready_for_pr_review task away (in_progress) when the record no longer
     counts. It never closes an open fix cycle: needs_fix is left only by fix-loop --outcome pass
-    (needs_verification), a new HEAD or --defer/--accept, and pending, blocked and needs_decision
-    are not its business either. Below high the roles are records and never reach here."""
+    (always needs_verification: a final_check recorded during or before the cycle is not counted
+    after it closes, final_check_gap), a new HEAD or --defer/--accept, and pending, blocked and
+    needs_decision are not its business either. Below high the roles are records and never reach
+    here."""
     status = entry["status"]
     if status in ("in_progress", "needs_verification") and task_ready(entry, risk, head, policy):
         entry["status"] = "ready_for_pr_review"
@@ -1757,13 +1779,15 @@ def result(args):
     record.update(verified)
     mandatory = policy in MANDATORY_ROLES_POLICIES and args.role in MANDATORY_FABLE_ROLES
     if mandatory and args.role == "final_check":
-        # which results of the task reviews this check was recorded after (final_check_gap)
+        # which results of the task reviews, and how many closed fix cycles, this check was
+        # recorded after (final_check_gap)
         record["after_reviews"] = {
             role: entry["results"][role]["result_id"]
             for role in REVIEW_ROLES
             if isinstance(entry["results"].get(role), dict)
             and entry["results"][role].get("result_id") is not None
         }
+        record["after_fix_cycles"] = fix_cycles_closed(entry)
     entry["results"][args.role] = record
     if mandatory and args.role == INTERNAL_SOURCE and started is None:
         # the credit of the internal review (internal_review_gap): the last record before the
@@ -2293,6 +2317,10 @@ def record_fix_outcome(args, entry, data, location, risk, policy):
             or fingerprint(location) != data["tree_fingerprint"]
         ):
             fail("working tree changed; run resume before recording a pass")
+        if entry["status"] == "needs_fix":
+            # the fix cycle closes here, at any risk and policy (a task may be raised to high):
+            # the final check of a high task counts only if recorded after this (final_check_gap)
+            entry["fix_cycles_closed"] = fix_cycles_closed(entry) + 1
         update_task_status(entry, risk, data["head"], policy)
         if entry["status"] != "ready_for_pr_review":
             entry["status"] = "needs_verification"

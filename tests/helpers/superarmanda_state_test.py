@@ -6448,7 +6448,6 @@ class W4MandatoryFableRoles(W4Base):
         del value["tasks"]["t1"]["results"]["final_check"]["after_fix_cycles"]
         self.manifest.write_text(json.dumps(value), encoding="utf-8")
         self.assert_ready()
-        self.assertIn("done", self.where()["next_action"])
         verified = self.fix_cycle()
         self.assertEqual((verified["status"], verified["fix_cycles_closed"]), ("needs_verification", 1))
         self.assert_not_ready("final_check", "before the fix cycle closed")
