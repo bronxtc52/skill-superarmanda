@@ -1,0 +1,81 @@
+{
+ "current": "W7",
+ "waves": {
+  "W1": {
+   "tmux": "fp-w1",
+   "phase": "done",
+   "notified": {
+    "ctx_frozen": "93d220f5-4b21-4b20-93ee-2502b1017958:2518609:302154",
+    "done": "1",
+    "exit_blocked": "no input box on the screen"
+   },
+   "last_status": "DONE",
+   "pr": 90,
+   "restarts": 1
+  },
+  "W2": {
+   "tmux": "fp-w2",
+   "phase": "done",
+   "notified": {
+    "done": "1",
+    "exit_blocked": "no input box on the screen"
+   },
+   "last_status": "DONE",
+   "pr": 93,
+   "restarts": 0
+  },
+  "W3": {
+   "tmux": "fp-w3",
+   "phase": "done",
+   "notified": {
+    "done": "1",
+    "exit_blocked": "no input box on the screen"
+   },
+   "last_status": "DONE",
+   "pr": 94,
+   "restarts": 0
+  },
+  "W4": {
+   "tmux": "fp-w4",
+   "phase": "done",
+   "notified": {
+    "done": "1",
+    "exit_blocked": "no input box on the screen"
+   },
+   "last_status": "DONE",
+   "pr": 97,
+   "restarts": 2
+  },
+  "W5": {
+   "tmux": "fp-w5",
+   "phase": "done",
+   "notified": {
+    "done": "1",
+    "exit_blocked": "no input box on the screen"
+   },
+   "last_status": "DONE",
+   "pr": 99,
+   "restarts": 0
+  },
+  "W6": {
+   "tmux": "fp-w6",
+   "phase": "done",
+   "notified": {
+    "done": "1",
+    "exit_blocked": "no input box on the screen"
+   },
+   "last_status": "DONE",
+   "pr": 101,
+   "restarts": 0
+  },
+  "W7": {
+   "tmux": "fp-w7",
+   "phase": "running",
+   "notified": {
+    "started": "1"
+   },
+   "last_status": "RUNNING",
+   "restarts": 0
+  }
+ }
+}
