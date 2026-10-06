@@ -482,6 +482,38 @@ class ReleaseDecisionPolicyAnswerDocs(unittest.TestCase):
             with self.subTest(checklist=needle):
                 self.assertIn(needle, checklist)
 
+    def test_review_round_refusal_is_final_and_the_recommendation_names_max_auto_answers(self):
+        """Internal review of W5: a refused episode is never re-checked (the owner answers it), a blocked_cap
+        limitation is accepted in a new run by `fix-loop --accept`, and the recommended configuration names
+        the independent fuse `max_auto_answers` (3 by default would end the autonomy before `max_runs: 5`)."""
+        text = doc("references/waves.md")
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        release = next(s for s in re.split(r"(?m)^## ", changelog) if s.startswith("1.2.5 — "))
+        for name, body in (("waves.md", flat(text)), ("CHANGELOG 1.2.5", flat(release))):
+            with self.subTest(doc=name):
+                self.assertNotIn("перепроверяется каждый такт", body)
+                self.assertNotIn("ответ уходит в том же эпизоде", body)
+                for needle in ("отказ окончателен для эпизода", "`wab.py say`", "fix-loop --accept",
+                               '`"max_auto_answers": 10`'):
+                    self.assertIn(needle, body)
+        policy = self.section(text, "### Политика решений")
+        rules, recommended = policy.split("**Рекомендуемая конфигурация фазы A.**", 1)
+        recommended = recommended.split("\n\n**", 1)[0]
+        self.assertIn('"max_auto_answers": 10', " ".join(flat(b) for b in fenced_blocks(recommended)))
+        for needle in ("`max_auto_answers`", "по умолчанию 3", "раньше прогонов"):
+            with self.subTest(recommended=needle):
+                self.assertIn(needle, flat(recommended))
+        rules = flat(rules)
+        for needle in ("`policy_refusal`", "штамп", "испорчен", "fix-loop --accept", "только у задачи `needs_decision`"):
+            with self.subTest(rules=needle):
+                self.assertIn(needle, rules)
+        for heading, needles in (("### Мандат", ("`max_auto_answers: 10`", "10 автоответов")),
+                                 ("### Предполётный чек-лист", ("`max_auto_answers: 10`",))):
+            body = flat(self.section(text, heading))
+            for needle in needles:
+                with self.subTest(heading=heading, needle=needle):
+                    self.assertIn(needle, body)
+
     def test_policy_section_describes_the_machine_check_and_the_refusal(self):
         text = doc("references/waves.md")
         rules = flat(self.section(text, "### Политика решений"))
