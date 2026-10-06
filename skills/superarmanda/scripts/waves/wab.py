@@ -2396,6 +2396,43 @@ REC_TOKEN = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 _LABEL = re.compile(r"BLOCKED:[ \t]*\[([^\]\n]*)\][ \t]*(.*)", re.S)
 POLICY_ANSWER = ("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант {rec}. Действуй по своей рекомендации, "
                  "затем запиши RUNNING в status. Находки low/P3 — fix-loop --defer в остаток.")
+# A rule with `answer` (#89): the dispatcher's own fixed variant, whatever the wave recommended. The
+# closed vocabulary per class; `question` has free variants and takes no `answer`.
+POLICY_ANSWERS = {"needs_decision": ("invariant", "cut_surface", "accept_limitation"),
+                  "blocked_cap": ("invariant", "new_run", "accept_limitation")}
+FORK_STATUS = {"needs_decision": "needs_decision", "blocked_cap": "blocked"}  # class -> manifest task status
+FIX_CYCLE_CAP = 3  # state.py: the third unsuccessful fix cycle blocks the task (a literal there, no constant)
+READINESS_ROLES = ("coder", "tester", "cross_provider_reviewer", "second_reviewer", "internal_reviewer",
+                   "final_check", "github_codex_review")
+FIXED_HEAD = "[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант {answer}."
+FIXED_THOROUGH = ("чини класс находки целиком, не латай; находки low/P3 — fix-loop --defer в остаток.")
+FIXED_RECORD = " Решение запиши: fix-loop --decision invariant."
+FIXED_NEW_RUN = " Открой новый прогон (state.py init --from-plan на новом пути), прогон {n} из {max}."
+# THE wording, one entry per (class, answer, «a new run is needed»). The invariant: an answer names only what
+# the wave can execute in the state of its fork, and one decision. state.py takes `fix-loop --decision` only
+# at a needs_decision task — so it is named for that class alone; a blocked task (blocked_cap) does not end
+# in its run, so every blocked_cap answer opens a new run, and a limitation is accepted there by
+# `fix-loop --accept` (the task of a new run is not needs_decision either).
+FIXED_MEANING = {
+    ("needs_decision", "invariant", False): " Доделай как следует: ещё один круг, " + FIXED_THOROUGH + FIXED_RECORD,
+    ("needs_decision", "invariant", True): " Доделай как следует: " + FIXED_THOROUGH + FIXED_RECORD + FIXED_NEW_RUN,
+    ("needs_decision", "cut_surface", False): (" Вырежи поверхность, давшую находку (fix-loop --decision "
+                                               "cut_surface), остаток — в result.md."),
+    ("needs_decision", "accept_limitation", False): (" Прими ограничение (fix-loop --decision accept_limitation): "
+                                                     "строка в «Принятые ограничения» PR и в остаток."),
+    ("blocked_cap", "invariant", True): " Доделай как следует: " + FIXED_THOROUGH + FIXED_NEW_RUN,
+    ("blocked_cap", "accept_limitation", True): (
+        " Прими ограничение: открой новый прогон (state.py init --from-plan на новом пути), прогон {n} из {max}, "
+        "и в нём находку не чини, а прими как ограничение (fix-loop --accept, строка в «Принятые ограничения» PR "
+        "и в остаток)."),
+}
+FIXED_MEANING["needs_decision", "cut_surface", True] = FIXED_MEANING["needs_decision", "cut_surface", False] + FIXED_NEW_RUN
+FIXED_MEANING["needs_decision", "accept_limitation", True] = (
+    FIXED_MEANING["needs_decision", "accept_limitation", False] + FIXED_NEW_RUN)
+FIXED_MEANING["blocked_cap", "new_run", True] = FIXED_MEANING["blocked_cap", "invariant", True]
+FORK_MARKS_CORRUPT = "отметки автоответов в state.json испорчены (policy_keys / policy_key_pending)"
+FORK_CHANGED = "состояние развилки изменилось после ввода ответа: "  # + the reason of the check as it reads now
+FIXED_TAIL = " Затем запиши RUNNING в status."
 MAX_AUTO_ANSWERS = 3  # chain.json `max_auto_answers` default: automatic answers per wave
 MAX_RUNS = 2  # chain.json `max_runs` default: superarmanda runs (`init --from-plan`) per wave
 
@@ -2421,7 +2458,8 @@ def parse_blocked_label(status):
 
 
 def check_decision_policy(value):
-    """chain.json `decision_policy`: a list of {"class": <class>, "rec": <token>?}. The reason it is
+    """chain.json `decision_policy`: a list of {"class": <class>, "rec": <token>?, "answer": <variant>?}
+    (`answer`: POLICY_ANSWERS of the class, never with `question`). The reason it is
     refused, or None. Never in it: `red` (the red zone always goes to the owner), merge_gate,
     plan_mismatch (OWNER_ONLY_CLASSES), any other key, an unknown class, a rec that is not a token."""
     if not isinstance(value, list):
@@ -2431,9 +2469,9 @@ def check_decision_policy(value):
             return f"[{i}] must be an object, got {rule!r}"
         if "red" in rule:
             return f"[{i}]: `red` is not a policy key: the red zone always goes to the owner"
-        extra = sorted(set(rule) - {"class", "rec"})
+        extra = sorted(set(rule) - {"class", "rec", "answer"})
         if extra:
-            return f"[{i}]: unknown key(s) {', '.join(map(repr, extra))} (allowed: class, rec)"
+            return f"[{i}]: unknown key(s) {', '.join(map(repr, extra))} (allowed: class, rec, answer)"
         cls = rule.get("class")
         if isinstance(cls, str) and cls in OWNER_ONLY_CLASSES:
             return f"[{i}]: {OWNER_ONLY_CLASSES[cls]}"
@@ -2442,13 +2480,163 @@ def check_decision_policy(value):
         rec = rule.get("rec")
         if "rec" in rule and not (isinstance(rec, str) and REC_TOKEN.fullmatch(rec)):
             return f"[{i}]: rec must match [A-Za-z0-9_.-]{{1,40}} (or be left out), got {rec!r}"
+        if "answer" in rule:
+            answer, allowed = rule["answer"], POLICY_ANSWERS.get(cls)
+            if allowed is None:
+                return f"[{i}]: answer is not allowed with class {cls} (its variants are free text)"
+            if not isinstance(answer, str) or answer not in allowed:
+                return (f"[{i}]: answer of class {cls} must be one of {', '.join(allowed)} "
+                        f"(or be left out), got {answer!r}")
     return None
 
 
 def decision_policy(cfg):
     """The rules of chain.json `decision_policy` (checked by load_chain) as [{class, rec}], rec None =
-    any recommended variant of that class. No field: no automatic answers."""
-    return [{"class": r["class"], "rec": r.get("rec")} for r in cfg.get("decision_policy") or []]
+    any recommended variant of that class; a rule with `answer` carries it too, one without has no such
+    key (the 1.2.0 shape; read it with .get: None = the wave's own recommendation).
+    No field: no automatic answers. The FIRST rule that fits the class and the rec decides."""
+    return [dict({"class": r["class"], "rec": r.get("rec")}, **({"answer": r["answer"]} if "answer" in r else {}))
+            for r in cfg.get("decision_policy") or []]
+
+
+def _refuse(reason):
+    return {"ok": False, "reason": reason}
+
+
+def _fork_keys(rec):
+    """(answered keys, the key in flight or None) of one wave record of state.json. A mark that is there
+    but corrupt (`policy_keys` not a list of lists, `policy_key_pending` not an object with a list `key`)
+    raises ValueError: it is never read as «nothing was answered» — fixed_answer refuses (fail closed)."""
+    keys, pend = rec.get("policy_keys", []), rec.get("policy_key_pending")
+    if (not isinstance(keys, list) or not all(isinstance(k, list) for k in keys)
+            or not (pend is None or (isinstance(pend, dict) and isinstance(pend.get("key"), list)))):
+        raise ValueError(FORK_MARKS_CORRUPT)
+    return keys, pend
+
+
+def _keep_fork_key(w):
+    """A typed fixed answer (#89) is given up and may have been submitted: its fork key leaves the flight
+    and counts as answered (`policy_keys`) — never just dropped. A corrupt mark stays as it is:
+    fixed_answer refuses on it."""
+    try:
+        keys, pend = _fork_keys(w)
+    except ValueError:
+        return
+    if pend:
+        w["policy_keys"] = keys if pend["key"] in keys else [*keys, pend["key"]]
+        w.pop("policy_key_pending")
+
+
+def _forget_fork_key(w, fixed):
+    """Nothing of THIS fixed answer reached the window: its own key (and only its own) leaves the flight."""
+    pend = w.get("policy_key_pending")
+    if isinstance(pend, dict) and pend.get("key") == fixed["key"]:
+        w.pop("policy_key_pending")
+
+
+def _refusal_ok(refusal):
+    """Is it a `policy_refusal` mark as _policy_answer writes it. Anything else under that name is corrupt
+    and reads as a refusal for as long as the wave is BLOCKED (fail closed), never as «decide anew»."""
+    return (isinstance(refusal, dict) and isinstance(refusal.get("status"), str)
+            and isinstance(refusal.get("reason"), str)
+            and (refusal.get("stamp") is None or isinstance(refusal.get("stamp"), list)))
+
+
+def fixed_answer(cfg, wave, w, label, rule, status):
+    """THE decision of a rule with `answer` (#89), by the dispatcher's files only — runs.json, the manifest
+    of the current run (current_manifest, read by state.py's own reader), state.json — never by the wave's
+    text. {"ok": True, text, key, answer, rec} or {"ok": False, reason}: the reason is a fixed wording of
+    the dispatcher plus a task/role name of the manifest and numbers. Refused (the owner decides): runs.json
+    or the manifest missing/broken/of another run; not exactly one task in the status of the class, or a
+    needs_decision without a fix-loop source; a readiness role unavailable/error on the manifest's HEAD (an
+    external failure is not fixed by another run); a new run needed above `max_runs`; the same fork (key)
+    answered before; a corrupt mark of the answered keys in state.json (this try or an archived one), a
+    corrupt `attempts` container included. The Enter-only retry of a typed answer is the whole check again
+    (only its own key in flight is not «answered before»): the Enter goes out only when the check passes NOW
+    and gives the very decision that was typed (the same key and text) — otherwise a refusal (FORK_CHANGED).
+    Never raises."""
+    try:
+        return _fixed_answer(cfg, wave, w, label, rule, status)
+    except Exception:  # noqa: BLE001 - fail closed: no automatic answer, a fixed reason
+        return _refuse("состояние развилки не разбирается")
+
+
+def _fixed_answer(cfg, wave, w, label, rule, status):
+    attempts = w.get("attempts", [])  # wave_attempts() skips a corrupt container: here it would hide archived keys
+    if not isinstance(attempts, list) or not all(isinstance(a, dict) for a in attempts):
+        return _refuse(FORK_MARKS_CORRUPT)
+    try:  # before anything else, the Enter-only retry included: a corrupt mark of ANY record of the wave
+        marks = [_fork_keys(rec) for rec in [w, *wave_attempts(w)]]
+    except ValueError:
+        return _refuse(FORK_MARKS_CORRUPT)
+    pend = marks[0][1]
+    # the Enter-only retry of THIS episode: the answer is typed, its Enter is owed — and is pressed only when
+    # the check below passes now and gives the same decision (a role may have failed, the run or `max_runs`
+    # changed since the text was typed)
+    retry = bool(pend and pend.get("status") == status and w.get("pending_enter") == "policy answer"
+                 and w.get("policy_pending") == status)
+    got = _fork_decision(cfg, wave, label, rule, marks, pend if retry else None)
+    if retry and not (got["ok"] and got["key"] == pend["key"] and got["text"] == pend.get("text")):
+        return _refuse(FORK_CHANGED + ("пересчитанный ответ не совпадает с напечатанным" if got["ok"]
+                                       else got["reason"]))
+    return got
+
+
+def _fork_decision(cfg, wave, label, rule, marks, own):
+    """The machine check of fixed_answer by the files as they are now. `own`: the key in flight of the
+    Enter-only retry — the one mark that does not read as «answered before»."""
+    cls, answer = label["class"], rule["answer"]
+    path, why = current_manifest(cfg, wave)
+    if path is None:
+        return _refuse(why)
+    try:  # with `answer` runs.json is mandatory: the standard-manifest fallback of current_manifest is not enough
+        runs = gate.state.read_runs(wave_dir(cfg, wave) / "runs.json", wave)
+    except (SystemExit, Exception):  # noqa: BLE001 - state.py refuses by SystemExit
+        runs = None
+    if not runs:
+        return _refuse("runs.json волны нет, он пуст или не читается")
+    index = runs[-1].get("index")
+    try:
+        data = gate.state.read(path)  # the one schema check of state.py, not a copy
+    except (SystemExit, Exception):  # noqa: BLE001
+        return _refuse("manifest текущего прогона не читается или не проходит схему state.py")
+    run = data.get("run")
+    if (not _count(index) or not isinstance(run, dict) or run.get("index") != index
+            or not isinstance(data.get("tasks"), dict)):
+        return _refuse("номер прогона в manifest не совпадает с runs.json")
+    want = FORK_STATUS[cls]
+    found = [(n, e) for n, e in data["tasks"].items() if isinstance(e, dict) and e.get("status") == want]
+    if len(found) != 1:
+        return _refuse(f"задач в статусе {want}: {len(found)} (нужна ровно одна)")
+    task, entry = found[0]
+    if not REC_TOKEN.fullmatch(task):
+        return _refuse("имя задачи развилки не токен")
+    source = ""
+    if cls == "needs_decision":
+        source = entry.get("decision_required_for")
+        if not isinstance(source, str) or source not in gate.state.FIX_SOURCES:
+            return _refuse(f"у задачи {task} нет источника fix-loop (decision_required_for)")
+    results = entry.get("results") if isinstance(entry.get("results"), dict) else {}
+    for role in READINESS_ROLES:
+        item = results.get(role)
+        if (isinstance(item, dict) and item.get("head") == data.get("head")
+                and item.get("status") in ("unavailable", "error")):
+            return _refuse(f"внешний сбой: роль {role} задачи {task} — {item['status']} на текущем HEAD")
+    cycles = entry.get("fix_cycles")
+    if isinstance(cycles, bool) or not isinstance(cycles, int):
+        return _refuse(f"счётчик fix-loop задачи {task} не число")
+    new_run = cls == "blocked_cap" or cycles >= FIX_CYCLE_CAP
+    cap = cfg["max_runs"]
+    if new_run and index >= cap:
+        return _refuse(f"потолок прогонов исчерпан ({index}/{cap}), новый прогон открыть нельзя")
+    key = [wave, cfg["run_id"], index, task, cls, source]
+    for keys, pend in marks:
+        if key in keys or (pend and pend is not own and pend.get("key") == key):
+            return _refuse(f"развилка задачи {task} уже получила автоответ в прогоне {index}")
+    text = FIXED_HEAD.format(answer=answer) + FIXED_MEANING[cls, answer, new_run].format(n=index + 1, max=cap)
+    if label["rec"] != answer:
+        text += f" (рекомендация волны: {label['rec']})"
+    return {"ok": True, "text": text + FIXED_TAIL, "key": key, "answer": answer, "rec": label["rec"]}
 
 
 def system_prompt(cfg):
@@ -3222,6 +3410,8 @@ def _abandon_input(cfg, st, wave, w, why, locked=False, target=None):
     into this window (_deliver, `say`). `locked`: the caller already holds the window's input lock."""
     what = w.get("pending_enter")
     if what:
+        if what == "policy answer" and "policy_key_pending" in w:
+            _keep_fork_key(w)  # a fixed answer (#89) given up, possibly submitted: its fork counts as answered
         w["pending_clear"] = {"what": what, "why": why}
         w.pop("pending_enter", None)
         w.pop("pending_text_head", None)
@@ -5071,8 +5261,27 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     policy does not allow, no policy, the cap reached, or a failed delivery (the next
     tick tries again; `pending_enter` makes the retry Enter-only, so the answer is never typed twice).
     None: the status file changed between the tick's read and the delivery: nothing is sent and the
-    tick ends; the next tick starts the new episode."""
+    tick ends; the next tick starts the new episode.
+    A rule with `answer` (#89) answers with the dispatcher's fixed variant after fixed_answer()'s machine
+    check; its refusal is the usual BLOCKED path (False) with one event per episode and the reason in the
+    owner's notice, the cap untouched. THE refusal is final for its episode — the same status line AND the
+    same stamp of the status file, kept in `policy_refusal` of state.json (it outlives the watch): the owner
+    was asked and may be answering in the window, so later ticks neither re-check nor answer, even when the
+    reason is gone; a rewritten or another line is a new episode — rewritten means the file READS as this
+    line under another stamp (an empty or unreadable file mid-rewrite, decided on last_status, is still the
+    refused episode). A corrupt `policy_refusal` (not an object, or an object with corrupt fields) reads as
+    a refusal (fail closed). `_tick` drops the mark when the episode ends. Under a rule with `answer` the
+    `blocked` mark of the owner's notice belongs to the EPISODE too, not to the text of the line: a new
+    episode of the very line answered or refused before, and the first record of a refusal, reset it, so
+    every outcome without an auto-answer (a machine refusal, the cap) raises BLOCKED to the owner again —
+    one notice per episode; a rule without `answer` keeps the 1.2.0 dedup by text. An answered fork key is kept in
+    `policy_keys`, one in flight in `policy_key_pending`. THE key in flight lives only inside its episode
+    and is never lost: when its typed answer is given up (_abandon_input — it may have been submitted) it
+    MOVES to `policy_keys` and counts as answered; it is dropped unanswered only by its own decision and
+    only when nothing reached the window. The path of a rule without `answer` in this function neither
+    reads nor writes `policy_key_pending` / `policy_keys`."""
     stamp = _status_stamp(cfg, wave)
+    anew = False  # the very line of the last decision under another stamp: a new episode of the same text
     if _answered(w) == status:
         if w.get("policy_answered_stamp") in (None, stamp):
             return True
@@ -5080,12 +5289,29 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         # the poll): a NEW episode, not the answered one — otherwise the wave would wait silently
         w.get("notified", {}).pop("policy_answer", None)
         w.pop("policy_answered_stamp", None)
+        anew = True
+    refusal = w.get("policy_refusal")
+    if refusal is not None:
+        if not _refusal_ok(refusal) or (refusal["status"] == status and (
+                refusal.get("stamp") == stamp or read(wave_dir(cfg, wave) / "status", on_error=None) != status)):
+            # one decision per episode: this one was refused and stays with the owner. Another stamp alone
+            # is not a new episode: the file must read as this very line again (not empty or unreadable)
+            return False
+        w.pop("policy_refusal")  # the same line written anew: another episode, decided anew
+        anew = True
     label = parse_blocked_label(status)
     if label is None or label["red"] or label["class"] == "merge_gate":
         return False
     rules = decision_policy(cfg)
-    if not any(r["class"] == label["class"] and r["rec"] in (None, label["rec"]) for r in rules):
+    rule = next((r for r in rules if r["class"] == label["class"] and r["rec"] in (None, label["rec"])), None)
+    if rule is None:
         return False
+    fixed = None  # a rule with `answer` (#89); without it every line below is the 1.2.0 path
+    if anew and rule.get("answer") is not None:
+        # under a rule with `answer` the `blocked` mark belongs to the EPISODE (the line AND the stamp), not to
+        # the text: the earlier episode of this line left it set (answered or refused), and an outcome of the
+        # new one without an auto-answer (a machine refusal, the cap) must still raise BLOCKED to the owner
+        drop_notice(w, "blocked")
     if owner_answered(cfg, wave, status):  # the owner answered this very episode with `say`
         if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
             # our answer is typed and waits for its Enter, the owner's came after: clear it (it may
@@ -5116,6 +5342,23 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
             event(cfg, f"{wave}: policy cap reached ({used}/{cap}): class={label['class']} "
                        f"rec={label['rec']} goes to the owner")
         return False
+    if rule.get("answer") is not None:
+        fixed = fixed_answer(cfg, wave, w, label, rule, status)
+        if not fixed["ok"]:  # a machine refusal: the usual BLOCKED path with the reason, the cap untouched
+            w["policy_refusal"] = {"status": status, "stamp": stamp, "reason": fixed["reason"]}
+            # the refusal is this episode's decision and always reaches the owner WITH its reason, whatever
+            # `blocked` mark the text of the line already carries (once per episode: later ticks return above)
+            drop_notice(w, "blocked")
+            if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
+                # a typed answer waits for its Enter, and the check no longer gives it (a corrupt mark, or the
+                # fork changed since the typing: FORK_CHANGED) — the Enter is not pressed, and its text never
+                # stays in the input line of an episode the owner now answers (it may have gone out: charged)
+                w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
+                w.pop("policy_pending", None)
+                _abandon_input(cfg, st, wave, w, "policy answer: refused by the machine check")
+            save_state(cfg, st)
+            event(cfg, f"{wave}: policy answer not sent: {safe_text(fixed['reason'], 200)}")
+            return False
     seen = {}
 
     def still():  # the status read AND its file stamp, taken under the input lock right before typing
@@ -5129,10 +5372,18 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         return None
     retry = w.get("pending_enter") == "policy answer"  # typed earlier: only its Enter is owed
     w["policy_pending"] = status
-    sent = _deliver(cfg, st, wave, "policy answer", send_text, POLICY_ANSWER.format(rec=label["rec"]),
+    if fixed:  # the intent, saved by the same save as policy_pending (before typing): the key is in flight
+        old = _fork_keys(w)[1]
+        if old and old.get("key") != fixed["key"]:  # an earlier answer given up, possibly submitted
+            w["policy_keys"] = [*_fork_keys(w)[0], old.get("key")]
+        w["policy_key_pending"] = {"key": fixed["key"], "status": status, "text": fixed["text"]}
+    sent = _deliver(cfg, st, wave, "policy answer", send_text,
+                    fixed["text"] if fixed else POLICY_ANSWER.format(rec=label["rec"]),
                     precheck=still)  # re-read again UNDER the input lock: `say` may have answered meanwhile
     if sent is None:
         w.pop("policy_pending", None)
+        if fixed and not retry:
+            _forget_fork_key(w, fixed)  # nothing was typed: this fork key is not in flight
         if retry:  # the typed answer was given up, possibly already submitted: charged to the cap
             w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
         save_state(cfg, st)
@@ -5144,9 +5395,16 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     if not sent:
         if w.get("pending_enter") != "policy answer":
             w.pop("policy_pending", None)  # nothing reached the window: the next tick starts afresh
+            if fixed:
+                _forget_fork_key(w, fixed)
         save_state(cfg, st)
         return False
     w.pop("policy_pending", None)
+    if fixed:  # the fork is answered: its key outlives the watch and the wave's restart (`attempts`)
+        w.pop("policy_key_pending", None)
+        w["policy_keys"] = [*_fork_keys(w)[0], fixed["key"]]
+    tokens = f"class={label['class']} " + (f"answer={fixed['answer']} " if fixed else "") + f"rec={label['rec']}"
+    variant = f"вариант {fixed['answer']}; рекомендация волны: {label['rec']}" if fixed else f"вариант {label['rec']}"
     w.setdefault("notified", {})["policy_answer"] = status
     # the stamp of the status the answer was for, taken BEFORE typing: a fast wave may already have
     # rewritten the same line by now, and that rewrite must read as a new episode
@@ -5157,15 +5415,15 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     question = _policy_question(label)
     try:
         with open(wave_dir(cfg, wave) / "policy-decisions.log", "a", encoding="utf-8") as f:
-            f.write(f"{_utc(now)} class={label['class']} rec={label['rec']} {question}\n")
+            f.write(f"{_utc(now)} {tokens} {question}\n")
     except OSError as e:
         event(cfg, f"{wave}: policy-decisions.log not written ({e.strerror or e})")
     put_notice(w, "policy_answer", status,
                f"{SIGN}волна {wave}: развилка закрыта по политике chain.json "
-               f"(class={label['class']}, вариант {label['rec']}), ответ не нужен.\n\n"
+               f"(class={label['class']}, {variant}), ответ не нужен.\n\n"
                f"{quote(status)}\n\nСмотреть: {attach}")
     save_state(cfg, st)  # the mark, the counter and the notice together
-    event(cfg, f"{wave}: policy auto-answer: class={label['class']} rec={label['rec']}")
+    event(cfg, f"{wave}: policy auto-answer: {tokens}")
     return True
 
 
@@ -5173,13 +5431,14 @@ _OPTIONS = re.compile(r"(?i)\b(?:варианты|variants)[ \t]*:[ \t]*")
 BLOCKED_PART_LIMIT = 220  # quoted question / options of the BLOCKED notice, each: the notice must keep its tail
 
 
-def blocked_notice(cfg, wave, status, attach):
+def blocked_notice(cfg, wave, status, attach, refusal=None):
     """The BLOCKED notice that needs the owner. A labelled line (`[class=… rec=… red=…]`, see
     parse_blocked_label) is shown as the decision it is: class, red zone, the wave's recommendation,
     the first line of the question and its options, where to answer. The class/red/rec are the
     parser's validated tokens (trusted wording); the question and the options are the wave's text and
     go through quote() (cleaned, redacted, marked, capped). No label, a broken label and the dispatcher's
-    own `BLOCKED: merge gate:` keep the whole-line quote."""
+    own `BLOCKED: merge gate:` keep the whole-line quote. `refusal`: why a rule with `answer` did not
+    answer this episode (fixed_answer's reason: the dispatcher's wording, through the same safe_text)."""
     plain = (f"{SIGN}волна {wave} ждёт тебя.\n\n{quote(status)}\n\nОтветить: {attach}")
     label = parse_blocked_label(status)
     if label is None or label["class"] == "merge_gate":
@@ -5201,6 +5460,8 @@ def blocked_notice(cfg, wave, status, attach):
              f"Вопрос: {quote(question or '(пусто)', BLOCKED_PART_LIMIT)}"]
     if options:
         lines.append(f"Варианты: {quote(options, BLOCKED_PART_LIMIT)}")
+    if refusal:
+        lines.append(f"Автоответ по политике не отправлен: {safe_text(refusal, BLOCKED_PART_LIMIT)}")
     lines.append(f"Ответить: {attach}")
     lines.append(f"Или текстом: python3 {wab_py} say {home_form(cfg['chain_file'])} {wave} <файл-ответа>")
     return "\n".join(lines)
@@ -5242,6 +5503,11 @@ def _tick(cfg, st):
         status = w.get("last_status", "")
     now = time.time()
     attach = f"{attach_cmd(name)}  (выйти: Ctrl-b d)"
+    refusal = w.get("policy_refusal")
+    if refusal is not None and (refusal["status"] != status if _refusal_ok(refusal)
+                                else not status.startswith("BLOCKED")):
+        w.pop("policy_refusal")  # the refused episode is over (whatever comes next, DONE included): its mark goes with it
+        save_state(cfg, st)
 
     if w.get("phase") == "awaiting_merge":
         return False  # handed to the coordinator: the watch ends and frees the run lock
@@ -5357,7 +5623,9 @@ def _tick(cfg, st):
         if fresh:
             if not status.startswith("BLOCKED: merge gate:"):  # the wave fixes a gate failure itself
                 note_question(w, status, now)
-            put_notice(w, "blocked", status, blocked_notice(cfg, wave, status, attach))
+            refusal = w.get("policy_refusal") if _refusal_ok(w.get("policy_refusal")) else {}
+            put_notice(w, "blocked", status, blocked_notice(
+                cfg, wave, status, attach, refusal.get("reason") if refusal.get("status") == status else None))
         save_state(cfg, st)
         if fresh:
             event(cfg, f"{wave}: {safe_text(status, 200)}")
