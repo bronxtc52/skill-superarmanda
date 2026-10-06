@@ -4588,6 +4588,9 @@ class HighRiskReviews(PolicyBase):
                           "cross_provider_reviewer": "claude-host", "second_reviewer": "codex-host",
                           "final_check": None})
         self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
+        # 1.2.4 (W4, task_epoch): a later record of the task asks for the final word again
+        self.assertIn(W4MandatoryFableRoles.EPOCH_REASON, self.where()["next_action"])
+        self.final_check()
         self.assertIn("done", self.where()["next_action"])
 
     def test_roles_may_swap_profiles_but_the_pair_must_be_astra_and_fable(self):
@@ -5865,7 +5868,17 @@ class W3FableRoles(PolicyBase):
                 for role in roles:
                     with self.subTest(risk=risk, role=role, status=status):
                         entry = self.record(role, status, model="fable")
-                        self.assertEqual(entry["status"], "ready_for_pr_review")
+                        if risk == "high":
+                            # 1.2.4 (W4, task_epoch): on high every later record of the task takes the
+                            # readiness away until the final check says the last word again
+                            self.assertEqual(entry["status"], "in_progress")
+                            where = self.where()
+                            self.assertEqual((where["step"], where["role"]), (7, "final_check"))
+                            self.assertIn(W4MandatoryFableRoles.EPOCH_REASON, where["next_action"])
+                            self.assertTrue(any("final_check" in p for p in problems(plan)), problems(plan))
+                            self.assertEqual(self.final_check()["status"], "ready_for_pr_review")
+                        else:
+                            self.assertEqual(entry["status"], "ready_for_pr_review")
                         self.assertEqual(position(), before)
                         self.assertEqual(problems(plan), [])
             status = self.ok("status")
@@ -6236,7 +6249,10 @@ class W4MandatoryFableRoles(W4Base):
         entry = self.final()
         self.assertEqual(entry["status"], "ready_for_pr_review")
         self.assert_ready()
+        # the PR gate recorded after the final check is a later record of the task: the final word again
         self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
+        self.assert_not_ready("final_check", self.EPOCH_REASON)
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
         self.assertIn("done", self.where()["next_action"])
 
     def test_high_task_without_internal_review_is_not_pass(self):
@@ -6601,7 +6617,7 @@ class W4MandatoryFableRoles(W4Base):
                 self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
                 entry = self.record("tester", "findings", model="fable" if risk == "high" else None)
                 self.assertEqual((entry["status"], entry.get("fix_cycles_closed", 0)), ("in_progress", 0))
-                self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "coder")
+                self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "second_reviewer")
                 entry = self.record("tester", model="fable" if risk == "high" else None)
                 self.assertEqual((entry["status"], entry["fix_cycles_closed"]), ("ready_for_pr_review", 1))
 
@@ -6624,7 +6640,6 @@ class W4MandatoryFableRoles(W4Base):
             "github_codex_review pass": lambda: self.record(
                 "github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1"),
             "coderabbit unavailable": lambda: self.record("coderabbit", "unavailable"),
-            "task-risk repeated": lambda: self.ok("task-risk", "--task", "t1", "--risk", "high"),
         }
         for case, change in cases.items():
             with self.subTest(case=case):
@@ -6636,9 +6651,15 @@ class W4MandatoryFableRoles(W4Base):
                 entry = self.final()
                 self.assertEqual((entry["status"], entry["results"]["final_check"]["after_epoch"]),
                                  ("ready_for_pr_review", epoch + 1))
-                self.assert_ready()
+                where = self.where()  # ready: step 7, the PR gate or done once it is recorded
+                self.assertEqual((where["step"], where["task_status"]), (7, "ready_for_pr_review"))
+                self.assertNotIn("final_check", where["next_action"])
                 epoch += 1
-        # the PR gate recorded before the final check does not ask for another one
+        # the PR gate recorded before the final check does not ask for another one; task-risk that
+        # changes nothing (the same risk again) is no change of the task either
+        self.assertIn("done", self.where()["next_action"])
+        self.assertEqual(self.ok("task-risk", "--task", "t1", "--risk", "high")["task_epoch"], epoch)
+        self.assertEqual(self.where()["task_status"], "ready_for_pr_review")
         self.assertIn("done", self.where()["next_action"])
         self.assertEqual(self.next_head()["invalidated_tasks"], ["t1"])
         self.assertEqual(self.entry()["task_epoch"], epoch)
@@ -6648,6 +6669,20 @@ class W4MandatoryFableRoles(W4Base):
         self.assertEqual(entry["status"], "ready_for_pr_review")
         self.assertEqual(entry["results"]["final_check"]["after_epoch"], epoch + 4)
         self.assert_ready()
+        # a raise of the risk is a change of the task: the final check recorded below high is stale
+        self.init(risk="medium")
+        self.ok("task-risk", "--task", "t1", "--risk", "medium")
+        self.record("coder", model="fable")
+        self.record("tester", model="fable")
+        self.internal()
+        self.reviews()
+        entry = self.final()
+        self.assertEqual((entry["status"], entry["task_epoch"]), ("ready_for_pr_review", 5))
+        raised = self.ok("task-risk", "--task", "t1", "--risk", "high")
+        self.assertEqual((raised["status"], raised["task_epoch"]), ("in_progress", 6))
+        self.assertEqual(raised["results"]["final_check"]["after_epoch"], 5)  # stale: an older epoch
+        gap = _load("superarmanda_state_for_epoch", STATE).final_check_gap(raised, raised["results"])
+        self.assertIn(self.EPOCH_REASON, gap)
 
     def test_final_check_without_after_epoch_or_with_a_bool_counter_is_not_counted(self):
         """No compatibility for a record without `after_epoch`: the field was born in the same wave as the
@@ -6810,9 +6845,13 @@ class W4MandatoryFableRoles(W4Base):
         self.reviews()
         self.assertEqual(self.position(), (7, "final_check"))
         self.assertEqual(self.final()["status"], "ready_for_pr_review")
-        # a later internal record does not replace the counted one
+        # a later internal record does not replace the counted one; as a later record of the task it
+        # asks for the final word again (task_epoch)
         self.assertEqual(self.internal("unavailable")["internal_review"]["head"], reviewed)
-        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertEqual(self.entry()["status"], "in_progress")
+        self.assert_not_ready("final_check", self.EPOCH_REASON)
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assertEqual(self.entry()["internal_review"]["head"], reviewed)
 
     def test_internal_round_leads_to_a_new_internal_review_on_the_new_head(self):
         self.built()

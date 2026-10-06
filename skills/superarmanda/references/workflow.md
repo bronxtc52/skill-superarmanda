@@ -113,8 +113,8 @@ SHA может закрыть gate; неуспешная Opus-попытка о�
   применимость держит правило выше и итоговый отчёт. `internal_reviewer` и `final_check` для
   задачи high с 1.2.4 обязательны машинно — правила в «Local state interface» ниже: внутреннее
   ревью засчитывается только до первого внешнего пакета задачи и на его HEAD, финальная сверка —
-  `pass` на финальном HEAD после последнего ревью задачи и после закрытия последнего круга
-  исправлений; обязательность задаёт
+  `pass` на финальном HEAD как последнее слово по задаче (после последнего ревью задачи, закрытия
+  последнего круга исправлений и любой другой записи задачи); обязательность задаёт
   `review_policy.version` manifest (`1.2.4`; manifest политики `1.2.1` судится как раньше).
 
 ## Смена координатора и восстановление
@@ -285,37 +285,49 @@ manifest: `state.py init` 1.2.4 пишет `review_policy.version: "1.2.4"`; man
   действие — новый прогон задачи (`state.py init` на новом пути; в волне — `init --from-plan`,
   новый прогон волны). Запись `internal_reviewer` после маркера принимается как запись (в
   `internal_review` она не попадает).
-- **Финальная сверка — на финальном HEAD, после последнего ревью задачи и после закрытия
-  последнего круга исправлений.** Засчитывается текущий
-  результат `final_check` (HEAD и дерево manifest) с моделью `claude-fable-5-1` (как у coder и
-  tester задачи high) и статусом `pass`, записанный не раньше
-  последних текущих результатов обоих ревью задачи: `task-result --role final_check` пишет в
-  результат `after_reviews` — `result_id` текущих `cross_provider_reviewer` и `second_reviewer` на
-  момент записи, и зачёт требует совпадения с текущими результатами (ревью, записанное позже или
-  заново, просит новую сверку). Тем же способом сверка привязана к кругам исправлений: в результат
-  пишется `after_fix_cycles` — счётчик задачи `fix_cycles_closed` (сколько кругов закрыто выходом
-  из `needs_fix` через `fix-loop --outcome pass` или через `--defer`/`--accept`, давшие готовность;
-  растёт при любом риске, переживает `resume`, как `fix_cycles`), и зачёт требует совпадения с текущим счётчиком: сверка, записанная во время круга
-  или до него, после его закрытия не засчитывается — это не сверка исправленной задачи. Запись
-  без `after_fix_cycles` (сделана до того, как поле появилось) засчитывается, только пока задача не
-  закрыла ни одного круга. PR-гейт (`github_codex_review`, `coderabbit`) в сравнение не
-  входит: draft PR и `github_codex_review` можно делать до сверки, а новый HEAD по их находкам и так
-  сбрасывает её через `resume`. `findings`, `unavailable`, `error`, `incomplete`, запись на прошлом
-  HEAD, раньше ревью задачи или раньше закрытия круга — не pass; такая запись не отклоняется
-  (совместимость записи 1.2.3),
+- **Финальная сверка — последнее слово по задаче: на финальном HEAD, после последнего ревью
+  задачи, после закрытия последнего круга исправлений и после любой другой записи задачи.**
+  Засчитывается текущий результат `final_check` (HEAD и дерево manifest) с моделью
+  `claude-fable-5-1` (как у coder и tester задачи high) и статусом `pass`, после которого в записи
+  задачи ничего не менялось. Три стража, от частного к общему:
+  - `after_reviews` — `result_id` текущих `cross_provider_reviewer` и `second_reviewer` на момент
+    записи сверки; ревью, записанное позже или заново, просит новую сверку.
+  - `after_fix_cycles` — счётчик задачи `fix_cycles_closed` на момент записи: сколько кругов
+    исправлений закрыто выходом из `needs_fix` (через `fix-loop --outcome pass`, через
+    `--defer`/`--accept` или запись роли, после которых все требуемые роли pass или покрыты; растёт
+    при любом риске, переживает `resume`, как `fix_cycles`). Сверка, записанная во время круга или
+    до него, после его закрытия не засчитывается — это не сверка исправленной задачи. Запись без
+    `after_fix_cycles` (сделана до того, как поле появилось) засчитывается, только пока задача не
+    закрыла ни одного круга.
+  - `after_epoch` — счётчик записи задачи `task_epoch` на момент сверки. `task_epoch` растёт при
+    КАЖДОМ изменении записи задачи, кроме самой `final_check`: любой `task-result` другой роли
+    (coder, tester, оба ревью задачи, `internal_reviewer`, `triage`, `architect`, `investigator`,
+    PR-гейт `github_codex_review`/`coderabbit`), любой `fix-loop` (`--outcome failed`/`pass`,
+    `--defer`, `--accept`, `--decision`), `task-risk`; переживает `resume`. Сверка с другим
+    `after_epoch` или без него не засчитывается (совместимых живых записей нет — поле появилось в
+    той же волне, что и правило; запись без него — правка руками). Это общий страж: он закрывает и
+    те двери, которых первые два не видят — покрытие находок после сверки, повторную запись роли,
+    запись PR-гейта после сверки.
+  PR-гейт в сравнение `after_reviews` не входит: draft PR и `github_codex_review` можно делать до
+  сверки, а новый HEAD по их находкам и так сбрасывает её через `resume`; но запись PR-гейта
+  ПОСЛЕ сверки — изменение задачи (`task_epoch`), и сверка нужна заново. `findings`, `unavailable`,
+  `error`, `incomplete`, запись на прошлом HEAD, раньше ревью задачи, раньше закрытия круга или
+  раньше другой записи задачи — не pass; такая запись не отклоняется (совместимость записи 1.2.3),
   она лишь не засчитывается, причина — в `next_action` (`where` после двух ревью ведёт к шагу 7
-  `final_check`; `unavailable`/`error` — `BLOCKED`). Результат `final_check` и `internal_reviewer`
-  под `1.2.4` меняет статус задачи high: `pass` сверки при полной готовности даёт
-  `ready_for_pr_review` из `in_progress` или `needs_verification`, не-pass после готовности
-  возвращает `in_progress`. Из `needs_fix` запись роли не повышает: открытый круг закрывают только
-  `fix-loop --outcome pass`, новый HEAD или `--defer`/`--accept`. Выход через `fix-loop --outcome
-  pass` у задачи high — всегда `needs_verification`: прежняя `final_check` (записанная до закрытия
-  круга, в том числе прямо в `needs_fix`) не засчитывается, нужна новая `final_check pass` после
-  закрытия круга — она и даёт `ready_for_pr_review`. Выход через `--defer`/`--accept` — та же
-  дверь: покрытие, при котором все роли pass или покрыты, закрывает круг (`fix_cycles_closed`), и
-  задача high идёт в `needs_verification` до новой `final_check pass`; покрытие, не дающее
-  готовности, круг не закрывает — задача остаётся в `needs_fix`. Ниже high и под `1.2.1` покрытие
-  из `needs_fix` даёт `ready_for_pr_review`, как раньше.
+  `final_check`; `unavailable`/`error` — `BLOCKED`). Результат любой Fable-роли под `1.2.4` меняет
+  статус задачи high: `pass` сверки при полной готовности даёт `ready_for_pr_review` из
+  `in_progress` или `needs_verification`; любая другая запись после готовности (не-pass сверки,
+  повторное внутреннее ревью, `triage`, PR-гейт) возвращает `in_progress` до новой сверки.
+  Из `needs_fix` запись `internal_reviewer`/`final_check` не повышает. Открытый круг закрывают
+  `fix-loop --outcome pass`, новый HEAD, `--defer`/`--accept` и запись роли (coder, tester, ревью,
+  PR-гейт), после которых все требуемые роли pass или покрыты (`fix_cycle_closable`: сверка в этот
+  вопрос не входит — она обязана ИДТИ ПОСЛЕ закрытия). Выход из `needs_fix` у задачи high под
+  `1.2.4` — всегда `needs_verification`: прежняя `final_check` (записанная до закрытия круга, в том
+  числе прямо в `needs_fix`) не засчитывается, нужна новая `final_check pass` после закрытия круга —
+  она и даёт `ready_for_pr_review`. Покрытие или запись роли, после которых какая-то требуемая
+  роль не pass и не покрыта, круг не закрывают: покрытие оставляет `needs_fix`, запись роли даёт
+  `in_progress`, как в 1.2.3. Ниже high и под `1.2.1` выход из `needs_fix` даёт
+  `ready_for_pr_review`, как раньше.
 - **Ниже high** обе роли остаются записями: `task_ready` их не требует, `where` их не называет,
   их запись любого статуса статус задачи не трогает (задача в `needs_fix` остаётся в `needs_fix`).
   Задача, поднятая до high (`task-risk`) после первого внешнего пакета без зачтённого внутреннего
@@ -396,7 +408,7 @@ A reviewer `findings` result counts as passed for readiness (and for the wave me
 a deferral of the same role recorded no earlier than the result; coder and tester still need `pass`.
 After `resume` new results are not covered by older deferrals. Severity is not parsed: deferring
 only low/P3 findings is coordinator discipline. `where` reports the count as `deferred`.
-Both `--defer` and `--accept` also work from `needs_fix` (the same findings were first sent through `--outcome failed`, then judged acceptable): once every required role is pass or covered the task becomes `ready_for_pr_review`; while another role is still open it stays `needs_fix`.
+Both `--defer` and `--accept` also work from `needs_fix` (the same findings were first sent through `--outcome failed`, then judged acceptable): once every required role is pass or covered the task leaves `needs_fix` and the fix cycle closes (`fix_cycles_closed`) — `ready_for_pr_review` below high and under the policy 1.2.1, `needs_verification` for a high task of 1.2.4 until a new `final_check pass` (the one recorded before the closing is not counted); while another role is still open it stays `needs_fix`.
 `fix-loop --accept --source <source> --severity <low|medium|high> --note <text>` (mutually exclusive
 with `--defer`/`--outcome`/`--decision`; `--severity` only with `--accept`) has the same preconditions
 as `--defer` (reviewer sources, a `findings` result on the current head and tree, task not `blocked`
