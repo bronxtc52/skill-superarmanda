@@ -1078,8 +1078,9 @@ class Mutations(unittest.TestCase):
             run_scenario("no_final_check", limit=70 * 60)
         failures = [l for l in held.exception.run.events_log.splitlines() if "W1: merge gate failed" in l]
         self.assertTrue(failures, "the gate of W1 never failed")
-        for line in failures:
-            self.assertIn("final_check", line)
+        # the first refusal of the scenario is the red CI the wave then fixes; from then on the gate names the role
+        self.assertIn("final_check", failures[-1])
+        self.assertTrue(any("задача T1: final_check" in l for l in failures), failures)
         self.assertNotIn("W2: merge gate", held.exception.run.events_log)
 
     def test_a_nudge_that_ignores_the_process_tree_is_a_false_nudge(self):
