@@ -364,14 +364,13 @@ class ReleaseMandatoryFableRolesDocs(unittest.TestCase):
     """1.2.4 (W4, #86): `internal_reviewer` and `final_check` are machine-checked for a high-risk task and in
     the merge gate of a high wave; the obligation is a version of the review policy in the manifest."""
 
-    def test_release_1_2_4_is_versioned_and_names_the_compatibility_boundary(self):
-        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.4"?$')
+    def test_release_1_2_4_names_the_compatibility_boundary(self):
+        # the version of SKILL.md and the newest section moved on to 1.2.5 (ReleaseDecisionPolicyAnswerDocs)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         sections = re.split(r"(?m)^## ", changelog)
         section = next((s for s in sections if s.startswith("1.2.4 — 2026-10-05")), None)
         self.assertIsNotNone(section, "CHANGELOG has no section 1.2.4")
-        self.assertEqual(sections.index(section), 1, "1.2.4 must be the newest section")
-        self.assertTrue(sections[2].startswith("1.2.3 — "), "1.2.3 follows 1.2.4")
+        self.assertTrue(sections[sections.index(section) + 1].startswith("1.2.3 — "), "1.2.3 follows 1.2.4")
         self.assertIn("#86", section)
         boundary = next((l for l in flat(section).split(" - ") if "Граница совместимости" in l), "")
         for needle in ("`review_policy.version`", "`1.2.1`", "`1.2.4`", "`internal_reviewer`", "`final_check`",
@@ -425,6 +424,91 @@ class ReleaseMandatoryFableRolesDocs(unittest.TestCase):
             with self.subTest(doc=name, needle="architect.md"):
                 self.assertIn("`<run_dir>/plan-review/architect.md`", text)
                 self.assertRegex(text, r"`task-result`[^.]*не требуется|запись `task-result`[^.]*не требуется")
+
+
+class ReleaseDecisionPolicyAnswerDocs(unittest.TestCase):
+    """1.2.5 (W5, #89): a rule of `decision_policy` may carry `answer` — the dispatcher's fixed variant after a
+    machine check by the manifest of the current run and runs.json; the owner's default is `invariant` and
+    `max_runs` 5."""
+
+    @staticmethod
+    def section(text, heading):
+        return text.split(heading, 1)[1].split("\n### ", 1)[0]
+
+    def test_release_1_2_5_is_versioned_and_names_the_compatibility_boundary(self):
+        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.5"?$')
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        sections = re.split(r"(?m)^## ", changelog)
+        section = next((s for s in sections if s.startswith("1.2.5 — 2026-10-06")), None)
+        self.assertIsNotNone(section, "CHANGELOG has no section 1.2.5")
+        self.assertEqual(sections.index(section), 1, "1.2.5 must be the newest section")
+        self.assertTrue(sections[2].startswith("1.2.4 — "), "1.2.4 follows 1.2.5")
+        self.assertIn("[#89](https://github.com/bronxtc52/skill-superarmanda/issues/89)", section)
+        whole = flat(section)
+        for needle in ("`answer`", "`invariant`", "`cut_surface`", "`accept_limitation`", "`new_run`",
+                       "`runs.json`", "`max_runs`", "`policy-decisions.log`", "policy answer not sent",
+                       "`policy_keys`", "`max_auto_answers`"):
+            with self.subTest(section=needle):
+                self.assertIn(needle, whole)
+        boundary = next((l for l in whole.split(" - ") if "Граница совместимости" in l), "")
+        for needle in ("`answer`", "1.2.0", "идентичность прогона", "1.2.4"):
+            with self.subTest(boundary=needle):
+                self.assertIn(needle, boundary)
+
+    def test_waves_doc_names_answer_invariant_and_max_runs_5_in_four_places(self):
+        text = doc("references/waves.md")
+        policy = self.section(text, "### Политика решений")
+        marker = "**Рекомендуемая конфигурация фазы A.**"
+        self.assertIn(marker, policy, "the policy section has no recommended configuration")
+        rules, recommended = policy.split(marker, 1)
+        recommended = recommended.split("\n\n**", 1)[0]
+        for needle in ("`answer`", "`invariant`", "`max_runs`"):
+            with self.subTest(policy=needle):
+                self.assertIn(needle, rules)
+        blocks = fenced_blocks(recommended)
+        self.assertTrue(blocks, "the recommended configuration has no fenced example")
+        example = " ".join(flat(b) for b in blocks)
+        for needle in ('{"class": "needs_decision", "answer": "invariant"}',
+                       '{"class": "blocked_cap", "answer": "invariant"}', '"max_runs": 5'):
+            with self.subTest(recommended=needle):
+                self.assertIn(needle, example)
+        mandate = flat(self.section(text, "### Мандат"))
+        for needle in ("`answer: invariant`", "needs_decision", "blocked_cap", "доделай как следует",
+                       "`max_runs: 5`", "5 прогонов"):
+            with self.subTest(mandate=needle):
+                self.assertIn(needle, mandate)
+        checklist = flat(self.section(text, "### Предполётный чек-лист"))
+        for needle in ("политика решений", "`answer: invariant`", "`max_runs: 5`"):
+            with self.subTest(checklist=needle):
+                self.assertIn(needle, checklist)
+
+    def test_policy_section_describes_the_machine_check_and_the_refusal(self):
+        text = doc("references/waves.md")
+        rules = flat(self.section(text, "### Политика решений"))
+        for needle in ("`class`, `rec` и `answer`", "`cut_surface`", "`accept_limitation`", "`new_run`",
+                       "первое по порядку", "`runs.json`", "`run.index`", "ровно одна задача",
+                       "`decision_required_for`", "`unavailable`", "`error`", "`codex-host-opus`",
+                       "`fix_cycles`", "`policy_keys`", "`policy_key_pending`", "`state.json`",
+                       "policy answer not sent:", "Автоответ по политике не отправлен", "`max_auto_answers`",
+                       "answer=", "как в 1.2.0", "`red=yes`"):
+            with self.subTest(policy=needle):
+                self.assertIn(needle, rules)
+        table = text.split("## Что реализовано", 1)[1].split("## Фаза A", 1)[0]
+        row = next((l for l in table.splitlines() if "1.2.5; #89" in l), "")
+        for needle in ("`answer`", "`invariant`", "`runs.json`", "`max_runs`"):
+            with self.subTest(row=needle):
+                self.assertIn(needle, row)
+        forks = flat(self.section(text, "### Развилки через `status`"))
+        self.assertIn("`answer`", forks)
+        field = next((l for l in text.splitlines() if l.startswith("| `decision_policy` |")), "")
+        self.assertIn('"answer"', field)
+
+    def test_protocol_rule_3_tells_the_wave_to_follow_a_fixed_variant(self):
+        protocol = flat(doc("scripts/waves/PROTOCOL.md"))
+        for needle in ("фиксированный вариант", "`answer`", "а не по своей рекомендации", "`invariant`",
+                       "`max_runs`", "класс находки целиком", "действуй по своей рекомендации"):
+            with self.subTest(protocol=needle):
+                self.assertIn(needle, protocol)
 
 
 if __name__ == "__main__":
