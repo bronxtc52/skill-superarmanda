@@ -265,7 +265,9 @@ manifest: `state.py init` 1.2.4 пишет `review_policy.version: "1.2.4"`; man
   была запись `github_codex_review` или `coderabbit` (в `review_history` они не пишутся), после
   `resume` её результата нет, маркер и `session_roles` стёрты руками, а по этому источнику не было
   ни круга `fix-loop`, ни `--defer`/`--accept`, — свидетелей не остаётся, и такую правку правило не
-  отличит от прогона без внешнего ревью.
+  отличит от прогона без внешнего ревью. И обратное: ошибочный `fix-loop --outcome failed` под
+  внешним источником до результата этой роли делает `fix_sources` свидетелем пакета — задача до
+  конца прогона в «новом прогоне», а причина свидетеля не называет (остаток, issue #95).
   Зачёт — долговечный ключ задачи `internal_review` (`{status, head, model, recorded_at}`): его
   пишет `task-result --role internal_reviewer` при любом статусе, пока внешнее ревью задачи не
   началось; каждая новая запись заменяет предыдущую, `resume` ключ сохраняет (входит в
@@ -295,7 +297,10 @@ manifest: `state.py init` 1.2.4 пишет `review_policy.version: "1.2.4"`; man
   она лишь не засчитывается, причина — в `next_action` (`where` после двух ревью ведёт к шагу 7
   `final_check`; `unavailable`/`error` — `BLOCKED`). Результат `final_check` и `internal_reviewer`
   под `1.2.4` меняет статус задачи high: `pass` сверки при полной готовности даёт
-  `ready_for_pr_review`, не-pass после готовности возвращает `in_progress`.
+  `ready_for_pr_review` из `in_progress` или `needs_verification`, не-pass после готовности
+  возвращает `in_progress`. Из `needs_fix` запись роли не повышает: открытый круг закрывают только
+  `fix-loop --outcome pass` (→ `needs_verification`, после него `final_check pass` даёт
+  `ready_for_pr_review`), новый HEAD или `--defer`/`--accept`.
 - **Ниже high** обе роли остаются записями: `task_ready` их не требует, `where` их не называет,
   их запись любого статуса статус задачи не трогает (задача в `needs_fix` остаётся в `needs_fix`).
   Задача, поднятая до high (`task-risk`) после первого внешнего пакета без зачтённого внутреннего

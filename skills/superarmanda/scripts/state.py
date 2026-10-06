@@ -1221,14 +1221,16 @@ def update_task_status(entry, risk, head, policy):
 
 def settle_mandatory_role(entry, risk, head, policy):
     """After a result of internal_reviewer or final_check of a HIGH-risk task under the policy
-    1.2.4 (the caller checks both): it may complete the task or take its readiness away; any
-    other status (needs_fix, needs_verification, pending) is not its business. Below high the
-    roles are records and never reach here."""
-    if entry["status"] in ("blocked", "needs_decision"):
-        return
-    if task_ready(entry, risk, head, policy):
+    1.2.4 (the caller checks both). It may complete a task that is in_progress or
+    needs_verification (every other record counted, the final check the last one), and it takes
+    the readiness of a ready_for_pr_review task away (in_progress) when the record no longer
+    counts. It never closes an open fix cycle: needs_fix is left only by fix-loop --outcome pass
+    (needs_verification), a new HEAD or --defer/--accept, and pending, blocked and needs_decision
+    are not its business either. Below high the roles are records and never reach here."""
+    status = entry["status"]
+    if status in ("in_progress", "needs_verification") and task_ready(entry, risk, head, policy):
         entry["status"] = "ready_for_pr_review"
-    elif entry["status"] == "ready_for_pr_review":
+    elif status == "ready_for_pr_review" and not task_ready(entry, risk, head, policy):
         entry["status"] = "in_progress"
 
 
@@ -1789,7 +1791,8 @@ def result(args):
     # else: a result of a Fable subagent role is a record: the task status is not its business.
     # Below high this holds for internal_reviewer and final_check too (task_ready does not read
     # them there): a record of theirs must not promote a task that waits for its fix, nor touch
-    # a status at all; their credit and after_reviews above are kept for a later raise to high
+    # a status at all; their credit and after_reviews above are kept for a later raise to high.
+    # On high settle_mandatory_role never closes an open fix cycle either (needs_fix stays).
     data["updated_at"] = now()
     write(path, data)
     print(json.dumps(entry, sort_keys=True))
