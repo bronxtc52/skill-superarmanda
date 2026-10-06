@@ -51,6 +51,8 @@ State хранит эти значения как metadata. Coordinator подт
 контракту. Отчёт `review.py` (профили `claude-host`, `codex-host`, `codex-host-opus`) как артефакт
 внутреннего ревью не принимается, а источник `fix-loop --source internal_reviewer` закрывается с
 первой записью внешнего ревью задачи — правила в [workflow.md](workflow.md), «Local state interface».
+С 1.2.4 внутреннее ревью задачи high обязательно машинно: засчитывается только запись до первого
+внешнего пакета задачи и на его HEAD — сначала `task-result --role internal_reviewer`, потом пакет.
 
 ## Ревью задачи с риском high (1.2.1, #86)
 

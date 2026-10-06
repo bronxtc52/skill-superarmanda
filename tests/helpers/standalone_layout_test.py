@@ -260,14 +260,13 @@ class ReleaseFableRolesDocs(unittest.TestCase):
     RULE = "обязательны в применимых случаях"
     MODEL_COMMANDS = ("`/model`", "`claude --model claude-fable-5-1`")
 
-    def test_release_1_2_3_is_versioned_and_names_the_accepted_limitation(self):
-        self.assertRegex(doc("SKILL.md"), r'(?m)^  version: "?1\.2\.3"?$')
+    def test_release_1_2_3_names_the_accepted_limitation(self):
+        # the version of SKILL.md and the newest section moved on to 1.2.4 (ReleaseMandatoryFableRolesDocs)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         sections = re.split(r"(?m)^## ", changelog)
         section = next((s for s in sections if s.startswith("1.2.3 — 2026-10-05")), None)
         self.assertIsNotNone(section, "CHANGELOG has no section 1.2.3")
-        self.assertEqual(sections.index(section), 1, "1.2.3 must be the newest section")
-        self.assertTrue(sections[2].startswith("1.2.2 — "), "1.2.2 follows 1.2.3")
+        self.assertTrue(sections[sections.index(section) + 1].startswith("1.2.2 — "), "1.2.2 follows 1.2.3")
         self.assertIn("#86", section)
         items = flat(section).split(" - ")
         limitation = next((l for l in items if "Принятое ограничение" in l), "")
