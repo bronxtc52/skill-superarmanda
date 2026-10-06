@@ -6380,6 +6380,98 @@ class W4MandatoryFableRoles(W4Base):
         self.assertEqual(self.final()["status"], "ready_for_pr_review")
         self.assert_ready()
 
+    def fix_cycle(self, source="tester"):
+        """One fix cycle of t1 on the same HEAD: `source` failed (needs_fix), then fix-loop pass."""
+        failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", source)
+        self.assertEqual(failed["status"], "needs_fix")
+        return self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+
+    def test_final_check_recorded_in_an_open_fix_cycle_is_not_counted_after_it_closes(self):
+        """GitHub Codex P2 on PR #97: a final_check recorded while the fix cycle is open stays needs_fix
+        (settle_mandatory_role), but fix-loop --outcome pass must not count it either — the final check
+        counts only after the last fix cycle of the task closed (`after_fix_cycles` of the record against
+        `fix_cycles_closed` of the task), so the way out of needs_fix is always needs_verification."""
+        self.built()
+        self.internal()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.assertEqual((failed["status"], failed.get("fix_cycles_closed", 0)), ("needs_fix", 0))
+        entry = self.final()
+        self.assertEqual(entry["status"], "needs_fix")
+        verified = self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        self.assertEqual(verified["status"], "needs_verification")  # the defect: ready_for_pr_review
+        self.assertEqual(entry["results"]["final_check"]["after_fix_cycles"], 0)
+        self.assertEqual(verified["fix_cycles_closed"], 1)
+        self.assert_not_ready("final_check", "before the fix cycle closed", "task-result --role final_check")
+        self.assertEqual(self.position(), (7, "final_check"))
+        # a pass recorded again outside needs_fix closes no cycle
+        again = self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        self.assertEqual((again["status"], again["fix_cycles_closed"]), ("needs_verification", 1))
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(entry["results"]["final_check"]["after_fix_cycles"], 1)
+        self.assert_ready()
+
+    def test_final_check_recorded_before_a_fix_cycle_is_not_counted_after_it(self):
+        """The other door: the counted final_check of a ready task (recorded in in_progress, it made the
+        task ready) is older than the fix cycle that followed on the same tree; fix-loop --outcome pass
+        asks for a new one, and so does every later cycle."""
+        self.built()
+        self.internal()
+        entry = self.reviews()
+        self.assertEqual(entry["status"], "in_progress")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        verified = self.fix_cycle()
+        self.assertEqual((verified["status"], verified["fix_cycles_closed"]), ("needs_verification", 1))
+        self.assert_not_ready("final_check", "before the fix cycle closed")
+        self.assertEqual(self.position(), (7, "final_check"))
+        self.assertEqual(self.ok("status")["tasks"]["t1"]["status"], "needs_verification")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+        # the second cycle asks again (another source: two tester rounds would ask for a decision)
+        verified = self.fix_cycle("second_reviewer")
+        self.assertEqual((verified["status"], verified["fix_cycles_closed"]), ("needs_verification", 2))
+        self.assert_not_ready("final_check", "before the fix cycle closed")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+
+    def test_final_check_without_after_fix_cycles_counts_only_while_no_cycle_closed(self):
+        """Compatibility: a final_check written before `after_fix_cycles` existed counts while the task
+        closed no fix cycle (counter 0 or absent) and not after one; `resume` keeps the counter."""
+        self.built()
+        self.internal()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        value = self.data()
+        self.assertNotIn("fix_cycles_closed", value["tasks"]["t1"])  # no cycle: the counter is not written
+        del value["tasks"]["t1"]["results"]["final_check"]["after_fix_cycles"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        self.assert_ready()
+        self.assertIn("done", self.where()["next_action"])
+        verified = self.fix_cycle()
+        self.assertEqual((verified["status"], verified["fix_cycles_closed"]), ("needs_verification", 1))
+        self.assert_not_ready("final_check", "before the fix cycle closed")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        value = self.data()
+        del value["tasks"]["t1"]["results"]["final_check"]["after_fix_cycles"]
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        where = self.where()
+        self.assertEqual((where["step"], where["role"]), (7, "final_check"))
+        self.assertIn("before the fix cycle closed", where["next_action"])
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+        # resume keeps the counter as it keeps fix_cycles; the next final check snapshots it
+        self.assertEqual(self.next_head()["invalidated_tasks"], ["t1"])
+        entry = self.entry()
+        self.assertEqual((entry["fix_cycles"], entry["fix_cycles_closed"]), (1, 1))
+        self.built()
+        self.reviews()
+        entry = self.final()
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(entry["results"]["final_check"]["after_fix_cycles"], 1)
+        self.assert_ready()
+
     def test_fable_roles_below_high_do_not_close_an_open_fix_cycle(self):
         """Astra round 1: below high the records of internal_reviewer and final_check are records, as in
         1.2.3 — a task waiting for its fix stays needs_fix whatever status they carry."""
@@ -6934,6 +7026,41 @@ class W4GateRoles(W4Base):
         problems = self.problems(HIGH_PLAN)
         self.assert_reason(problems, "t1", "цикл исправлений не завершён")
         self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
+
+    def test_final_check_recorded_before_the_fix_cycle_closed_fails_the_gate(self):
+        """GitHub Codex P2 on PR #97: the final_check recorded during the fix cycle (or before it) is no
+        final check of the fixed task; after fix-loop --outcome pass the gate asks for a new one, with the
+        action. A manifest whose record disagrees with the task's closed cycles is refused the same way."""
+        self.complete()
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.assertEqual(self.final()["status"], "needs_fix")
+        verified = self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        self.assertEqual(verified["status"], "needs_verification")
+        problems = self.problems(HIGH_PLAN)
+        self.assert_reason(problems, "t1", "final_check", "волна high", "before the fix cycle closed",
+                           "task-result --role final_check")
+        v = self.verdict(HIGH_PLAN)
+        self.assertEqual(v["verdict"], "fail")
+        self.assert_reason(v["reasons"], "t1", "final_check", "before the fix cycle closed")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assertEqual(self.problems(HIGH_PLAN), [])
+        self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
+        cases = {
+            "record of an earlier cycle": lambda t: t["results"]["final_check"].update(after_fix_cycles=0),
+            "record without the snapshot": lambda t: t["results"]["final_check"].pop("after_fix_cycles"),
+            "a cycle closed after the record": lambda t: t.update(fix_cycles_closed=2),
+        }
+        for case, edit in cases.items():
+            with self.subTest(case=case):
+                value = self.forged(edit)
+                self.assertEqual(value["tasks"]["t1"]["status"], "ready_for_pr_review")
+                problems = self.problems(HIGH_PLAN, value)
+                self.assert_reason(problems, "t1", "final_check", "before the fix cycle closed",
+                                   "task-result --role final_check")
+                self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
+        value = self.forged(lambda t: t.update(fix_cycles_closed="1"))
+        self.assert_reason(self.problems(HIGH_PLAN, value), "manifest", "t1", "fix_cycles_closed не число")
+        self.assertEqual(self.verdict(HIGH_PLAN, value)["verdict"], "fail")
 
     def test_marker_null_fails_the_gate_as_malformed(self):
         self.complete()
