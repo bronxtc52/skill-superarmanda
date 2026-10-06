@@ -17,11 +17,13 @@
     в `TASK_KEYS`, `resume` сохраняет), который пишет `task-result --role internal_reviewer`, пока внешнее ревью
     задачи не началось (`external_review_started` — одно правило для `state.py` и гейта по свидетелям, которые
     переживают `resume` и лежат в сыром manifest: маркер `external_review`, `session_roles`, `fix_sources`,
-    текущие `results` и `review_history` задачи); засчитана ПОСЛЕДНЯЯ такая запись со статусом `pass` или
-    `findings` и моделью Fable на HEAD первого внешнего пакета (`external_review.head`). Маркер, удалённый
-    руками, ничего не открывает заново, пока цел хоть один свидетель; `external_review: null` — malformed
-    manifest. Остаток (manifest не подписан): первый пакет `github_codex_review`/`coderabbit` в
-    `review_history` не пишется, и после `resume` стёртые маркер и `session_roles` свидетелей не оставляют. `unavailable`, `error`, `incomplete`, отсутствие записи, запись на
+    `deferrals`/`acceptances`, текущие `results` и `review_history` задачи); засчитана ПОСЛЕДНЯЯ такая запись
+    со статусом `pass` или `findings` и моделью Fable на HEAD первого внешнего пакета (`external_review.head`).
+    Маркер, удалённый руками, ничего не открывает заново, пока цел хоть один свидетель, и следующая внешняя
+    запись его не пересоздаёт (HEAD первого пакета неизвестен); `external_review: null` — malformed manifest.
+    Остаток (manifest не подписан): первый пакет `github_codex_review`/`coderabbit` в `review_history` не
+    пишется, и после `resume` при стёртых руками маркере и `session_roles` свидетелей не остаётся, если по
+    этому источнику не было ни круга `fix-loop`, ни `--defer`/`--accept`. `unavailable`, `error`, `incomplete`, отсутствие записи, запись на
     другом HEAD или после маркера — не засчитано. До маркера `where` после tester ведёт к `internal_reviewer`;
     после маркера без зачёта задача в этом прогоне готовой не станет: `next_action` —
     `BLOCKED: internal_reviewer: new run required …` с действием «новый прогон» (в волне —

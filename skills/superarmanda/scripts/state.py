@@ -1730,6 +1730,9 @@ def result(args):
     verified = verified_review(args, risk, packet_hash, entry)
     if args.role == INTERNAL_SOURCE:
         refuse_external_report(args.artifact, "--artifact")
+    # whether the first external packet of the task already went out, BEFORE this record joins the
+    # witnesses: the credit of the internal review and the marker both depend on it
+    started = external_review_started(entry)
     entry["session_roles"][args.session_id] = args.role
     record = {
         "status": args.status,
@@ -1759,7 +1762,7 @@ def result(args):
             and entry["results"][role].get("result_id") is not None
         }
     entry["results"][args.role] = record
-    if mandatory and args.role == INTERNAL_SOURCE and external_review_started(entry) is None:
+    if mandatory and args.role == INTERNAL_SOURCE and started is None:
         # the credit of the internal review (internal_review_gap): the last record before the
         # first external packet; kept through resume, at any risk (a task may be raised to high)
         entry["internal_review"] = {
@@ -1770,8 +1773,10 @@ def result(args):
         }
     if risk == "high" and args.role in REVIEW_ROLES:
         note_review(entry, args.role, record)
-    if data["version"] == 2 and args.role in EXTERNAL_REVIEW_ROLES:
-        # the first external packet of the task in this run: kept through resume and new HEADs
+    if data["version"] == 2 and args.role in EXTERNAL_REVIEW_ROLES and started is None:
+        # the first external packet of the task in this run: kept through resume and new HEADs.
+        # A marker that is gone while a witness says the packet went out is not recreated: the
+        # HEAD of the first packet is unknown, and a new one would bind the credit to a later HEAD
         entry.setdefault(
             "external_review",
             {"role": args.role, "head": args.head, "recorded_at": record["recorded_at"]},
@@ -2307,12 +2312,13 @@ def external_review_started(entry):
     """The role of the first external review recorded for the task in this run, or None.
     The marker `external_review` is written by task-result since 1.2.3; a manifest of 1.2.2 has
     none, so every record that survives `resume` is read as a witness as well: the session
-    ownership of the task, its per-source fix counters, the current results and the review
-    history. The rule is the same for state.py and the merge gate, which reads the raw manifest
-    (without the session_roles that `read` restores from the results), so a marker and sessions
-    removed by hand reopen nothing while any witness is left. Remainder: a first packet of
-    github_codex_review/coderabbit leaves no review_history, so after `resume` the marker and
-    the sessions are the only witnesses of it."""
+    ownership of the task, its per-source fix counters, its deferrals and acceptances, the
+    current results and the review history. The rule is the same for state.py and the merge
+    gate, which reads the raw manifest (without the session_roles that `read` restores from the
+    results), so a marker and sessions removed by hand reopen nothing while any witness is left.
+    Remainder: a first packet of github_codex_review/coderabbit leaves no review_history, so
+    after `resume` (its result gone) with the marker and the sessions removed by hand no witness
+    is left when that source had neither a fix-loop round nor a --defer/--accept."""
     marker = entry.get("external_review")
     if isinstance(marker, dict):
         return marker.get("role") or "an external review"
@@ -2324,6 +2330,12 @@ def external_review_started(entry):
         for item in (entry.get("review_history") or ())
         if isinstance(item, dict) and isinstance(item.get("role"), str)
     ]
+    for kind in ("deferrals", "acceptances"):
+        used += [
+            item.get("source")
+            for item in (entry.get(kind) or ())
+            if isinstance(item, dict) and isinstance(item.get("source"), str)
+        ]
     return next((role for role in sorted(used) if role in EXTERNAL_REVIEW_ROLES), None)
 
 
