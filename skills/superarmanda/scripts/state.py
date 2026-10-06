@@ -1141,13 +1141,21 @@ def fix_cycles_closed(entry):
     return task_counter(entry, "fix_cycles_closed")
 
 
+# The roles whose result changes what the final check has to judge (task_epoch): the results of the
+# readiness rules (coder, tester, both task reviews, the internal review). Not the PR gate
+# (github_codex_review, coderabbit: no part of the comparison — CodeRabbit comes after the draft is
+# lifted, i.e. after the final check; its findings go through fix-loop, which raises the epoch
+# itself), not the informational Fable roles (architect, triage, investigator: they change neither
+# readiness nor the step), not the final check itself.
+EPOCH_ROLES = ("coder", "tester") + REVIEW_ROLES + (INTERNAL_SOURCE,)
+
+
 def task_epoch(entry):
-    """The epoch of the task: raised by every change of its record except the final check itself —
-    any task-result of another role (coder, tester, the task and PR reviews, the Fable subagent roles
-    internal_reviewer, triage, architect, investigator), any fix-loop record (--outcome failed/pass,
-    --defer, --accept, --decision) and task-risk that changes the effective risk of the task
-    (repeating it, or naming the level the task already has, changes nothing). The final check
-    snapshots it (after_epoch): a final
+    """The epoch of the task: raised by every change of its record the final check has to judge,
+    except the final check itself — a task-result of a role in EPOCH_ROLES, any fix-loop record
+    (--outcome failed/pass, --defer, --accept, --decision) and task-risk that changes the effective
+    risk of the task (repeating it, or naming the level the task already has, changes nothing).
+    The final check snapshots it (after_epoch): a final
     check of an older epoch is not the last word of the task and is not counted (final_check_gap).
     Survives resume like fix_cycles; absent is 0; None when malformed (task_counter)."""
     return task_counter(entry, "task_epoch")
@@ -1173,9 +1181,10 @@ def final_check_gap(entry, results):
     without `after_fix_cycles` (written before 1.2.4 knew the field) counts only while the task
     closed no cycle. The PR reviews (github_codex_review, coderabbit) are no part of the
     after_reviews comparison. Behind these specific reasons the general guard: `after_epoch` is
-    the task_epoch at the record, and every later record of the task (any role incl. the PR gate,
-    any fix-loop, task-risk) raised it, so a mismatch — or a record without the field (born in the
-    same wave as the rule: no live record lacks it honestly) — is not counted."""
+    the task_epoch at the record, and every later change the final check has to judge (a result of
+    a role in EPOCH_ROLES, any fix-loop, a change of the effective risk) raised it, so a mismatch —
+    or a record without the field (born in the same wave as the rule: no live record lacks it
+    honestly) — is not counted. The PR gate and the informational Fable roles raise nothing."""
     recorded = "task-result --role final_check --status pass --model fable"
     result = results.get("final_check")
     if not isinstance(result, dict):
@@ -1278,7 +1287,9 @@ def fix_cycle_closable(entry, risk, head):
     """Whether a record or cover leaves needs_fix: every required role pass or covered and, on high,
     the rules over the reviews (high_risk_gaps) — the readiness of 1.2.3, without the Fable roles.
     The final check is no part of this question: it must FOLLOW the closing (final_check_gap), so a
-    stale one must not keep the cycle open, and a missing one must not either."""
+    stale one must not keep the cycle open, and a missing one must not either — on high 1.2.4 the
+    final check recorded before the closing is always stale (task_epoch), so with it in the question
+    no fix cycle of a high task could ever close."""
     if not all(effective_status(entry, role) == "pass" for role in required_roles(risk)):
         return False
     return risk != "high" or not high_risk_gaps(entry, entry["results"], head)
@@ -1313,12 +1324,12 @@ def update_task_status(entry, risk, head, policy):
 
 
 def settle_mandatory_role(entry, risk, head, policy):
-    """After a result of a Fable role (internal_reviewer, final_check; architect, triage,
-    investigator as changes of the task) of a HIGH-risk task under the policy 1.2.4 (the caller
-    checks both). It may complete a task that is in_progress or needs_verification (every other
-    record counted, the final check the last one: only a final_check record can do this, every
-    other record raised task_epoch), and it takes the readiness of a ready_for_pr_review task away
-    (in_progress) when the final check no longer counts — after any later record. It never closes an open fix cycle: needs_fix is left only by fix-loop --outcome pass,
+    """After a result of internal_reviewer or final_check of a HIGH-risk task under the policy
+    1.2.4 (the caller checks both). It may complete a task that is in_progress or
+    needs_verification (every other record counted, the final check the last one: only a
+    final_check record can do this, an internal_reviewer record raised task_epoch), and it takes
+    the readiness of a ready_for_pr_review task away (in_progress) when the final check no longer
+    counts — after a later internal review, or when its own status is not pass. It never closes an open fix cycle: needs_fix is left only by fix-loop --outcome pass,
     by --defer/--accept or a result of another role that makes every role pass or covered (on high
     always through needs_verification: a final_check recorded during or before the cycle is not the
     last word of the task, final_check_gap) or by a new HEAD; pending, blocked and needs_decision
@@ -1864,8 +1875,8 @@ def result(args):
         }
         record["after_fix_cycles"] = fix_cycles_closed(entry)
         record["after_epoch"] = task_epoch(entry)
-    else:
-        # every other record is a change of the task the final check must follow (task_epoch)
+    elif args.role in EPOCH_ROLES:
+        # a record the final check has to judge: a change of the task it must follow (task_epoch)
         new_epoch(entry)
     entry["results"][args.role] = record
     if mandatory and args.role == INTERNAL_SOURCE and started is None:
@@ -1889,9 +1900,7 @@ def result(args):
         )
     if args.role not in FABLE_ROLES:
         update_task_status(entry, risk, data["head"], policy)
-    elif policy in MANDATORY_ROLES_POLICIES and risk == "high":
-        # the mandatory roles may complete the task; every Fable role record is a change of the
-        # task (task_epoch) that takes the readiness of a ready task away until a new final check
+    elif mandatory and risk == "high":
         settle_mandatory_role(entry, risk, data["head"], policy)
     # else: a result of a Fable subagent role is a record: the task status is not its business.
     # Below high this holds for internal_reviewer and final_check too (task_ready does not read
