@@ -32,8 +32,9 @@
     финальном HEAD и дереве, записанный после последних результатов обоих ревью задачи и после закрытия
     последнего круга исправлений: `task-result --role final_check` пишет
     в результат `after_reviews` (`result_id` текущих `cross_provider_reviewer` и `second_reviewer`) и
-    `after_fix_cycles` (счётчик задачи `fix_cycles_closed` — сколько кругов закрыл `fix-loop --outcome pass` из
-    `needs_fix`; новый ключ в `TASK_KEYS`, растёт при любом риске, `resume` сохраняет), зачёт
+    `after_fix_cycles` (счётчик задачи `fix_cycles_closed` — сколько кругов закрыто выходом из `needs_fix` через
+    `fix-loop --outcome pass` или через `--defer`/`--accept`, давшие готовность; новый ключ в `TASK_KEYS`, растёт
+    при любом риске, `resume` сохраняет), зачёт
     требует совпадения того и другого с текущим состоянием задачи; запись без `after_fix_cycles` засчитывается,
     только пока задача не закрыла ни одного круга. PR-гейт (`github_codex_review`, `coderabbit`) в сравнение не
     входит. `findings`, `unavailable`, `error`, `incomplete`, запись на прошлом HEAD, раньше последнего ревью или
@@ -42,9 +43,10 @@
     Результат обеих ролей меняет статус задачи high: `pass` сверки при полной готовности даёт
     `ready_for_pr_review` из `in_progress`/`needs_verification`, не-pass после готовности возвращает `in_progress`;
     из `needs_fix` запись роли не повышает (открытый круг закрывают только `fix-loop --outcome pass`, новый HEAD или
-    `--defer`/`--accept`), и выход через `fix-loop --outcome pass` у задачи high — всегда `needs_verification`:
-    сверка, записанная во время круга или до него, после него не засчитывается (находка GitHub Codex P2 на PR #97),
-    нужна новая `final_check pass`; ниже high запись статус не трогает.
+    `--defer`/`--accept`), и выход у задачи high — через `fix-loop --outcome pass`, равно как через `--defer`/`--accept`,
+    закрывшие круг, — всегда `needs_verification`: сверка, записанная во время круга или до него, после него не
+    засчитывается (находка GitHub Codex P2 на PR #97 и та же дверь через покрытие), нужна новая `final_check pass`;
+    ниже high и под `1.2.1` покрытие из `needs_fix` даёт `ready_for_pr_review`, как раньше, а запись роли статус не трогает.
 - Гейт мерджа (`waves/gate.py`): в high-волне (по плану, копии волны или уровню) у каждой задачи, какой бы `risk`
   у неё ни стоял, и в любой волне у задачи политики `high` требуются оба зачёта на нужных HEAD; причина отказа
   называет роль, что с ней не так и действие — команду записи (`state.py task-result --role final_check …`) либо

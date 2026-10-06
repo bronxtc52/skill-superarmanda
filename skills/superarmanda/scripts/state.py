@@ -1120,8 +1120,9 @@ def internal_review_gap(entry, head):
 
 
 def fix_cycles_closed(entry):
-    """How many fix cycles of the task fix-loop --outcome pass closed (left needs_fix) in this run;
-    the counter survives resume like fix_cycles and is absent (0) until the first one closes."""
+    """How many fix cycles of the task were closed (needs_fix left by fix-loop --outcome pass, or by
+    --defer/--accept that made the task ready) in this run; the counter survives resume like
+    fix_cycles and is absent (0) until the first one closes."""
     return entry.get("fix_cycles_closed", 0)
 
 
@@ -1133,8 +1134,8 @@ def final_check_gap(entry, results):
     task reviews AND after the last fix cycle of the task closed:
     `after_reviews` of the record names the result_id of each review it was recorded after, so
     a review recorded later (or again) asks for a new final check; `after_fix_cycles` is the
-    task's fix_cycles_closed at the record, so a cycle closed later (fix-loop --outcome pass out of
-    needs_fix, on the same tree) asks for a new one too — a final check recorded during the cycle
+    task's fix_cycles_closed at the record, so a cycle closed later (fix-loop --outcome pass or
+    --defer/--accept out of needs_fix, on the same tree) asks for a new one too — a final check recorded during the cycle
     or before it is no check of the fixed task. A record without `after_fix_cycles` (written
     before 1.2.4 knew the field) counts only while the task closed no cycle. The PR reviews
     (github_codex_review, coderabbit) are no part of the comparison."""
@@ -1245,9 +1246,9 @@ def settle_mandatory_role(entry, risk, head, policy):
     needs_verification (every other record counted, the final check the last one), and it takes
     the readiness of a ready_for_pr_review task away (in_progress) when the record no longer
     counts. It never closes an open fix cycle: needs_fix is left only by fix-loop --outcome pass
-    (always needs_verification: a final_check recorded during or before the cycle is not counted
-    after it closes, final_check_gap), a new HEAD or --defer/--accept, and pending, blocked and
-    needs_decision are not its business either. Below high the roles are records and never reach
+    or --defer/--accept (on high always through needs_verification: a final_check recorded during
+    or before the cycle is not counted after it closes, final_check_gap) or a new HEAD, and
+    pending, blocked and needs_decision are not its business either. Below high the roles are records and never reach
     here."""
     status = entry["status"]
     if status in ("in_progress", "needs_verification") and task_ready(entry, risk, head, policy):
@@ -2231,13 +2232,21 @@ def cover_digest(target):
 
 
 def settle_after_cover(entry, risk, head, policy):
-    """A deferral/acceptance may complete the task. From needs_fix it may only promote to
-    ready_for_pr_review (every role pass or covered): update_task_status would otherwise
-    demote a still-open needs_fix to in_progress. blocked/needs_decision never get here."""
+    """A deferral/acceptance may complete the task. From needs_fix it may only promote (every role
+    pass or covered): update_task_status would otherwise demote a still-open needs_fix to
+    in_progress. Leaving needs_fix this way closes the fix cycle like fix-loop --outcome pass does
+    (fix_cycles_closed += 1), so on a high task of the policy 1.2.4 a final_check recorded during or
+    before the cycle is no longer counted (final_check_gap) and the task goes to needs_verification:
+    a new final check makes it ready (settle_mandatory_role). Below high and under 1.2.1 the roles
+    are no part of readiness, so the task is ready_for_pr_review as before. A cover that does not
+    make the task ready closes nothing: needs_fix stays. blocked/needs_decision never get here."""
     if entry["status"] != "needs_fix":
         update_task_status(entry, risk, head, policy)
     elif task_ready(entry, risk, head, policy):
-        entry["status"] = "ready_for_pr_review"
+        entry["fix_cycles_closed"] = fix_cycles_closed(entry) + 1
+        entry["status"] = (
+            "ready_for_pr_review" if task_ready(entry, risk, head, policy) else "needs_verification"
+        )
 
 
 def record_deferral(args, entry, data, location, risk, policy):
@@ -2318,8 +2327,9 @@ def record_fix_outcome(args, entry, data, location, risk, policy):
         ):
             fail("working tree changed; run resume before recording a pass")
         if entry["status"] == "needs_fix":
-            # the fix cycle closes here, at any risk and policy (a task may be raised to high):
-            # the final check of a high task counts only if recorded after this (final_check_gap)
+            # the fix cycle closes here (or in settle_after_cover), at any risk and policy (a task
+            # may be raised to high): the final check of a high task counts only if recorded after
+            # this (final_check_gap)
             entry["fix_cycles_closed"] = fix_cycles_closed(entry) + 1
         update_task_status(entry, risk, data["head"], policy)
         if entry["status"] != "ready_for_pr_review":

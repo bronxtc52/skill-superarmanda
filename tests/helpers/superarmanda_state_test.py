@@ -6545,12 +6545,26 @@ class W4MandatoryFableRoles(W4Base):
                     self.assertEqual(failed["status"], "needs_fix")
                     covered = self.cover(flag)
                     self.assertEqual((covered["status"], covered["fix_cycles_closed"]), ("ready_for_pr_review", 1))
-                    # a cover that does not make the task ready leaves needs_fix and closes nothing
-                    failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+                    # a cover that does not make the task ready (another role still findings) leaves
+                    # needs_fix and closes nothing
+                    self.init(risk=risk)
+                    self.policy(policy)
+                    if risk == "high":
+                        self.record("coder", model="fable")
+                        self.record("tester", "findings", model="fable")
+                        self.record("cross_provider_reviewer", "findings",
+                                    **self.review_flags(self.report("codex-host", "findings")))
+                        self.record("second_reviewer", **self.review_flags(self.report("claude-host")))
+                    else:
+                        self.record("coder")
+                        self.record("tester", "findings")
+                        self.record("cross_provider_reviewer", "findings", reviewed_head=self.head(),
+                                    packet_hash="ab12" * 16)
+                    failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed",
+                                     "--source", "cross_provider_reviewer")
                     self.assertEqual(failed["status"], "needs_fix")
-                    self.record("tester", "findings", model="fable" if risk == "high" else None)
                     covered = self.cover(flag)
-                    self.assertEqual((covered["status"], covered["fix_cycles_closed"]), ("needs_fix", 1))
+                    self.assertEqual((covered["status"], covered.get("fix_cycles_closed", 0)), ("needs_fix", 0))
 
     def test_fable_roles_below_high_do_not_close_an_open_fix_cycle(self):
         """Astra round 1: below high the records of internal_reviewer and final_check are records, as in
