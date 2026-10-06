@@ -6346,6 +6346,40 @@ class W4MandatoryFableRoles(W4Base):
         self.assertEqual(self.position(), (7, "final_check"))
         self.assertEqual(self.final()["status"], "ready_for_pr_review")
 
+    def test_fable_roles_on_high_do_not_close_an_open_fix_cycle(self):
+        """Astra round 2 (decision: invariant): on high too, a record of internal_reviewer or final_check
+        never closes an open fix cycle — needs_fix is left by fix-loop --outcome pass, a new HEAD or
+        --defer/--accept only; the honest way out goes through needs_verification."""
+        self.built()
+        self.internal()
+        self.reviews()
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        reviewed = self.entry()["internal_review"]["head"]
+        failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        self.assertEqual(failed["status"], "needs_fix")
+        before = self.where()
+        self.assertEqual((before["step"], before["role"]), (6, "coder"))
+        for role in ("internal_reviewer", "final_check"):
+            for status in ("pass", "findings", "unavailable", "error", "incomplete"):
+                with self.subTest(role=role, status=status):
+                    entry = self.record(role, status, model="fable")
+                    self.assertEqual(entry["status"], "needs_fix")
+                    self.assertEqual(entry["internal_review"]["head"], reviewed)
+                    where = self.where()
+                    self.assertEqual((where["step"], where["role"], where["next_action"], where["task_status"]),
+                                     (before["step"], before["role"], before["next_action"], "needs_fix"))
+                    self.assertEqual(self.ok("status")["tasks"]["t1"]["status"], "needs_fix")
+        # the honest way out: the fix is verified (needs_verification), then the final check closes it
+        self.init()
+        self.built()
+        self.internal()
+        self.reviews()
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        verified = self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+        self.assertEqual(verified["status"], "needs_verification")
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+        self.assert_ready()
+
     def test_fable_roles_below_high_do_not_close_an_open_fix_cycle(self):
         """Astra round 1: below high the records of internal_reviewer and final_check are records, as in
         1.2.3 — a task waiting for its fix stays needs_fix whatever status they carry."""
@@ -6888,6 +6922,17 @@ class W4GateRoles(W4Base):
         self.final()
         problems = self.problems(HIGH_PLAN)
         self.assert_reason(problems, "t1", "internal_reviewer", "новый прогон волны")
+        self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
+
+    def test_open_fix_cycle_of_a_high_task_is_not_closed_by_a_final_check_at_the_gate(self):
+        """Astra round 2: a high task in needs_fix stays so after `final_check pass`; the gate says the fix
+        cycle is open."""
+        self.complete()
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+        entry = self.final()
+        self.assertEqual(entry["status"], "needs_fix")
+        problems = self.problems(HIGH_PLAN)
+        self.assert_reason(problems, "t1", "цикл исправлений не завершён")
         self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
 
     def test_marker_null_fails_the_gate_as_malformed(self):
