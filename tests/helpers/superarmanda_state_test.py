@@ -6332,6 +6332,44 @@ class W4MandatoryFableRoles(W4Base):
         self.assertEqual(entry["status"], "ready_for_pr_review")
         self.assertEqual(self.ok("task-risk", "--task", "t1", "--risk", "high")["status"], "in_progress")
         self.assert_not_ready("internal_reviewer", "new run")
+        # the credit is written at any risk: an internal review before the first packet of a low task
+        # counts once the task is raised to high, and only the final check is owed then
+        self.init(risk="low")
+        self.built()
+        entry = self.internal()
+        self.assertEqual((entry["status"], entry["internal_review"]["head"]), ("in_progress", self.head()))
+        entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assertEqual(self.ok("task-risk", "--task", "t1", "--risk", "high")["status"], "in_progress")
+        self.assertNotIn("new run", self.where()["next_action"])
+        self.reviews()  # the verified reports a high-risk task asks for
+        self.assertEqual(self.position(), (7, "final_check"))
+        self.assertEqual(self.final()["status"], "ready_for_pr_review")
+
+    def test_fable_roles_below_high_do_not_close_an_open_fix_cycle(self):
+        """Astra round 1: below high the records of internal_reviewer and final_check are records, as in
+        1.2.3 — a task waiting for its fix stays needs_fix whatever status they carry."""
+        for risk, policy in (("medium", "1.2.4"), ("low", "1.2.4"), ("medium", "1.2.1")):
+            with self.subTest(risk=risk, policy=policy):
+                self.init(risk=risk)
+                self.policy(policy)
+                self.record("coder")
+                self.record("tester")
+                entry = self.record("cross_provider_reviewer", reviewed_head=self.head(), packet_hash="ab12" * 16)
+                self.assertEqual(entry["status"], "ready_for_pr_review")
+                failed = self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+                self.assertEqual(failed["status"], "needs_fix")
+                before = self.where()
+                self.assertEqual((before["step"], before["role"]), (6, "coder"))
+                for role in ("internal_reviewer", "final_check"):
+                    for status in ("pass", "findings", "unavailable", "error", "incomplete"):
+                        with self.subTest(risk=risk, policy=policy, role=role, status=status):
+                            entry = self.record(role, status, model="fable")
+                            self.assertEqual(entry["status"], "needs_fix")
+                            where = self.where()
+                            self.assertEqual((where["step"], where["role"], where["next_action"], where["task_status"]),
+                                             (before["step"], before["role"], before["next_action"], "needs_fix"))
+                            self.assertEqual(self.ok("status")["tasks"]["t1"]["status"], "needs_fix")
 
     # ----- acceptance 3 -----
     def test_final_check_of_a_previous_head_is_not_pass(self):
