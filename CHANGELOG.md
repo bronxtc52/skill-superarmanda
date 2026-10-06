@@ -63,6 +63,7 @@
   `internal_review` на нём — malformed; гейт мерджа версией политики не ослабляется: manifest `1.2.1` в
   high-волне или с задачей high — `fail` с действием «новый прогон волны». Записи `internal_reviewer` и
   `final_check` на задаче ниже high остаются записями.
+- CI: `timeout-minutes` job `tests` поднят с 25 до 40 — macOS-прогон тестов W4 вышел за 25 минут.
 
 ## 1.2.3 — 2026-10-05
 
