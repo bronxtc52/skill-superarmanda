@@ -491,6 +491,8 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
     if version is None:
         return problems
     review_policy = state.policy_version(manifest) if version == 2 else None  # the rules the manifest is judged by
+    if version != 2 and "role_models" in manifest:  # a trace of 1.4.0 only; never read unvalidated (Codex P2 on #109)
+        return problems + ["manifest: role_models outside a version 2 manifest: this gate cannot judge it"]
     models = state.role_models(manifest)  # its role policy (1.4.0; built-in defaults without `role_models`)
     if not cwd_fingerprint:
         problems.append("отпечаток дерева рабочей копии не получен")

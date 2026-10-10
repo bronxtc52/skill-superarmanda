@@ -7769,6 +7769,21 @@ class GateVerdict(unittest.TestCase):
         self.assertEqual(v["verdict"], "fail")
         self.assertTrue(any("unknown record type 'waivers'" in r for r in v["reasons"]), v["reasons"])
 
+    def test_role_models_in_a_version_1_manifest_is_a_closed_refusal(self):  # Codex P2 on #109
+        for junk in ({"junk": "anything"}, {"coder": "x"}, "text"):
+            m = green_manifest()
+            m.update({"version": 1, "role_models": junk})
+            v = self.ev(manifest=m)
+            self.assertEqual(v["verdict"], "fail", v["reasons"])
+            self.assertTrue(any("role_models" in r for r in v["reasons"]), v["reasons"])
+
+    def test_malformed_role_models_in_a_version_2_manifest_is_a_closed_refusal(self):  # Codex P2 on #109
+        for junk in ({"junk": "anything"}, "text", {"coder": {"low": "claude-sonnet-5-5"}}):
+            m = green_manifest()
+            m["role_models"] = junk
+            v = self.ev(manifest=m)
+            self.assertEqual(v["verdict"], "fail", v["reasons"])
+
     def test_a_malformed_manifest_is_a_closed_refusal_not_an_exception(self):  # W1 fix1
         def fails(m, needle):
             v = self.ev(manifest=m)

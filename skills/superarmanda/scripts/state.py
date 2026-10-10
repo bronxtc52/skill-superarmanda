@@ -271,9 +271,13 @@ def role_models(data):
     """The role policy a manifest is judged by: its `role_models` (fixed at init), else the
     built-in defaults of 1.4.0 — a manifest of 1.2.x/1.3.x included. Callers that judge readiness
     take it from here and pass it on explicitly, like the risk and the policy version."""
-    table = data.get("role_models") if isinstance(data, dict) else None
-    source = table if isinstance(table, dict) else DEFAULT_ROLE_MODELS
-    return {role: dict(row) for role, row in source.items()}
+    if not isinstance(data, dict) or "role_models" not in data:
+        return {role: dict(row) for role, row in DEFAULT_ROLE_MODELS.items()}
+    # present: judged only after the same validation as the schema check (a closed refusal, never a crash
+    # or a silent fall back to the defaults; Codex P2 on #109)
+    policy = data.get("review_policy") if data.get("version") == 2 else None
+    check_role_models(data["role_models"], policy.get("version") if isinstance(policy, dict) else None)
+    return {role: dict(row) for role, row in data["role_models"].items()}
 
 
 def policy_model(models, role, risk):
