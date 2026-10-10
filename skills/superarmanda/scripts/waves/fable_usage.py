@@ -5,10 +5,11 @@ Reads `~/.claude/projects/**/*.jsonl` (the root is `--root`), takes the assistan
 Fable and sums their `message.usage` with the weights input 1, cache_creation 1.25, cache_read 0.1, output 5.
 One unit is 1 000 000 weighted tokens. Two windows by the line's `timestamp`: the last 24 hours and the rolling
 last 7 days (both end at `--now`). One answer of the assistant is written as several journal lines (one per
-content block): it counts once, by `message.id`, else by `requestId`, with the LARGEST usage of its lines — a
+content block): it counts once, by `message.id`, with the LARGEST usage of its lines — a
 subagent journal writes the partial `output_tokens` of the stream on the early blocks and the final number on the
 last one (live sample `tests/fixtures/transcripts/fable-usage-journal.jsonl`); the same answer in two journals (a
-resumed session copies the history) counts once too; a line with neither key counts on its own. Sidechain lines
+resumed session copies the history) counts once too. A Fable line without `message.id` is a form never seen live
+(every one of 13 138 sampled lines has it): it is not counted, only reported as `unkeyed`. Sidechain lines
 (`isSidechain: true`, the journals of subagents under `<session>/subagents/`) count: a Fable subagent spends the
 same subscription limit.
 
@@ -103,7 +104,7 @@ def usage(root=None, now=None, budget=DEFAULT_BUDGET, threshold=DEFAULT_THRESHOL
         out["reason"] = f"no journal directory {root}"
         return out
     best = {}  # key of one answer -> (weighted value, time) of its largest line
-    loose = []  # lines without a key: each counts on its own
+    unkeyed = 0  # Fable lines without message.id: not counted (no live sample of that form), only reported
     found = readable = 0
     for path in _journals(root):
         found += 1
@@ -130,19 +131,17 @@ def usage(root=None, now=None, budget=DEFAULT_BUDGET, threshold=DEFAULT_THRESHOL
                 if t is None or not week_from < t <= now:
                     continue
                 key = msg.get("id") if isinstance(msg.get("id"), str) and msg.get("id") else None
-                key = ("m", key) if key else (("r", d["requestId"]) if isinstance(d.get("requestId"), str)
-                                              and d.get("requestId") else None)
                 value = weighted(msg.get("usage"))
                 if key is None:
-                    loose.append((value, t))
+                    unkeyed += 1
                 elif key not in best or value > best[key][0]:
                     best[key] = (value, t)
     day = week = 0.0
-    for value, t in [*best.values(), *loose]:
+    for value, t in best.values():
         week += value
         if t > day_from:
             day += value
-    out["files"] = readable
+    out["files"], out["unkeyed"] = readable, unkeyed
     if not readable:
         out["reason"] = (f"no journal (*.jsonl) under {root}" if not found
                          else f"no journal under {root} could be read")

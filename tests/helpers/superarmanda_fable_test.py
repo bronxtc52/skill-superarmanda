@@ -600,22 +600,11 @@ class FableUsage(unittest.TestCase):
         self.journal("p/session-fx-2.jsonl", dump(MAIN))
         self.assertAlmostEqual(self.count(now=MAIN_DAY)["week_units"], round(final_units(MAIN), 4), places=4)
 
-    def test_request_id_without_message_id_and_neither(self):
-        # not seen live (every one of 13 138 Fable lines has both keys): derived from the live answer msg_fx07 of
-        # the subagent sample — message.id removed (then requestId too); the usage stays live
-        lines = [d for d in SUB if d["type"] == "assistant" and d["message"]["id"] == "msg_fx07"]
-        no_id = [json.loads(json.dumps(d)) for d in lines]
-        for d in no_id:
-            del d["message"]["id"]
-        neither = [json.loads(json.dumps(d)) for d in no_id]
-        for d in neither:
-            del d["requestId"]
-        final = fable_usage.weighted(lines[-1]["message"]["usage"]) / 1_000_000
-        partial = fable_usage.weighted(lines[0]["message"]["usage"]) / 1_000_000
-        self.journal("p/a.jsonl", dump(no_id))
-        self.assertAlmostEqual(self.count(now=SUB_DAY)["week_units"], round(final, 4), places=4)  # by requestId
-        self.journal("p/a.jsonl", dump(neither))
-        self.assertAlmostEqual(self.count(now=SUB_DAY)["week_units"], round(final + partial, 4), places=4)
+    def test_the_live_sample_has_no_unkeyed_line(self):
+        # every Fable line of the live sample carries message.id; the counter reports lines without it (unkeyed)
+        # instead of guessing a key for a form never seen live (Codex P1 on #109)
+        self.journal("p/session-fx-1.jsonl", dump(MAIN))
+        self.assertEqual(self.count(now=MAIN_DAY)["unkeyed"], 0)
 
     def test_budget_and_threshold(self):
         self.journal("p/a.jsonl", [scaled(64)])  # 64 units

@@ -142,6 +142,6 @@ echo 'Reply ok.' | claude --safe-mode -p --model claude-nonexistent-9 --tools ""
 `message.stop_sequence` и весь `message.usage` (числа токенов, `cache_creation`, `iterations`, `service_tier`,
 `inference_geo`, `speed`). Проверено обходом всех строковых значений и grep на пути, e-mail, токены и исходные id.
 
-Синтетика в тестах (`tests/helpers/superarmanda_fable_test.py`) — только производные от названных живых строк: ответ
-`msg_fx07` без `message.id` (и без `requestId`) — такой формы живьём нет; строка `msg_fx04` с подменённым `usage` — для
-арифметики бюджета и строки расхода в `launch`.
+Синтетика в тестах (`tests/helpers/superarmanda_fable_test.py`) — только производная от названной живой строки:
+`msg_fx04` с подменённым `usage` — для арифметики бюджета и строки расхода в `launch`. Строк Fable без `message.id`
+живьём нет, поэтому счётчик их не считает (только поле `unkeyed`), и выдуманной фикстуры этой формы нет.
