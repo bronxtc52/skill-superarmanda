@@ -17962,6 +17962,16 @@ class T3PlanReviewFableRounds(PlanReviewBase):
         self.fable_round(cfg, 3)
         self.refused(cfg, "r3-codex-host.json", "Astra")
 
+    def test_a_fable_report_after_the_astra_pass_is_refused_even_without_its_packet(self):
+        # the packet only makes a report count as a round; the order rule holds for every valid Fable report
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        self.fable_round(cfg, 3)
+        (cfg["run_dir"] / "plan-review" / "history" / "r3-packet.json").unlink()
+        self.refused(cfg, "r3-codex-host.json", "Astra")
+
     def test_a_report_without_created_at_is_no_round(self):
         cfg, _ = self.new_chain()
         self.fable_round(cfg, 1)

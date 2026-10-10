@@ -19,18 +19,18 @@
   `high`); субагентские роли — Opus. Порядок силы Sonnet < Opus < Fable: роль принимает модель политики или сильнее,
   Fable — везде. Переопределение только вверх и только при `init`: `--role-model <роль>[.<риск>]=<модель>`
   (повторяемый) и env `SUPERARMANDA_ROLE_MODELS` (JSON); итог пишется в manifest и дальше не меняется. Модель ниже
-  дефолта, `coordinator`, неизвестные роль, риск или модель — отказ. Словарь моделей пополнился `claude-opus-5-5` /
+  дефолта, флаг ниже env (политики цепочки), `coordinator`, неизвестные роль, риск или модель — отказ. Словарь моделей пополнился `claude-opus-5-5` /
   `opus`. `role-model` отдаёт модель любой из семи ролей и `effort` tester.
 - `review.py run` пишет в каждый отчёт (`pass`, `findings`, `error`) `created_at` — UTC ISO-8601.
 - `chain.json`: `role_models` (политика ролей волн, уходит в окно волны env `SUPERARMANDA_ROLE_MODELS`, входит в
   идентичность), `plan_review_fable_rounds` (по умолчанию 2), `fable_budget_units` (по умолчанию 80, tunable).
 - Ревью плана фазы A: после `plan_review_fable_rounds` кругов Fable `wab.py launch` принимает `pass` одной Astra.
   Круги лежат в `plan-review/history/` (пакет и отчёт Fable каждого круга), считаются по разным пакетам, отчёты
-  ошибки не считаются; Astra обязана быть новее каждого круга (`created_at`), `findings` Fable на одобренном пакете —
+  ошибки не считаются; Astra обязана быть новее каждого отчёта Fable в `history/` (`created_at`), `findings` Fable на одобренном пакете —
   отказ. Событие `plan review: Fable rounds exhausted (N), Astra-only pass accepted; last Fable report: …`.
 - Лимит Fable в окне волны: строка `rate_limit` / 429 основного потока в журнале сессии волны на Fable — диспетчер
   закрывает окно и запускает ту же волну на Opus с сообщением продолжения (фаза `switching`, `model_override`,
-  счётчик `fable_switches`); перезапуски и `max_runs` не расходуются, цепочка не останавливается. Строки субагентов
+  счётчик `fable_switches`; модель окна берётся из `session_model` в `state.json`, а не из текущего `chain.json`); перезапуски и `max_runs` не расходуются, цепочка не останавливается. Строки субагентов
   волну не переключают.
 - `scripts/waves/fable_usage.py`: локальный расход Fable по журналам Claude Code за сутки и 7 дней во взвешенных
   токенах (дедуп по `message.id`), JSON, rc 3 при недоступных журналах. `launch` пишет строку расхода и при ≥80%

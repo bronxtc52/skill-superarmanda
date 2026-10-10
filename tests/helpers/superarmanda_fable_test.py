@@ -145,6 +145,23 @@ class FableLimitSwitch(FableLimitBase):
         self.tick()
         self.assertEqual((self.new_sessions(), self.kills()), ([], []))
 
+    def test_owner_edit_of_the_chain_model_does_not_hide_the_fable_session(self):
+        # the window was started on Fable; the owner sets `model` of chain.json to Opus and restarts watch:
+        # the session still runs on Fable, its limit is still the Fable limit (session_model, #108)
+        self.setup_wave()
+        st = wab.load_state(self.cfg)
+        wab.start_session(self.cfg, st, "W1")
+        self.assertEqual(self.w()["session_model"], FABLE)
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["phase"] = "running"
+        wab.save_state(self.cfg, st)
+        self.cfg, _ = self.chain(model=OPUS)
+        self.tick()
+        w = self.w()
+        self.assertEqual((w.get("model_override"), w.get("fable_switches")), (OPUS, 1))
+        self.assertEqual(w["session_model"], OPUS)  # the new window is on Opus, and it is recorded
+        self.assertEqual(len(self.kills()), 1)
+
     def test_already_on_opus_by_override_is_left_alone(self):
         self.setup_wave(model_override=OPUS, fable_switches=1)
         self.tick()

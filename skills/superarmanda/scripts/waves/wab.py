@@ -192,7 +192,7 @@ def load_chain(path, create=True):
             del cfg[key]  # an explicit null is the same as leaving the field out (the default)
     for key in ("titles", "role_models"):
         if key in cfg and cfg[key] is None:
-            del cfg[key]  # no titles / no role policy of the chain, like leaving it out  # no titles, like leaving it out (dash reads cfg.get("titles", {}))
+            del cfg[key]  # no titles / no role policy of the chain, like leaving it out (dash reads cfg.get("titles", {}))
     _check_types(cfg)
     if cfg.get("role_models") == {}:
         del cfg["role_models"]  # an empty policy is no policy: not a part of the identity, no env for the wave
@@ -3285,7 +3285,7 @@ def _history_files(history):
 def fable_rounds_problem(cfg, directory, envelope, astra):
     """The plan review without result-codex-host.json (1.4.0, #108): (None, (rounds, last report)) when
     plan-review/history/ holds at least `plan_review_fable_rounds` real Fable rounds and the Astra pass of
-    the current packet is newer than each of them; (reason, None) otherwise.
+    the current packet is newer than each valid Fable report there (a round or not); (reason, None) otherwise.
 
     A round is a review.py report of profile codex-host whose models are Fable's (report_models_problem)
     with `primary_model_verified`, status `findings`, a `created_at`, and the packet it reviewed lying in
@@ -3333,12 +3333,12 @@ def fable_rounds_problem(cfg, directory, envelope, astra):
         if packet_hash == current:
             return (f"{rel} holds Fable findings on the approved packet itself: they were never addressed by "
                     f"a change of the plan"), None
+        if moment >= astra_at:  # every valid Fable report, its packet in history/ or not (#108)
+            return (f"{rel} is not older than the Astra pass of the current packet: the last Fable round "
+                    f"must be addressed and the change reviewed by Astra"), None
         env = packets.get(packet_hash)
         if env is None or response.get("reviewed_head") != env["packet"]["head"]:
             continue  # its packet is not in history/ (or adds no waves.json): no round
-        if moment >= astra_at:
-            return (f"{rel} is not older than the Astra pass of the current packet: the last Fable round "
-                    f"must be addressed and the change reviewed by Astra"), None
         if packet_hash not in rounds or moment > rounds[packet_hash][0]:
             rounds[packet_hash] = (moment, rel)
     if len(rounds) < need:
@@ -3717,6 +3717,18 @@ def wave_model(cfg, w):
     return override if isinstance(override, str) and override else cfg.get("model")
 
 
+def session_model(cfg, w):
+    """The model the CURRENT window of the wave was really started on: `model_override` -> `session_model`
+    (written by start_session; "" = the CLI default) -> chain.json `model` for a wave started before the
+    field. A tunable `model` changed in chain.json after the start does not change the live session (#108)."""
+    override = w.get("model_override") if isinstance(w, dict) else None
+    if isinstance(override, str) and override:
+        return override
+    if isinstance(w, dict) and isinstance(w.get("session_model"), str):
+        return w["session_model"] or None
+    return cfg.get("model")
+
+
 def start_session(cfg, st, wave, sid=None, phase="starting"):
     """launching -> starting: create the tmux window (same session id on a repeat). `sid`/`phase`: the
     Fable switch (#108) starts its new session with its own saved id and stays in its own phase."""
@@ -3728,6 +3740,7 @@ def start_session(cfg, st, wave, sid=None, phase="starting"):
     model = wave_model(cfg, w)
     if model:
         cmd += ["--model", model]
+    w["session_model"] = model or ""  # saved with the phase below: the limit detection reads it (#108)
     pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
     if cfg.get("role_models"):  # read by `state.py init` of the wave; no field, no env (the built-in policy)
         pin += ["-e", f"{gate.state.ROLE_MODELS_ENV}="
@@ -4401,7 +4414,7 @@ FABLE_SWITCH_NOTE = "модель переключена на Opus из-за л�
 def fable_limit_hit(cfg, w):
     """True when the wave runs on Fable and the transcript of its CURRENT session holds a provider refusal of
     the main thread (TranscriptCache `limit`). Subagents (sidechain lines) run on their own role models."""
-    if wave_model(cfg, w) != gate.state.FABLE_MODEL:
+    if session_model(cfg, w) != gate.state.FABLE_MODEL:
         return False
     sessions = w.get("sessions") or []
     if not sessions:

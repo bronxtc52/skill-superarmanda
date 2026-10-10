@@ -311,7 +311,7 @@ def init_role_models(flags):
     """The full role policy of a new manifest: the built-in defaults <- env SUPERARMANDA_ROLE_MODELS
     (a JSON object) <- the repeated --role-model flags, merged by key. Within one source a
     <role> key fills the role first, a <role>.<risk> key refines it. An override may only RAISE a
-    model above the built-in default: a value below it, an unknown role, risk or model, a
+    model above the built-in default, and a flag also not below the env (the chain policy): a value below it, an unknown role, risk or model, a
     `coordinator` key or a malformed input is refused, and no manifest is written."""
     sources = []
     raw = os.environ.get(ROLE_MODELS_ENV)
@@ -346,6 +346,12 @@ def init_role_models(flags):
                     fail(
                         f"{origin}: {key}={value} is below the built-in {role}.{risk} "
                         f"({DEFAULT_ROLE_MODELS[role][risk]}): an override may only raise the model"
+                    )
+                if origin == "--role-model" and weaker(model, table[role][risk]):
+                    # the env is the policy of the chain (#108): a flag of the wave may not lower it
+                    fail(
+                        f"{origin}: {key}={value} is below the chain policy {role}.{risk} "
+                        f"({table[role][risk]}, env {ROLE_MODELS_ENV}): a flag may only raise the model"
                     )
             parsed.append((len(risks) == 1, role, risks, model))
         # the whole role first, its single risks after: a <role>.<risk> key refines a <role> key

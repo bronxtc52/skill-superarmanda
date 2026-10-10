@@ -7942,6 +7942,17 @@ class RolePolicy140(W4Base):
             with self.subTest(flags=flags, env=env):
                 self.init_refused(*flags, env=env, needle="below")
 
+    def test_flag_below_the_chain_policy_of_the_env_is_refused(self):
+        # the env is the policy of the chain: a --role-model flag may not lower a cell below it (#108)
+        env = {"SUPERARMANDA_ROLE_MODELS": json.dumps({"coder": "fable"})}
+        for flags in (["--role-model", "coder.high=opus"], ["--role-model", "coder=opus"]):
+            with self.subTest(flags=flags):
+                proc = self.init_refused(*flags, env=env, needle="chain policy")
+                self.assertIn("(claude-fable", proc.stderr)
+        # equal or above the env stays allowed, and a cell the env does not touch keeps the default floor
+        self.init_with("--role-model", "coder.high=fable", "--role-model", "tester.high=fable", env=env)
+        self.assertEqual(self.data()["role_models"]["coder"]["high"], FABLE)
+
     def test_unknown_role_risk_model_coordinator_and_malformed_input_are_refused(self):
         for flags, env in (
             (["--role-model", "coordinator=fable"], None),
