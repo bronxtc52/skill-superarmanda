@@ -50,6 +50,7 @@ if str(HERE) not in sys.path:  # gate.py lies next to this file, also when it is
     sys.path.insert(0, str(HERE))
 import gate  # noqa: E402  (stdlib only, like this module)
 import humantime  # noqa: E402  (the one function that shows a time to a human, #88)
+import fable_usage  # noqa: E402  (stdlib only: the local Fable count of `launch`, #108)
 
 PROTOCOL = HERE / "PROTOCOL.md"
 MIN_TMUX = (3, 2)
@@ -90,6 +91,7 @@ DEFAULTS_MARK = "1.4"
 NEW_DEFAULTS = {"model": gate.state.OPUS_MODEL, "ctx_limit": 200_000}
 LEGACY_DEFAULTS = {"model": None, "ctx_limit": 300_000}
 PLAN_REVIEW_FABLE_ROUNDS = 2  # chain.json plan_review_fable_rounds: the Fable rounds of phase A before Astra decides
+FABLE_BUDGET_UNITS = fable_usage.DEFAULT_BUDGET  # chain.json fable_budget_units: Fable units per 7 days (advisory)
 
 
 MANDATE_PIN = re.compile(r"[0-9a-f]{64}")
@@ -136,6 +138,12 @@ def _check_types(cfg):
         if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 100:
             bad("plan_review_fable_rounds", "a whole number 1..100 (the Fable rounds of the plan review, "
                                             f"default {PLAN_REVIEW_FABLE_ROUNDS})")
+    if "fable_budget_units" in cfg:  # absent = the default; never written into cfg (#108, T5)
+        v = cfg["fable_budget_units"]
+        if (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                or not 0 < v <= 1_000_000):
+            bad("fable_budget_units", "a number > 0 (Fable units of 1M weighted tokens per 7 days, "
+                                      f"default {FABLE_BUDGET_UNITS})")
 
 
 def check_chain_role_models(table):
@@ -816,7 +824,7 @@ class TranscriptCache:
     @staticmethod
     def _blank(key):
         return {"key": key, "offset": None, "partial": b"", "discard_first": False, "head": None,
-                "turns": 0, "tools": 0, "out": 0, "read": 0, "ctx": 0}
+                "turns": 0, "tools": 0, "out": 0, "read": 0, "ctx": 0, "limit": 0}
 
     def read(self, path):
         path = str(path)
@@ -863,7 +871,7 @@ class TranscriptCache:
 
     @staticmethod
     def _summary(e):
-        return {k: e[k] for k in ("turns", "tools", "out", "read", "ctx")}
+        return {k: e[k] for k in ("turns", "tools", "out", "read", "ctx", "limit")}
 
     @staticmethod
     def _count(e, raw):
@@ -884,6 +892,8 @@ class TranscriptCache:
         if d.get("isSidechain"):
             return
         e["turns"] += 1
+        if d.get("error") == "rate_limit" or d.get("apiErrorStatus") == 429:
+            e["limit"] += 1  # the provider refused the session itself (#108): by the fields, never by the text
         if u:
             e["ctx"] = (_num(u.get("input_tokens")) + _num(u.get("cache_creation_input_tokens"))
                         + _num(u.get("cache_read_input_tokens")))
@@ -3586,6 +3596,10 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
         st["waves"][wave]["restart"] = len(attempts) + 1
     if carried:
         st["waves"][wave]["outbox"] = carried
+    if isinstance(old, dict):  # a relaunch of a wave switched to Opus on the Fable limit stays on Opus (#108)
+        for key in ("model_override", "fable_switches"):
+            if key in old:
+                st["waves"][wave][key] = old[key]
     if new_chain:  # saved with the first launch intent: from now on the run keeps the defaults of 1.4.0
         st["defaults"] = DEFAULTS_MARK
     warn_model = not cfg["model"] and not st.get("model_warned")
@@ -3594,8 +3608,30 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     save_state(cfg, st)
     if warn_model:  # after every refusal of this launch: a refused and repeated launch does not repeat it
         event(cfg, NO_MODEL_WARNING)
+    fable_usage_event(cfg)
     start_session(cfg, st, wave)
     return deliver_first_prompt(cfg, st, wave)
+
+
+FABLE_USAGE_WARNING = "Fable ≥80% недельного бюджета: ревью Fable может упереться в лимит"
+
+
+def fable_usage_event(cfg):
+    """The local Fable count (fable_usage.py, #108) as an event of the launch: advisory, never a refusal. The
+    journals are this machine's only (other machines and claude.ai are not seen); a count that could not be
+    made is said so, never shown as 0 %."""
+    budget = cfg.get("fable_budget_units", FABLE_BUDGET_UNITS)
+    try:
+        r = fable_usage.usage(projects_dir(), budget=budget)
+        if not r.get("valid"):
+            event(cfg, f"fable-usage: не посчитан ({r.get('reason') or 'нет данных'})")
+            return
+        event(cfg, f"fable-usage: сутки {round(r['day_units'], 2)} ед., 7 дней {round(r['week_units'], 2)} из {budget} ед. "
+                   f"({r['pct']}%; локально, только эта машина)")
+        if r["over_threshold"]:
+            event(cfg, f"предупреждение: {FABLE_USAGE_WARNING} (сверь claude.ai/settings/usage)")
+    except Exception as e:  # noqa: BLE001 - an advisory count never stops a launch
+        event(cfg, f"fable-usage: не посчитан ({type(e).__name__}: {_exc_text(e)})")
 
 
 def restart_prompt_matches(prompt_copy, prompt_text, prompt_file, wave):
@@ -3674,15 +3710,24 @@ def sync_max_runs(cfg, wave):
         event(cfg, f"{wave}: max-runs file not written: {_exc_text(e)}")
 
 
-def start_session(cfg, st, wave):
-    """launching -> starting: create the tmux window (same session id on a repeat)."""
+def wave_model(cfg, w):
+    """The model the wave's window runs on: the switch to Opus on the Fable limit (`model_override`, #108)
+    wins over chain.json `model`; None = the CLI default (a legacy chain without `model`)."""
+    override = w.get("model_override") if isinstance(w, dict) else None
+    return override if isinstance(override, str) and override else cfg.get("model")
+
+
+def start_session(cfg, st, wave, sid=None, phase="starting"):
+    """launching -> starting: create the tmux window (same session id on a repeat). `sid`/`phase`: the
+    Fable switch (#108) starts its new session with its own saved id and stays in its own phase."""
     w = st["waves"][wave]
     wdir = wave_dir(cfg, wave)
     sync_max_runs(cfg, wave)
     cmd = ["claude", "--permission-mode", "auto", "--append-system-prompt-file", str(system_prompt(cfg)),
-           "--name", f"wab-{cfg['chain']}-{wave}", "--session-id", w["sessions"][0]]
-    if cfg["model"]:
-        cmd += ["--model", cfg["model"]]
+           "--name", f"wab-{cfg['chain']}-{wave}", "--session-id", sid or w["sessions"][0]]
+    model = wave_model(cfg, w)
+    if model:
+        cmd += ["--model", model]
     pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
     if cfg.get("role_models"):  # read by `state.py init` of the wave; no field, no env (the built-in policy)
         pin += ["-e", f"{gate.state.ROLE_MODELS_ENV}="
@@ -3691,7 +3736,7 @@ def start_session(cfg, st, wave):
                 "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", "-e", f"WAB_MAX_RUNS={cfg['max_runs']}",
                 "-e", f"SUPERARMANDA_TZ={humantime.resolve(cfg.get('timezone'))[0]}", *pin, *cmd)
     mark_owner(cfg, w["tmux"], (made.stdout or "").strip())
-    w["phase"] = "starting"
+    w["phase"] = phase
     save_state(cfg, st)
 
 
@@ -4334,6 +4379,128 @@ def recover_update(cfg, st, wave):
         put_notice(cfg, w, wave, "updating", str(w.get("restarts", 0)))
     finish_update(cfg, st, wave)  # saves the phase, the mark and the notice together
     flush_notices(cfg, st, w)
+
+
+# ---------- the Fable limit of a wave window -> the same wave on Opus (1.4.0, #108) ----------
+#
+# A wave window that runs on Fable and gets the subscription limit (a main-thread assistant line of its
+# transcript with error "rate_limit" or apiErrorStatus 429, written by Claude Code itself; the text is not
+# read) would stand still for hours. The dispatcher closes that window and starts a NEW session of the same
+# wave on Opus with the resume message: the chain goes on. Phase `switching`, its steps in `fable_switch`
+# {sid, step}: closing -> starting -> ready -> sending; every step is saved before its outside action, so a
+# dispatcher that dies anywhere carries it on without a second window, a second session id or a blind resend.
+# It is not a restart of the wave: `restarts`, the attempts and `max_runs` stay untouched (`fable_switches`
+# counts it). Once per wave: `model_override` is Opus afterwards, a limit of Opus takes the ordinary idle /
+# ATTENTION path. `/model` is never typed into the TUI (it would change the owner's global default).
+
+FABLE_SWITCH_WHAT = "fable switch resume"  # step label for _deliver / pending_enter
+FABLE_SWITCH_TO = gate.state.OPUS_MODEL
+FABLE_SWITCH_NOTE = "модель переключена на Opus из-за лимита Fable; отметь это в PR"
+
+
+def fable_limit_hit(cfg, w):
+    """True when the wave runs on Fable and the transcript of its CURRENT session holds a provider refusal of
+    the main thread (TranscriptCache `limit`). Subagents (sidechain lines) run on their own role models."""
+    if wave_model(cfg, w) != gate.state.FABLE_MODEL:
+        return False
+    sessions = w.get("sessions") or []
+    if not sessions:
+        return False
+    return CACHE.read(transcript_path(w["cwd"], sessions[-1]))["limit"] > 0
+
+
+def fable_switch_message(cfg, wave, wdir):
+    return resume_message(cfg, wave, wdir) + "\n" + FABLE_SWITCH_NOTE
+
+
+def begin_fable_switch(cfg, st, wave, w):
+    """The decision, in ONE save: the override, the counter, the new session id and the phase."""
+    w["model_override"] = FABLE_SWITCH_TO
+    w["fable_switches"] = (w["fable_switches"] if _count(w.get("fable_switches")) else 0) + 1
+    w["fable_switch"] = {"sid": str(uuid.uuid4()), "step": "closing", "from": (w.get("sessions") or [None])[-1]}
+    w["phase"] = "switching"
+    save_state(cfg, st)
+    event(cfg, f"fable limit: {wave} → relaunch on {FABLE_SWITCH_TO}")
+
+
+def _fable_switch_done(cfg, st, wave, w, how):
+    sid = (w.get("fable_switch") or {}).get("sid")
+    w["phase"] = "running"
+    w.pop("fable_switch", None)
+    w["checkpoint_at"] = None  # the new session starts with a fresh context: no checkpoint of the old one
+    w.pop("checkpoint_sent", None)
+    w.pop("ctx_watch", None)
+    w["tokens"] = 0
+    save_state(cfg, st)
+    event(cfg, f"{wave}: new session {sid} on {wave_model(cfg, w)} after the Fable limit: {how}")
+    return True
+
+
+def _fable_switch_tick(cfg, st, wave, w):
+    """Carry the switch on from its saved step (see above). False only when the chain stops (not_ready)."""
+    sw = w.get("fable_switch")
+    name, wdir = w["tmux"], wave_dir(cfg, wave)
+    if not (isinstance(sw, dict) and isinstance(sw.get("sid"), str) and sw.get("step") in
+            ("closing", "starting", "ready", "sending")):
+        event(cfg, f"{wave}: fable switch record is broken ({safe_text(sw, 200)}); supervision resumed as running")
+        w["phase"] = "running"
+        w.pop("fable_switch", None)
+        save_state(cfg, st)
+        return True
+    if sw["step"] == "closing":
+        if tmux_alive(name):
+            tmux("kill-session", "-t", session_target(name), check=False)
+        if tmux_alive(name):
+            if once_per(w, "fable_switch", "close"):
+                event(cfg, f"{wave}: fable switch: session {name} is not closed yet; retried next tick")
+            save_state(cfg, st)
+            return True
+        for key in ("pending_enter", "pending_text_head", "pending_clear", "await_session"):
+            w.pop(key, None)  # the old window is gone with whatever was in its input
+        if sw["sid"] not in w.setdefault("sessions", []):
+            w["sessions"].append(sw["sid"])  # known up front: bound by id, not by its marker
+        w["cleared_at"] = time.time()  # background shells older than this were the old session's (#68)
+        sw["step"] = "starting"
+        save_state(cfg, st)
+    if sw["step"] == "starting":
+        if tmux_alive(name):  # the dispatcher died right after new-session
+            event(cfg, f"{wave}: fable switch resumed: the window exists, not starting another")
+            _mark_recovered(cfg, name, wave)
+        else:
+            start_session(cfg, st, wave, sid=sw["sid"], phase="switching")
+        sw["step"] = "ready"
+        save_state(cfg, st)
+    if sw["step"] == "ready":
+        if not wait_ready(name):
+            blocked = "BLOCKED: окно Claude на Opus не стало готовым после лимита Fable, продолжение не отправлено\n"
+            (wdir / "status").write_text(blocked, encoding="utf-8")
+            w["phase"] = "not_ready"
+            w.pop("fable_switch", None)
+            put_notice(cfg, w, wave, "not_ready", "1", reason="window_not_ready")
+            save_state(cfg, st)
+            event(cfg, f"{wave}: Claude TUI on {wave_model(cfg, w)} not ready in {name}, resume NOT sent")
+            flush_notices(cfg, st, w)
+            return False
+        sw["step"] = "sending"  # from here the resume message is never resent blindly
+        save_state(cfg, st)
+    elif w.get("pending_enter") != FABLE_SWITCH_WHAT:  # `sending` found on disk, nothing recorded as typed
+        if session_marker(cfg, wave) in _first_user_text(transcript_path(w["cwd"], sw["sid"])):
+            return _fable_switch_done(cfg, st, wave, w, "the resume message evidently arrived")
+        try:
+            why = input_empty_reason(pane_ansi(name))
+        except (subprocess.SubprocessError, OSError) as e:
+            why = type(e).__name__
+        if why is not None:  # something may sit in the input: neither typed over nor resent
+            event(cfg, f"{wave}: fable switch: unknown whether the resume message arrived ({why}), NOT resent")
+            return _fable_switch_done(cfg, st, wave, w, "resume NOT resent")
+    try:
+        ok = _deliver(cfg, st, wave, FABLE_SWITCH_WHAT, send_text, fable_switch_message(cfg, wave, wdir))
+    except _WindowGone:
+        return False
+    if not ok:
+        save_state(cfg, st)
+        return True  # step `sending` is on disk: the next tick decides by pending_enter and the screen
+    return _fable_switch_done(cfg, st, wave, w, "resume sent")
 
 
 def next_prompt_problem(path):
@@ -6014,6 +6181,8 @@ def _tick(cfg, st):
     if w.get("phase") == "launching":
         recover_launch(cfg, st, wave)
         return True
+    if w.get("phase") == "switching":  # the Fable limit (#108): the window is closed and started again by us
+        return _fable_switch_tick(cfg, st, wave, w)
 
     if w.get("phase") == "gate" and status != "DONE":
         w["phase"] = "running"  # the wave took its DONE back while the gate waited
@@ -6168,6 +6337,9 @@ def _tick(cfg, st):
         w["peak"] = max(w.get("peak", 0), tokens)
         w["ctx_hist"] = (w.get("ctx_hist", []) + [tokens])[-120:]
         watch_context(cfg, st, wave, w, tokens)
+        if w.get("phase") in ("running", "checkpoint") and status != "HANDOFF_READY" and fable_limit_hit(cfg, w):
+            begin_fable_switch(cfg, st, wave, w)
+            return _fable_switch_tick(cfg, st, wave, w)
 
     if w.get("phase") == "running" and not awaiting and tokens >= cfg["ctx_limit"]:
         event(cfg, f"{wave}: context {tokens} >= {cfg['ctx_limit']}, checkpoint requested")
@@ -6725,7 +6897,8 @@ def _state_or_event(cfg):
 
 TUNABLE = ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds", "telegram",
            "titles", "model", "plan_sha256", "max_auto_answers", "max_runs", "idle_nudge_minutes",
-           "timezone")  # timezone only changes how a time is shown: never part of whose run this is (#88)
+           "timezone",  # timezone only changes how a time is shown: never part of whose run this is (#88)
+           "fable_budget_units")  # an advisory threshold of launch (#108): tuning it changes no run
 
 
 def _identity(cfg):
@@ -7003,6 +7176,7 @@ def status_cmd(cfg):
         ctx = tokens // 1000 if isinstance(tokens, int) and not isinstance(tokens, bool) else "?"
         print(f"{safe_text(wave, 200)}: tmux={safe_text(w.get('tmux'), 200)} phase={safe_text(w.get('phase'), 200)} ctx={ctx}k "
               f"restarts={safe_text(w.get('restarts', 0), 50)} sessions={len(w.get('sessions') or [])} "
+              + (f"model={safe_text(w['model_override'], 200)} (лимит Fable) " if w.get("model_override") else "") +
               f"started={hum(cfg, num(w.get('started')))} "
               f"status={safe_text(read(cfg['run_dir'] / wave / 'status'), 10 ** 6)}")
         line = manifest_status_line(cfg, wave)

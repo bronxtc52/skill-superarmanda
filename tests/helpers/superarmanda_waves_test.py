@@ -18798,7 +18798,8 @@ class W7NoticeTemplates(Base):
         tree = ast.parse((WAVES / "wab.py").read_text(encoding="utf-8"))
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
                  and n.func.id == "put_notice"]
-        self.assertEqual(len(calls), 24, "the 25 call sites of 1.2.6; chain_done is put by one helper now (23 keys)")
+        # the 25 call sites of 1.2.6; chain_done is put by one helper now (23 keys); +1 not_ready of the Fable switch (#108)
+        self.assertEqual(len(calls), 25)
         self.assertEqual({c.args[3].value for c in calls if len(c.args) == 5}, set(wab.NOTICE_TEMPLATES))
         for node in calls:
             self.assertEqual(len(node.args), 5, f"put_notice(cfg, w, wave, key, value, **fields), line {node.lineno}")
@@ -18998,7 +18999,8 @@ class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
         mods = set(re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", src))
-        stdlib = set(sys.stdlib_module_names) | {"gate", "humantime"}  # gate.py is the sibling module, stdlib-only itself
+        # gate.py, humantime.py and fable_usage.py are sibling modules, stdlib-only themselves (fable_usage: its own test)
+        stdlib = set(sys.stdlib_module_names) | {"gate", "humantime", "fable_usage"}
         self.assertFalse(mods - stdlib, mods - stdlib)
         gate_src = (WAVES / "gate.py").read_text(encoding="utf-8")
         gate_mods = set(re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", gate_src))
