@@ -4504,18 +4504,32 @@ def fable_limit_hit(cfg, w):
     return CACHE.read(transcript_path(w["cwd"], sessions[-1]))["limit"] > 0
 
 
-def fable_limit_after_blocked(cfg, wave, w):
+def _status_snapshot(cfg, wave):
+    """The status file's text and stamp as ONE write: stamp, text, stamp again; None when the file changed
+    between the reads or is unreadable (the caller decides on the next tick). Codex/CodeRabbit on #111."""
+    before = _status_stamp(cfg, wave)
+    text = read(wave_dir(cfg, wave) / "status", on_error=None)
+    after = _status_stamp(cfg, wave)
+    if before is None or text is None or before != after:
+        return None
+    return text, before
+
+
+def fable_limit_after_blocked(cfg, wave, w, status):
     """#110: the limit of a Fable wave whose status file says BLOCKED. Fresh only when the newest limit line of
     the current session is newer than the status file: the wave got an answer, went on and was refused, or its
     very turn after writing BLOCKED was refused (the window is out of Fable either way). A wave that waits for the
     owner calls nobody, so no new limit line appears and it is not switched; a limit line without a time is not
     fresh either (fail safe: the owner sees the idle wave, as before). Returns the stamp of the status write the
-    freshness was judged on ([inode, mtime_ns], the one read: Codex P2 on #111), or None."""
+    freshness was judged on ([inode, mtime_ns]), or None. The write is one snapshot of text and stamp, and its
+    text must be `status`, the line of this tick: a rewrite in between defers the switch to the next tick, so the
+    question handed to Opus and its stamp always belong to the same write (Codex and CodeRabbit on #111)."""
     if not fable_limit_hit(cfg, w):
         return None
-    stamp = _status_stamp(cfg, wave)
-    if stamp is None:
+    snap = _status_snapshot(cfg, wave)
+    if snap is None or snap[0] != status:
         return None
+    stamp = snap[1]
     limit_at = CACHE.read(transcript_path(w["cwd"], w["sessions"][-1]))["limit_at"]
     return stamp if limit_at > stamp[1] / 1e9 else None
 
@@ -6468,7 +6482,7 @@ def _tick(cfg, st):
 
     # before any retry typed into the window (a gate failure, an answer): a refused Fable window gets nothing more
     if status.startswith("BLOCKED") and w.get("phase") in ("running", "checkpoint") and not w.get("await_session"):
-        stamp = fable_limit_after_blocked(cfg, wave, w)  # #110: answered, went on, refused — not a wait
+        stamp = fable_limit_after_blocked(cfg, wave, w, status)  # #110: answered, went on, refused — not a wait
         if stamp is not None:  # one read of the stamp: a rewrite after it is a new episode, not this one
             begin_fable_switch(cfg, st, wave, w, blocked={"status": status, "since": stamp[1] / 1e9, "stamp": stamp})
             return _fable_switch_tick(cfg, st, wave, w)
