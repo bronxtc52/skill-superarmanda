@@ -17972,6 +17972,33 @@ class T3PlanReviewFableRounds(PlanReviewBase):
         (cfg["run_dir"] / "plan-review" / "history" / "r3-packet.json").unlink()
         self.refused(cfg, "r3-codex-host.json", "Astra")
 
+    def test_a_fable_pass_after_the_astra_pass_is_refused(self):
+        # the order rule holds for every valid Fable report of history/, whatever its status (#108)
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        self.fable_round(cfg, 3, mode="success")
+        self.refused(cfg, "r3-codex-host.json", "Astra")
+
+    def test_a_fable_quota_report_after_the_astra_pass_is_refused(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        self.fable_round(cfg, 3, mode="quota_failure")
+        self.refused(cfg, "r3-codex-host.json", "Astra")
+
+    def test_older_fable_pass_and_quota_reports_do_not_stop_the_chain(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1, mode="success")
+        self.fable_round(cfg, 2, mode="quota_failure")
+        self.fable_round(cfg, 3)
+        self.fable_round(cfg, 4)
+        self.astra_only(cfg)
+        self.launched(cfg)
+        self.assertIn("Fable rounds exhausted (2)", self.log(cfg))
+
     def test_a_report_without_created_at_is_no_round(self):
         cfg, _ = self.new_chain()
         self.fable_round(cfg, 1)

@@ -3285,7 +3285,9 @@ def _history_files(history):
 def fable_rounds_problem(cfg, directory, envelope, astra):
     """The plan review without result-codex-host.json (1.4.0, #108): (None, (rounds, last report)) when
     plan-review/history/ holds at least `plan_review_fable_rounds` real Fable rounds and the Astra pass of
-    the current packet is newer than each valid Fable report there (a round or not); (reason, None) otherwise.
+    the current packet is newer than each valid Fable report there with a created_at (a round or not, any
+    status: pass, findings, error/quota; a report without created_at is no round and takes no part in the
+    order); (reason, None) otherwise.
 
     A round is a review.py report of profile codex-host whose models are Fable's (report_models_problem)
     with `primary_model_verified`, status `findings`, a `created_at`, and the packet it reviewed lying in
@@ -3316,26 +3318,31 @@ def fable_rounds_problem(cfg, directory, envelope, astra):
             report, _digest = state.read_report(str(path), path.name)
         except SystemExit:
             continue
-        if report.get("profile") == state.FABLE_PROFILE and report.get("status") == "findings":
+        if report.get("profile") == state.FABLE_PROFILE:
             reports.append((path, report))
     rounds = {}
     for path, report in reports:
+        # (1) the order: the Astra pass is newer than EVERY valid Fable report of history/ with a created_at,
+        # whatever its status (pass, findings, error/quota) and its packet in history/ or not (#108)
+        moment = _report_moment(report)
+        rel = f"{PLAN_HISTORY_DIR}/{path.name}"
         response = report.get("response")
         capabilities = report.get("capabilities")
-        moment = _report_moment(report)
-        if (state.report_models_problem(report, state.FABLE_PROFILE)
-                or not (isinstance(capabilities, dict) and capabilities.get("primary_model_verified") is True)
-                or not (isinstance(response, dict) and response.get("status") == "findings")
-                or moment is None):
-            continue
+        is_round = (report.get("status") == "findings"
+                    and not state.report_models_problem(report, state.FABLE_PROFILE)
+                    and isinstance(capabilities, dict) and capabilities.get("primary_model_verified") is True
+                    and isinstance(response, dict) and response.get("status") == "findings"
+                    and moment is not None)
         packet_hash = report.get("state_packet_hash")
-        rel = f"{PLAN_HISTORY_DIR}/{path.name}"
-        if packet_hash == current:
+        if is_round and packet_hash == current:
             return (f"{rel} holds Fable findings on the approved packet itself: they were never addressed by "
                     f"a change of the plan"), None
-        if moment >= astra_at:  # every valid Fable report, its packet in history/ or not (#108)
-            return (f"{rel} is not older than the Astra pass of the current packet: the last Fable round "
+        if moment is not None and moment >= astra_at:
+            return (f"{rel} is not older than the Astra pass of the current packet: the last Fable report "
                     f"must be addressed and the change reviewed by Astra"), None
+        # (2) the count: only verified Fable findings on a plan packet lying in history/
+        if not is_round:
+            continue
         env = packets.get(packet_hash)
         if env is None or response.get("reviewed_head") != env["packet"]["head"]:
             continue  # its packet is not in history/ (or adds no waves.json): no round

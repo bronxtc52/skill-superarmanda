@@ -26,7 +26,7 @@
   идентичность), `plan_review_fable_rounds` (по умолчанию 2), `fable_budget_units` (по умолчанию 80, tunable).
 - Ревью плана фазы A: после `plan_review_fable_rounds` кругов Fable `wab.py launch` принимает `pass` одной Astra.
   Круги лежат в `plan-review/history/` (пакет и отчёт Fable каждого круга), считаются по разным пакетам, отчёты
-  ошибки не считаются; Astra обязана быть новее каждого отчёта Fable в `history/` (`created_at`), `findings` Fable на одобренном пакете —
+  ошибки не считаются; Astra обязана быть новее каждого отчёта Fable в `history/` (`created_at`, любой статус — `pass`, `findings`, `error`/quota), `findings` Fable на одобренном пакете —
   отказ. Событие `plan review: Fable rounds exhausted (N), Astra-only pass accepted; last Fable report: …`.
 - Лимит Fable в окне волны: строка `rate_limit` / 429 основного потока в журнале сессии волны на Fable — диспетчер
   закрывает окно и запускает ту же волну на Opus с сообщением продолжения (фаза `switching`, `model_override`,
