@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -1185,6 +1186,9 @@ def state_packet_hash(envelope):
 
 
 def write_result(output, value):
+    """Every report of `run` (pass, findings, error) names the moment it was written: `created_at`,
+    UTC ISO-8601. The plan review of `wab.py launch` orders the Fable rounds and the Astra pass by it."""
+    value = dict(value, created_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
     atomic_write(output, canonical(value) + b"\n")
 
 

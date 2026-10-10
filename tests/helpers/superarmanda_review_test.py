@@ -1424,7 +1424,7 @@ raise SystemExit(1)
                 self.assertEqual(
                     set(result),
                     {"status", "profile", "attempts", "error", "error_category", "gate_ready",
-                     "reviewed_head", "state_packet_hash"},
+                     "reviewed_head", "state_packet_hash", "created_at"},
                 )
                 self.assertEqual((result["status"], result["error_category"]), ("error", category))
                 self.assertIs(result["gate_ready"], False)
@@ -1448,7 +1448,7 @@ raise SystemExit(1)
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertEqual(
                     set(self.result()),
-                    {"status", "profile", "attempts", "error", "error_category", "gate_ready"},
+                    {"status", "profile", "attempts", "error", "error_category", "gate_ready", "created_at"},
                 )
         # the packet is intact but the repository moved on: it was never verified against it
         self.git("commit", "--allow-empty", "-qm", "moved on")
@@ -2417,6 +2417,25 @@ raise SystemExit(1)
         proc = self.packet(output=second)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(second.read_bytes(), first.read_bytes())
+
+
+    def test_run_report_carries_created_at_in_utc(self):
+        """1.4.0 (#108, T3): every report of `run` (pass, findings, error) names when it was written, in UTC
+        ISO-8601: the plan review of `wab.py launch` orders the Fable rounds and the Astra pass by it."""
+        from datetime import datetime, timedelta, timezone
+        self.assert_packet_ok()
+        for profile, mode in (("claude-host", "success"), ("codex-host", "findings"),
+                              ("codex-host", "quota_failure")):
+            with self.subTest(profile=profile, mode=mode):
+                before = datetime.now(timezone.utc) - timedelta(seconds=1)
+                self.review_run(profile, mode)
+                after = datetime.now(timezone.utc) + timedelta(seconds=1)
+                result = self.result()
+                stamp = result.get("created_at")
+                self.assertIsInstance(stamp, str, result)
+                moment = datetime.fromisoformat(stamp)
+                self.assertEqual(moment.utcoffset(), timedelta(0), stamp)
+                self.assertTrue(before <= moment <= after, (before, stamp, after))
 
 
 if __name__ == "__main__":
