@@ -25,6 +25,7 @@ Every contact with tmux, claude, Telegram and az goes through the module-level f
 time, not at import.
 """
 import bisect
+import datetime
 import fcntl
 import hashlib
 import json
@@ -81,6 +82,15 @@ ALARM_POLL_SECONDS = 120  # the alarm of a running wave: GitHub is asked no more
 NUM_LIMITS = {"ctx_limit": 10_000_000, "idle_minutes": 1440, "handoff_timeout_minutes": 1440,
               "tick_seconds": 3600}
 
+# The defaults of `model` and `ctx_limit` (1.4.0, #108): a chain first launched by 1.4.0+ carries the marker
+# `defaults: "1.4"` in its state.json and runs on Opus with 200 000 tokens; a chain started before (state.json
+# with waves and without the marker) keeps the defaults it was started with, None (the CLI default) and
+# 300 000. Both fields are tunable: the identity of a running chain does not change with them.
+DEFAULTS_MARK = "1.4"
+NEW_DEFAULTS = {"model": gate.state.OPUS_MODEL, "ctx_limit": 200_000}
+LEGACY_DEFAULTS = {"model": None, "ctx_limit": 300_000}
+PLAN_REVIEW_FABLE_ROUNDS = 2  # chain.json plan_review_fable_rounds: the Fable rounds of phase A before Astra decides
+
 
 MANDATE_PIN = re.compile(r"[0-9a-f]{64}")
 
@@ -119,6 +129,42 @@ def _check_types(cfg):
         bad("mandate_sha256", "a string of 64 lowercase hex characters")
     if "plan_sha256" in cfg and not isinstance(cfg["plan_sha256"], str):
         bad("plan_sha256", "a string of 64 lowercase hex characters")
+    if "role_models" in cfg and not isinstance(cfg["role_models"], dict):
+        bad("role_models", "an object of \"<role>[.<risk>]\" -> model (the role policy of the waves)")
+    if "plan_review_fable_rounds" in cfg:
+        v = cfg["plan_review_fable_rounds"]
+        if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 100:
+            bad("plan_review_fable_rounds", "a whole number 1..100 (the Fable rounds of the plan review, "
+                                            f"default {PLAN_REVIEW_FABLE_ROUNDS})")
+
+
+def check_chain_role_models(table):
+    """chain.json `role_models`: the same keys and models `state.py init` takes from env
+    SUPERARMANDA_ROLE_MODELS (its parser, not a copy), refused here at the entry and not in the wave's
+    session: an unknown role, risk or model, a `coordinator` key, or a model below the built-in default."""
+    state = gate.state
+    try:
+        for key, value in table.items():
+            role, risks = state.parse_role_model_key(key, "role_models")
+            model = state.parse_role_model_value(value, key, "role_models")
+            for risk in risks:
+                floor = state.DEFAULT_ROLE_MODELS[role][risk]
+                if state.weaker(model, floor):
+                    raise SystemExit(f"{key}={value} is below the built-in {role}.{risk} ({floor}): "
+                                     f"an override may only raise the model")
+    except SystemExit as e:
+        raise SystemExit(f"chain.json: role_models: {_exc_text(e).removeprefix('state: ')}")
+
+
+def chain_started_before_defaults(run_dir):
+    """True for a run whose state.json has waves and no `defaults` marker: a chain started before 1.4.0.
+    No state, no wave yet or an unreadable state: the chain is new (a broken state.json is refused later
+    by load_state anyway)."""
+    try:
+        st = json.loads((pathlib.Path(run_dir) / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(st, dict) and "defaults" not in st and isinstance(st.get("waves"), dict) and bool(st["waves"])
 
 
 def load_chain(path, create=True):
@@ -136,9 +182,14 @@ def load_chain(path, create=True):
     for key in OPTIONAL_STRINGS + ("tmux_prefix",):
         if key in cfg and cfg[key] is None:
             del cfg[key]  # an explicit null is the same as leaving the field out (the default)
-    if "titles" in cfg and cfg["titles"] is None:
-        del cfg["titles"]  # no titles, like leaving it out (dash reads cfg.get("titles", {}))
+    for key in ("titles", "role_models"):
+        if key in cfg and cfg[key] is None:
+            del cfg[key]  # no titles / no role policy of the chain, like leaving it out  # no titles, like leaving it out (dash reads cfg.get("titles", {}))
     _check_types(cfg)
+    if cfg.get("role_models") == {}:
+        del cfg["role_models"]  # an empty policy is no policy: not a part of the identity, no env for the wave
+    if "role_models" in cfg:
+        check_chain_role_models(cfg["role_models"])
     if cfg.get("telegram_quote") is False:
         del cfg["telegram_quote"]  # «false» is the default: it is no field, and so not a part of the run's identity (#83)
     if "timezone" in cfg and cfg["timezone"] is None:
@@ -147,13 +198,13 @@ def load_chain(path, create=True):
         cfg["timezone"] = humantime.resolve(cfg.get("timezone"))[0]
     except humantime.TzError as e:
         raise SystemExit(f"chain.json: {e.reason}")
-    cfg.setdefault("ctx_limit", 300_000)
     cfg.setdefault("idle_minutes", 12)
     cfg.setdefault("handoff_timeout_minutes", 25)
     cfg.setdefault("tick_seconds", 60)
-    cfg.setdefault("model", None)
     cfg.setdefault("tmux_prefix", "wab-")
     for key in NUM_LIMITS:
+        if key == "ctx_limit" and key not in cfg:
+            continue  # its default depends on the run (DEFAULTS_MARK), set below once run_dir is known
         v = cfg[key]  # an explicit null/string/bool/<=0/nan/inf would crash `watch` later
         if isinstance(v, bool) or not isinstance(v, (int, float)) \
                 or (isinstance(v, float) and not math.isfinite(v))  \
@@ -240,6 +291,9 @@ def load_chain(path, create=True):
             cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     except (OSError, RuntimeError, ValueError) as e:  # symlink loop, no permission, a file in the way
         raise SystemExit(f"chain.json: run_dir/workdir cannot be used: {_exc_text(e)}")
+    defaults = LEGACY_DEFAULTS if chain_started_before_defaults(cfg["run_dir"]) else NEW_DEFAULTS
+    for key, value in defaults.items():
+        cfg.setdefault(key, value)
     return cfg
 
 
@@ -3194,17 +3248,113 @@ def _plan_report_problem(report, profile, envelope):
     return None
 
 
+PLAN_HISTORY_DIR = "history"
+PLAN_HISTORY_MAX_FILES = 1000  # more files than that in history/ is not a phase A, it is a refusal
+
+
+def _report_moment(report):
+    """The `created_at` of a review.py report (1.4.0) as an aware UTC datetime, or None."""
+    value = report.get("created_at") if isinstance(report, dict) else None
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None and moment.utcoffset() == datetime.timedelta(0) else None
+
+
+def _history_files(history):
+    """The regular .json files of plan-review/history/ (symlinks and anything else are left out), by name."""
+    names = sorted(e.name for e in os.scandir(history) if e.name.endswith(".json"))
+    if len(names) > PLAN_HISTORY_MAX_FILES:
+        raise ValueError(f"more than {PLAN_HISTORY_MAX_FILES} files")
+    return [history / n for n in names if stat.S_ISREG(os.lstat(history / n).st_mode)]
+
+
+def fable_rounds_problem(cfg, directory, envelope, astra):
+    """The plan review without result-codex-host.json (1.4.0, #108): (None, (rounds, last report)) when
+    plan-review/history/ holds at least `plan_review_fable_rounds` real Fable rounds and the Astra pass of
+    the current packet is newer than each of them; (reason, None) otherwise.
+
+    A round is a review.py report of profile codex-host whose models are Fable's (report_models_problem)
+    with `primary_model_verified`, status `findings`, a `created_at`, and the packet it reviewed lying in
+    history/ as well: a valid review.py packet whose diff ADDS waves.json, whose head the report reviewed,
+    and which is not the approved packet itself. review.py writes `gate_ready: false` for every findings
+    report, so gate_ready is not asked of a round. Rounds count by distinct packets; error reports
+    (a quota among them) are no rounds. Files are regular files, never symlinks (like the reports above)."""
+    state, review = gate.state, review_py()
+    need = cfg.get("plan_review_fable_rounds", PLAN_REVIEW_FABLE_ROUNDS)
+    current = review.state_packet_hash(envelope)
+    astra_at = _report_moment(astra)
+    if astra_at is None:
+        return f"result-{state.ASTRA_PROFILE}.json has no created_at (UTC ISO-8601; review.py 1.4.0+)", None
+    history = directory / PLAN_HISTORY_DIR
+    if history.is_symlink() or not history.is_dir():
+        return f"no {PLAN_HISTORY_DIR}/ directory with the Fable rounds (a symlink is none)", None
+    packets, reports = {}, []
+    for path in _history_files(history):
+        try:
+            env, _raw = review.load_packet(path, PLAN_REVIEW_PACKET_LIMIT)
+        except Exception:  # noqa: BLE001 - not a packet: maybe a report
+            env = None
+        if env is not None:
+            if diff_added_file(env["packet"]["diff"], "waves.json") is not None:
+                packets[review.state_packet_hash(env)] = env
+            continue
+        try:
+            report, _digest = state.read_report(str(path), path.name)
+        except SystemExit:
+            continue
+        if report.get("profile") == state.FABLE_PROFILE and report.get("status") == "findings":
+            reports.append((path, report))
+    rounds = {}
+    for path, report in reports:
+        response = report.get("response")
+        capabilities = report.get("capabilities")
+        moment = _report_moment(report)
+        if (state.report_models_problem(report, state.FABLE_PROFILE)
+                or not (isinstance(capabilities, dict) and capabilities.get("primary_model_verified") is True)
+                or not (isinstance(response, dict) and response.get("status") == "findings")
+                or moment is None):
+            continue
+        packet_hash = report.get("state_packet_hash")
+        rel = f"{PLAN_HISTORY_DIR}/{path.name}"
+        if packet_hash == current:
+            return (f"{rel} holds Fable findings on the approved packet itself: they were never addressed by "
+                    f"a change of the plan"), None
+        env = packets.get(packet_hash)
+        if env is None or response.get("reviewed_head") != env["packet"]["head"]:
+            continue  # its packet is not in history/ (or adds no waves.json): no round
+        if moment >= astra_at:
+            return (f"{rel} is not older than the Astra pass of the current packet: the last Fable round "
+                    f"must be addressed and the change reviewed by Astra"), None
+        if packet_hash not in rounds or moment > rounds[packet_hash][0]:
+            rounds[packet_hash] = (moment, rel)
+    if len(rounds) < need:
+        return (f"{len(rounds)} Fable round(s) in {PLAN_HISTORY_DIR}/ (findings reports of codex-host on "
+                f"distinct plan packets that lie in {PLAN_HISTORY_DIR}/), {need} needed for an Astra-only "
+                f"pass"), None
+    return None, (len(rounds), max(rounds.values())[1])
+
+
 def plan_review_problem(cfg):
     """Why the approved plan of this chain does not carry its two reviews (None: it does)."""
+    return _plan_review(cfg)[0]
+
+
+def _plan_review(cfg):
+    """(reason, None) when the plan is not reviewed; (None, None) when both reviews of the current packet
+    pass; (None, (rounds, last Fable report)) for the Astra-only pass after the Fable rounds."""
     if "plan_sha256" not in cfg:
         return ("chain.json has no plan_sha256: a new chain starts from an approved waves.json pinned by "
-                "plan_sha256 and reviewed by both reviewers")
+                "plan_sha256 and reviewed by both reviewers"), None
     state, review = gate.state, review_py()
     pin, directory = cfg["plan_sha256"], cfg["run_dir"] / PLAN_REVIEW_DIR
     if directory.is_symlink():  # like the files inside (O_NOFOLLOW): the reviews live in the run directory itself
-        return f"{PLAN_REVIEW_DIR}/ is a symlink: it must be a real directory inside the run directory"
+        return f"{PLAN_REVIEW_DIR}/ is a symlink: it must be a real directory inside the run directory", None
     if not directory.is_dir():
-        return f"no {PLAN_REVIEW_DIR}/ in the run directory"
+        return f"no {PLAN_REVIEW_DIR}/ in the run directory", None
     try:
         fd = os.open(directory / "plan.sha256", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # bytes ("rb"), no text encoding
         with os.fdopen(fd, "rb") as f:
@@ -3212,51 +3362,65 @@ def plan_review_problem(cfg):
     except OSError:
         recorded = None
     if recorded is None:
-        return "plan.sha256 is missing or unreadable"
+        return "plan.sha256 is missing or unreadable", None
     # the bare hash or a line of `sha256sum waves.json`: the first field is the hash
     recorded = (recorded.split() or [""])[0]
     if not MANDATE_PIN.fullmatch(recorded):
         return ("plan.sha256 must start with the sha256 of the approved waves.json as 64 lowercase hex characters "
-                "(the bare hash or a line of `sha256sum waves.json`)")
+                "(the bare hash or a line of `sha256sum waves.json`)"), None
     if recorded != pin:
-        return "plan.sha256 differs from chain.json plan_sha256: the reviews are of another plan"
+        return "plan.sha256 differs from chain.json plan_sha256: the reviews are of another plan", None
     try:
         envelope, _raw = review.load_packet(directory / "packet.json", PLAN_REVIEW_PACKET_LIMIT)
     except Exception:  # noqa: BLE001 - ValueError of review.py and whatever a hostile file raises
-        return "packet.json is missing or is not a review.py packet (its hash must match its payload)"
+        return "packet.json is missing or is not a review.py packet (its hash must match its payload)", None
     added = diff_added_file(envelope["packet"]["diff"], "waves.json")
     if added is None or hashlib.sha256(added).hexdigest() != pin:
         return ("the diff of packet.json does not add waves.json with sha256 equal to chain.json plan_sha256: "
-                "the reviewed packet is not the approved plan")
+                "the reviewed packet is not the approved plan"), None
     packet_hash = review.state_packet_hash(envelope)
     astra, why = _plan_report(directory, state.ASTRA_PROFILE)
     why = why or _plan_report_problem(astra, state.ASTRA_PROFILE, envelope)
     if why:
-        return why
+        return why, None
+    name = f"result-{state.FABLE_PROFILE}.json"
+    present = (directory / name).exists() or (directory / name).is_symlink()
+    opus_name = directory / f"result-{state.OPUS_PROFILE}.json"
+    opus_present = opus_name.exists() or opus_name.is_symlink()
+    if not present and not opus_present:  # 1.4.0 (#108): after the Fable rounds of phase A, Astra decides
+        rounds_why, accepted = fable_rounds_problem(cfg, directory, envelope, astra)
+        if not rounds_why:
+            return None, accepted
+        return (f"{name} is missing and the Astra-only pass after the Fable rounds does not hold: "
+                f"{rounds_why}"), None
     fable, missing = _plan_report(directory, state.FABLE_PROFILE)
     why = missing or _plan_report_problem(fable, state.FABLE_PROFILE, envelope)
     if not why:
-        return None
+        return None, None
     opus, no_opus = _plan_report(directory, state.OPUS_PROFILE)
     if no_opus:
-        return why  # no fallback offered: the reason is the Fable report itself
+        return why, None  # no fallback offered: the reason is the Fable report itself
     opus_why = _plan_report_problem(opus, state.OPUS_PROFILE, envelope)
     if opus_why:
-        return opus_why
+        return opus_why, None
     evidence = state.quota_evidence_problem(fable, envelope["packet"]["head"], packet_hash) if fable else "is missing"
     if evidence:
         return (f"result-{state.OPUS_PROFILE}.json counts only with the quota evidence of this packet: "
-                f"result-{state.FABLE_PROFILE}.json {evidence}")
-    return None
+                f"result-{state.FABLE_PROFILE}.json {evidence}"), None
+    return None, None
 
 
 def check_plan_review(cfg):
     """The launch of a NEW chain (no wave was ever launched in this run) is refused without both reviews of
     the approved plan: an event and SystemExit with the reason. A chain that already runs is not asked."""
     try:
-        why = plan_review_problem(cfg)
+        why, accepted = _plan_review(cfg)
     except Exception as e:  # noqa: BLE001 - fail closed: the launch never starts on an unchecked plan
-        why = f"the check failed ({type(e).__name__})"
+        why, accepted = f"the check failed ({type(e).__name__})", None
+    if not why and accepted:
+        rounds, last = accepted
+        event(cfg, f"plan review: Fable rounds exhausted ({rounds}), Astra-only pass accepted; "
+                   f"last Fable report: {PLAN_REVIEW_DIR}/{last}")
     if why:
         text = (f"launch refused: plan review: {why}. A new chain needs gate_ready reviews of the approved plan "
                 f"by claude-host and codex-host in {cfg['run_dir'] / PLAN_REVIEW_DIR} (references/waves.md, phase A)")
@@ -3264,8 +3428,9 @@ def check_plan_review(cfg):
         raise SystemExit(f"wab: {text}")
 
 
-NO_MODEL_WARNING = ("warning: chain.json has no `model`: the waves run on the default model of the Claude CLI; "
-                    "the default of phase A is \"model\": \"claude-fable-5-1\" (launch is not refused)")
+NO_MODEL_WARNING = ("warning: chain.json has no `model` and the chain started before 1.4.0: its waves keep the "
+                    "default model of the Claude CLI; a chain started on 1.4.0+ runs on \"model\": "
+                    f"\"{NEW_DEFAULTS['model']}\" by default (launch is not refused)")
 
 
 def _check_launch_allowed(cfg, st, wave, name):
@@ -3351,7 +3516,8 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     if wave == cfg["waves"][0] and wave not in st["waves"]:
         warn_stale_chains(cfg)  # a hint about finished chains' leftovers; nothing is closed here
     check_plan_pin(cfg)  # before prepare_clone, the workdir and the STARTING record
-    if not st["waves"]:  # a NEW chain: no wave of this run was ever launched
+    new_chain = not st["waves"]  # a NEW chain: no wave of this run was ever launched
+    if new_chain:
         check_plan_review(cfg)
     wdir = wave_dir(cfg, wave)
     cur = st.get("current")
@@ -3420,6 +3586,8 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
         st["waves"][wave]["restart"] = len(attempts) + 1
     if carried:
         st["waves"][wave]["outbox"] = carried
+    if new_chain:  # saved with the first launch intent: from now on the run keeps the defaults of 1.4.0
+        st["defaults"] = DEFAULTS_MARK
     warn_model = not cfg["model"] and not st.get("model_warned")
     if warn_model:
         st["model_warned"] = True  # once per run: the mark is saved with the launch intent, the event follows it
@@ -3516,6 +3684,9 @@ def start_session(cfg, st, wave):
     if cfg["model"]:
         cmd += ["--model", cfg["model"]]
     pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
+    if cfg.get("role_models"):  # read by `state.py init` of the wave; no field, no env (the built-in policy)
+        pin += ["-e", f"{gate.state.ROLE_MODELS_ENV}="
+                      f"{json.dumps(cfg['role_models'], sort_keys=True, separators=(',', ':'))}"]
     made = tmux("new-session", "-d", "-P", "-F", "#{pane_id}", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
                 "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", "-e", f"WAB_MAX_RUNS={cfg['max_runs']}",
                 "-e", f"SUPERARMANDA_TZ={humantime.resolve(cfg.get('timezone'))[0]}", *pin, *cmd)
