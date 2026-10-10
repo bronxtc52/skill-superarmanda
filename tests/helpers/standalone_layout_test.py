@@ -26,6 +26,7 @@ EXPECTED_FILES = {
     "scripts/install-skill.py",
     "scripts/waves/wab.py",
     "scripts/waves/dash.py",
+    "scripts/waves/fable_usage.py",
     "scripts/waves/gate.py",
     "scripts/waves/humantime.py",
     "scripts/waves/metrics.py",
@@ -138,7 +139,8 @@ class ReleasePolicyDocs(unittest.TestCase):
         template = next((b for b in fenced_blocks(profiles) if re.search(r'state\.py"? role-model', b)), None)
         self.assertIsNotNone(template, "profiles.md has no brief template with state.py role-model")
         self.assertIn("--role <coder|tester>", template)
-        self.assertIn("claude-fable-5-1", template)
+        for model in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"):  # 1.4.0: Fable allowed, not asked
+            self.assertIn(model, template)
         contract = doc("references/review-contract.md")
         command = next((b for b in fenced_blocks(contract)
                         if len(re.findall(r'review\.py"? run', b)) == 2 and "--profile claude-host" in b), None)
@@ -206,9 +208,10 @@ class ReleaseWaveGateDocs(unittest.TestCase):
         mandate = flat(text.split("### Мандат", 1)[1].split("### Политика решений", 1)[0])
         fields = text.split("Поля `chain.json`:", 1)[1].split("**Admission.**", 1)[0]
         model_row = next((l for l in fields.splitlines() if l.startswith("| `model`")), "")
-        self.assertIn("claude-fable-5-1", model_row)
+        # 1.4.0 (#108): a new chain without `model` runs on Opus; a chain of 1.3.x keeps the CLI default and the warning
+        self.assertIn("claude-opus-5-5", model_row)
         self.assertIn("предупрежд", model_row)
-        self.assertIn('"model": "claude-fable-5-1"', text)
+        self.assertNotIn('"model": "claude-fable-5-1"', text)
         self.assertIn("модель координатора", checklist)
         # the plan review: both reviewers, kept in the run directory, checked by launch
         for part, name in ((phase_a, "phase A"), (checklist, "checklist")):
@@ -295,8 +298,12 @@ class ReleaseFableRolesDocs(unittest.TestCase):
                     self.assertIn(word, whole.lower())
                     # the model stands next to the role: one paragraph names both
                     paragraphs = [flat(part) for part in re.split(r"\n(?=\s*(?:[-*]|\d+\.) |\s*\n)", text)]
-                    self.assertTrue(any(f"`{role}`" in part and "Fable" in part for part in paragraphs),
-                                    f"{relative}: no paragraph names `{role}` together with Fable")
+                    # 1.4.0 (#108): the model of the subagent roles is the role policy (state.py role-model, Opus
+                    # by default), named once for all five; no paragraph still asks Fable of the role
+                    self.assertIn("role-model", whole)
+                    self.assertIn("субагенты на модели политики", whole)
+                    self.assertFalse(any(f"`{role}`, Fable" in part or f"`{role}` | " in part and "| Fable |" in part
+                                         for part in paragraphs), f"{relative}: `{role}` still runs on Fable")
             with self.subTest(doc=relative, rule=self.RULE):
                 self.assertIn(self.RULE, whole)
                 sentence = next(part for part in re.split(r"(?<=[.;:]) ", whole) if self.RULE in part)
@@ -309,7 +316,7 @@ class ReleaseFableRolesDocs(unittest.TestCase):
             with self.subTest(rule=needle):
                 self.assertIn(needle, rule)
         for needle in ("машинно не проверяются", "W4", "1.2.4",
-                       "task-result --role <роль> --status unavailable --model fable", "поле `model`",
+                       "task-result --role <роль> --status unavailable --model <модель политики>", "поле `model`",
                        "--source internal_reviewer", "`internal_rounds`", "`external_review`",
                        "requires manifest version 2"):
             with self.subTest(workflow=needle):
@@ -322,12 +329,13 @@ class ReleaseFableRolesDocs(unittest.TestCase):
             brief = next((b for b in blocks if re.search(rf"(?m)^Роль: {role}\b", b)), None)
             with self.subTest(role=role):
                 self.assertIsNotNone(brief, f"role-briefs.md has no brief of {role}")
-                self.assertRegex(brief, r"(?m)^model: fable$")
-                for needle in ("Вход:", "Выход:", "Запреты:", "Fable недоступна"):
+                # 1.4.0 (#108): the model line names state.py role-model of this very role
+                self.assertRegex(brief, rf"(?m)^model: <[^\n]*state\.py role-model [^\n]*--role {role}>$")
+                for needle in ("Вход:", "Выход:", "Запреты:", "Модель недоступна"):
                     self.assertIn(needle, brief)
                 command = flat(brief.replace("\\\n", " "))
-                self.assertRegex(command, rf"task-result [^\n]*--role {role} [^\n]*--model fable")
-                self.assertIn(f"task-result --role {role} --status unavailable --model fable", command)
+                self.assertRegex(command, rf"task-result [^\n]*--role {role} [^\n]*--model <model из role-model>")
+                self.assertIn(f"task-result --role {role} --status unavailable --model <model из role-model>", command)
         for relative in ("SKILL.md", "references/profiles.md"):
             with self.subTest(link=relative):
                 self.assertIn("(references/role-briefs.md)" if relative == "SKILL.md" else "(role-briefs.md)",
@@ -337,15 +345,14 @@ class ReleaseFableRolesDocs(unittest.TestCase):
             with self.subTest(profiles=role):
                 self.assertIn(f"`{role}`", profiles)
 
-    def test_session_model_warning_for_high_risk_is_one_line_with_the_command(self):
-        for relative, extra in (("SKILL.md", ()), ("references/waves.md", ("chain.json",))):
-            lines = [l for l in doc(relative).splitlines() if all(c in l for c in self.MODEL_COMMANDS)]
+    def test_session_model_warning_for_high_risk_is_gone_in_1_4_0(self):
+        # 1.2.3 asked a one-line «Fable recommended to the coordinator» on a high task; 1.4.0 (#108) dropped it:
+        # the coordinator needs no Fable at any risk, its wave model is `model` of chain.json (Opus by default)
+        for relative in ("SKILL.md", "references/waves.md"):
+            text = doc(relative)
             with self.subTest(doc=relative):
-                self.assertEqual(len(lines), 1, f"{relative}: the warning must be exactly one line")
-                for needle in ("high", "Fable", "не переключа", *extra):
-                    self.assertIn(needle, lines[0])
-        self.assertIn("координатор", next(l for l in doc("SKILL.md").splitlines()
-                                          if all(c in l for c in self.MODEL_COMMANDS)).lower())
+                self.assertNotIn("рекомендована Fable", text)
+                self.assertFalse([l for l in text.splitlines() if all(c in l for c in self.MODEL_COMMANDS)])
 
     def test_waves_doc_has_the_1_2_3_row_and_the_extended_gate_border(self):
         text = doc("references/waves.md")

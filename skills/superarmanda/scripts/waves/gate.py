@@ -424,7 +424,7 @@ def _old_policy_problems(manifest, tasks, wave_risk):
             f"`final_check`, а {why}: прогон шёл по старым правилам; нужен {NEW_RUN}"]
 
 
-def _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk, policy):
+def _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk, policy, models):
     """A task judged as high (the wave is high by the plan, or the task's own policy is): both task reviews on
     HEAD and the rules of state.py over them (high_risk_gaps: models, verified reports, the pair, the quota
     evidence of Opus, findings and a Fable review kept by review_history; fable_role_gaps of the policy 1.2.4:
@@ -444,9 +444,9 @@ def _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk, polic
     try:
         current = state.current_results(dict(entry, results={r: v for r, v in results.items() if isinstance(v, dict)}),
                                         head, cwd_fingerprint)
-        for role, gap in sorted(state.high_risk_gaps(entry, current, head).items()):
+        for role, gap in sorted(state.high_risk_gaps(entry, current, head, models).items()):
             problems.append(f"задача {name}: {role} ({why}): {gap}")
-        for role, gap in sorted(state.fable_role_gaps(entry, current, head, policy).items()):
+        for role, gap in sorted(state.fable_role_gaps(entry, current, head, policy, models).items()):
             action = f"; нужен {NEW_RUN}" if gap.startswith(state.NEW_RUN_REQUIRED) else ""
             problems.append(f"задача {name}: {role} ({why}): {gap}{action}")
         history = entry.get("review_history")
@@ -491,6 +491,9 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
     if version is None:
         return problems
     review_policy = state.policy_version(manifest) if version == 2 else None  # the rules the manifest is judged by
+    if version != 2 and "role_models" in manifest:  # a trace of 1.4.0 only; never read unvalidated (Codex P2 on #109)
+        return problems + ["manifest: role_models outside a version 2 manifest: this gate cannot judge it"]
+    models = state.role_models(manifest)  # its role policy (1.4.0; built-in defaults without `role_models`)
     if not cwd_fingerprint:
         problems.append("отпечаток дерева рабочей копии не получен")
     for name, entry in sorted(tasks.items()):
@@ -504,7 +507,7 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
         risk = None if version == 1 else "high" if wave_risk == "high" else state.task_risk(manifest, entry)
         if status != "ready_for_pr_review" and not _needs_fix_explained(entry, review, head, cwd_fingerprint):
             problems.append(f"задача {name}: статус {status} (цикл исправлений не завершён)")
-        elif version == 2 and status == "ready_for_pr_review" and not _ready_by_state(entry, results, risk, head, review_policy):
+        elif version == 2 and status == "ready_for_pr_review" and not _ready_by_state(entry, results, risk, head, review_policy, models):
             problems.append(f"задача {name}: статус ready_for_pr_review не подтверждён пересчётом по правилам "
                             f"state.py (риск {risk}); гейт не верит сохранённому статусу")
         for role, other in sorted(results.items()):  # github_codex_review, coderabbit, ...
@@ -520,8 +523,10 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
                     and not (role == "second_reviewer" and (risk == "high" or other.get("status") != "findings"))
                     and not _covered(entry, role, other)):
                 problems.append(f"задача {name}: {role} {other.get('status')}")
+        if version == 2 and risk != "high":
+            problems += _model_problems(name, entry, results, risk, head, cwd_fingerprint, models)
         if risk == "high":
-            problems += _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk, review_policy)
+            problems += _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk, review_policy, models)
         elif version == 2 and _high_traces(name, entry, results):
             problems.append(f"задача {name}: несёт записи политики high ({', '.join(_high_traces(name, entry, results))}), "
                             f"а её риск в manifest — {risk}: риск задачи или review_policy.level понижен вручную; "
@@ -550,12 +555,25 @@ def _as_list(value):
     return value if isinstance(value, list) else []
 
 
-def _ready_by_state(entry, results, risk, head, policy):
+def _model_problems(name, entry, results, risk, head, cwd_fingerprint, models):
+    """Below high: coder/tester on HEAD ran on the model of the role policy for the task's risk where it asks
+    more than Sonnet (state.policy_model_gaps, the rule of task_ready itself, not a copy). Records it cannot
+    read are a reason, never a pass."""
+    try:
+        current = state.current_results(dict(entry, results={r: v for r, v in results.items() if isinstance(v, dict)}),
+                                        head, cwd_fingerprint)
+        return [f"задача {name}: {role} (риск {risk}): {gap}"
+                for role, gap in sorted(state.policy_model_gaps(entry, current, risk, models).items())]
+    except Exception:  # noqa: BLE001 - fail closed
+        return [f"manifest: задача {name}: модели coder/tester не разбираются правилами state.py"]
+
+
+def _ready_by_state(entry, results, risk, head, policy, models):
     """state.task_ready over the manifest's records: the readiness rule of state.py itself, not a copy.
     Records it cannot read are «not ready»."""
     try:
         return state.task_ready(dict(entry, results={r: v for r, v in results.items() if isinstance(v, dict)}),
-                                risk, head, policy)
+                                risk, head, policy, models)
     except Exception:  # noqa: BLE001 - fail closed
         return False
 

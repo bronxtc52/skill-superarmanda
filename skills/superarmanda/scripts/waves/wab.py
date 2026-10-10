@@ -25,6 +25,7 @@ Every contact with tmux, claude, Telegram and az goes through the module-level f
 time, not at import.
 """
 import bisect
+import datetime
 import fcntl
 import hashlib
 import json
@@ -49,6 +50,7 @@ if str(HERE) not in sys.path:  # gate.py lies next to this file, also when it is
     sys.path.insert(0, str(HERE))
 import gate  # noqa: E402  (stdlib only, like this module)
 import humantime  # noqa: E402  (the one function that shows a time to a human, #88)
+import fable_usage  # noqa: E402  (stdlib only: the local Fable count of `launch`, #108)
 
 PROTOCOL = HERE / "PROTOCOL.md"
 MIN_TMUX = (3, 2)
@@ -80,6 +82,16 @@ ALARM_POLL_SECONDS = 120  # the alarm of a running wave: GitHub is asked no more
 
 NUM_LIMITS = {"ctx_limit": 10_000_000, "idle_minutes": 1440, "handoff_timeout_minutes": 1440,
               "tick_seconds": 3600}
+
+# The defaults of `model` and `ctx_limit` (1.4.0, #108): a chain first launched by 1.4.0+ carries the marker
+# `defaults: "1.4"` in its state.json and runs on Opus with 200 000 tokens; a chain started before (state.json
+# with waves and without the marker) keeps the defaults it was started with, None (the CLI default) and
+# 300 000. Both fields are tunable: the identity of a running chain does not change with them.
+DEFAULTS_MARK = "1.4"
+NEW_DEFAULTS = {"model": gate.state.OPUS_MODEL, "ctx_limit": 200_000}
+LEGACY_DEFAULTS = {"model": None, "ctx_limit": 300_000}
+PLAN_REVIEW_FABLE_ROUNDS = 2  # chain.json plan_review_fable_rounds: the Fable rounds of phase A before Astra decides
+FABLE_BUDGET_UNITS = fable_usage.DEFAULT_BUDGET  # chain.json fable_budget_units: Fable units per 7 days (advisory)
 
 
 MANDATE_PIN = re.compile(r"[0-9a-f]{64}")
@@ -119,6 +131,48 @@ def _check_types(cfg):
         bad("mandate_sha256", "a string of 64 lowercase hex characters")
     if "plan_sha256" in cfg and not isinstance(cfg["plan_sha256"], str):
         bad("plan_sha256", "a string of 64 lowercase hex characters")
+    if "role_models" in cfg and not isinstance(cfg["role_models"], dict):
+        bad("role_models", "an object of \"<role>[.<risk>]\" -> model (the role policy of the waves)")
+    if "plan_review_fable_rounds" in cfg:
+        v = cfg["plan_review_fable_rounds"]
+        if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 100:
+            bad("plan_review_fable_rounds", "a whole number 1..100 (the Fable rounds of the plan review, "
+                                            f"default {PLAN_REVIEW_FABLE_ROUNDS})")
+    if "fable_budget_units" in cfg:  # absent = the default; never written into cfg (#108, T5)
+        v = cfg["fable_budget_units"]
+        if (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                or not 0 < v <= 1_000_000):
+            bad("fable_budget_units", "a number > 0 (Fable units of 1M weighted tokens per 7 days, "
+                                      f"default {FABLE_BUDGET_UNITS})")
+
+
+def check_chain_role_models(table):
+    """chain.json `role_models`: the same keys and models `state.py init` takes from env
+    SUPERARMANDA_ROLE_MODELS (its parser, not a copy), refused here at the entry and not in the wave's
+    session: an unknown role, risk or model, a `coordinator` key, or a model below the built-in default."""
+    state = gate.state
+    try:
+        for key, value in table.items():
+            role, risks = state.parse_role_model_key(key, "role_models")
+            model = state.parse_role_model_value(value, key, "role_models")
+            for risk in risks:
+                floor = state.DEFAULT_ROLE_MODELS[role][risk]
+                if state.weaker(model, floor):
+                    raise SystemExit(f"{key}={value} is below the built-in {role}.{risk} ({floor}): "
+                                     f"an override may only raise the model")
+    except SystemExit as e:
+        raise SystemExit(f"chain.json: role_models: {_exc_text(e).removeprefix('state: ')}")
+
+
+def chain_started_before_defaults(run_dir):
+    """True for a run whose state.json has waves and no `defaults` marker: a chain started before 1.4.0.
+    No state, no wave yet or an unreadable state: the chain is new (a broken state.json is refused later
+    by load_state anyway)."""
+    try:
+        st = json.loads((pathlib.Path(run_dir) / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(st, dict) and "defaults" not in st and isinstance(st.get("waves"), dict) and bool(st["waves"])
 
 
 def load_chain(path, create=True):
@@ -136,9 +190,16 @@ def load_chain(path, create=True):
     for key in OPTIONAL_STRINGS + ("tmux_prefix",):
         if key in cfg and cfg[key] is None:
             del cfg[key]  # an explicit null is the same as leaving the field out (the default)
-    if "titles" in cfg and cfg["titles"] is None:
-        del cfg["titles"]  # no titles, like leaving it out (dash reads cfg.get("titles", {}))
+    if cfg.get("model") == "":
+        del cfg["model"]  # "" is no model either: the default of the chain (Opus for a new one), not the CLI's (#108)
+    for key in ("titles", "role_models"):
+        if key in cfg and cfg[key] is None:
+            del cfg[key]  # no titles / no role policy of the chain, like leaving it out (dash reads cfg.get("titles", {}))
     _check_types(cfg)
+    if cfg.get("role_models") == {}:
+        del cfg["role_models"]  # an empty policy is no policy: not a part of the identity, no env for the wave
+    if "role_models" in cfg:
+        check_chain_role_models(cfg["role_models"])
     if cfg.get("telegram_quote") is False:
         del cfg["telegram_quote"]  # «false» is the default: it is no field, and so not a part of the run's identity (#83)
     if "timezone" in cfg and cfg["timezone"] is None:
@@ -147,13 +208,13 @@ def load_chain(path, create=True):
         cfg["timezone"] = humantime.resolve(cfg.get("timezone"))[0]
     except humantime.TzError as e:
         raise SystemExit(f"chain.json: {e.reason}")
-    cfg.setdefault("ctx_limit", 300_000)
     cfg.setdefault("idle_minutes", 12)
     cfg.setdefault("handoff_timeout_minutes", 25)
     cfg.setdefault("tick_seconds", 60)
-    cfg.setdefault("model", None)
     cfg.setdefault("tmux_prefix", "wab-")
     for key in NUM_LIMITS:
+        if key == "ctx_limit" and key not in cfg:
+            continue  # its default depends on the run (DEFAULTS_MARK), set below once run_dir is known
         v = cfg[key]  # an explicit null/string/bool/<=0/nan/inf would crash `watch` later
         if isinstance(v, bool) or not isinstance(v, (int, float)) \
                 or (isinstance(v, float) and not math.isfinite(v))  \
@@ -240,6 +301,9 @@ def load_chain(path, create=True):
             cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     except (OSError, RuntimeError, ValueError) as e:  # symlink loop, no permission, a file in the way
         raise SystemExit(f"chain.json: run_dir/workdir cannot be used: {_exc_text(e)}")
+    defaults = LEGACY_DEFAULTS if chain_started_before_defaults(cfg["run_dir"]) else NEW_DEFAULTS
+    for key, value in defaults.items():
+        cfg.setdefault(key, value)
     return cfg
 
 
@@ -762,7 +826,7 @@ class TranscriptCache:
     @staticmethod
     def _blank(key):
         return {"key": key, "offset": None, "partial": b"", "discard_first": False, "head": None,
-                "turns": 0, "tools": 0, "out": 0, "read": 0, "ctx": 0}
+                "turns": 0, "tools": 0, "out": 0, "read": 0, "ctx": 0, "limit": 0}
 
     def read(self, path):
         path = str(path)
@@ -809,7 +873,7 @@ class TranscriptCache:
 
     @staticmethod
     def _summary(e):
-        return {k: e[k] for k in ("turns", "tools", "out", "read", "ctx")}
+        return {k: e[k] for k in ("turns", "tools", "out", "read", "ctx", "limit")}
 
     @staticmethod
     def _count(e, raw):
@@ -830,6 +894,8 @@ class TranscriptCache:
         if d.get("isSidechain"):
             return
         e["turns"] += 1
+        if d.get("error") == "rate_limit" or d.get("apiErrorStatus") == 429:
+            e["limit"] += 1  # the provider refused the session itself (#108): by the fields, never by the text
         if u:
             e["ctx"] = (_num(u.get("input_tokens")) + _num(u.get("cache_creation_input_tokens"))
                         + _num(u.get("cache_read_input_tokens")))
@@ -2124,7 +2190,7 @@ def put_notice(cfg, w, wave, key, value, **fields):
     started/tmux_failed -> window gone; permission/idle/auto_off -> window gone or their screen
     end (SCREEN_EPISODE_ENDS); not_ready, no_prompt,
     checkpoint_timeout, dead, handoff -> their phase is left; sending -> the wave wrote a status;
-    updating -> the new session is bound; blocked -> status not BLOCKED; done/no_next/
+    updating -> the new session is bound (a Fable switch: its step left `unconfirmed`); blocked -> status not BLOCKED; done/no_next/
     launch_refused -> ack only (`done` is information: it opens no ATTENTION, INFO_NOTICES);
     chain_done -> never).
     The caller saves it with the SAME save_state as the change it reports (the phase, the
@@ -2194,6 +2260,12 @@ WINDOW_GONE = ("dead", "done", "awaiting_merge")  # no live window of this wave 
 
 def _gone(w):
     return w.get("phase") in WINDOW_GONE
+
+
+def _switch_unconfirmed(w):
+    """A Fable switch (#108) whose resume message may or may not have reached the new session."""
+    sw = w.get("fable_switch")
+    return w.get("phase") == "switching" and isinstance(sw, dict) and sw.get("step") == "unconfirmed"
 
 
 def _status(w):
@@ -2297,7 +2369,7 @@ NOTICE_EPISODE_ENDS = {
     "not_ready": lambda w: w.get("phase") != "not_ready",
     "no_prompt": lambda w: w.get("phase") != "starting",
     "sending": lambda w: _gone(w) or _status(w) not in ("", "STARTING"),
-    "updating": lambda w: _gone(w) or not w.get("await_session"),
+    "updating": lambda w: _gone(w) or not (w.get("await_session") or _switch_unconfirmed(w)),
     "checkpoint_timeout": lambda w: w.get("phase") != "checkpoint",
     "tmux_failed": _gone,
     "unverified_enter": _gone,  # a delivery of an older-version state pressed Enter unverified
@@ -3194,17 +3266,120 @@ def _plan_report_problem(report, profile, envelope):
     return None
 
 
+PLAN_HISTORY_DIR = "history"
+PLAN_HISTORY_MAX_FILES = 1000  # more files than that in history/ is not a phase A, it is a refusal
+
+
+def _report_moment(report):
+    """The `created_at` of a review.py report (1.4.0) as an aware UTC datetime, or None."""
+    value = report.get("created_at") if isinstance(report, dict) else None
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None and moment.utcoffset() == datetime.timedelta(0) else None
+
+
+def _history_files(history):
+    """The regular .json files of plan-review/history/ (symlinks and anything else are left out), by name."""
+    names = sorted(e.name for e in os.scandir(history) if e.name.endswith(".json"))
+    if len(names) > PLAN_HISTORY_MAX_FILES:
+        raise ValueError(f"more than {PLAN_HISTORY_MAX_FILES} files")
+    return [history / n for n in names if stat.S_ISREG(os.lstat(history / n).st_mode)]
+
+
+def fable_rounds_problem(cfg, directory, envelope, astra):
+    """The plan review without result-codex-host.json (1.4.0, #108): (None, (rounds, last report)) when
+    plan-review/history/ holds at least `plan_review_fable_rounds` real Fable rounds and the Astra pass of
+    the current packet is newer than each valid Fable report there with a created_at (a round or not, any
+    status: pass, findings, error/quota; a report without created_at is no round and takes no part in the
+    order); (reason, None) otherwise.
+
+    A round is a review.py report of profile codex-host whose models are Fable's (report_models_problem)
+    with `primary_model_verified`, status `findings`, a `created_at`, and the packet it reviewed lying in
+    history/ as well: a valid review.py packet whose diff ADDS waves.json, whose head the report reviewed,
+    and which is not the approved packet itself. review.py writes `gate_ready: false` for every findings
+    report, so gate_ready is not asked of a round. Rounds count by distinct packets; error reports
+    (a quota among them) are no rounds. Files are regular files, never symlinks (like the reports above)."""
+    state, review = gate.state, review_py()
+    need = cfg.get("plan_review_fable_rounds", PLAN_REVIEW_FABLE_ROUNDS)
+    current = review.state_packet_hash(envelope)
+    astra_at = _report_moment(astra)
+    if astra_at is None:
+        return f"result-{state.ASTRA_PROFILE}.json has no created_at (UTC ISO-8601; review.py 1.4.0+)", None
+    history = directory / PLAN_HISTORY_DIR
+    if history.is_symlink() or not history.is_dir():
+        return f"no {PLAN_HISTORY_DIR}/ directory with the Fable rounds (a symlink is none)", None
+    packets, reports = {}, []
+    for path in _history_files(history):
+        try:
+            env, _raw = review.load_packet(path, PLAN_REVIEW_PACKET_LIMIT)
+        except Exception:  # noqa: BLE001 - not a packet: maybe a report
+            env = None
+        if env is not None:
+            if diff_added_file(env["packet"]["diff"], "waves.json") is not None:
+                packets[review.state_packet_hash(env)] = env
+            continue
+        try:
+            report, _digest = state.read_report(str(path), path.name)
+        except SystemExit:
+            continue
+        if report.get("profile") == state.FABLE_PROFILE:
+            reports.append((path, report))
+    rounds = {}
+    for path, report in reports:
+        # (1) the order: the Astra pass is newer than EVERY valid Fable report of history/ with a created_at,
+        # whatever its status (pass, findings, error/quota) and its packet in history/ or not (#108)
+        moment = _report_moment(report)
+        rel = f"{PLAN_HISTORY_DIR}/{path.name}"
+        response = report.get("response")
+        capabilities = report.get("capabilities")
+        is_round = (report.get("status") == "findings"
+                    and not state.report_models_problem(report, state.FABLE_PROFILE)
+                    and isinstance(capabilities, dict) and capabilities.get("primary_model_verified") is True
+                    and isinstance(response, dict) and response.get("status") == "findings"
+                    and moment is not None)
+        packet_hash = report.get("state_packet_hash")
+        if is_round and packet_hash == current:
+            return (f"{rel} holds Fable findings on the approved packet itself: they were never addressed by "
+                    f"a change of the plan"), None
+        if moment is not None and moment >= astra_at:
+            return (f"{rel} is not older than the Astra pass of the current packet: the last Fable report "
+                    f"must be addressed and the change reviewed by Astra"), None
+        # (2) the count: only verified Fable findings on a plan packet lying in history/
+        if not is_round:
+            continue
+        env = packets.get(packet_hash)
+        if env is None or response.get("reviewed_head") != env["packet"]["head"]:
+            continue  # its packet is not in history/ (or adds no waves.json): no round
+        if packet_hash not in rounds or moment > rounds[packet_hash][0]:
+            rounds[packet_hash] = (moment, rel)
+    if len(rounds) < need:
+        return (f"{len(rounds)} Fable round(s) in {PLAN_HISTORY_DIR}/ (findings reports of codex-host on "
+                f"distinct plan packets that lie in {PLAN_HISTORY_DIR}/), {need} needed for an Astra-only "
+                f"pass"), None
+    return None, (len(rounds), max(rounds.values())[1])
+
+
 def plan_review_problem(cfg):
     """Why the approved plan of this chain does not carry its two reviews (None: it does)."""
+    return _plan_review(cfg)[0]
+
+
+def _plan_review(cfg):
+    """(reason, None) when the plan is not reviewed; (None, None) when both reviews of the current packet
+    pass; (None, (rounds, last Fable report)) for the Astra-only pass after the Fable rounds."""
     if "plan_sha256" not in cfg:
         return ("chain.json has no plan_sha256: a new chain starts from an approved waves.json pinned by "
-                "plan_sha256 and reviewed by both reviewers")
+                "plan_sha256 and reviewed by both reviewers"), None
     state, review = gate.state, review_py()
     pin, directory = cfg["plan_sha256"], cfg["run_dir"] / PLAN_REVIEW_DIR
     if directory.is_symlink():  # like the files inside (O_NOFOLLOW): the reviews live in the run directory itself
-        return f"{PLAN_REVIEW_DIR}/ is a symlink: it must be a real directory inside the run directory"
+        return f"{PLAN_REVIEW_DIR}/ is a symlink: it must be a real directory inside the run directory", None
     if not directory.is_dir():
-        return f"no {PLAN_REVIEW_DIR}/ in the run directory"
+        return f"no {PLAN_REVIEW_DIR}/ in the run directory", None
     try:
         fd = os.open(directory / "plan.sha256", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # bytes ("rb"), no text encoding
         with os.fdopen(fd, "rb") as f:
@@ -3212,51 +3387,65 @@ def plan_review_problem(cfg):
     except OSError:
         recorded = None
     if recorded is None:
-        return "plan.sha256 is missing or unreadable"
+        return "plan.sha256 is missing or unreadable", None
     # the bare hash or a line of `sha256sum waves.json`: the first field is the hash
     recorded = (recorded.split() or [""])[0]
     if not MANDATE_PIN.fullmatch(recorded):
         return ("plan.sha256 must start with the sha256 of the approved waves.json as 64 lowercase hex characters "
-                "(the bare hash or a line of `sha256sum waves.json`)")
+                "(the bare hash or a line of `sha256sum waves.json`)"), None
     if recorded != pin:
-        return "plan.sha256 differs from chain.json plan_sha256: the reviews are of another plan"
+        return "plan.sha256 differs from chain.json plan_sha256: the reviews are of another plan", None
     try:
         envelope, _raw = review.load_packet(directory / "packet.json", PLAN_REVIEW_PACKET_LIMIT)
     except Exception:  # noqa: BLE001 - ValueError of review.py and whatever a hostile file raises
-        return "packet.json is missing or is not a review.py packet (its hash must match its payload)"
+        return "packet.json is missing or is not a review.py packet (its hash must match its payload)", None
     added = diff_added_file(envelope["packet"]["diff"], "waves.json")
     if added is None or hashlib.sha256(added).hexdigest() != pin:
         return ("the diff of packet.json does not add waves.json with sha256 equal to chain.json plan_sha256: "
-                "the reviewed packet is not the approved plan")
+                "the reviewed packet is not the approved plan"), None
     packet_hash = review.state_packet_hash(envelope)
     astra, why = _plan_report(directory, state.ASTRA_PROFILE)
     why = why or _plan_report_problem(astra, state.ASTRA_PROFILE, envelope)
     if why:
-        return why
+        return why, None
+    name = f"result-{state.FABLE_PROFILE}.json"
+    present = (directory / name).exists() or (directory / name).is_symlink()
+    opus_name = directory / f"result-{state.OPUS_PROFILE}.json"
+    opus_present = opus_name.exists() or opus_name.is_symlink()
+    if not present and not opus_present:  # 1.4.0 (#108): after the Fable rounds of phase A, Astra decides
+        rounds_why, accepted = fable_rounds_problem(cfg, directory, envelope, astra)
+        if not rounds_why:
+            return None, accepted
+        return (f"{name} is missing and the Astra-only pass after the Fable rounds does not hold: "
+                f"{rounds_why}"), None
     fable, missing = _plan_report(directory, state.FABLE_PROFILE)
     why = missing or _plan_report_problem(fable, state.FABLE_PROFILE, envelope)
     if not why:
-        return None
+        return None, None
     opus, no_opus = _plan_report(directory, state.OPUS_PROFILE)
     if no_opus:
-        return why  # no fallback offered: the reason is the Fable report itself
+        return why, None  # no fallback offered: the reason is the Fable report itself
     opus_why = _plan_report_problem(opus, state.OPUS_PROFILE, envelope)
     if opus_why:
-        return opus_why
+        return opus_why, None
     evidence = state.quota_evidence_problem(fable, envelope["packet"]["head"], packet_hash) if fable else "is missing"
     if evidence:
         return (f"result-{state.OPUS_PROFILE}.json counts only with the quota evidence of this packet: "
-                f"result-{state.FABLE_PROFILE}.json {evidence}")
-    return None
+                f"result-{state.FABLE_PROFILE}.json {evidence}"), None
+    return None, None
 
 
 def check_plan_review(cfg):
     """The launch of a NEW chain (no wave was ever launched in this run) is refused without both reviews of
     the approved plan: an event and SystemExit with the reason. A chain that already runs is not asked."""
     try:
-        why = plan_review_problem(cfg)
+        why, accepted = _plan_review(cfg)
     except Exception as e:  # noqa: BLE001 - fail closed: the launch never starts on an unchecked plan
-        why = f"the check failed ({type(e).__name__})"
+        why, accepted = f"the check failed ({type(e).__name__})", None
+    if not why and accepted:
+        rounds, last = accepted
+        event(cfg, f"plan review: Fable rounds exhausted ({rounds}), Astra-only pass accepted; "
+                   f"last Fable report: {PLAN_REVIEW_DIR}/{last}")
     if why:
         text = (f"launch refused: plan review: {why}. A new chain needs gate_ready reviews of the approved plan "
                 f"by claude-host and codex-host in {cfg['run_dir'] / PLAN_REVIEW_DIR} (references/waves.md, phase A)")
@@ -3264,8 +3453,9 @@ def check_plan_review(cfg):
         raise SystemExit(f"wab: {text}")
 
 
-NO_MODEL_WARNING = ("warning: chain.json has no `model`: the waves run on the default model of the Claude CLI; "
-                    "the default of phase A is \"model\": \"claude-fable-5-1\" (launch is not refused)")
+NO_MODEL_WARNING = ("warning: chain.json has no `model` and the chain started before 1.4.0: its waves keep the "
+                    "default model of the Claude CLI; a chain started on 1.4.0+ runs on \"model\": "
+                    f"\"{NEW_DEFAULTS['model']}\" by default (launch is not refused)")
 
 
 def _check_launch_allowed(cfg, st, wave, name):
@@ -3351,7 +3541,8 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     if wave == cfg["waves"][0] and wave not in st["waves"]:
         warn_stale_chains(cfg)  # a hint about finished chains' leftovers; nothing is closed here
     check_plan_pin(cfg)  # before prepare_clone, the workdir and the STARTING record
-    if not st["waves"]:  # a NEW chain: no wave of this run was ever launched
+    new_chain = not st["waves"]  # a NEW chain: no wave of this run was ever launched
+    if new_chain:
         check_plan_review(cfg)
     wdir = wave_dir(cfg, wave)
     cur = st.get("current")
@@ -3420,6 +3611,12 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
         st["waves"][wave]["restart"] = len(attempts) + 1
     if carried:
         st["waves"][wave]["outbox"] = carried
+    if isinstance(old, dict):  # a relaunch of a wave switched to Opus on the Fable limit stays on Opus (#108)
+        for key in ("model_override", "fable_switches"):
+            if key in old:
+                st["waves"][wave][key] = old[key]
+    if new_chain:  # saved with the first launch intent: from now on the run keeps the defaults of 1.4.0
+        st["defaults"] = DEFAULTS_MARK
     warn_model = not cfg["model"] and not st.get("model_warned")
     if warn_model:
         st["model_warned"] = True  # once per run: the mark is saved with the launch intent, the event follows it
@@ -3427,7 +3624,35 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     if warn_model:  # after every refusal of this launch: a refused and repeated launch does not repeat it
         event(cfg, NO_MODEL_WARNING)
     start_session(cfg, st, wave)
-    return deliver_first_prompt(cfg, st, wave)
+    delivered = deliver_first_prompt(cfg, st, wave)
+    # after the window and its first prompt (#108, Codex P2): the count reads every local journal and is slow on a
+    # big ~/.claude/projects; advisory, so neither its time nor its failure may hold or undo the launch
+    try:
+        fable_usage_event(cfg)
+    except Exception:  # noqa: BLE001 - fable_usage_event catches its own errors; this guards the event itself
+        pass
+    return delivered
+
+
+FABLE_USAGE_WARNING = "Fable ≥80% недельного бюджета: ревью Fable может упереться в лимит"
+
+
+def fable_usage_event(cfg):
+    """The local Fable count (fable_usage.py, #108) as an event of the launch: advisory, never a refusal. The
+    journals are this machine's only (other machines and claude.ai are not seen); a count that could not be
+    made is said so, never shown as 0 %."""
+    budget = cfg.get("fable_budget_units", FABLE_BUDGET_UNITS)
+    try:
+        r = fable_usage.usage(projects_dir(), budget=budget)
+        if not r.get("valid"):
+            event(cfg, f"fable-usage: не посчитан ({r.get('reason') or 'нет данных'})")
+            return
+        event(cfg, f"fable-usage: сутки {round(r['day_units'], 2)} ед., 7 дней {round(r['week_units'], 2)} из {budget} ед. "
+                   f"({r['pct']}%; локально, только эта машина)")
+        if r["over_threshold"]:
+            event(cfg, f"предупреждение: {FABLE_USAGE_WARNING} (сверь claude.ai/settings/usage)")
+    except Exception as e:  # noqa: BLE001 - an advisory count never stops a launch
+        event(cfg, f"fable-usage: не посчитан ({type(e).__name__}: {_exc_text(e)})")
 
 
 def restart_prompt_matches(prompt_copy, prompt_text, prompt_file, wave):
@@ -3506,21 +3731,49 @@ def sync_max_runs(cfg, wave):
         event(cfg, f"{wave}: max-runs file not written: {_exc_text(e)}")
 
 
-def start_session(cfg, st, wave):
-    """launching -> starting: create the tmux window (same session id on a repeat)."""
+def wave_model(cfg, w):
+    """The model the wave's window runs on: the switch to Opus on the Fable limit (`model_override`, #108)
+    wins over chain.json `model`; None = the CLI default (a legacy chain without `model`)."""
+    override = w.get("model_override") if isinstance(w, dict) else None
+    return override if isinstance(override, str) and override else cfg.get("model")
+
+
+def session_model(cfg, w):
+    """The model the CURRENT window of the wave was really started on: `model_override` -> `session_model`
+    (written by start_session; "" = the CLI default) -> chain.json `model` for a wave started before the
+    field. A tunable `model` changed in chain.json after the start does not change the live session (#108)."""
+    override = w.get("model_override") if isinstance(w, dict) else None
+    if isinstance(override, str) and override:
+        return override
+    if isinstance(w, dict) and isinstance(w.get("session_model"), str):
+        return w["session_model"] or None
+    return cfg.get("model")
+
+
+def start_session(cfg, st, wave, sid=None, phase="starting"):
+    """launching -> starting: create the tmux window (same session id on a repeat). `sid`/`phase`: the
+    Fable switch (#108) starts its new session with its own saved id and stays in its own phase."""
     w = st["waves"][wave]
     wdir = wave_dir(cfg, wave)
     sync_max_runs(cfg, wave)
     cmd = ["claude", "--permission-mode", "auto", "--append-system-prompt-file", str(system_prompt(cfg)),
-           "--name", f"wab-{cfg['chain']}-{wave}", "--session-id", w["sessions"][0]]
-    if cfg["model"]:
-        cmd += ["--model", cfg["model"]]
+           "--name", f"wab-{cfg['chain']}-{wave}", "--session-id", sid or w["sessions"][0]]
+    model = wave_model(cfg, w)
+    if model:
+        cmd += ["--model", model]
+    w["session_model"] = model or ""  # the limit detection reads it (#108); on disk BEFORE the outside action:
+    save_state(cfg, st)  # a dispatcher that dies right after new-session still knows the model of the live window
     pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
+    # read by `state.py init` of the wave; always set, empty without a policy (= the built-in one): the global
+    # environment of the tmux server could otherwise hand the window someone else's policy (#108)
+    policy = cfg.get("role_models")
+    pin += ["-e", f"{gate.state.ROLE_MODELS_ENV}="
+                  f"{json.dumps(policy, sort_keys=True, separators=(',', ':')) if policy else ''}"]
     made = tmux("new-session", "-d", "-P", "-F", "#{pane_id}", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
                 "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", "-e", f"WAB_MAX_RUNS={cfg['max_runs']}",
                 "-e", f"SUPERARMANDA_TZ={humantime.resolve(cfg.get('timezone'))[0]}", *pin, *cmd)
     mark_owner(cfg, w["tmux"], (made.stdout or "").strip())
-    w["phase"] = "starting"
+    w["phase"] = phase
     save_state(cfg, st)
 
 
@@ -3808,11 +4061,22 @@ def _settle_clear(cfg, st, wave, w, locked=False, target=None):
     return False
 
 
+def first_prompt_head(cfg, wave, w):
+    """The dispatcher's head of the first message of a wave (marker, wave dir, admitted clone, restart note)."""
+    head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wave_dir(cfg, wave)} "
+            f"(он же $WAB_DIR). Рабочая копия (admitted clone): {w['cwd']}. "
+            f"Протокол — в системной инструкции.\n\n")
+    n = w.get("restart")
+    if isinstance(n, int) and not isinstance(n, bool) and n > 1:
+        head += RESTART_NOTE.format(wave=wave, n=n) + "\n\n"
+    return head
+
+
 def deliver_first_prompt(cfg, st, wave):
     """starting -> sending -> running. The phase is saved before the paste: a dispatcher
     that dies in between leaves `sending`, which is never resent blindly."""
     w = st["waves"][wave]
-    name, cwd, wdir = w["tmux"], w["cwd"], wave_dir(cfg, wave)
+    name, wdir = w["tmux"], wave_dir(cfg, wave)
     if _plan_pin_refused(cfg, st, wave):
         return False
     if not wait_ready(name):
@@ -3828,12 +4092,7 @@ def deliver_first_prompt(cfg, st, wave):
     if _plan_pin_refused(cfg, st, wave):
         return False
     prompt = pathlib.Path(w["prompt_file"]).read_text(encoding="utf-8").strip()
-    head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wdir} "
-            f"(он же $WAB_DIR). Рабочая копия (admitted clone): {cwd}. "
-            f"Протокол — в системной инструкции.\n\n")
-    n = w.get("restart")
-    if isinstance(n, int) and not isinstance(n, bool) and n > 1:
-        head += RESTART_NOTE.format(wave=wave, n=n) + "\n\n"
+    head = first_prompt_head(cfg, wave, w)
     (wdir / "first-prompt.md").write_text(head + prompt + "\n", encoding="utf-8")
     w["phase"] = "sending"
     save_state(cfg, st)
@@ -4163,6 +4422,182 @@ def recover_update(cfg, st, wave):
         put_notice(cfg, w, wave, "updating", str(w.get("restarts", 0)))
     finish_update(cfg, st, wave)  # saves the phase, the mark and the notice together
     flush_notices(cfg, st, w)
+
+
+# ---------- the Fable limit of a wave window -> the same wave on Opus (1.4.0, #108) ----------
+#
+# A wave window that runs on Fable and gets the subscription limit (a main-thread assistant line of its
+# transcript with error "rate_limit" or apiErrorStatus 429, written by Claude Code itself; the text is not
+# read) would stand still for hours. The dispatcher closes that window and starts a NEW session of the same
+# wave on Opus with the resume message: the chain goes on. Phase `switching`, its steps in `fable_switch`
+# {sid, step}: closing -> starting -> ready -> sending; every step is saved before its outside action, so a
+# dispatcher that dies anywhere carries it on without a second window, a second session id or a blind resend.
+# It is not a restart of the wave: `restarts`, the attempts and `max_runs` stay untouched (`fable_switches`
+# counts it). Once per wave: `model_override` is Opus afterwards, a limit of Opus takes the ordinary idle /
+# ATTENTION path. `/model` is never typed into the TUI (it would change the owner's global default).
+
+FABLE_SWITCH_WHAT = "fable switch resume"  # step label for _deliver / pending_enter
+FABLE_SWITCH_TO = gate.state.OPUS_MODEL
+FABLE_SWITCH_NOTE = "модель переключена на Opus из-за лимита Fable; отметь это в PR"
+
+
+def fable_limit_hit(cfg, w):
+    """True when the wave runs on Fable and the transcript of its CURRENT session holds a provider refusal of
+    the main thread (TranscriptCache `limit`). Subagents (sidechain lines) run on their own role models."""
+    model = session_model(cfg, w)  # an accepted selector ("fable") is the same model (Codex P2 on #109)
+    if gate.state.MODEL_ALIASES.get(model, model) != gate.state.FABLE_MODEL:
+        return False
+    sessions = w.get("sessions") or []
+    if not sessions:
+        return False
+    return CACHE.read(transcript_path(w["cwd"], sessions[-1]))["limit"] > 0
+
+
+def fable_switch_message(cfg, wave, w, wdir):
+    """The first message of the Opus session; chosen once the old window is closed (nothing writes the wave
+    files any more) and saved in `fable_switch.text`, so a resumed dispatcher sends the same text. The limit
+    may come before the first WAB-CHECKPOINT, when handoff.md does not exist (Codex P1 on #109):
+    - a manifest of the current run exists -> resume with its explicit path (`--manifest`), whatever
+      handoff.md says (a checkpoint before `init` leaves a handoff.md without the manifest);
+    - handoff.md exists, or runs.json names a run the choice refused -> the ordinary resume message;
+    - neither: the wave wrote nothing to resume from -> the wave's first message again (same head, same task)."""
+    path, why = current_manifest(cfg, wave)
+    if path is not None and path.is_file():
+        text = (f"/superarmanda --wave {wave} --resume {session_marker(cfg, wave)} --manifest {path} "
+                f"Каталог волны: {wdir}. Manifest волны уже есть: позиция — state.py where --manifest {path}; "
+                f"state.py init не вызывай. handoff.md, если есть, прочитай для контекста.")
+    elif (wdir / "handoff.md").exists() or path is None:
+        text = resume_message(cfg, wave, wdir)
+    else:
+        first = wdir / "first-prompt.md"
+        try:
+            text = first.read_text(encoding="utf-8").strip() if first.is_file() else ""
+        except (OSError, ValueError):
+            text = ""
+        if session_marker(cfg, wave) not in text:
+            try:
+                prompt = pathlib.Path(w["prompt_file"]).read_text(encoding="utf-8").strip()
+            except (KeyError, TypeError, OSError, ValueError):
+                prompt = None
+            text = first_prompt_head(cfg, wave, w) + prompt if prompt else resume_message(cfg, wave, wdir)
+    return text + "\n" + FABLE_SWITCH_NOTE
+
+
+def begin_fable_switch(cfg, st, wave, w):
+    """The decision, in ONE save: the override, the counter, the new session id and the phase."""
+    w["model_override"] = FABLE_SWITCH_TO
+    w["fable_switches"] = (w["fable_switches"] if _count(w.get("fable_switches")) else 0) + 1
+    w["fable_switch"] = {"sid": str(uuid.uuid4()), "step": "closing", "from": (w.get("sessions") or [None])[-1]}
+    w["phase"] = "switching"
+    save_state(cfg, st)
+    event(cfg, f"fable limit: {wave} → relaunch on {FABLE_SWITCH_TO}")
+
+
+def _fable_switch_done(cfg, st, wave, w, how):
+    sid = (w.get("fable_switch") or {}).get("sid")
+    w["phase"] = "running"
+    w.pop("fable_switch", None)
+    w["checkpoint_at"] = None  # the new session starts with a fresh context: no checkpoint of the old one
+    w.pop("checkpoint_sent", None)
+    w.pop("ctx_watch", None)
+    w["tokens"] = 0
+    save_state(cfg, st)
+    event(cfg, f"{wave}: new session {sid} on {wave_model(cfg, w)} after the Fable limit: {how}")
+    return True
+
+
+def _fable_switch_unconfirmed_tick(cfg, st, wave, w, sw):
+    """Step `unconfirmed`: the resume message may sit unsent in the input of the new window. Nothing is sent
+    blindly; the switch is done once the marker shows up in the new session's journal (the owner pressed
+    Enter, or the text did arrive). The window gone -> the ordinary dead window."""
+    if session_marker(cfg, wave) in _first_user_text(transcript_path(w["cwd"], sw["sid"])):
+        return _fable_switch_done(cfg, st, wave, w, "resume delivered")
+    if not tmux_alive(w["tmux"]):
+        _mark_dead(cfg, st, wave, read(wave_dir(cfg, wave) / "status"))
+        return False
+    return True
+
+
+def _fable_switch_tick(cfg, st, wave, w):
+    """Carry the switch on from its saved step (see above). False only when the chain stops (not_ready)."""
+    sw = w.get("fable_switch")
+    name, wdir = w["tmux"], wave_dir(cfg, wave)
+    if not (isinstance(sw, dict) and isinstance(sw.get("sid"), str) and sw.get("step") in
+            ("closing", "starting", "ready", "sending", "unconfirmed")):
+        event(cfg, f"{wave}: fable switch record is broken ({safe_text(sw, 200)}); supervision resumed as running")
+        w["phase"] = "running"
+        w.pop("fable_switch", None)
+        save_state(cfg, st)
+        return True
+    if sw["step"] == "unconfirmed":
+        return _fable_switch_unconfirmed_tick(cfg, st, wave, w, sw)
+    if sw["step"] == "closing":
+        if tmux_alive(name):
+            tmux("kill-session", "-t", session_target(name), check=False)
+        if tmux_alive(name):
+            if once_per(w, "fable_switch", "close"):
+                event(cfg, f"{wave}: fable switch: session {name} is not closed yet; retried next tick")
+            save_state(cfg, st)
+            return True
+        for key in ("pending_enter", "pending_text_head", "pending_clear", "await_session"):
+            w.pop(key, None)  # the old window is gone with whatever was in its input
+        if sw["sid"] not in w.setdefault("sessions", []):
+            w["sessions"].append(sw["sid"])  # known up front: bound by id, not by its marker
+        w["cleared_at"] = time.time()  # background shells older than this were the old session's (#68)
+        sw["text"] = fable_switch_message(cfg, wave, w, wdir)  # fixed now: a resumed dispatcher sends the same
+        sw["step"] = "starting"
+        save_state(cfg, st)
+    if sw["step"] == "starting":
+        if tmux_alive(name):  # the dispatcher died right after new-session
+            event(cfg, f"{wave}: fable switch resumed: the window exists, not starting another")
+            _mark_recovered(cfg, name, wave)
+        else:
+            start_session(cfg, st, wave, sid=sw["sid"], phase="switching")
+        sw["step"] = "ready"
+        save_state(cfg, st)
+    if sw["step"] == "ready":
+        if not wait_ready(name):
+            blocked = "BLOCKED: окно Claude на Opus не стало готовым после лимита Fable, продолжение не отправлено\n"
+            (wdir / "status").write_text(blocked, encoding="utf-8")
+            w["phase"] = "not_ready"
+            w.pop("fable_switch", None)
+            put_notice(cfg, w, wave, "not_ready", "1", reason="window_not_ready")
+            save_state(cfg, st)
+            event(cfg, f"{wave}: Claude TUI on {wave_model(cfg, w)} not ready in {name}, resume NOT sent")
+            flush_notices(cfg, st, w)
+            return False
+        sw["step"] = "sending"  # from here the resume message is never resent blindly
+        save_state(cfg, st)
+    elif w.get("pending_enter") != FABLE_SWITCH_WHAT:  # `sending` found on disk, nothing recorded as typed
+        if session_marker(cfg, wave) in _first_user_text(transcript_path(w["cwd"], sw["sid"])):
+            return _fable_switch_done(cfg, st, wave, w, "the resume message evidently arrived")
+        try:
+            why = input_empty_reason(pane_ansi(name))
+        except (subprocess.SubprocessError, OSError) as e:
+            why = type(e).__name__
+        if why is not None:  # something may sit in the input: neither typed over nor resent
+            # not the end of the switch (Codex P2 on #109): the wave waits for a confirmed delivery or the
+            # owner, who is told at once (CodeRabbit on #109); the phase, the step and the notice in ONE save
+            sw["step"] = "unconfirmed"
+            if once_per(w, "updating", f"fable:{sw['sid']}"):
+                put_notice(cfg, w, wave, "updating", f"fable:{sw['sid']}")
+            save_state(cfg, st)
+            event(cfg, f"{wave}: fable switch: unknown whether the resume message arrived ({why}), NOT resent; "
+                       f"waiting for the new session to confirm it")
+            flush_notices(cfg, st, w)
+            return True
+    try:
+        text = sw.get("text") if isinstance(sw.get("text"), str) else None
+        if text is None:  # a record of an older 1.4.0 build: choose now and keep it
+            sw["text"] = text = fable_switch_message(cfg, wave, w, wdir)
+            save_state(cfg, st)
+        ok = _deliver(cfg, st, wave, FABLE_SWITCH_WHAT, send_text, text)
+    except _WindowGone:
+        return False
+    if not ok:
+        save_state(cfg, st)
+        return True  # step `sending` is on disk: the next tick decides by pending_enter and the screen
+    return _fable_switch_done(cfg, st, wave, w, "resume sent")
 
 
 def next_prompt_problem(path):
@@ -5843,6 +6278,8 @@ def _tick(cfg, st):
     if w.get("phase") == "launching":
         recover_launch(cfg, st, wave)
         return True
+    if w.get("phase") == "switching":  # the Fable limit (#108): the window is closed and started again by us
+        return _fable_switch_tick(cfg, st, wave, w)
 
     if w.get("phase") == "gate" and status != "DONE":
         w["phase"] = "running"  # the wave took its DONE back while the gate waited
@@ -5997,6 +6434,9 @@ def _tick(cfg, st):
         w["peak"] = max(w.get("peak", 0), tokens)
         w["ctx_hist"] = (w.get("ctx_hist", []) + [tokens])[-120:]
         watch_context(cfg, st, wave, w, tokens)
+        if w.get("phase") in ("running", "checkpoint") and status != "HANDOFF_READY" and fable_limit_hit(cfg, w):
+            begin_fable_switch(cfg, st, wave, w)
+            return _fable_switch_tick(cfg, st, wave, w)
 
     if w.get("phase") == "running" and not awaiting and tokens >= cfg["ctx_limit"]:
         event(cfg, f"{wave}: context {tokens} >= {cfg['ctx_limit']}, checkpoint requested")
@@ -6554,7 +6994,8 @@ def _state_or_event(cfg):
 
 TUNABLE = ("ctx_limit", "idle_minutes", "handoff_timeout_minutes", "tick_seconds", "telegram",
            "titles", "model", "plan_sha256", "max_auto_answers", "max_runs", "idle_nudge_minutes",
-           "timezone")  # timezone only changes how a time is shown: never part of whose run this is (#88)
+           "timezone",  # timezone only changes how a time is shown: never part of whose run this is (#88)
+           "fable_budget_units")  # an advisory threshold of launch (#108): tuning it changes no run
 
 
 def _identity(cfg):
@@ -6832,6 +7273,9 @@ def status_cmd(cfg):
         ctx = tokens // 1000 if isinstance(tokens, int) and not isinstance(tokens, bool) else "?"
         print(f"{safe_text(wave, 200)}: tmux={safe_text(w.get('tmux'), 200)} phase={safe_text(w.get('phase'), 200)} ctx={ctx}k "
               f"restarts={safe_text(w.get('restarts', 0), 50)} sessions={len(w.get('sessions') or [])} "
+              + (f"model={safe_text(w['model_override'], 200)} (лимит Fable) " if w.get("model_override") else "")
+              + (f"step={safe_text(w['fable_switch'].get('step'), 50)} " if w.get("phase") == "switching"
+                 and isinstance(w.get("fable_switch"), dict) else "") +
               f"started={hum(cfg, num(w.get('started')))} "
               f"status={safe_text(read(cfg['run_dir'] / wave / 'status'), 10 ** 6)}")
         line = manifest_status_line(cfg, wave)

@@ -86,7 +86,9 @@ TICK = 60
 DELAY = 20  # virtual seconds between what the dispatcher typed and the session's reaction
 BOT_STATUS = "[class=needs_decision rec=A red=no]"
 CAP_STATUS = "[class=blocked_cap rec=new_run red=no]"
-MODEL = "claude-fable-5-1"  # chain.json `model` (1.3.0): every wave session starts with it
+MODEL = "claude-opus-5-5"  # the default `model` of a NEW chain (1.4.0, #108): chain.json has none, every wave starts on it
+# the role policy of 1.4.0 for a high task: coder and the subagent roles on Opus, tester on Sonnet (Fable only reviews)
+ROLE_MODEL = {"coder": "opus", "tester": "sonnet", "internal_reviewer": "opus", "final_check": "opus"}
 # unique words in the wave questions: no external text may carry them (telegram_quote is off, #83)
 QUESTION_MARKERS = {"W1": "ВОПРОС-КЕДР-7731", "W2": "ВОПРОС-ЯСЕНЬ-4418", "W2-owner": "ВОПРОС-ЛИПА-5902"}
 NUDGE_MINUTES = 5  # chain.json idle_nudge_minutes of the scenario
@@ -276,7 +278,7 @@ class World:
         chain = {"chain": CHAIN, "run_id": RUN_ID, "waves": ["W1", "W2"], "repo": REPO, "base_branch": "main",
                  "workdir": str(self.workdir), "merge_gate": "auto", "tick_seconds": TICK,
                  "ctx_limit": CTX_LIMIT, "idle_minutes": 1440, "handoff_timeout_minutes": 1440,
-                 "idle_nudge_minutes": NUDGE_MINUTES, "telegram": False, "model": MODEL}
+                 "idle_nudge_minutes": NUDGE_MINUTES, "telegram": False}  # no `model`: the default
         if self.quote:  # the mutant: the wave's question is allowed into the notices
             chain["telegram_quote"] = True
         if self.policy:
@@ -560,15 +562,16 @@ class Actor:
         for role in ("coder", "tester"):
             self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", role, "--status", "pass",
                           "--session-id", f"e2e-{s.wave}-{role}", "--head", head,
-                          *(["--model", "fable"] if high else []))
+                          *(["--model", ROLE_MODEL[role]] if high else []))
         if not high:  # below high: one review, its report is not dereferenced (the rules of 1.2.0)
             return self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", "cross_provider_reviewer",
                                  "--status", "pass", "--session-id", f"e2e-{s.wave}-reviewer", "--head", head,
                                  "--reviewed-head", head, "--packet-hash", hashlib.sha256(b"packet").hexdigest())
-        # a high wave (policy 1.2.4): the internal Fable review of this HEAD before the external packet, both
+        # a high wave (policy 1.4.0): the internal review (Opus) of this HEAD before the external packet, both
         # task reviews of this HEAD, written by the real review.py and verified by state.py, then the final check
         self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", "internal_reviewer", "--status",
-                      "pass", "--session-id", f"e2e-{s.wave}-internal", "--head", head, "--model", "fable")
+                      "pass", "--session-id", f"e2e-{s.wave}-internal", "--head", head,
+                      "--model", ROLE_MODEL["internal_reviewer"])
         packet_hash, reports = self.w.review(self.w.workdir, self.w.git("rev-parse", "origin/main"), head,
                                              s.wave_dir / "superarmanda" / "reports", f"задача волны {s.wave}\n")
         for role, profile in (("cross_provider_reviewer", "claude-host"), ("second_reviewer", "codex-host")):
@@ -577,7 +580,8 @@ class Actor:
                           "--packet-hash", packet_hash, "--artifact", reports[profile])
         if self.mode != "no_final_check":  # the mutant: a high wave that skips the final check never merges
             self.state_py("task-result", "--manifest", m, "--task", "T1", "--role", "final_check", "--status",
-                          "pass", "--session-id", f"e2e-{s.wave}-final", "--head", head, "--model", "fable")
+                          "pass", "--session-id", f"e2e-{s.wave}-final", "--head", head,
+                          "--model", ROLE_MODEL["final_check"])
         self.did(s, "internal review, two task reviews and the final check recorded")
 
     def finish(self, s, next_prompt=None):
@@ -900,7 +904,7 @@ def oracle_wave_risk(run):
     """The gate judged each wave by its risk in the approved plan: the high wave W1 was merged with a manifest
     version 2 of level high carrying BOTH task reviews of the merged head (claude-host and codex-host, verified
     review.py reports of one packet); the medium wave W2 with one review, as in 1.2.0. The launch of the new
-    chain passed the check of the two reviews of the plan, and warned once about the missing `model`."""
+    chain passed the check of the two reviews of the plan and, as a chain of 1.4.0 without `model`, did not warn."""
     w = run.world
     merged = {m["pr"]: m["sha"] for m in w.jsonl(w.gh_state / "merges.jsonl")}
     manifests = {}
@@ -909,7 +913,7 @@ def oracle_wave_risk(run):
         manifests[wave] = json.loads(Path(runs[-1]["manifest"]).read_text(encoding="utf-8"))
         m = manifests[wave]
         must((m["version"], m["review_policy"], m["plan"]["sha256"])
-             == (2, {"version": "1.2.4", "level": WAVE_RISK[wave]}, w.plan_sha256),
+             == (2, {"version": "1.4.0", "level": WAVE_RISK[wave]}, w.plan_sha256),
              f"{wave}: manifest policy {m.get('version')}/{m.get('review_policy')}")
     results = manifests["W1"]["tasks"]["T1"]["results"]
     reviews = {role: results.get(role) or {} for role in ("cross_provider_reviewer", "second_reviewer")}
@@ -918,18 +922,19 @@ def oracle_wave_risk(run):
     for role, r in reviews.items():
         must(r["status"] == "pass" and r["head"] == merged.get(1) and r["artifact_sha256"], f"W1 {role}: {r}")
     must(len({r["packet_hash"] for r in reviews.values()}) == 1, "the two reviews of W1 cover different packets")
-    must(all(results[role]["model"] == "claude-fable-5-1" for role in ("coder", "tester")), "W1 coder/tester model")
+    must((results["coder"]["model"], results["tester"]["model"]) == ("claude-opus-5-5", "claude-sonnet-5-5"),
+         "W1 coder/tester model: the role policy of 1.4.0 (coder Opus, tester Sonnet)")
     # 1.2.4: the internal review of the HEAD of the first external packet and the final check of the merged HEAD
     task = manifests["W1"]["tasks"]["T1"]
     internal = task.get("internal_review") or {}
     must(internal.get("status") == "pass" and internal.get("head") == task["external_review"]["head"] == merged.get(1),
          f"W1 internal review: {internal}")
     final = results.get("final_check") or {}
-    must(final.get("status") == "pass" and final.get("head") == merged.get(1) and final.get("model") == "claude-fable-5-1"
+    must(final.get("status") == "pass" and final.get("head") == merged.get(1) and final.get("model") == "claude-opus-5-5"
          and final.get("after_reviews") == {role: reviews[role]["result_id"] for role in reviews},
          f"W1 final check: {final}")
     must("second_reviewer" not in manifests["W2"]["tasks"]["T1"]["results"], "the medium wave W2 needs one review")
-    must("chain.json has no `model`" not in run.events_log, "the chain has a model, the launch must not warn about it")
+    must("chain.json has no `model`" not in run.events_log, "a new chain runs on Opus by default: no warning")
     must("plan review" not in run.events_log, "the launch complained about the plan review")
 
 
@@ -970,7 +975,8 @@ def oracle_blocked_cap(run):
 
 
 def oracle_model(run):
-    """chain.json `model` reaches the command of EVERY wave session (`claude ... --model <model>`), and the zone
+    """The model of the chain — the default Opus of a new chain without `model` (1.4.0) — reaches the command of
+    EVERY wave session (`claude ... --model <model>`), and the zone
     the session is told is the default one (Dubai: SUPERARMANDA_TZ was cleared, #88)."""
     news = run.world.jsonl(run.world.tmux_state / "new_sessions.jsonl")
     must([n["name"] for n in news] == ["wab-w1", "wab-w2"], f"sessions: {[n['name'] for n in news]}")

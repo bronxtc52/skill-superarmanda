@@ -18,7 +18,8 @@ from pathlib import Path
 
 # Fable subagent roles of the ordinary pipeline (1.2.3, #86 п.5-9): the architect of step 1, the
 # internal review before the external packet, the triage of external findings, the investigator of
-# a bug and the final check against the requirements. Manifest version 2 only; always Fable.
+# a bug and the final check against the requirements. Manifest version 2 only. Their model is the
+# role policy (1.4.0: Opus by default, Fable accepted; before 1.4.0 always Fable); the name stays.
 # The results of architect, triage and investigator are records: they change neither the task
 # status, nor readiness, nor the merge gate. Under the review policy 1.2.4 internal_reviewer and
 # final_check are part of the readiness of a high-risk task (fable_role_gaps); under the policy
@@ -56,7 +57,7 @@ MAX_DECISION_NOTE_LENGTH = 500
 # carrying a key outside these sets: it cannot judge a record type it does not know.
 MANIFEST_KEYS = {
     "version", "run_id", "repo", "base", "head", "tree_fingerprint", "tasks",
-    "created_at", "updated_at", "plan", "wave", "position", "run", "review_policy",
+    "created_at", "updated_at", "plan", "wave", "position", "run", "review_policy", "role_models",
 }
 TASK_KEYS = {
     "status", "fix_cycles", "fix_cycles_closed", "task_epoch", "results", "session_roles",
@@ -80,22 +81,45 @@ MANIFEST_VERSIONS = (1, 2)
 # `init` writes POLICY_VERSION, and every rule takes the version from the manifest it judges.
 # 1.2.1: the model by risk and two reviews for high (1.2.1-1.2.3). 1.2.4: for a high-risk task
 # internal_reviewer and final_check are mandatory as well (MANDATORY_ROLES_POLICIES).
-POLICY_VERSION = "1.2.4"
-POLICY_VERSIONS = {"1.2.1", POLICY_VERSION}
-MANDATORY_ROLES_POLICIES = {"1.2.4"}
+# 1.4.0 (#108, variant B): the rules of 1.2.4, but the model of every executing role comes from
+# the role policy of the manifest (`role_models`, ROLE_POLICY_ROLES), not from «Fable on high».
+# Fable is no longer required of coder, tester or the subagent roles; it stays acceptable
+# everywhere, because it is not weaker than any policy. A manifest without `role_models` (1.2.x,
+# 1.3.x, a 1.4.0 manifest before the field) is judged by DEFAULT_ROLE_MODELS.
+POLICY_VERSION = "1.4.0"
+POLICY_VERSIONS = {"1.2.1", "1.2.4", POLICY_VERSION}
+MANDATORY_ROLES_POLICIES = {"1.2.4", POLICY_VERSION}
+ROLE_MODELS_POLICIES = {POLICY_VERSION}
 MANDATORY_FABLE_ROLES = ("internal_reviewer", "final_check")
 POLICY_KEYS = {"version", "level"}
 V2_ONLY_ROLES = {"second_reviewer", *FABLE_ROLES}
-# Closed dictionary of coder/tester models. Matching is exact: no trim, no case folding, no prefix.
+# Closed dictionary of role models. Matching is exact: no trim, no case folding, no prefix.
 FABLE_MODEL = "claude-fable-5-1"
+OPUS_MODEL = "claude-opus-5-5"
 SONNET_MODEL = "claude-sonnet-5-5"
 MODEL_ALIASES = {
     FABLE_MODEL: FABLE_MODEL,
+    OPUS_MODEL: OPUS_MODEL,
     SONNET_MODEL: SONNET_MODEL,
     "fable": FABLE_MODEL,
+    "opus": OPUS_MODEL,
     "sonnet": SONNET_MODEL,
 }
+# The strength order of the canonical models: a role may run on its policy model or a stronger one.
+MODEL_STRENGTH = {SONNET_MODEL: 0, OPUS_MODEL: 1, FABLE_MODEL: 2}
 MODEL_ROLES = ("coder", "tester")
+# The roles of the role policy (1.4.0). The coordinator is not one of them: its model is the
+# `model` of chain.json alone, and a `coordinator` key is refused.
+ROLE_POLICY_ROLES = MODEL_ROLES + FABLE_ROLES
+DEFAULT_ROLE_MODELS = {
+    "coder": {"low": SONNET_MODEL, "medium": SONNET_MODEL, "high": OPUS_MODEL},
+    "tester": {"low": SONNET_MODEL, "medium": SONNET_MODEL, "high": SONNET_MODEL},
+    **{role: {"low": OPUS_MODEL, "medium": OPUS_MODEL, "high": OPUS_MODEL} for role in FABLE_ROLES},
+}
+# The effort of a tester session depends on the risk alone, not on the model; task-result does not
+# check it.
+TESTER_EFFORT = {"low": "medium", "medium": "medium", "high": "high"}
+ROLE_MODELS_ENV = "SUPERARMANDA_ROLE_MODELS"
 # The two task reviews of a high-risk task, and the review.py profiles their reports may carry:
 # exactly one claude-host (Astra) and one codex-host (Fable); codex-host-opus stands in for
 # codex-host only with a quota error report of codex-host for the same HEAD and packet.
@@ -157,6 +181,8 @@ def check_schema(value):
         # Version 1 keeps the shape of 1.2.0: nothing of the policy may ride on it.
         if "review_policy" in value:
             fail("malformed manifest: review_policy requires manifest version 2")
+        if "role_models" in value:
+            fail("malformed manifest: role_models requires manifest version 2")
         for entry in tasks.values():
             if not isinstance(entry, dict):
                 continue
@@ -179,6 +205,8 @@ def check_schema(value):
         fail(f"unknown review_policy version: this state.py knows {sorted(POLICY_VERSIONS)}")
     if not isinstance(policy["level"], str) or policy["level"] not in RISKS:
         fail(f"review_policy level must be one of {sorted(RISKS)}")
+    if "role_models" in value:
+        check_role_models(value["role_models"], policy["version"])
     for name, entry in tasks.items():
         if isinstance(entry, dict) and "risk" in entry and not (
             isinstance(entry["risk"], str) and entry["risk"] in RISKS
@@ -213,6 +241,130 @@ def check_schema(value):
             fail(f"task {name} internal_review is malformed")
 
 
+def weaker(model, required):
+    """Whether the canonical `model` is weaker than `required` (or not a known model at all)."""
+    return MODEL_STRENGTH.get(model, -1) < MODEL_STRENGTH[required]
+
+
+def check_role_models(table, version):
+    """`role_models` of a manifest: the full table init wrote — every policy role, every risk, a
+    canonical model id, never below DEFAULT_ROLE_MODELS — and only under a policy that knows it.
+    A hand edit that weakens a cell is refused like any malformed manifest, never judged."""
+    if version not in ROLE_MODELS_POLICIES:
+        fail(f"malformed manifest: role_models requires review_policy {sorted(ROLE_MODELS_POLICIES)}")
+    if not isinstance(table, dict) or set(table) != set(ROLE_POLICY_ROLES):
+        fail(f"malformed role_models: must name exactly the roles {sorted(ROLE_POLICY_ROLES)}")
+    for role, row in table.items():
+        if not isinstance(row, dict) or set(row) != RISKS:
+            fail(f"malformed role_models: {role} must name exactly the risks {sorted(RISKS)}")
+        for risk, model in row.items():
+            if not isinstance(model, str) or model not in MODEL_STRENGTH:
+                fail(f"malformed role_models: {role}.{risk} is not a canonical model id")
+            if weaker(model, DEFAULT_ROLE_MODELS[role][risk]):
+                fail(
+                    f"malformed role_models: {role}.{risk} is {model}, below the built-in "
+                    f"{DEFAULT_ROLE_MODELS[role][risk]}"
+                )
+
+
+def role_models(data):
+    """The role policy a manifest is judged by: its `role_models` (fixed at init), else the
+    built-in defaults of 1.4.0 — a manifest of 1.2.x/1.3.x included. Callers that judge readiness
+    take it from here and pass it on explicitly, like the risk and the policy version."""
+    if not isinstance(data, dict) or "role_models" not in data:
+        return {role: dict(row) for role, row in DEFAULT_ROLE_MODELS.items()}
+    # present: judged only after the same validation as the schema check (a closed refusal, never a crash
+    # or a silent fall back to the defaults; Codex P2 on #109)
+    policy = data.get("review_policy") if data.get("version") == 2 else None
+    check_role_models(data["role_models"], policy.get("version") if isinstance(policy, dict) else None)
+    return {role: dict(row) for role, row in data["role_models"].items()}
+
+
+def policy_model(models, role, risk):
+    """The model the policy asks of `role` at the effective `risk`."""
+    return models[role][risk]
+
+
+def parse_role_model_key(key, origin):
+    if not isinstance(key, str):
+        fail(f"{origin}: role-model key must be a string")
+    parts = key.split(".")
+    role = parts[0]
+    if role == "coordinator":
+        fail(
+            f"{origin}: coordinator is not part of the role policy: its model is the `model` of "
+            "chain.json alone"
+        )
+    if role not in ROLE_POLICY_ROLES or len(parts) > 2:
+        fail(f"{origin}: unknown role in {key!r}: must be <role>[.<risk>] with role one of "
+             f"{', '.join(ROLE_POLICY_ROLES)}")
+    if len(parts) == 2 and parts[1] not in RISKS:
+        fail(f"{origin}: unknown risk in {key!r}: must be one of {', '.join(RISK_ORDER)}")
+    return role, (parts[1],) if len(parts) == 2 else RISK_ORDER
+
+
+def parse_role_model_value(value, key, origin):
+    model = MODEL_ALIASES.get(value) if isinstance(value, str) else None
+    if model is None:
+        fail(f"{origin}: unknown model {value!r} for {key}: must be exactly one of "
+             f"{', '.join(sorted(MODEL_ALIASES))}")
+    return model
+
+
+def init_role_models(flags):
+    """The full role policy of a new manifest: the built-in defaults <- env SUPERARMANDA_ROLE_MODELS
+    (a JSON object) <- the repeated --role-model flags, merged by key. Within one source a
+    <role> key fills the role first, a <role>.<risk> key refines it. An override may only RAISE a
+    model above the built-in default, and a flag also not below the env (the chain policy): a value below it, an unknown role, risk or model, a
+    `coordinator` key or a malformed input is refused, and no manifest is written."""
+    sources = []
+    raw = os.environ.get(ROLE_MODELS_ENV)
+    if raw:
+        origin = f"env {ROLE_MODELS_ENV}"
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            fail(f"{origin} is not valid JSON")
+        if not isinstance(value, dict):
+            fail(f"{origin} must be a JSON object {{\"<role>[.<risk>]\": \"<model>\"}}")
+        sources.append((origin, list(value.items())))
+    items = []
+    seen = set()
+    for flag in flags or ():
+        key, sep, value = flag.partition("=")
+        if not sep:
+            fail(f"--role-model {flag!r} must be <role>[.<risk>]=<model>")
+        if key in seen:
+            fail(f"--role-model {key} is given twice")
+        seen.add(key)
+        items.append((key, value))
+    sources.append(("--role-model", items))
+    table = {role: dict(row) for role, row in DEFAULT_ROLE_MODELS.items()}
+    for origin, pairs in sources:
+        parsed = []
+        for key, value in pairs:
+            role, risks = parse_role_model_key(key, origin)
+            model = parse_role_model_value(value, key, origin)
+            for risk in risks:
+                if weaker(model, DEFAULT_ROLE_MODELS[role][risk]):
+                    fail(
+                        f"{origin}: {key}={value} is below the built-in {role}.{risk} "
+                        f"({DEFAULT_ROLE_MODELS[role][risk]}): an override may only raise the model"
+                    )
+                if origin == "--role-model" and weaker(model, table[role][risk]):
+                    # the env is the policy of the chain (#108): a flag of the wave may not lower it
+                    fail(
+                        f"{origin}: {key}={value} is below the chain policy {role}.{risk} "
+                        f"({table[role][risk]}, env {ROLE_MODELS_ENV}): a flag may only raise the model"
+                    )
+            parsed.append((len(risks) == 1, role, risks, model))
+        # the whole role first, its single risks after: a <role>.<risk> key refines a <role> key
+        for _specific, role, risks, model in sorted(parsed, key=lambda item: item[0]):
+            for risk in risks:
+                table[role][risk] = model
+    return table
+
+
 def require_v2(data, what):
     if data["version"] != 2:
         fail(f"{what} requires manifest version 2 (version 1 is judged by the rules of 1.2.0)")
@@ -231,10 +383,6 @@ def task_risk(data, entry):
 def policy_version(data):
     """The version of the review policy the manifest is judged by; None for manifest version 1."""
     return data["review_policy"]["version"] if data["version"] == 2 else None
-
-
-def role_model(risk):
-    return FABLE_MODEL if risk == "high" else SONNET_MODEL
 
 
 def read(path):
@@ -957,7 +1105,38 @@ def required_roles(risk):
     return ("coder", "tester") + (REVIEW_ROLES if risk == "high" else REVIEW_ROLES[:1])
 
 
-def high_risk_gaps(entry, results, head):
+def policy_model_gaps(entry, results, risk, models):
+    """Why passed coder/tester results do not count for the effective `risk`: {role: reason}.
+
+    The single model rule of readiness at EVERY risk (task_ready, fix_cycle_closable, current_gaps
+    and so derive_step/where, the merge gate through them): a passed (or covered) coder/tester
+    result ran on the model of the role policy for this risk or a stronger one (`models`,
+    role_models). Below high it applies only where the policy asks more than Sonnet (an override
+    such as coder.medium=opus): results of low/medium without --model, valid since 1.2.x, keep
+    counting under the built-in defaults. On high it always applies (high_risk_gaps). A risk raised
+    after the record (task-risk) is judged by the new risk: the old result counts no more."""
+    gaps = {}
+    if risk not in RISKS:
+        return gaps
+    for role in MODEL_ROLES:
+        required = policy_model(models, role, risk)
+        if risk != "high" and not weaker(SONNET_MODEL, required):
+            continue
+        result = results.get(role)
+        if not isinstance(result, dict):
+            continue
+        if not (result.get("status") == "pass" or is_covered(entry, role, result)):
+            continue
+        if weaker(result.get("model"), required):
+            gaps[role] = (
+                f"{role} result has model {result.get('model') or 'not recorded'}; a {risk}-risk "
+                f"task requires {required} or a stronger model (the role policy): re-run {role} "
+                "on it, no weaker model"
+            )
+    return gaps
+
+
+def high_risk_gaps(entry, results, head, models):
     """Why the passed results of a high-risk task still do not make it ready: {role: reason}.
 
     `results` are the task's results on the current head and tree, `head` that HEAD. Findings
@@ -965,7 +1144,8 @@ def high_risk_gaps(entry, results, head):
     of the role is (`review_history`). Otherwise only results that read as
     pass (pass, or findings covered by a deferral/acceptance) are judged here; a missing or
     failed role is the ordinary flow's business. The single rule behind update_task_status,
-    is_complete, derive_step and where: coder and tester ran on Fable; each review carries a
+    is_complete, derive_step and where: coder and tester ran on the model of the role policy
+    for high or a stronger one (`models`, role_models); each review carries a
     report verified at recording time; the pair is one claude-host and one codex-host
     (codex-host-opus only with quota evidence) over one packet."""
     gaps = {}
@@ -978,13 +1158,7 @@ def high_risk_gaps(entry, results, head):
             return result
         return None
 
-    for role in MODEL_ROLES:
-        result = passed(role)
-        if result is not None and result.get("model") != FABLE_MODEL:
-            gaps[role] = (
-                f"{role} result has model {result.get('model') or 'not recorded'}; a high-risk "
-                f"task requires {FABLE_MODEL}: re-run {role} on it, no weaker model"
-            )
+    gaps.update(policy_model_gaps(entry, results, "high", models))
     reviews = {}
     for role in REVIEW_ROLES:
         if open_review_findings(entry, head, role):
@@ -1051,8 +1225,8 @@ NEW_RUN_REQUIRED = "new run required"
 INTERNAL_COUNTED = ("pass", "findings")
 
 
-def internal_review_gap(entry, results, head):
-    """Why the internal Fable review of a high-risk task is not counted, or None (policy 1.2.4).
+def internal_review_gap(entry, results, head, models):
+    """Why the internal review of a high-risk task is not counted, or None (policy 1.2.4+).
 
     The credit is the durable task record `internal_review`: the LAST task-result of
     internal_reviewer recorded before the first external packet of the task in this run
@@ -1060,7 +1234,8 @@ def internal_review_gap(entry, results, head):
     `resume` keeps both. The credit is bound to the exact state it judged — HEAD, tree
     (`tree_fingerprint`) and epoch of the task (`epoch`, task_epoch after its own record) — and the
     marker names the state the first packet went out at (HEAD, tree, epoch before the first
-    external record). Counted after the packet: status pass or findings, model Fable, and all
+    external record). Counted after the packet: status pass or findings, a model not weaker than
+    the role policy for high (`models`; Fable always), and all
     three equal the marker's, so the internal review read exactly the diff that went out and
     nothing (a readiness role result, a fix-loop record, a change of the risk or of the tree)
     happened in between; the reason names what differs. Before the packet the requirement is
@@ -1073,7 +1248,8 @@ def internal_review_gap(entry, results, head):
     record = record if isinstance(record, dict) else {}
     status = record.get("status")
     model = record.get("model")
-    recorded = f"task-result --role {INTERNAL_SOURCE} --status <pass|findings> --model fable"
+    required = policy_model(models, INTERNAL_SOURCE, "high")
+    recorded = f"task-result --role {INTERNAL_SOURCE} --status <pass|findings> --model {required}"
     # one rule of «the packet already went out» (external_review_started): the marker, and
     # behind it the session history of the task — a removed marker reopens nothing
     started = external_review_started(entry)
@@ -1083,7 +1259,7 @@ def internal_review_gap(entry, results, head):
         if (
             status in INTERNAL_COUNTED
             and record.get("head") == head
-            and model == FABLE_MODEL
+            and not weaker(model, required)
             and record.get("result_id") is not None
             and current.get("result_id") == record.get("result_id")
             and current.get("tree_fingerprint") == record.get("tree_fingerprint")
@@ -1095,7 +1271,7 @@ def internal_review_gap(entry, results, head):
             what = f"the {INTERNAL_SOURCE} result is of another HEAD ({str(record.get('head'))[:12]})"
         elif status not in INTERNAL_COUNTED:
             what = f"the last {INTERNAL_SOURCE} result is {status}"
-        elif model != FABLE_MODEL:
+        elif weaker(model, required):
             what = f"the {INTERNAL_SOURCE} record carries model {model or 'not recorded'}"
         else:
             what = (
@@ -1103,9 +1279,10 @@ def internal_review_gap(entry, results, head):
                 "changed since, or the credit carries no result_id)"
             )
         return (
-            f"{what}; a high-risk task requires the internal Fable review ({FABLE_MODEL}) of this "
-            f"HEAD before the first external review packet: record {recorded} (Fable unavailable: "
-            "retry or escalate to the owner, no weaker model, and do not start the external review)"
+            f"{what}; a high-risk task requires the internal review ({required} or a stronger model, "
+            f"the role policy) of this HEAD before the first external review packet: record "
+            f"{recorded} ({required} unavailable: retry or escalate to the owner, no weaker model, "
+            "and do not start the external review)"
         )
     marker = entry.get("external_review")
     packet = marker.get("head") if isinstance(marker, dict) else None
@@ -1118,7 +1295,7 @@ def internal_review_gap(entry, results, head):
         )
     elif (
         status in INTERNAL_COUNTED
-        and model == FABLE_MODEL
+        and not weaker(model, required)
         and record.get("head") == packet
         and isinstance(record.get("tree_fingerprint"), str)
         and record.get("tree_fingerprint") == marker.get("tree_fingerprint")
@@ -1130,10 +1307,10 @@ def internal_review_gap(entry, results, head):
         what = f"no {INTERNAL_SOURCE} result was recorded before the first external packet"
     elif status not in INTERNAL_COUNTED:
         what = f"the last {INTERNAL_SOURCE} result before the first external packet is {status}"
-    elif model != FABLE_MODEL:
+    elif weaker(model, required):
         what = (
             f"the {INTERNAL_SOURCE} record carries model {model or 'not recorded'}, "
-            f"required {FABLE_MODEL}"
+            f"required {required} or a stronger model"
         )
     elif record.get("head") != packet:
         what = (
@@ -1219,11 +1396,12 @@ def new_epoch(entry):
     raise_counter(entry, "task_epoch")
 
 
-def final_check_gap(entry, results):
+def final_check_gap(entry, results, models):
     """Why the final check of a high-risk task is not counted, or None (policy 1.2.4).
 
     `results` are the task's results on the current head and tree. Counted: a current
-    final_check with model Fable and status pass that is the LAST WORD of the task: recorded after
+    final_check with a model not weaker than the role policy for high (`models`) and status pass
+    that is the LAST WORD of the task: recorded after
     the current results of both task reviews, after the last fix cycle of the task closed, and
     after every other change of the task record.
     `after_reviews` of the record names the result_id of each review it was recorded after, so
@@ -1238,18 +1416,20 @@ def final_check_gap(entry, results):
     a role in EPOCH_ROLES, any fix-loop, a change of the effective risk) raised it, so a mismatch —
     or a record without the field (born in the same wave as the rule: no live record lacks it
     honestly) — is not counted. The PR gate and the informational Fable roles raise nothing."""
-    recorded = "task-result --role final_check --status pass --model fable"
+    required = policy_model(models, "final_check", "high")
+    recorded = f"task-result --role final_check --status pass --model {required}"
     result = results.get("final_check")
     if not isinstance(result, dict):
         return (
-            "no final_check result on this HEAD; a high-risk task requires the final Fable "
+            "no final_check result on this HEAD; a high-risk task requires the final "
             f"check after the last task review: record {recorded}"
         )
     status = result.get("status")
-    if result.get("model") != FABLE_MODEL:
+    if weaker(result.get("model"), required):
         return (
             f"final_check result has model {result.get('model') or 'not recorded'}; a high-risk "
-            f"task requires the final check by {FABLE_MODEL}: record {recorded}"
+            f"task requires the final check by {required} or a stronger model (the role policy): "
+            f"record {recorded}"
         )
     if status != "pass":
         if status == "findings":
@@ -1304,7 +1484,7 @@ def final_check_gap(entry, results):
     return None
 
 
-def fable_role_gaps(entry, results, head, policy):
+def fable_role_gaps(entry, results, head, policy, models):
     """{role: reason} for the mandatory Fable roles of a HIGH-risk task that are not counted.
 
     Empty under a policy that does not make them mandatory (1.2.1) and for manifest version 1
@@ -1313,31 +1493,32 @@ def fable_role_gaps(entry, results, head, policy):
     if policy not in MANDATORY_ROLES_POLICIES:
         return {}
     gaps = {}
-    reason = internal_review_gap(entry, results, head)
+    reason = internal_review_gap(entry, results, head, models)
     if reason is not None:
         gaps["internal_reviewer"] = reason
-    reason = final_check_gap(entry, results)
+    reason = final_check_gap(entry, results, models)
     if reason is not None:
         gaps["final_check"] = reason
     return gaps
 
 
-def task_ready(entry, risk, head, policy):
+def task_ready(entry, risk, head, policy, models):
     """The single readiness rule of a task for its effective risk (None: manifest version 1).
     `risk` and `policy` have no default here or in any caller that recomputes a status: a
     forgotten argument must be an error, never a silent return to older rules. Callers take them
     from `task_risk(data, entry)` and `policy_version(data)`; `head` is the manifest HEAD the
-    entry's results belong to."""
+    entry's results belong to. At every risk coder and tester must have run on the model of the
+    role policy where it asks more than Sonnet (policy_model_gaps)."""
     if not all(effective_status(entry, role) == "pass" for role in required_roles(risk)):
         return False
     if risk != "high":
-        return True
-    return not high_risk_gaps(entry, entry["results"], head) and not fable_role_gaps(
-        entry, entry["results"], head, policy
+        return not policy_model_gaps(entry, entry["results"], risk, models)
+    return not high_risk_gaps(entry, entry["results"], head, models) and not fable_role_gaps(
+        entry, entry["results"], head, policy, models
     )
 
 
-def fix_cycle_closable(entry, risk, head):
+def fix_cycle_closable(entry, risk, head, models):
     """Whether a record or cover leaves needs_fix: every required role pass or covered and, on high,
     the rules over the reviews (high_risk_gaps) — the readiness of 1.2.3, without the Fable roles.
     The final check is no part of this question: it must FOLLOW the closing (final_check_gap), so a
@@ -1346,38 +1527,41 @@ def fix_cycle_closable(entry, risk, head):
     no fix cycle of a high task could ever close."""
     if not all(effective_status(entry, role) == "pass" for role in required_roles(risk)):
         return False
-    return risk != "high" or not high_risk_gaps(entry, entry["results"], head)
+    if risk != "high":
+        return not policy_model_gaps(entry, entry["results"], risk, models)
+    return not high_risk_gaps(entry, entry["results"], head, models)
 
 
-def close_fix_cycle(entry, risk, head, policy):
+def close_fix_cycle(entry, risk, head, policy, models):
     """needs_fix is left: the fix cycle closes (fix_cycles_closed), and the task is ready_for_pr_review
     if everything counts, else needs_verification — on high 1.2.4 always the latter, because the
     final check recorded before the closing is stale (final_check_gap) and a new one is needed."""
     raise_counter(entry, "fix_cycles_closed")
     entry["status"] = (
-        "ready_for_pr_review" if task_ready(entry, risk, head, policy) else "needs_verification"
+        "ready_for_pr_review" if task_ready(entry, risk, head, policy, models) else "needs_verification"
     )
 
 
-def update_task_status(entry, risk, head, policy):
+def update_task_status(entry, risk, head, policy, models):
     """Only coder, tester and the task review(s) can make a task PR-ready.
     Coder and tester need pass; a reviewer may also be findings + deferral/acceptance.
-    A high-risk task (manifest version 2) also needs Fable models and the second review, and
+    A high-risk task (manifest version 2) also needs the models of the role policy and the second
+    review, and
     under the policy 1.2.4 the internal review and the final check (fable_role_gaps).
     From needs_fix a record that makes every role pass or covered (fix_cycle_closable) leaves it and
     closes the fix cycle (close_fix_cycle: ready_for_pr_review, or needs_verification on high 1.2.4
     until a new final check); a record that does not gives in_progress, as in 1.2.3."""
     if entry["status"] == "blocked":
         return
-    if entry["status"] == "needs_fix" and fix_cycle_closable(entry, risk, head):
-        close_fix_cycle(entry, risk, head, policy)
-    elif task_ready(entry, risk, head, policy):
+    if entry["status"] == "needs_fix" and fix_cycle_closable(entry, risk, head, models):
+        close_fix_cycle(entry, risk, head, policy, models)
+    elif task_ready(entry, risk, head, policy, models):
         entry["status"] = "ready_for_pr_review"
     elif entry["results"]:
         entry["status"] = "in_progress"
 
 
-def settle_mandatory_role(entry, risk, head, policy):
+def settle_mandatory_role(entry, risk, head, policy, models):
     """After a result of internal_reviewer or final_check of a HIGH-risk task under the policy
     1.2.4 (the caller checks both). It may complete a task that is in_progress or
     needs_verification (every other record counted, the final check the last one: only a
@@ -1390,9 +1574,9 @@ def settle_mandatory_role(entry, risk, head, policy):
     are not its business either. Below high the roles are records and never reach
     here."""
     status = entry["status"]
-    if status in ("in_progress", "needs_verification") and task_ready(entry, risk, head, policy):
+    if status in ("in_progress", "needs_verification") and task_ready(entry, risk, head, policy, models):
         entry["status"] = "ready_for_pr_review"
-    elif status == "ready_for_pr_review" and not task_ready(entry, risk, head, policy):
+    elif status == "ready_for_pr_review" and not task_ready(entry, risk, head, policy, models):
         entry["status"] = "in_progress"
 
 
@@ -1726,6 +1910,8 @@ def init(args):
     if args.risk is not None and args.from_plan is not None:
         fail("--risk is not allowed with --from-plan: the wave's risk is the policy level")
     counter = run_counter_settings(args)
+    # the role policy is fixed here, before any write: an invalid override writes nothing
+    models = init_role_models(args.role_model)
     base, head = validate_revision_pair(location, args.base, args.head)
     plan = wave_copy = None
     level = args.risk or "low"
@@ -1741,6 +1927,8 @@ def init(args):
     data = {
         "version": 2,
         "review_policy": {"version": POLICY_VERSION, "level": level},
+        # the full table after the merge of defaults, env and flags; no command changes it later
+        "role_models": models,
         "run_id": args.run_id,
         "repo": location,
         "base": base,
@@ -1862,7 +2050,8 @@ def result(args):
             "decision required for source "
             f"{entry['decision_required_for']}: run fix-loop --decision ..."
         )
-    model = result_model(args, risk)
+    models = role_models(data)
+    model = result_model(args, risk, models)
     if risk == "high" and args.role in REVIEW_ROLES and open_review_findings(
         entry, data["head"], args.role
     ):
@@ -1971,9 +2160,9 @@ def result(args):
             },
         )
     if args.role not in FABLE_ROLES:
-        update_task_status(entry, risk, data["head"], policy)
+        update_task_status(entry, risk, data["head"], policy, role_models(data))
     elif mandatory and risk == "high":
-        settle_mandatory_role(entry, risk, data["head"], policy)
+        settle_mandatory_role(entry, risk, data["head"], policy, role_models(data))
     # else: a result of a Fable subagent role is a record: the task status is not its business.
     # Below high this holds for internal_reviewer and final_check too (task_ready does not read
     # them there): a record of theirs must not promote a task that waits for its fix, nor touch
@@ -1984,36 +2173,44 @@ def result(args):
     print(json.dumps(entry, sort_keys=True))
 
 
-def result_model(args, risk):
+def result_model(args, risk, models):
     """Canonical model ID for the `model` field of a result, or None.
-    A high-risk task requires Fable for coder and tester at ANY status: `unavailable` with
-    `--model fable` is the record "Fable was requested and is unavailable"; nothing weaker may
-    take the role. The Fable subagent roles require it at any status and any risk."""
-    if args.model is not None and args.role not in MODEL_ROLES + FABLE_ROLES:
-        fail(f"--model is only allowed for roles {', '.join(MODEL_ROLES + FABLE_ROLES)}")
+    The role policy (1.4.0): coder, tester and the subagent roles run on the model of the policy
+    for the task's effective risk or a stronger one, at ANY status: `unavailable` with the policy
+    model is the record "the policy model was requested and is unavailable"; nothing weaker may
+    take the role. Fable is accepted everywhere (not weaker than any policy). The model must be
+    named for a subagent role at any risk, for coder/tester on high and wherever the policy asks
+    more than the weakest model (an override raised it); below that it is optional, as in 1.2.0."""
+    if args.model is not None and args.role not in ROLE_POLICY_ROLES:
+        fail(f"--model is only allowed for roles {', '.join(ROLE_POLICY_ROLES)}")
     model = MODEL_ALIASES.get(args.model) if args.model is not None else None
-    if args.role in FABLE_ROLES and model != FABLE_MODEL:
-        given = "no --model" if args.model is None else repr(args.model)
-        fail(
-            f"role {args.role} runs only on Fable: --model {FABLE_MODEL} (or fable) is required "
-            f"at any status and any risk (got {given}); no substitution by a weaker or another "
-            f"model. If Fable is unavailable, record task-result --role {args.role} --status "
-            "unavailable --model fable: the field `model` then says Fable was requested and "
-            "did not answer"
-        )
-    if risk == "high" and args.role in MODEL_ROLES and model != FABLE_MODEL:
-        given = "no --model" if args.model is None else repr(args.model)
-        fail(
-            f"high-risk task requires --model {FABLE_MODEL} for {args.role} (got {given}); "
-            "no substitution by a weaker or another model. If this host cannot run "
-            f"{args.role} on Fable, record --status unavailable --model fable: the task is "
-            "then not pass, as the policy intends"
-        )
+    required = (
+        policy_model(models, args.role, risk)
+        if args.role in ROLE_POLICY_ROLES and risk is not None
+        else None
+    )
+    way_out = (
+        f"{risk}-risk task requires --model {required} or a stronger one for {args.role} (the role "
+        "policy of the manifest, state.py role-model); no substitution by a weaker model. If this "
+        f"host cannot run {args.role} on {required}, record task-result --role {args.role} "
+        f"--status unavailable --model {required}: the task is then not pass, as the policy intends"
+    )
     if args.model is not None and model is None:
         fail(
             f"unknown --model {args.model!r}: must be exactly one of "
-            f"{', '.join(sorted(MODEL_ALIASES))}"
+            f"{', '.join(sorted(MODEL_ALIASES))}" + (f"; {way_out}" if required else "")
         )
+    if required is None:
+        return model
+    named = (
+        args.role in FABLE_ROLES
+        or risk == "high"
+        or MODEL_STRENGTH[required] > min(MODEL_STRENGTH.values())
+    )
+    if model is None and named:
+        fail(f"no --model: {way_out}")
+    if model is not None and weaker(model, required):
+        fail(f"--model {model} is weaker than the policy: {way_out}")
     return model
 
 
@@ -2278,7 +2475,7 @@ def set_risk(args):
                 note_review(entry, role, current)
     # A task that was ready by the old rules is ready no more once the new ones ask for more.
     if entry["status"] == "ready_for_pr_review" and not task_ready(
-        entry, risk, data["head"], policy_version(data)
+        entry, risk, data["head"], policy_version(data), role_models(data)
     ):
         entry["status"] = "in_progress"
     data["updated_at"] = now()
@@ -2287,24 +2484,23 @@ def set_risk(args):
 
 
 def show_role_model(args):
-    """role-model: the model a coder/tester session of this task must run on. Read-only."""
+    """role-model: the model a session of this role for this task must run on (the role policy of
+    the manifest at the task's effective risk), and for tester its effort. Read-only."""
     if not valid_name(args.task):
         fail("invalid task id")
     data = read(Path(args.manifest))
     require_v2(data, "role-model")
     risk = task_risk(data, data["tasks"].get(args.task))
-    print(
-        json.dumps(
-            {
-                "task": args.task,
-                "role": args.role,
-                "risk": risk,
-                "model": role_model(risk),
-                "policy_version": data["review_policy"]["version"],
-            },
-            sort_keys=True,
-        )
-    )
+    answer = {
+        "task": args.task,
+        "role": args.role,
+        "risk": risk,
+        "model": policy_model(role_models(data), args.role, risk),
+        "policy_version": data["review_policy"]["version"],
+    }
+    if args.role == "tester":
+        answer["effort"] = TESTER_EFFORT[risk]
+    print(json.dumps(answer, sort_keys=True))
 
 
 def fix_loop(args):
@@ -2396,7 +2592,7 @@ def cover_digest(target):
     return target.get("result_sha256") or result_digest(target)
 
 
-def settle_after_cover(entry, risk, head, policy):
+def settle_after_cover(entry, risk, head, policy, models):
     """A deferral/acceptance may complete the task. From needs_fix it may only promote (every role
     pass or covered, fix_cycle_closable): update_task_status would otherwise demote a still-open
     needs_fix to in_progress. Leaving needs_fix this way closes the fix cycle like fix-loop
@@ -2407,9 +2603,9 @@ def settle_after_cover(entry, risk, head, policy):
     A cover that leaves another role open closes nothing: needs_fix stays. blocked/needs_decision
     never get here."""
     if entry["status"] != "needs_fix":
-        update_task_status(entry, risk, head, policy)
-    elif fix_cycle_closable(entry, risk, head):
-        close_fix_cycle(entry, risk, head, policy)
+        update_task_status(entry, risk, head, policy, models)
+    elif fix_cycle_closable(entry, risk, head, models):
+        close_fix_cycle(entry, risk, head, policy, models)
 
 
 def record_deferral(args, entry, data, location, risk, policy):
@@ -2426,7 +2622,7 @@ def record_deferral(args, entry, data, location, risk, policy):
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }
     )
-    settle_after_cover(entry, risk, data["head"], policy)
+    settle_after_cover(entry, risk, data["head"], policy, role_models(data))
 
 
 def record_acceptance(args, entry, data, location, risk, policy):
@@ -2447,7 +2643,7 @@ def record_acceptance(args, entry, data, location, risk, policy):
             "recorded_at": max(now(), result_entry["recorded_at"]),
         }
     )
-    settle_after_cover(entry, risk, data["head"], policy)
+    settle_after_cover(entry, risk, data["head"], policy, role_models(data))
 
 
 def record_decision(args, entry):
@@ -2493,9 +2689,9 @@ def record_fix_outcome(args, entry, data, location, risk, policy):
             # a verified fix closes the cycle whatever the roles say (close_fix_cycle: ready, or
             # needs_verification), at any risk and policy — a task may be raised to high later and
             # its final check counts only if recorded after this (final_check_gap)
-            close_fix_cycle(entry, risk, data["head"], policy)
+            close_fix_cycle(entry, risk, data["head"], policy, role_models(data))
             return
-        update_task_status(entry, risk, data["head"], policy)
+        update_task_status(entry, risk, data["head"], policy, role_models(data))
         if entry["status"] != "ready_for_pr_review":
             entry["status"] = "needs_verification"
         return
@@ -2583,7 +2779,7 @@ def record_internal_round(entry, data, location):
         fail(
             f"--source {INTERNAL_SOURCE} requires an {INTERNAL_SOURCE} findings result on the "
             f"current head: record task-result --role {INTERNAL_SOURCE} --status findings "
-            "--model fable first"
+            "--model <model from state.py role-model> first"
         )
     if current.get("status") != "findings":
         fail(
@@ -2652,21 +2848,27 @@ def current_results(entry, head, tree):
     }
 
 
-def current_gaps(entry, head, tree, risk, policy):
-    """Everything that keeps the passed results of a high-risk task from making it ready:
-    high_risk_gaps plus, under the policy 1.2.4, the gaps of the mandatory Fable roles."""
-    if risk != "high" or not entry:
+def current_gaps(entry, head, tree, risk, policy, models):
+    """Everything that keeps the passed results of a task from making it ready: below high the
+    models of the role policy (policy_model_gaps); on high high_risk_gaps plus, under the policy
+    1.2.4, the gaps of the mandatory Fable roles."""
+    if not entry:
         return {}
     results = current_results(entry, head, tree)
-    return {**high_risk_gaps(entry, results, head), **fable_role_gaps(entry, results, head, policy)}
+    if risk != "high":
+        return policy_model_gaps(entry, results, risk, models)
+    return {
+        **high_risk_gaps(entry, results, head, models),
+        **fable_role_gaps(entry, results, head, policy, models),
+    }
 
 
-def is_complete(entry, head, tree, risk, policy):
+def is_complete(entry, head, tree, risk, policy, models):
     step, role, _note = derive_step(
         entry,
         current_verdicts(entry, head, tree),
         risk=risk,
-        gaps=current_gaps(entry, head, tree, risk, policy),
+        gaps=current_gaps(entry, head, tree, risk, policy, models),
     )
     return step == 7 and role is None
 
@@ -2678,7 +2880,9 @@ def pick_task(data, head, tree):
     marked = position["task"] if position is not None else None
 
     def done(entry):
-        return is_complete(entry, head, tree, task_risk(data, entry), policy_version(data))
+        return is_complete(
+            entry, head, tree, task_risk(data, entry), policy_version(data), role_models(data)
+        )
 
     if marked in tasks and not done(tasks[marked]):
         return marked
@@ -2708,7 +2912,8 @@ REVIEW_ORDER = (
     ("github_codex_review", 7),
 )
 NO_WEAKER_MODEL = (
-    f"a high-risk task requires {FABLE_MODEL}: retry once explicitly or escalate to the owner, "
+    "a high-risk task requires the model of the role policy (state.py role-model) or a stronger "
+    "one: retry once explicitly or escalate to the owner, "
     "no substitution by a weaker model (not a fix-loop)"
 )
 SECOND_REVIEW_FALLBACK = (
@@ -2936,7 +3141,9 @@ def where(args):
         effective,
         last_run,
         risk=risk,
-        gaps=current_gaps(entry, current_head, current_tree, risk, policy_version(data)),
+        gaps=current_gaps(
+            entry, current_head, current_tree, risk, policy_version(data), role_models(data)
+        ),
         fallback=second_review_fallback(entry, current_head) if risk == "high" else "",
     )
     position = data.get("position")
@@ -3065,6 +3272,7 @@ def parser():
     q.add_argument("--max-runs", default=None)
     q.add_argument("--runs-file", default=None)
     q.add_argument("--risk", choices=RISK_ORDER, default=None)
+    q.add_argument("--role-model", action="append", default=None)
     q.set_defaults(func=init)
     q = sub.add_parser("status", parents=[common])
     q.set_defaults(func=status)
@@ -3091,7 +3299,7 @@ def parser():
     q.set_defaults(func=set_risk)
     q = sub.add_parser("role-model", parents=[common])
     q.add_argument("--task", required=True)
-    q.add_argument("--role", required=True, choices=MODEL_ROLES)
+    q.add_argument("--role", required=True, choices=ROLE_POLICY_ROLES)
     q.set_defaults(func=show_role_model)
     q = sub.add_parser("fix-loop", parents=[common])
     q.add_argument("--task", required=True)

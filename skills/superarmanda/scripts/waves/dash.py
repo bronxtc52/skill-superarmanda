@@ -41,6 +41,8 @@ STYLE = {  # phase/status -> (icon, colour, label)
     "STARTING": ("◌", "cyan", "старт"),
     "RUNNING": ("⚙", "bright_green", "работает"),
     "RESUMING": ("↻", "cyan", "свежая голова"),
+    "switching": ("↻", "cyan", "лимит Fable: перезапуск на Opus"),
+    "switch_unconfirmed": ("⏸", "bright_yellow", "лимит Fable: ждёт подтверждения доставки"),
     "checkpoint": ("💾", "yellow", "handoff"),
     "HANDOFF_READY": ("💾", "yellow", "handoff готов"),
     "BLOCKED": ("✋", "bold red", "ждёт тебя"),
@@ -209,6 +211,8 @@ def wave_state(cfg, st, wave):
         return "pending", w
     if w.get("phase") in TERMINAL_PHASES:
         return TERMINAL_PHASES[w["phase"]], w
+    if w.get("phase") == "switching":  # the dispatcher itself closed the window to start it on Opus (#108)
+        return ("switch_unconfirmed" if wab._switch_unconfirmed(w) else "switching"), w
     status = wave_status(cfg, wave, w)
     # the window is gone before the watch noticed it: nobody to answer, no attach
     if st.get("current") == wave and status != "DONE" and not wab.tmux_alive(w["tmux"]):
@@ -455,6 +459,8 @@ def current_panel(cfg, st):
     else:
         head.append(wab.attach_cmd(w["tmux"]), style="bold white on grey23")
         head.append(f"   статус: {_safe(status)}", style="yellow" if key == "BLOCKED" else "green")
+    if w.get("model_override"):  # the wave was switched from Fable on its limit (#108)
+        head.append(f"   модель: {_safe(w['model_override'])} (лимит Fable)", style="bright_yellow")
     ctx = Group(Text("Контекст ", style="bold").append_text(ctx_cell(w, cfg["ctx_limit"], 40)),
                 Text("История  ", style="bold").append(spark(w.get("ctx_hist", []), cfg["ctx_limit"])))
     # the screen of the wave is shown too: masked as a whole BEFORE it is cut into lines and into 150 characters

@@ -5282,7 +5282,7 @@ class W4Round31ChainNulls(Base):
 
     def test_other_optional_nulls_load(self):
         cfg = wab.load_chain(self.write(model=None, merge_gate=None, workdir=None, run_dir=None))
-        self.assertIsNone(cfg.get("model"))
+        self.assertEqual(cfg.get("model"), wab.NEW_DEFAULTS["model"])  # null = the default (Opus for a new chain, 1.4.0)
         self.assertIsNone(cfg.get("merge_gate"))
 
 
@@ -7768,6 +7768,21 @@ class GateVerdict(unittest.TestCase):
         v = self.ev(manifest=m)
         self.assertEqual(v["verdict"], "fail")
         self.assertTrue(any("unknown record type 'waivers'" in r for r in v["reasons"]), v["reasons"])
+
+    def test_role_models_in_a_version_1_manifest_is_a_closed_refusal(self):  # Codex P2 on #109
+        for junk in ({"junk": "anything"}, {"coder": "x"}, "text"):
+            m = green_manifest()
+            m.update({"version": 1, "role_models": junk})
+            v = self.ev(manifest=m)
+            self.assertEqual(v["verdict"], "fail", v["reasons"])
+            self.assertTrue(any("role_models" in r for r in v["reasons"]), v["reasons"])
+
+    def test_malformed_role_models_in_a_version_2_manifest_is_a_closed_refusal(self):  # Codex P2 on #109
+        for junk in ({"junk": "anything"}, "text", {"coder": {"low": "claude-sonnet-5-5"}}):
+            m = green_manifest()
+            m["role_models"] = junk
+            v = self.ev(manifest=m)
+            self.assertEqual(v["verdict"], "fail", v["reasons"])
 
     def test_a_malformed_manifest_is_a_closed_refusal_not_an_exception(self):  # W1 fix1
         def fails(m, needle):
@@ -17638,8 +17653,9 @@ class W2RunningChainWithoutPlanReview(PlanReviewBase):
         return cfg, path, st
 
     def test_fixture_is_a_chain_of_before_the_check(self):
-        cfg, _, st = self.live_run()
-        self.assertIsNone(cfg["model"])  # the live chain.json has no `model`
+        cfg, path, st = self.live_run()
+        # the live chain.json has no `model`; read with its state, the chain of 1.3.0 keeps the CLI default (1.4.0)
+        self.assertIsNone(wab.load_chain(path)["model"])
         self.assertIn("plan_sha256", cfg)
         # the identity computed today is the one the first launch saved then: no new field joined it
         self.assertEqual(wab._pinned_identity(cfg), st["identity"])
@@ -17677,7 +17693,8 @@ class W2RunningChainWithoutPlanReview(PlanReviewBase):
 
 
 class W2ModelWarning(PlanReviewBase):
-    """1.2.2 (W2, #86): chain.json without `model` gets ONE warning event; the launch is not refused."""
+    """1.2.2 (W2, #86): chain.json without `model` gets ONE warning event; the launch is not refused.
+    1.4.0 (#108, T2): only a chain started before 1.4.0 can be without a model; a new one runs on Opus."""
 
     WARNING = "chain.json has no `model`"
 
@@ -17685,31 +17702,43 @@ class W2ModelWarning(PlanReviewBase):
         log = cfg["run_dir"] / "events.log"
         return [l for l in log.read_text(encoding="utf-8").splitlines() if self.WARNING in l] if log.exists() else []
 
-    def test_launch_without_model_warns_once_and_starts(self):
+    def legacy_chain(self, **over):
+        """A chain started before 1.4.0: W1 is done in a state.json without the `defaults` marker."""
+        cfg, path = self.new_chain(**over)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="done")}})
+        return wab.load_chain(path), path
+
+    def test_new_chain_without_model_runs_on_opus_and_does_not_warn(self):
         cfg, _ = self.new_chain(waves=["W1", "W2", "W3"])
-        self.assertIsNone(cfg["model"])
+        self.assertEqual(cfg["model"], wab.NEW_DEFAULTS["model"])
         self.reviewed(cfg)
         self.launched(cfg)
+        self.assertEqual(self.warnings(cfg), [])
+        self.assertIn(wab.NEW_DEFAULTS["model"], [a for c in self.tmux_calls for a in c])
+
+    def test_launch_without_model_warns_once_and_starts(self):
+        cfg, _ = self.legacy_chain(waves=["W1", "W2", "W3"])
+        self.assertIsNone(cfg["model"])
+        self.launched(cfg, "W2")
         (line,) = self.warnings(cfg)
-        self.assertIn("claude-fable-5-1", line)
+        self.assertIn(wab.NEW_DEFAULTS["model"], line)
         self.assertNotIn("--model", [a for c in self.tmux_calls for a in c])  # the CLI default, as before
         # the next waves of the same run do not repeat it
         st = self.get_state(cfg)
-        st["waves"]["W1"]["phase"] = "done"
+        st["waves"]["W2"]["phase"] = "done"
         self.put_state(cfg, st)
-        self.launched(cfg, "W2")
+        self.launched(cfg, "W3")
         self.assertEqual(len(self.warnings(cfg)), 1)
 
     def test_launch_that_fails_after_the_checks_and_is_repeated_warns_once(self):
         """review of Fable: the warning goes out with the saved launch intent, not before the later refusals."""
-        cfg, _ = self.new_chain()
-        self.reviewed(cfg)
+        cfg, _ = self.legacy_chain()
         with mock.patch.object(wab, "prepare_clone", side_effect=SystemExit("admission refused")):
             for _ in range(2):
                 with self.assertRaises(SystemExit):
-                    wab.launch(cfg, "W1", self.prompt)
+                    wab.launch(cfg, "W2", self.prompt)
         self.assertEqual(self.warnings(cfg), [])  # nothing was launched: nothing to warn about yet
-        self.launched(cfg)
+        self.launched(cfg, "W2")
         self.assertEqual(len(self.warnings(cfg)), 1)
         self.assertIs(self.get_state(cfg).get("model_warned"), True)
 
@@ -17721,8 +17750,7 @@ class W2ModelWarning(PlanReviewBase):
         self.assertIn("claude-fable-5-1", [a for c in self.tmux_calls for a in c])
 
     def test_chain_started_before_the_warning_gets_it_once_at_its_next_launch(self):
-        cfg, _ = self.new_chain(waves=["W1", "W2", "W3"])
-        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="done")}})
+        cfg, _ = self.legacy_chain(waves=["W1", "W2", "W3"])
         self.launched(cfg, "W2")
         self.assertEqual(len(self.warnings(cfg)), 1)
 
@@ -17731,6 +17759,343 @@ class W2ModelWarning(PlanReviewBase):
         self.assertEqual(wab._pinned_identity(cfg),
                          {"chain": CHAIN, "run_id": RUN_ID, "repo": "o/r", "waves": ["W1", "W2"],
                           "tmux_prefix": "wv-", "run_dir": str(cfg["run_dir"])})
+
+
+# ---------------------------------------------------------------- 1.4.0 (#108, T2): defaults and role models
+OPUS = "claude-opus-5-5"
+
+
+class T2ChainDefaults(PlanReviewBase):
+    """1.4.0 (#108, T2): a NEW chain runs its waves on Opus with ctx_limit 200 000; a chain started before 1.4.0
+    (state.json with waves and without the `defaults` marker) keeps None/300 000 and its identity."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(wab, "check_plan_review")  # the plan review has its own tests (T3 below)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def new_session_args(self):
+        (call,) = [c for c in self.tmux_calls if "new-session" in c]
+        return list(call)
+
+    def test_new_chain_defaults_to_opus_and_200k(self):
+        cfg, _ = self.new_chain(ctx_limit=None)
+        self.assertEqual(cfg["model"], OPUS)
+        self.assertEqual(cfg["ctx_limit"], 200_000)
+
+    def test_launch_of_a_new_chain_writes_the_marker_and_passes_opus(self):
+        cfg, _ = self.new_chain(ctx_limit=None)
+        self.launched(cfg)
+        self.assertEqual(self.get_state(cfg).get("defaults"), "1.4")
+        args = self.new_session_args()
+        self.assertEqual(args[args.index("--model") + 1], OPUS)
+        self.assertNotIn("has no `model`", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_chain_started_before_1_4_keeps_none_and_300k_and_its_identity(self):
+        cfg, path = self.new_chain(ctx_limit=None, waves=["W1", "W2", "W3"])
+        before = wab._pinned_identity(cfg)
+        self.put_state(cfg, {"current": "W1", "identity": before,
+                             "waves": {"W1": self.wave_rec("W1", phase="done")}})
+        cfg = wab.load_chain(path)  # the dispatcher of 1.4.0 reads the chain of 1.3.0
+        self.assertIsNone(cfg["model"])
+        self.assertEqual(cfg["ctx_limit"], 300_000)
+        self.assertEqual(wab._pinned_identity(cfg), before)
+        self.launched(cfg, "W2")
+        self.assertNotIn("--model", self.new_session_args())
+        self.assertNotIn("defaults", self.get_state(cfg))  # a running chain does not become a new one
+        self.assertEqual(wab.load_chain(path)["ctx_limit"], 300_000)
+        self.alive = True
+        self.set_status(cfg, "W2", "RUNNING")
+        wab.watch(wab.load_chain(path), path, max_ticks=1)  # no refusal
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn("watch started, ctx_limit=300000", log)
+        self.assertNotIn("refused:", log)
+        self.assertNotIn("identity", log)
+
+    def test_legacy_chain_without_model_is_warned_once(self):
+        cfg, path = self.new_chain(waves=["W1", "W2", "W3"])
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="done")}})
+        cfg = wab.load_chain(path)
+        self.launched(cfg, "W2")
+        log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        (line,) = [l for l in log.splitlines() if "has no `model`" in l]
+        self.assertIn(OPUS, line)
+        self.assertIn("1.4.0", line)
+
+    def test_explicit_values_win_over_both_defaults(self):
+        cfg, path = self.new_chain(ctx_limit=123_456, model="claude-fable-5-1")
+        self.assertEqual((cfg["model"], cfg["ctx_limit"]), ("claude-fable-5-1", 123_456))
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1", phase="done")}})
+        cfg = wab.load_chain(path)
+        self.assertEqual((cfg["model"], cfg["ctx_limit"]), ("claude-fable-5-1", 123_456))
+
+    def test_state_with_the_marker_keeps_the_new_defaults(self):
+        cfg, path = self.new_chain(ctx_limit=None)
+        self.put_state(cfg, {"current": "W1", "defaults": "1.4",
+                             "waves": {"W1": self.wave_rec("W1", phase="done")}})
+        cfg = wab.load_chain(path)
+        self.assertEqual((cfg["model"], cfg["ctx_limit"]), (OPUS, 200_000))
+
+    def test_role_models_are_validated_pinned_and_passed_to_the_wave(self):
+        table = {"coder.medium": "opus", "final_check": "claude-fable-5-1"}
+        cfg, _ = self.new_chain(role_models=table)
+        self.assertEqual(cfg["role_models"], table)
+        self.assertEqual(wab._pinned_identity(cfg)["role_models"], table)
+        self.launched(cfg)
+        args = self.new_session_args()
+        envs = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
+        (value,) = [e for e in envs if e.startswith("SUPERARMANDA_ROLE_MODELS=")]
+        self.assertEqual(json.loads(value.partition("=")[2]), table)
+
+    def test_without_role_models_the_env_is_set_empty(self):
+        # always -e, empty without a policy: a SUPERARMANDA_ROLE_MODELS in the global environment of the tmux
+        # server would otherwise reach the wave window (tmux merges the global and the session env; Codex P2)
+        for over in ({}, {"role_models": None}, {"role_models": {}}):
+            with self.subTest(over=over):
+                cfg, _ = self.new_chain(run_id=f"r-{len(over)}-{len(str(over))}", **over)
+                self.assertNotIn("role_models", wab._pinned_identity(cfg))
+                self.launched(cfg)
+                args = self.new_session_args()
+                envs = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
+                self.assertEqual([e for e in envs if "SUPERARMANDA_ROLE_MODELS" in e],
+                                 ["SUPERARMANDA_ROLE_MODELS="])
+                self.assertEqual([a for a in args if "SUPERARMANDA_ROLE_MODELS" in a],
+                                 ["SUPERARMANDA_ROLE_MODELS="])
+
+    def test_an_empty_model_of_a_new_chain_is_the_opus_default(self):
+        cfg, _ = self.new_chain(ctx_limit=None, model="")
+        self.assertEqual(cfg["model"], OPUS)
+        self.launched(cfg)
+        args = self.new_session_args()
+        self.assertEqual(args[args.index("--model") + 1], OPUS)
+        self.assertNotIn("has no `model`", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_an_empty_model_of_a_legacy_chain_is_like_none(self):
+        cfg, path = self.new_chain(waves=["W1", "W2", "W3"], model="")
+        before = wab._pinned_identity(cfg)
+        self.put_state(cfg, {"current": "W1", "identity": before,
+                             "waves": {"W1": self.wave_rec("W1", phase="done")}})
+        cfg = wab.load_chain(path)
+        self.assertIsNone(cfg["model"])
+        self.assertEqual(wab._pinned_identity(cfg), before)
+
+    def test_role_models_refuses_unknown_and_weaker_entries(self):
+        bad = {
+            "not an object": ["coder=opus"],
+            "unknown role": {"reviewer": "opus"},
+            "coordinator": {"coordinator": "opus"},
+            "unknown risk": {"coder.extreme": "opus"},
+            "deep key": {"coder.high.x": "opus"},
+            "unknown model": {"coder": "gpt-5"},
+            "model not a string": {"coder": 1},
+            "below the default": {"coder.high": "sonnet"},
+        }
+        for label, value in bad.items():
+            with self.subTest(case=label):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.chain(role_models=value)
+                self.assertIn("role_models", str(ctx.exception))
+
+    def test_plan_review_fable_rounds_must_be_a_whole_number_of_at_least_one(self):
+        for value in (0, -1, True, "2", 1.5, None and 0):
+            if value is None:
+                continue
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.chain(plan_review_fable_rounds=value)
+                self.assertIn("plan_review_fable_rounds", str(ctx.exception))
+        cfg, _ = self.chain()
+        self.assertNotIn("plan_review_fable_rounds", wab._pinned_identity(cfg))  # the default 2 is no field
+        for value in (1, 3):
+            cfg, _ = self.chain(plan_review_fable_rounds=value)
+            self.assertEqual(cfg["plan_review_fable_rounds"], value)
+
+
+class T3PlanReviewFableRounds(PlanReviewBase):
+    """1.4.0 (#108, T3): after `plan_review_fable_rounds` (2) real Fable rounds on different plan packets the
+    approved plan needs only the Astra pass of the current packet, newer than every Fable round."""
+
+    def fable_round(self, cfg, n, mode="findings", packet=None, name="waves.json"):
+        h = cfg["run_dir"] / "plan-review" / "history"
+        if packet is None:
+            plan = plan_bytes(plan_wave("W1", "high"), plan_wave(f"V{n}", "medium", ["W1"]))
+            packet = self.packet(h / f"r{n}-packet.json", plan=plan, note=f"round {n}\n", name=name)
+        repo, path = packet
+        self.report(repo, path, "codex-host", h / f"r{n}-codex-host.json", mode)
+        return packet
+
+    def astra_only(self, cfg):
+        return self.reviewed(cfg, profiles=("claude-host",))
+
+    def log(self, cfg):
+        return (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+
+    def test_two_fable_rounds_and_a_later_astra_pass_start_the_chain(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        self.launched(cfg)
+        log = self.log(cfg)
+        self.assertIn("plan review: Fable rounds exhausted (2), Astra-only pass accepted", log)
+        self.assertIn("r2-codex-host.json", log)
+
+    def test_one_round_is_not_enough(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.astra_only(cfg)
+        self.refused(cfg, "result-codex-host.json", "Fable")
+
+    def test_one_round_is_enough_when_the_chain_asks_for_one(self):
+        cfg, _ = self.new_chain(plan_review_fable_rounds=1)
+        self.fable_round(cfg, 1)
+        self.astra_only(cfg)
+        self.launched(cfg)
+        self.assertIn("Fable rounds exhausted (1)", self.log(cfg))
+
+    def test_three_asked_two_given_is_refused(self):
+        cfg, _ = self.new_chain(plan_review_fable_rounds=3)
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        self.refused(cfg, "Fable")
+
+    def test_the_same_packet_twice_is_one_round(self):
+        cfg, _ = self.new_chain()
+        packet = self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2, packet=packet)
+        self.astra_only(cfg)
+        self.refused(cfg, "Fable")
+
+    def test_quota_reports_are_no_rounds(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1, mode="quota_failure")
+        self.fable_round(cfg, 2, mode="quota_failure")
+        self.astra_only(cfg)
+        self.refused(cfg, "Fable")
+
+    def test_a_current_fable_report_must_still_pass(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        d, repo, packet = self.astra_only(cfg)
+        self.report(repo, packet, "codex-host", d / "result-codex-host.json", "findings")
+        self.refused(cfg, "result-codex-host.json", "gate_ready")
+
+    def test_astra_must_pass(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        d, _, _ = self.astra_only(cfg)
+        doc = json.loads((d / "result-claude-host.json").read_text(encoding="utf-8"))
+        doc.update(status="findings", gate_ready=False)  # the Astra double of the suite only passes
+        (d / "result-claude-host.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.refused(cfg, "result-claude-host.json", "gate_ready")
+
+    def test_a_fable_round_after_the_astra_pass_is_refused(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        self.fable_round(cfg, 3)
+        self.refused(cfg, "r3-codex-host.json", "Astra")
+
+    def test_a_fable_report_after_the_astra_pass_is_refused_even_without_its_packet(self):
+        # the packet only makes a report count as a round; the order rule holds for every valid Fable report
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        self.fable_round(cfg, 3)
+        (cfg["run_dir"] / "plan-review" / "history" / "r3-packet.json").unlink()
+        self.refused(cfg, "r3-codex-host.json", "Astra")
+
+    def test_a_fable_pass_after_the_astra_pass_is_refused(self):
+        # the order rule holds for every valid Fable report of history/, whatever its status (#108)
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        self.fable_round(cfg, 3, mode="success")
+        self.refused(cfg, "r3-codex-host.json", "Astra")
+
+    def test_a_fable_quota_report_after_the_astra_pass_is_refused(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        self.fable_round(cfg, 3, mode="quota_failure")
+        self.refused(cfg, "r3-codex-host.json", "Astra")
+
+    def test_older_fable_pass_and_quota_reports_do_not_stop_the_chain(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1, mode="success")
+        self.fable_round(cfg, 2, mode="quota_failure")
+        self.fable_round(cfg, 3)
+        self.fable_round(cfg, 4)
+        self.astra_only(cfg)
+        self.launched(cfg)
+        self.assertIn("Fable rounds exhausted (2)", self.log(cfg))
+
+    def test_a_report_without_created_at_is_no_round(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        r2 = cfg["run_dir"] / "plan-review" / "history" / "r2-codex-host.json"
+        doc = json.loads(r2.read_text(encoding="utf-8"))
+        del doc["created_at"]
+        r2.write_text(json.dumps(doc), encoding="utf-8")
+        self.refused(cfg, "Fable")
+
+    def test_astra_report_without_created_at_is_refused(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        d, _, _ = self.astra_only(cfg)
+        doc = json.loads((d / "result-claude-host.json").read_text(encoding="utf-8"))
+        del doc["created_at"]
+        (d / "result-claude-host.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.refused(cfg, "result-claude-host.json", "created_at")
+
+    def test_symlinked_history_report_is_no_round(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        h = cfg["run_dir"] / "plan-review" / "history"
+        real = cfg["run_dir"] / "r2-real.json"
+        (h / "r2-codex-host.json").rename(real)
+        (h / "r2-codex-host.json").symlink_to(real)
+        self.refused(cfg, "Fable")
+
+    def test_a_packet_that_does_not_add_waves_json_is_no_round(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2, name="plan.json")
+        self.astra_only(cfg)
+        self.refused(cfg, "Fable")
+
+    def test_a_round_without_its_packet_in_history_is_no_round(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        self.astra_only(cfg)
+        (cfg["run_dir"] / "plan-review" / "history" / "r2-packet.json").unlink()
+        self.refused(cfg, "Fable")
+
+    def test_fable_findings_on_the_approved_packet_itself_are_refused(self):
+        cfg, _ = self.new_chain()
+        self.fable_round(cfg, 1)
+        self.fable_round(cfg, 2)
+        d = cfg["run_dir"] / "plan-review"
+        repo, packet = self.packet(d / "packet.json")
+        (d / "plan.sha256").write_text(self.pin + "\n", encoding="utf-8")
+        shutil.copy(packet, d / "history" / "r3-packet.json")
+        self.report(repo, packet, "codex-host", d / "history" / "r3-codex-host.json", "findings")
+        self.report(repo, packet, "claude-host", d / "result-claude-host.json")
+        self.refused(cfg, "r3-codex-host.json")
 
 
 # ---------------------------------------------------------------- W6 (#88): the owner's time
@@ -18062,7 +18427,7 @@ class W6OwnerTime(Base):
     # ----- docs -----
     def test_release_docs_and_agent_docs(self):
         skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.[23]\.\d+"\s*$')  # the version itself is pinned by the newest release's test
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.[234]\.\d+"\s*$')  # the version itself is pinned by the newest release's test
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         m = re.search(r"(?ms)^## 1\.2\.6 — 2026-10-06\n(.*?)(?=^## )", log)
         self.assertTrue(m, "CHANGELOG.md: the section `## 1.2.6 — 2026-10-06`")
@@ -18509,7 +18874,9 @@ class W7NoticeTemplates(Base):
         tree = ast.parse((WAVES / "wab.py").read_text(encoding="utf-8"))
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
                  and n.func.id == "put_notice"]
-        self.assertEqual(len(calls), 24, "the 25 call sites of 1.2.6; chain_done is put by one helper now (23 keys)")
+        # the 25 call sites of 1.2.6; chain_done is put by one helper now (23 keys); +1 not_ready of the Fable switch (#108);
+        # +1 updating of an unconfirmed Fable switch delivery (Codex P2 / CodeRabbit on #109)
+        self.assertEqual(len(calls), 26)
         self.assertEqual({c.args[3].value for c in calls if len(c.args) == 5}, set(wab.NOTICE_TEMPLATES))
         for node in calls:
             self.assertEqual(len(node.args), 5, f"put_notice(cfg, w, wave, key, value, **fields), line {node.lineno}")
@@ -18672,9 +19039,8 @@ class Release130(unittest.TestCase):
         self.assertTrue(log.index("## 1.3.0") < log.index("## 1.2.7"), "1.3.0 is above 1.2.7")
         return m.group(1)
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.3\.0"\s*$')
+    # the version of SKILL.md moved on to 1.4.0 (#108): Release140 pins it
+
 
     def test_changelog_names_the_issues_and_the_compatibility_boundary(self):
         body = self.section()
@@ -18705,11 +19071,50 @@ class Release130(unittest.TestCase):
         self.assertRegex(waves, r"(?m)^- `metrics\.py <run_dir> \[--json\]`")
 
 
+class Release140(unittest.TestCase):
+    """The release 1.4.0 (#108, variant B «Fable only reviews»): version, the CHANGELOG section on top with the
+    owner's decision and the compatibility boundary, the row of «Что реализовано»."""
+
+    def section(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.0 — 2026-10-10$", "1.4.0 is the first section")
+        self.assertTrue(log.index("## 1.4.0") < log.index("## 1.3.0"), "1.4.0 is above 1.3.0")
+        return re.search(r"(?ms)^## 1\.4\.0 — 2026-10-10\n(.*?)(?=^## )", log).group(1)
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.0"\s*$')
+
+    def test_changelog_names_the_issue_the_decision_and_the_boundary(self):
+        body = self.section()
+        for needle in ("#108", "Решение владельца 2026-10-10", "### Добавлено", "### Изменено", "`role_models`",
+                       "`plan_review_fable_rounds`", "`fable_budget_units`", "fable_usage.py", "`created_at`",
+                       "`fable_switches`", "200 000"):
+            self.assertIn(needle, body)
+        boundary = body[body.index("Граница совместимости"):]
+        for needle in ("без `role_models`", "`defaults: \"1.4\"`", "300 000", "`result-codex-host-opus.json`"):
+            self.assertIn(needle, boundary)
+
+    def test_waves_doc_has_the_row_of_what_is_implemented(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        table = waves.split("## Что реализовано", 1)[1].split("## Фаза A", 1)[0]
+        self.assertRegex(table, r"(?m)^\| Политика моделей 1\.4\.0 [^\n]*\| реализовано \(1\.4\.0; \[#108\]")
+
+    def test_docs_no_longer_ask_fable_of_the_executors(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        refs = ROOT / "skills" / "superarmanda" / "references"
+        self.assertNotIn("координатору рекомендована Fable", skill)
+        self.assertNotIn('"model": "claude-fable-5-1"', (refs / "waves.md").read_text(encoding="utf-8"))
+        self.assertNotRegex((refs / "role-briefs.md").read_text(encoding="utf-8"), r"(?m)^model: fable$")
+        self.assertIn("остаток Fable", (refs / "waves.md").read_text(encoding="utf-8"))
+
+
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
         mods = set(re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", src))
-        stdlib = set(sys.stdlib_module_names) | {"gate", "humantime"}  # gate.py is the sibling module, stdlib-only itself
+        # gate.py, humantime.py and fable_usage.py are sibling modules, stdlib-only themselves (fable_usage: its own test)
+        stdlib = set(sys.stdlib_module_names) | {"gate", "humantime", "fable_usage"}
         self.assertFalse(mods - stdlib, mods - stdlib)
         gate_src = (WAVES / "gate.py").read_text(encoding="utf-8")
         gate_mods = set(re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", gate_src))
