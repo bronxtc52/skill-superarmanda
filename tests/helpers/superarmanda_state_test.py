@@ -2630,7 +2630,7 @@ class WavesContract(unittest.TestCase):
         )
         # 1.2.1 (#86): new manifests are version 2; the wave's risk is the policy level
         self.assertEqual(data["version"], 2)
-        self.assertEqual(data["review_policy"], {"version": "1.2.4", "level": selected["risk"]})
+        self.assertEqual(data["review_policy"], {"version": "1.4.0", "level": selected["risk"]})
         self.assertEqual(data["base"], self.base)
 
     # T1: init --expect-sha256 pins the approved plan bytes
@@ -2682,8 +2682,8 @@ class WavesContract(unittest.TestCase):
             "--run-id",
             "legacy",
         )
-        # 1.2.1 (#86): the only addition to the v0.6.0 keys is the review policy
-        self.assertEqual(set(self.manifest_data()), V060_KEYS | {"review_policy"})
+        # 1.2.1 (#86): the review policy; 1.4.0 (#108): the role policy of the run
+        self.assertEqual(set(self.manifest_data()), V060_KEYS | {"review_policy", "role_models"})
 
     def assert_init_rejected(self, selector):
         proc = self.init_wave_raw(selector)
@@ -4172,7 +4172,7 @@ class PolicyBase(unittest.TestCase):
     TASK = "t1"
 
     def setUp(self):
-        for key in [k for k in os.environ if k.startswith("WAB_")] + ["SUPERARMANDA_TZ"]:
+        for key in [k for k in os.environ if k.startswith("WAB_")] + ["SUPERARMANDA_TZ", "SUPERARMANDA_ROLE_MODELS"]:
             os.environ.pop(key, None)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -4358,17 +4358,17 @@ class RiskPolicyManifest(PolicyBase):
 
     def test_init_writes_version_2_with_policy_level_and_version(self):
         self.assertEqual(self.data()["version"], 2)
-        self.assertEqual(self.data()["review_policy"], {"version": "1.2.4", "level": "high"})
+        self.assertEqual(self.data()["review_policy"], {"version": "1.4.0", "level": "high"})
         self.manifest.unlink()
         printed = self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head())
-        self.assertEqual(printed["review_policy"], {"version": "1.2.4", "level": "low"})
+        self.assertEqual(printed["review_policy"], {"version": "1.4.0", "level": "low"})
         self.assertEqual(self.data()["version"], 2)
         for risk in ("low", "medium", "high"):
             with self.subTest(wave_risk=risk):
                 self.manifest.unlink()
                 self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head(),
                         "--from-plan", self.write_plan(risk))
-                self.assertEqual(self.data()["review_policy"], {"version": "1.2.4", "level": risk})
+                self.assertEqual(self.data()["review_policy"], {"version": "1.4.0", "level": risk})
                 self.assertEqual(self.data()["version"], 2)
 
     def test_init_refuses_risk_with_from_plan_and_unknown_risk(self):
@@ -4421,19 +4421,25 @@ class RiskPolicyManifest(PolicyBase):
                     self.refused(command, *args)
 
     def test_role_model_follows_the_effective_risk(self):
-        for level, model in (("high", FABLE), ("medium", SONNET), ("low", SONNET)):
+        # 1.4.0: coder high on Opus, tester on Sonnet at every risk with the effort of the risk
+        for level, coder, effort in (("high", OPUS, "high"), ("medium", SONNET, "medium"), ("low", SONNET, "medium")):
             self.init(risk=level)
             before = self.manifest.read_bytes()
-            for role in ("coder", "tester"):
+            for role, model in (("coder", coder), ("tester", SONNET)):
                 with self.subTest(level=level, role=role):
                     answer = self.ok("role-model", "--task", "t1", "--role", role)
-                    self.assertEqual(answer, {"task": "t1", "role": role, "risk": level, "model": model,
-                                              "policy_version": "1.2.4"})
+                    expected = {"task": "t1", "role": role, "risk": level, "model": model,
+                                "policy_version": "1.4.0"}
+                    if role == "tester":
+                        expected["effort"] = effort
+                    self.assertEqual(answer, expected)
             self.assertEqual(self.manifest.read_bytes(), before, "role-model is read-only")
-        # a task raised to high inside a low run gets Fable; its neighbour keeps Sonnet
+        # a task raised to high inside a low run gets the high policy; its neighbour keeps the low one
         self.ok("task-risk", "--task", "t1", "--risk", "high")
-        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "tester")["model"], FABLE)
+        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["model"], OPUS)
+        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "tester")["effort"], "high")
         self.assertEqual(self.ok("role-model", "--task", "t2", "--role", "coder")["model"], SONNET)
+        self.assertEqual(self.ok("role-model", "--task", "t2", "--role", "tester")["effort"], "medium")
         self.refused("role-model", "--task", "t1", "--role", "cross_provider_reviewer")
 
     def test_task_risk_can_be_raised_or_repeated_never_lowered(self):
@@ -4448,14 +4454,15 @@ class RiskPolicyManifest(PolicyBase):
         self.assertEqual(self.where()["risk"], "high")
 
     def test_high_wave_is_the_floor_for_a_medium_task(self):
-        """A medium task of a high wave: one Astra pass is not a pass, and its roles get Fable."""
+        """A medium task of a high wave: one Astra pass is not a pass, and its roles get the high policy."""
         self.manifest.unlink()
         self.ok("init", "--repo", self.repo, "--base", self.base, "--head", self.head(),
                 "--from-plan", self.write_plan("high"))
         self.ok("task-risk", "--task", "t1", "--risk", "medium")
         self.assertEqual(self.entry()["risk"], "medium")
-        for role in ("coder", "tester"):
-            self.assertEqual(self.ok("role-model", "--task", "t1", "--role", role)["model"], FABLE)
+        for role, model in (("coder", OPUS), ("tester", SONNET)):
+            self.assertEqual(self.ok("role-model", "--task", "t1", "--role", role)["model"], model)
+        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "tester")["effort"], "high")
         self.record_refused("coder", model="sonnet")
         self.code_and_test()
         self.review("cross_provider_reviewer", "claude-host")
@@ -4466,28 +4473,33 @@ class RiskPolicyManifest(PolicyBase):
 
 
 class HighRiskModels(PolicyBase):
-    """Coder and tester of a high-risk task run on Fable, and the result says so."""
+    """Coder and tester of a high-risk task run on the model of the role policy (1.4.0: coder Opus, tester
+    Sonnet) or a stronger one, and the result says so. Fable is never weaker than the policy."""
 
-    def test_high_coder_and_tester_require_the_fable_model(self):
-        for role in ("coder", "tester"):
-            for model in (None, "", "sonnet", SONNET, "claude-opus-5-5", "gpt-6-astra"):
+    def test_high_coder_and_tester_require_the_policy_model(self):
+        for role, refused in (("coder", (None, "", "sonnet", SONNET, "gpt-6-astra")),
+                              ("tester", (None, "", "gpt-6-astra", "Sonnet"))):
+            for model in refused:
                 with self.subTest(role=role, model=model):
                     self.record_refused(role, model=model)
         self.assertEqual(self.data()["tasks"], {})
-        self.record_refused("coder", needle=FABLE)
-        entry = self.record("coder", model=FABLE)
-        self.assertEqual(entry["results"]["coder"]["model"], FABLE)
+        self.record_refused("coder", needle=OPUS)
+        self.assertEqual(self.record("coder", model=OPUS)["results"]["coder"]["model"], OPUS)
+        self.assertEqual(self.record("tester", model=SONNET)["results"]["tester"]["model"], SONNET)
+        for role in ("coder", "tester"):
+            self.assertEqual(self.record(role, model=FABLE)["results"][role]["model"], FABLE)
 
     def test_refusal_of_another_model_names_the_way_out(self):
-        """PR #90 P1: a host without Fable (Codex host, #92) is told what to record, not left guessing."""
-        for role in ("coder", "tester"):
-            for model in (None, "sonnet", "gpt-5.6-terra", "gpt-6-astra", ""):
+        """PR #90 P1: a host without the policy model is told what to record, not left guessing."""
+        for role, required, models in (("coder", OPUS, (None, "sonnet", "gpt-5.6-terra", "gpt-6-astra", "")),
+                                       ("tester", SONNET, (None, "gpt-5.6-terra", "gpt-6-astra", ""))):
+            for model in models:
                 with self.subTest(role=role, model=model):
                     message = self.record_refused(role, model=model).stderr
-                    for needle in ("claude-fable-5-1", "--status unavailable --model fable",
+                    for needle in (required, f"--status unavailable --model {required}",
                                    "no substitution", "not pass"):
                         self.assertIn(needle, message)
-        entry = self.record("coder", "unavailable", model="fable")
+        entry = self.record("coder", "unavailable", model="opus")
         self.assertEqual((entry["results"]["coder"]["status"], entry["status"]), ("unavailable", "in_progress"))
         # below high a host is free to run its own models and to leave --model out, as in 1.2.0
         self.init(risk="medium")
@@ -4514,15 +4526,15 @@ class HighRiskModels(PolicyBase):
         for role in ("cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit"):
             self.record_refused(role, status="incomplete", model="fable")
 
-    def test_unavailable_fable_is_recorded_and_never_replaced_by_a_weaker_model(self):
-        for role, others in (("coder", ()), ("tester", ("coder",))):
+    def test_unavailable_policy_model_is_recorded_and_never_replaced_by_a_weaker_model(self):
+        for role, others, required in (("coder", (), OPUS), ("tester", ("coder",), SONNET)):
             with self.subTest(role=role):
                 self.init()
                 for other in others:
-                    self.record(other, model="fable")
-                entry = self.record(role, "unavailable", model="fable")
+                    self.record(other, model="opus")
+                entry = self.record(role, "unavailable", model=required)
                 self.assertEqual(
-                    (entry["results"][role]["status"], entry["results"][role]["model"]), ("unavailable", FABLE)
+                    (entry["results"][role]["status"], entry["results"][role]["model"]), ("unavailable", required)
                 )
                 self.assertNotEqual(entry["status"], "ready_for_pr_review")
                 where = self.where()
@@ -4531,11 +4543,13 @@ class HighRiskModels(PolicyBase):
                 self.assertIn("weaker model", where["next_action"])
                 self.assertNotIn("must finish", where["next_action"])
                 self.assertEqual(
-                    next(a for a in where["artifacts"] if a["role"] == role)["model"], FABLE
+                    next(a for a in where["artifacts"] if a["role"] == role)["model"], required
                 )
-                # Sonnet cannot take the role over, whatever status it reports
-                for status in ("pass", "unavailable", "error"):
-                    self.record_refused(role, status, model="sonnet")
+                # a weaker model cannot take the role over, whatever status it reports (tester: the
+                # policy is the weakest model, nothing is weaker); the model is always named on high
+                if role == "coder":
+                    for status in ("pass", "unavailable", "error"):
+                        self.record_refused(role, status, model="sonnet")
                 self.record_refused(role, "unavailable")
                 self.assertEqual(self.entry()["results"][role]["status"], "unavailable")
 
@@ -4551,9 +4565,9 @@ class HighRiskModels(PolicyBase):
         self.assertEqual(raised["status"], "in_progress")
         where = self.where()
         self.assertEqual((where["step"], where["role"]), (4, "coder"))
-        self.assertIn(FABLE, where["next_action"])
+        self.assertIn(OPUS, where["next_action"])
         self.assertIn(SONNET, where["next_action"])
-        # redoing the roles on Fable and adding both verified reviews and the final check makes it ready again
+        # redoing the roles on Fable (not weaker than the policy) and adding both verified reviews and the final check makes it ready again
         self.code_and_test()
         self.assertEqual(self.where()["role"], "cross_provider_reviewer")  # recorded without a verified report
         self.review("cross_provider_reviewer", "claude-host")
@@ -4582,7 +4596,7 @@ class HighRiskReviews(PolicyBase):
             self.assertEqual(stored["packet_hash"], self.packet_hash)
         where = self.where()
         self.assertEqual((where["step"], where["role"]), (7, "github_codex_review"))
-        self.assertEqual(where["review_policy"], {"version": "1.2.4", "level": "high"})
+        self.assertEqual(where["review_policy"], {"version": "1.4.0", "level": "high"})
         self.assertEqual({a["role"]: a["profile"] for a in where["artifacts"]},
                          {"coder": None, "tester": None, "internal_reviewer": None,
                           "cross_provider_reviewer": "claude-host", "second_reviewer": "codex-host",
@@ -4897,7 +4911,7 @@ class HighRiskReviews(PolicyBase):
         self.assertEqual(self.resume()["invalidated_tasks"], ["t1"])
         self.assertEqual(self.entry()["risk"], "high")
         self.assertEqual(self.where()["risk"], "high")
-        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["model"], FABLE)
+        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["model"], OPUS)
         self.record_refused("coder", model="sonnet")
         self.refused("task-risk", "--task", "t1", "--risk", "medium")
 
@@ -5072,6 +5086,7 @@ class HighRiskReviews(PolicyBase):
         value = self.data()
         value["version"] = 1
         del value["review_policy"]
+        del value["role_models"]
         del value["tasks"]["t1"]["risk"]
         self.manifest.write_text(json.dumps(value), encoding="utf-8")
         self.refused("where", needle="version 2")
@@ -5513,11 +5528,11 @@ class W2GateRules(PolicyBase):
                 problems = self.problems(plan, forged)
                 self.assert_reason(problems, "t1", "не подтверждён пересчётом")
                 self.assert_reason(problems, "t1", "нет second_reviewer на HEAD PR")
-        # models: a coder that did not run on Fable is caught by the same rules of state.py
+        # models: a coder below the role policy (Opus on high, 1.4.0) is caught by the same rules of state.py
         self.init()
         self.two_reviews()
         weak = self.forge(lambda v: v["tasks"]["t1"]["results"]["coder"].__setitem__("model", SONNET))
-        self.assert_reason(self.problems(HIGH_WAVE, weak), "t1", "coder", FABLE)
+        self.assert_reason(self.problems(HIGH_WAVE, weak), "t1", "coder", OPUS)
 
     def test_gate_catches_a_manifest_lowered_from_version_2_to_1(self):
         self.code_and_test()
@@ -5526,6 +5541,7 @@ class W2GateRules(PolicyBase):
         def lower(value):
             value["version"] = 1
             del value["review_policy"]
+            value.pop("role_models", None)
             value["tasks"]["t1"]["status"] = "ready_for_pr_review"
         lowered = self.forge(lower)
         for plan in (HIGH_WAVE, MEDIUM_WAVE, None):
@@ -5809,18 +5825,24 @@ class W3FableRoles(PolicyBase):
     since the review policy 1.2.4 (W4MandatoryFableRoles, W4GateRoles)."""
 
     def way_out(self, role):
-        return f"task-result --role {role} --status unavailable --model fable"
+        return f"task-result --role {role} --status unavailable --model {OPUS}"
 
-    def test_fable_roles_require_the_fable_model_at_any_status_and_any_risk(self):
+    def test_fable_roles_require_the_policy_model_at_any_status_and_any_risk(self):
+        """1.4.0: the five subagent roles run on the role policy (Opus by default) or a stronger model;
+        Fable stays acceptable. The model is named at any status and any risk."""
         for risk in ("low", "high"):
             self.init(risk=risk)
             for role in FABLE_ROLES:
                 for status in ("pass", "findings", "unavailable"):
                     with self.subTest(risk=risk, role=role, status=status, model=None):
                         self.record_refused(role, status, needle=self.way_out(role))
-                for model in ("sonnet", SONNET, "Fable", "fable ", "claude-opus-5-5"):
+                for model in ("sonnet", SONNET, "Fable", "fable ", "Opus", "claude-opus"):
                     with self.subTest(risk=risk, role=role, model=model):
                         self.record_refused(role, model=model, needle=self.way_out(role))
+                with self.subTest(risk=risk, role=role, model="opus"):
+                    self.assertEqual(self.record(role, model="opus")["results"][role]["model"], OPUS)
+                    entry = self.record(role, "unavailable", model=OPUS)
+                    self.assertEqual(entry["results"][role]["model"], OPUS)
                 with self.subTest(risk=risk, role=role, model="fable"):
                     entry = self.record(role, model="fable")
                     self.assertEqual(entry["results"][role]["model"], FABLE)
@@ -6181,9 +6203,12 @@ class W4Base(PolicyBase):
 
     def policy(self, version):
         """The one documented hand edit of these tests: the version of the review policy. A manifest of
-        1.2.1-1.2.3 differs from a fresh `init` of 1.2.4 in this field alone (state.py 1.2.4 writes 1.2.4)."""
+        1.2.1-1.2.3 (or of 1.2.4-1.3.x) differs from a fresh `init` of 1.4.0 in this field and in having no
+        `role_models` (state.py before 1.4.0 never wrote it), so the field goes too."""
         value = self.data()
         value["review_policy"]["version"] = version
+        if version != "1.4.0":
+            value.pop("role_models", None)
         self.manifest.write_text(json.dumps(value), encoding="utf-8")
 
     def position(self):
@@ -6207,10 +6232,13 @@ class W4Base(PolicyBase):
 class W4MandatoryFableRoles(W4Base):
     """Acceptance 2-4: `internal_reviewer` and `final_check` in the readiness of a high-risk task."""
 
-    def test_init_writes_policy_1_2_4_and_older_policy_is_still_read(self):
-        self.assertEqual(self.data()["review_policy"], {"version": "1.2.4", "level": "high"})
-        self.assertEqual(self.where()["review_policy"], {"version": "1.2.4", "level": "high"})
+    def test_init_writes_policy_1_4_0_and_older_policies_are_still_read(self):
+        self.assertEqual(self.data()["review_policy"], {"version": "1.4.0", "level": "high"})
+        self.assertEqual(self.where()["review_policy"], {"version": "1.4.0", "level": "high"})
+        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["policy_version"], "1.4.0")
+        self.policy("1.2.4")
         self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["policy_version"], "1.2.4")
+        self.assertEqual(self.where()["review_policy"], {"version": "1.2.4", "level": "high"})
         self.policy("1.2.1")
         self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["policy_version"], "1.2.1")
         self.assertEqual(self.where()["review_policy"], {"version": "1.2.1", "level": "high"})
@@ -6313,7 +6341,7 @@ class W4MandatoryFableRoles(W4Base):
         for risk in ("medium", "low"):
             with self.subTest(risk=risk):
                 self.init(risk=risk)
-                self.assertEqual(self.data()["review_policy"], {"version": "1.2.4", "level": risk})
+                self.assertEqual(self.data()["review_policy"], {"version": "1.4.0", "level": risk})
                 self.record("coder")
                 self.record("tester")
                 self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
@@ -6676,7 +6704,8 @@ class W4MandatoryFableRoles(W4Base):
         raised = self.ok("task-risk", "--task", "t1", "--risk", "high")
         self.assertEqual((raised["status"], raised["task_epoch"]), ("in_progress", 6))
         self.assertEqual(raised["results"]["final_check"]["after_epoch"], 5)  # stale: an older epoch
-        gap = _load("superarmanda_state_for_epoch", STATE).final_check_gap(raised, raised["results"])
+        module = _load("superarmanda_state_for_epoch", STATE)
+        gap = module.final_check_gap(raised, raised["results"], module.role_models(self.data()))
         self.assertIn(self.EPOCH_REASON, gap)
 
     def test_final_check_without_after_epoch_or_with_a_bool_counter_is_not_counted(self):
@@ -6900,6 +6929,7 @@ class W4MandatoryFableRoles(W4Base):
         value = copy.deepcopy(good)
         value["version"] = 1
         del value["review_policy"]
+        del value["role_models"]
         self.manifest.write_text(json.dumps(value), encoding="utf-8")
         self.refused("where", needle="require manifest version 2")
 
@@ -7010,9 +7040,10 @@ class W4MandatoryFableRoles(W4Base):
         entry = self.record("coderabbit", "unavailable", task="t2")
         self.assertEqual(entry["external_review"]["role"], "coderabbit")
 
-    def test_records_of_the_mandatory_roles_count_only_with_the_fable_model(self):
+    def test_records_of_the_mandatory_roles_count_only_with_the_policy_model(self):
         """Internal review F2: like coder/tester of a high-risk task, a final_check and the internal review
-        credit count only with `model` claude-fable-5-1 (state.py never records them otherwise)."""
+        credit count only with a `model` not weaker than the role policy (1.4.0: claude-opus-5-5; state.py
+        never records them otherwise). Fable, recorded here, is not weaker."""
         self.built()
         entry = self.internal()
         self.assertEqual(entry["internal_review"]["model"], FABLE)
@@ -7032,7 +7063,7 @@ class W4MandatoryFableRoles(W4Base):
                 self.manifest.write_text(json.dumps(value), encoding="utf-8")
                 where = self.where()
                 self.assertNotIn("done", where["next_action"])
-                self.assertIn(FABLE, where["next_action"])
+                self.assertIn(OPUS, where["next_action"])
                 self.assertEqual(where["role"], "final_check" if "final_check" in label else "internal_reviewer")
 
     # ----- acceptance 4 -----
@@ -7176,9 +7207,9 @@ class W4GateRoles(W4Base):
         cases["external_review without head"] = (lambda t: t.update(external_review={"role": "coderabbit"}),
                                                  "internal_reviewer", "новый прогон волны")
         cases["final_check without model"] = (lambda t: t["results"]["final_check"].pop("model"), "final_check",
-                                              "claude-fable-5-1")
+                                              "claude-opus-5-5")
         cases["final_check on sonnet"] = (lambda t: t["results"]["final_check"].update(model="claude-sonnet-5-5"),
-                                          "final_check", "claude-fable-5-1")
+                                          "final_check", "claude-opus-5-5")
         cases["credit without model"] = (lambda t: t["internal_review"].pop("model"), "internal_reviewer",
                                          "новый прогон волны")
         for label, (edit, role, action) in cases.items():
@@ -7645,6 +7676,305 @@ class W4GateRoles(W4Base):
         problems = self.problems(HIGH_PLAN)
         self.assert_reason(problems, "1.2.1", "новый прогон волны")
         self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "fail")
+
+
+OPUS = "claude-opus-5-5"
+SUBAGENT_ROLES = ("architect", "internal_reviewer", "triage", "investigator", "final_check")
+POLICY_ROLES = ("coder", "tester") + SUBAGENT_ROLES
+DEFAULT_ROLE_MODELS_1_4_0 = {
+    "coder": {"low": SONNET, "medium": SONNET, "high": OPUS},
+    "tester": {"low": SONNET, "medium": SONNET, "high": SONNET},
+    **{role: {"low": OPUS, "medium": OPUS, "high": OPUS} for role in SUBAGENT_ROLES},
+}
+
+
+class RolePolicy140(W4Base):
+    """Review policy 1.4.0 (#108, variant B): the model of a role comes from the role policy of the
+    manifest (`role_models`, built-in defaults raised only at init), Fable is no longer required of any
+    executing role and is accepted everywhere as «not weaker than the policy»."""
+
+    def setUp(self):
+        super().setUp()
+        self.gate = _load("superarmanda_gate_for_policy_140", GATE)
+
+    def run_state(self, command, *args, env=None):
+        environment = os.environ.copy()
+        environment.pop("SUPERARMANDA_ROLE_MODELS", None)
+        environment.update(env or {})
+        return subprocess.run(
+            ["python3", str(STATE), command, "--manifest", str(self.manifest), *map(str, args)],
+            text=True, capture_output=True, env=environment,
+        )
+
+    def init_with(self, *extra, env=None, risk="high", check=True):
+        self.manifest.unlink(missing_ok=True)
+        proc = self.run_state("init", "--repo", self.repo, "--base", self.base, "--head", self.head(),
+                              "--run-id", "policy", "--risk", risk, *extra, env=env)
+        if check:
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc
+
+    def init_refused(self, *extra, env=None, needle=None):
+        proc = self.init_with(*extra, env=env, check=False)
+        self.assertNotEqual(proc.returncode, 0, f"init {extra} {env} was accepted")
+        self.assertFalse(self.manifest.exists(), "a refused init must not write a manifest")
+        if needle is not None:
+            self.assertIn(needle, proc.stderr)
+        return proc
+
+    def gate_problems(self, plan=None):
+        value = self.data()
+        args = (value, value["head"], value["tree_fingerprint"])
+        return self.gate.manifest_problems(*args) if plan is None else self.gate.manifest_problems(*args, plan=plan)
+
+    def legacy(self, version="1.2.4"):
+        """A manifest of 1.2.x/1.3.x: no `role_models`, an older review policy."""
+        value = self.data()
+        value.pop("role_models")
+        value["review_policy"]["version"] = version
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+
+    # ----- init and the manifest -----
+    def test_init_writes_policy_1_4_0_and_the_full_default_role_models(self):
+        data = self.data()
+        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["review_policy"], {"version": "1.4.0", "level": "high"})
+        self.assertEqual(data["role_models"], DEFAULT_ROLE_MODELS_1_4_0)
+        self.assertNotIn("coordinator", data["role_models"])
+
+    def test_role_model_answers_every_policy_role_with_tester_effort_by_risk(self):
+        for level in ("low", "medium", "high"):
+            self.init_with(risk=level)
+            before = self.manifest.read_bytes()
+            for role in POLICY_ROLES:
+                with self.subTest(level=level, role=role):
+                    answer = self.ok("role-model", "--task", "t1", "--role", role)
+                    expected = {"task": "t1", "role": role, "risk": level,
+                                "model": DEFAULT_ROLE_MODELS_1_4_0[role][level], "policy_version": "1.4.0"}
+                    if role == "tester":
+                        expected["effort"] = "high" if level == "high" else "medium"
+                    self.assertEqual(answer, expected)
+            self.assertEqual(self.manifest.read_bytes(), before, "role-model is read-only")
+        self.refused("role-model", "--task", "t1", "--role", "coordinator")
+        self.refused("role-model", "--task", "t1", "--role", "second_reviewer")
+
+    # ----- task-result: not weaker than the policy -----
+    def test_coder_high_accepts_opus_and_refuses_sonnet(self):
+        self.assertEqual(self.record("coder", model="opus")["results"]["coder"]["model"], OPUS)
+        self.assertEqual(self.record("coder", model=OPUS)["results"]["coder"]["model"], OPUS)
+        for weaker in ("sonnet", SONNET, None):
+            with self.subTest(model=weaker):
+                self.record_refused("coder", model=weaker, needle=OPUS)
+                self.record_refused("coder", "unavailable", model=weaker)
+        for wrong in ("Opus", "opus ", "claude-opus", "claude-opus-5", OPUS + "-x", ""):
+            with self.subTest(model=wrong):
+                self.record_refused("coder", model=wrong)
+
+    def test_tester_high_accepts_sonnet(self):
+        entry = self.record("tester", model="sonnet")
+        self.assertEqual(entry["results"]["tester"]["model"], SONNET)
+        self.record_refused("tester")  # a high-risk task still names the model
+
+    def test_fable_is_accepted_for_every_policy_role_at_every_risk(self):
+        for level in ("low", "medium", "high"):
+            self.init_with(risk=level)
+            for role in POLICY_ROLES:
+                with self.subTest(level=level, role=role):
+                    entry = self.record(role, model="fable")
+                    self.assertEqual(entry["results"][role]["model"], FABLE)
+
+    def test_subagent_roles_run_on_opus_by_default_and_refuse_sonnet_or_no_model(self):
+        for level in ("low", "high"):
+            self.init_with(risk=level)
+            for role in SUBAGENT_ROLES:
+                with self.subTest(level=level, role=role):
+                    self.assertEqual(self.record(role, model="opus")["results"][role]["model"], OPUS)
+                    self.record_refused(role, model="sonnet", needle=OPUS)
+                    self.record_refused(role)
+
+    def test_unavailable_is_recorded_with_the_policy_model_and_is_no_pass(self):
+        entry = self.record("coder", "unavailable", model="opus")
+        self.assertEqual((entry["results"]["coder"]["model"], entry["status"]), (OPUS, "in_progress"))
+        self.assertTrue(self.where()["next_action"].startswith("BLOCKED"))
+        self.record("coder", model="opus")
+        self.record("tester", model="sonnet")
+        entry = self.record("internal_reviewer", "unavailable", model="opus")
+        self.assertEqual(entry["results"]["internal_reviewer"]["model"], OPUS)
+        self.reviews()
+        self.final()
+        self.assertNotEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertIn("internal_reviewer", " ".join(self.gate_problems(HIGH_PLAN)))
+
+    # ----- readiness of a high-risk task -----
+    def test_high_task_is_ready_with_coder_opus_tester_sonnet_and_both_reviews(self):
+        self.record("coder", model="opus")
+        self.record("tester", model="sonnet")
+        self.record("internal_reviewer", model="opus")
+        self.reviews()
+        self.ready_after_final_check_on("opus")
+        self.assertEqual(self.gate_problems(HIGH_PLAN), [])
+        self.assertEqual(self.gate_problems(), [])
+
+    def ready_after_final_check_on(self, model):
+        self.assertEqual(self.entry()["status"], "in_progress")
+        self.assertEqual(self.position(), (7, "final_check"))
+        entry = self.record("final_check", model=model)
+        self.assertEqual(entry["status"], "ready_for_pr_review")
+        self.assert_ready()
+
+    def test_a_weaker_result_recorded_below_high_takes_readiness_away_after_a_raise(self):
+        self.init_with(risk="medium")
+        self.record("coder", model="sonnet")
+        self.record("tester")
+        self.record("internal_reviewer", model="opus")
+        self.review("cross_provider_reviewer", "claude-host")
+        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertEqual(self.ok("task-risk", "--task", "t1", "--risk", "high")["status"], "in_progress")
+        action = self.where()["next_action"]
+        self.assertEqual(self.position(), (4, "coder"))
+        self.assertIn(OPUS, action)
+        self.assertIn(SONNET, action)
+        self.record("coder", model="opus")
+        self.record("tester", model="sonnet")
+        self.review("cross_provider_reviewer", "claude-host")
+        self.review("second_reviewer", "codex-host")
+        self.ready_after_final_check_on("opus")
+
+    def test_internal_and_final_check_count_on_opus_and_not_on_a_weaker_record(self):
+        self.record("coder", model="opus")
+        self.record("tester", model="sonnet")
+        self.record("internal_reviewer", model="opus")
+        self.reviews()
+        self.record("final_check", model="fable")
+        self.assert_ready()
+
+    # ----- overrides at init -----
+    def test_flag_override_is_written_and_kept_through_resume_and_env_changes(self):
+        self.init_with("--role-model", "coder.medium=opus", "--role-model", "final_check.high=fable",
+                       risk="medium")
+        expected = copy.deepcopy(DEFAULT_ROLE_MODELS_1_4_0)
+        expected["coder"]["medium"] = OPUS
+        expected["final_check"]["high"] = FABLE
+        self.assertEqual(self.data()["role_models"], expected)
+        self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["model"], OPUS)
+        # the raised requirement is enforced: Sonnet and a missing model are refused below high too
+        self.record_refused("coder", model="sonnet", needle=OPUS)
+        self.record_refused("coder")
+        self.record("coder", model="opus")
+        # the table is fixed at init: neither resume nor a later environment changes it
+        self.change("next\n")
+        proc = self.run_state("resume", "--repo", self.repo, "--base", self.base, "--head", self.head(),
+                              env={"SUPERARMANDA_ROLE_MODELS": json.dumps({"coder": "fable"})})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.data()["role_models"], expected)
+        proc = self.run_state("task-result", *self.result_args("coder", model="opus"),
+                              env={"SUPERARMANDA_ROLE_MODELS": json.dumps({"coder": "fable"})})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.data()["role_models"], expected)
+
+    def test_env_override_is_written_and_merged_with_flags_by_key(self):
+        env = {"SUPERARMANDA_ROLE_MODELS": json.dumps({"coder": "opus", "tester.high": "opus"})}
+        self.init_with(env=env)
+        expected = copy.deepcopy(DEFAULT_ROLE_MODELS_1_4_0)
+        expected["coder"] = {"low": OPUS, "medium": OPUS, "high": OPUS}
+        expected["tester"]["high"] = OPUS
+        self.assertEqual(self.data()["role_models"], expected)
+        # a flag refines one key; the rest of the environment stays
+        self.init_with("--role-model", "coder.high=fable", env=env)
+        expected["coder"]["high"] = FABLE
+        self.assertEqual(self.data()["role_models"], expected)
+        self.record_refused("tester", model="sonnet", needle=OPUS)
+
+    def test_override_below_the_default_is_refused(self):
+        for flags, env in (
+            (["--role-model", "coder.high=sonnet"], None),
+            (["--role-model", "coder=sonnet"], None),
+            (["--role-model", "internal_reviewer.low=sonnet"], None),
+            (["--role-model", "final_check=sonnet"], None),
+            ([], {"SUPERARMANDA_ROLE_MODELS": json.dumps({"architect": "sonnet"})}),
+            ([], {"SUPERARMANDA_ROLE_MODELS": json.dumps({"coder.high": "sonnet"})}),
+        ):
+            with self.subTest(flags=flags, env=env):
+                self.init_refused(*flags, env=env, needle="below")
+
+    def test_unknown_role_risk_model_coordinator_and_malformed_input_are_refused(self):
+        for flags, env in (
+            (["--role-model", "coordinator=fable"], None),
+            (["--role-model", "coordinator.high=opus"], None),
+            ([], {"SUPERARMANDA_ROLE_MODELS": json.dumps({"coordinator": "opus"})}),
+            (["--role-model", "reviewer=opus"], None),
+            (["--role-model", "second_reviewer=fable"], None),
+            (["--role-model", "coder.urgent=opus"], None),
+            (["--role-model", "coder.high.x=opus"], None),
+            (["--role-model", "coder.high=gpt-6-astra"], None),
+            (["--role-model", "coder.high=Opus"], None),
+            (["--role-model", "coder.high"], None),
+            (["--role-model", "=opus"], None),
+            (["--role-model", "coder.high="], None),
+            (["--role-model", "coder.high=opus", "--role-model", "coder.high=fable"], None),
+            ([], {"SUPERARMANDA_ROLE_MODELS": "not json"}),
+            ([], {"SUPERARMANDA_ROLE_MODELS": json.dumps(["coder.high", "opus"])}),
+            ([], {"SUPERARMANDA_ROLE_MODELS": json.dumps({"coder.high": 1})}),
+            ([], {"SUPERARMANDA_ROLE_MODELS": json.dumps({"tester.high": "gpt-6-astra"})}),
+        ):
+            with self.subTest(flags=flags, env=env):
+                proc = self.init_refused(*flags, env=env)
+                if "coordinator" in json.dumps([flags, env]):
+                    self.assertIn("coordinator", proc.stderr)
+
+    def test_hand_edited_role_models_are_a_closed_refusal(self):
+        good = self.data()
+
+        def broken(change):
+            value = copy.deepcopy(good)
+            change(value)
+            return value
+
+        cases = {
+            "weakened cell": broken(lambda v: v["role_models"]["coder"].update(high=SONNET)),
+            "alias instead of an id": broken(lambda v: v["role_models"]["coder"].update(high="opus")),
+            "unknown model": broken(lambda v: v["role_models"]["tester"].update(high="gpt-6-astra")),
+            "missing role": broken(lambda v: v["role_models"].pop("triage")),
+            "missing risk": broken(lambda v: v["role_models"]["coder"].pop("low")),
+            "coordinator": broken(lambda v: v["role_models"].update(coordinator={"low": OPUS, "medium": OPUS, "high": OPUS})),
+            "not an object": broken(lambda v: v.update(role_models="opus")),
+            "older policy with role_models": broken(lambda v: v["review_policy"].update(version="1.2.4")),
+            "v1 with role_models": broken(lambda v: (v.update(version=1), v.pop("review_policy"))),
+        }
+        for label, value in cases.items():
+            self.manifest.write_text(json.dumps(value), encoding="utf-8")
+            for command, args in (("where", []), ("role-model", ["--task", "t1", "--role", "coder"]),
+                                  ("task-result", self.result_args("coder", model="fable"))):
+                with self.subTest(case=label, command=command):
+                    self.refused(command, *args)
+            with self.subTest(case=label, command="gate"):
+                self.assertTrue(self.gate_problems(HIGH_PLAN))
+
+    # ----- compatibility: manifests without role_models -----
+    def test_legacy_manifest_is_judged_by_the_1_4_0_defaults(self):
+        for version in ("1.2.4", "1.4.0"):
+            with self.subTest(policy=version):
+                self.init_with()
+                self.legacy(version)
+                self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "coder")["model"], OPUS)
+                self.assertEqual(self.ok("role-model", "--task", "t1", "--role", "final_check")["model"], OPUS)
+                self.record_refused("coder", model="sonnet")
+                self.record("coder", model="opus")
+                self.record("tester", model="sonnet")
+                self.record("internal_reviewer", model="opus")
+                self.reviews()
+                self.ready_after_final_check_on("opus")
+                self.assertNotIn("role_models", self.data())
+                self.assertEqual(self.gate_problems(HIGH_PLAN), [])
+
+    def test_legacy_fable_records_stay_valid(self):
+        self.legacy()
+        self.built()  # coder and tester on Fable, as 1.3.0 recorded them
+        self.internal()
+        self.reviews()
+        self.final()
+        self.assert_ready()
+        self.assertEqual(self.gate_problems(HIGH_PLAN), [])
 
 
 if __name__ == "__main__":

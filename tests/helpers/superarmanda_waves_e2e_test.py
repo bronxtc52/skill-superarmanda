@@ -909,7 +909,7 @@ def oracle_wave_risk(run):
         manifests[wave] = json.loads(Path(runs[-1]["manifest"]).read_text(encoding="utf-8"))
         m = manifests[wave]
         must((m["version"], m["review_policy"], m["plan"]["sha256"])
-             == (2, {"version": "1.2.4", "level": WAVE_RISK[wave]}, w.plan_sha256),
+             == (2, {"version": "1.4.0", "level": WAVE_RISK[wave]}, w.plan_sha256),
              f"{wave}: manifest policy {m.get('version')}/{m.get('review_policy')}")
     results = manifests["W1"]["tasks"]["T1"]["results"]
     reviews = {role: results.get(role) or {} for role in ("cross_provider_reviewer", "second_reviewer")}
