@@ -15970,6 +15970,8 @@ def _allow(file, func, why, *exprs):
 
 
 _allow("wab.py", "_text_head", _LOGIC, "s[:n]")
+_allow("wab.py", "fable_blocked_note", "the answer to a BLOCKED carried into the switch message typed into the wave's own tmux window (#110): cut at FABLE_BLOCKED_ANSWER_CHARS and marked with «…»; never an outside text",
+       "text[:FABLE_BLOCKED_ANSWER_CHARS]")
 _allow("wab.py", "unsent_reason", _LOGIC, "rest[:k]", "head[:k]")
 _allow("wab.py", "_undimmed", _LOGIC, "line[pos:m.start()]")
 _allow("wab.py", "sub", "_LinearEmail.sub() is re.sub of the e-mail rule: it joins the text between its matches back whole, "
@@ -19077,13 +19079,11 @@ class Release140(unittest.TestCase):
 
     def section(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.0 — 2026-10-10$", "1.4.0 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.4\.0 — 2026-10-10$", "CHANGELOG.md: the section of 1.4.0")
         self.assertTrue(log.index("## 1.4.0") < log.index("## 1.3.0"), "1.4.0 is above 1.3.0")
         return re.search(r"(?ms)^## 1\.4\.0 — 2026-10-10\n(.*?)(?=^## )", log).group(1)
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.0"\s*$')
+    # the version of SKILL.md moved on to 1.4.1 (#110): Release141 pins it
 
     def test_changelog_names_the_issue_the_decision_and_the_boundary(self):
         body = self.section()
@@ -19107,6 +19107,26 @@ class Release140(unittest.TestCase):
         self.assertNotIn('"model": "claude-fable-5-1"', (refs / "waves.md").read_text(encoding="utf-8"))
         self.assertNotRegex((refs / "role-briefs.md").read_text(encoding="utf-8"), r"(?m)^model: fable$")
         self.assertIn("остаток Fable", (refs / "waves.md").read_text(encoding="utf-8"))
+
+
+class Release141(unittest.TestCase):
+    """The release 1.4.1 (#110): version, the CHANGELOG section on top, the paragraph of waves.md, the renamed row."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.1"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.1 — 2026-10-10$", "1.4.1 is the first section")
+        body = re.search(r"(?ms)^## 1\.4\.1 — 2026-10-10\n(.*?)(?=^## )", log).group(1)
+        for needle in ("#110", "### Исправлено", "`BLOCKED`", "`fable_switch.blocked`"):
+            self.assertIn(needle, body)
+
+    def test_waves_doc(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        self.assertIn("**Лимит после ответа на `BLOCKED` (1.4.1, #110).**", waves)
+        self.assertNotIn("| Обязательные Fable-роли задачи high", waves)
 
 
 class Packaging(unittest.TestCase):

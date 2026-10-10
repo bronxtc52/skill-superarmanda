@@ -1113,10 +1113,14 @@ _CLEAR_SCAFFOLD = re.compile(
     r"\s*<command-args>\s*</command-args>)\s*", re.S)
 
 
+# lines Claude Code writes itself as a user message: an interrupt (Esc) and slash commands with their output
+_NOT_AN_ANSWER = re.compile(r"\[Request interrupted|<command-(?:name|message|args)>|<local-command-")
+
+
 def _user_texts_since(path, since, tail=ANSWER_TAIL_BYTES):
     """Texts of the main-thread user messages newer than `since` (epoch seconds) in the last `tail` bytes of a
     journal, in order (#110: the answer to a BLOCKED). tool_result blocks, sidechain and isMeta lines, the /clear
-    scaffolding and lines without a readable time do not count."""
+    scaffolding, an interrupt, slash commands and lines without a readable time do not count."""
     try:
         with open(path, "rb") as fh:
             size = fh.seek(0, os.SEEK_END)
@@ -1124,11 +1128,8 @@ def _user_texts_since(path, since, tail=ANSWER_TAIL_BYTES):
             data = fh.read()
     except OSError:
         return []
-    lines = data.split(b"\n")
-    if size > tail:
-        lines.pop(0)  # cut mid-line
     out = []
-    for raw in lines:
+    for raw in data.split(b"\n"):  # a line cut by the tail is not JSON and drops out here
         try:
             d = json.loads(raw)
         except ValueError:
@@ -1142,7 +1143,8 @@ def _user_texts_since(path, since, tail=ANSWER_TAIL_BYTES):
         if isinstance(content, list):
             content = "\n".join(c["text"] for c in content
                                 if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str))
-        if isinstance(content, str) and content.strip() and not _CLEAR_SCAFFOLD.fullmatch(content):
+        if (isinstance(content, str) and content.strip() and not _CLEAR_SCAFFOLD.fullmatch(content)
+                and not _NOT_AN_ANSWER.match(content.strip())):
             out.append(content.strip())
     return out
 
@@ -4504,8 +4506,9 @@ def fable_limit_hit(cfg, w):
 
 def fable_limit_after_blocked(cfg, wave, w):
     """#110: the limit of a Fable wave whose status file says BLOCKED. Fresh only when the newest limit line of
-    the current session is newer than the status file: the wave got an answer, went on and was refused. A wave
-    that only waits for the owner calls nobody, so it is never switched; a limit line without a time is not
+    the current session is newer than the status file: the wave got an answer, went on and was refused, or its
+    very turn after writing BLOCKED was refused (the window is out of Fable either way). A wave that waits for the
+    owner calls nobody, so no new limit line appears and it is not switched; a limit line without a time is not
     fresh either (fail safe: the owner sees the idle wave, as before). Returns the status file's mtime, or None."""
     if not fable_limit_hit(cfg, w):
         return None
@@ -4581,6 +4584,17 @@ def begin_fable_switch(cfg, st, wave, w, blocked=None):
     w["fable_switch"] = {"sid": str(uuid.uuid4()), "step": "closing", "from": (w.get("sessions") or [None])[-1]}
     if blocked:
         w["fable_switch"]["blocked"] = blocked
+        # the BLOCKED line the switch came from is handled: its answer (or the request to ask again) goes into
+        # the Opus session; neither the policy nor the owner's notice take this line up again (reviewer on #110)
+        w["fable_blocked_episode"] = {"status": blocked["status"], "stamp": blocked.get("stamp")}
+        what = w.get("pending_enter")
+        if what == "policy answer":  # typed, Enter unconfirmed: it may have been submitted — never one free
+            w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
+            if "policy_key_pending" in w:
+                _keep_fork_key(w)
+        w.pop("policy_pending", None)
+        if what == "gate failure" and isinstance(w.get("gate_fail_msg"), dict):
+            w["gate_fail_msg"]["sent"] = True  # possibly delivered (then it is in the carried answer): not resent
     w["phase"] = "switching"
     save_state(cfg, st)
     event(cfg, f"fable limit: {wave} → relaunch on {FABLE_SWITCH_TO}")
@@ -6346,6 +6360,7 @@ def _tick(cfg, st):
     w.setdefault("sessions", [])
     name, wdir = w["tmux"], wave_dir(cfg, wave)
     status = read(wdir / "status", on_error=None)
+    read_ok = bool(status)  # False: unreadable or empty mid-rewrite, decided on the last known status below
     if status is None:  # unreadable: decide on the last known status, one event per episode
         if once_per(w, "status_unreadable", "1"):
             event(cfg, f"{wave}: status unreadable ({wdir / 'status'}), keeping «{w.get('last_status', '')}»")
@@ -6441,6 +6456,15 @@ def _tick(cfg, st):
         advance_pending(cfg, st)
         return True
 
+    episode = w.get("fable_blocked_episode")
+    if episode is not None:  # #110: the BLOCKED line the switch to Opus came from
+        same = isinstance(episode, dict) and episode.get("status") == status
+        if same and (not read_ok or episode.get("stamp") == _status_stamp(cfg, wave)):
+            save_state(cfg, st)
+            return True  # handed to the Opus session: no policy answer, no notice, no gate failure for it again
+        w.pop("fable_blocked_episode")  # the wave wrote another line (or the same one anew): a new episode
+        save_state(cfg, st)
+
     if w.get("pending_clear"):
         _settle_clear(cfg, st, wave, w)  # an earlier clearing that the screen did not confirm: again
 
@@ -6473,7 +6497,8 @@ def _tick(cfg, st):
     if status.startswith("BLOCKED") and w.get("phase") in ("running", "checkpoint") and not w.get("await_session"):
         since = fable_limit_after_blocked(cfg, wave, w)  # #110: answered, went on, refused — not a wait
         if since is not None:
-            begin_fable_switch(cfg, st, wave, w, blocked={"status": status, "since": since})
+            begin_fable_switch(cfg, st, wave, w,
+                               blocked={"status": status, "since": since, "stamp": _status_stamp(cfg, wave)})
             return _fable_switch_tick(cfg, st, wave, w)
 
     answered = _policy_answer(cfg, st, wave, w, status, now, attach) if status.startswith("BLOCKED") else False
