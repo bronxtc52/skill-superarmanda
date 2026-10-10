@@ -536,6 +536,273 @@ class FableSwitchMessage(FableLimitBase):
         self.assertNotIn("--manifest", text)
 
 
+
+def user_line(text, timestamp, side=False, content=None):
+    """The live typed-user line of `first-session-head.jsonl` (Claude Code 2.1.289) with its text and time set."""
+    for raw in FIXTURES.joinpath("first-session-head.jsonl").read_text(encoding="utf-8").splitlines():
+        d = json.loads(raw) if raw.strip() else None
+        if isinstance(d, dict) and d.get("type") == "user":
+            break
+    else:
+        raise AssertionError("first-session-head.jsonl has no user line")
+    d["message"]["content"] = content if content is not None else text
+    d["timestamp"] = timestamp
+    d["isSidechain"] = side
+    return json.dumps(d, ensure_ascii=False)
+
+
+def at(iso):
+    return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+class FableLimitWhileBlocked(FableLimitBase):
+    """#110 (Codex P2 on #109): the wave on Fable got an answer to its BLOCKED (the owner in the window, the
+    decision policy, a merge gate failure), went on working and hit the limit while the status file still says
+    BLOCKED. The limit is fresh when its line is newer than the BLOCKED line of the status file; the answer
+    typed after the BLOCKED goes into the message of the Opus session (the new session does not see the old
+    journal). A wave that only waits for the owner calls nobody: no fresh limit, no switch."""
+
+    BLOCKED = "BLOCKED: выбрать вариант A или B"
+    LIMIT_AT = "2026-10-10T10:00:00.000Z"  # the time limit_lines() puts in the live rate-limit line
+
+    def blocked_wave(self, lines, blocked_at="2026-10-10T09:00:00.000Z"):
+        self.setup_wave(lines=lines)
+        self.set_status(self.cfg, "W1", self.BLOCKED)
+        status = wab.wave_dir(self.cfg, "W1") / "status"
+        os.utime(status, (at(blocked_at), at(blocked_at)))
+
+    def switch_text(self):
+        texts = [s[2] for s in self.sent if s[0] == "text" and SWITCH_NOTE in s[2]]
+        self.assertEqual(len(texts), 1, self.sent)
+        return texts[0]
+
+    def test_limit_after_an_answer_switches_and_carries_the_answer(self):
+        self.blocked_wave([user_line("Ответ владельца: вариант B", "2026-10-10T09:30:00.000Z"),
+                           limit_lines()[0]])
+        self.assertTrue(self.tick())
+        w = self.w()
+        self.assertEqual(w["model_override"], OPUS)
+        self.assertEqual(w["fable_switches"], 1)
+        self.assertEqual(len(self.new_sessions()), 1)
+        text = self.switch_text()
+        self.assertIn("Ответ владельца: вариант B", text)
+        self.assertIn(self.BLOCKED, text)
+        self.assertIn(wab.session_marker(self.cfg, "W1"), text)
+        self.assertIn("fable limit: W1 → relaunch on claude-opus-5-5", self.events())
+
+    def test_waiting_for_the_owner_is_not_switched(self):
+        self.blocked_wave([user_line("ещё до вопроса", "2026-10-10T08:30:00.000Z")])
+        self.tick()
+        self.assertEqual(self.new_sessions(), [])
+        self.assertNotIn("model_override", self.w())
+
+    def test_an_answer_without_a_limit_is_not_switched(self):
+        self.blocked_wave([user_line("Ответ владельца: вариант B", "2026-10-10T09:30:00.000Z")])
+        self.tick()
+        self.assertEqual(self.new_sessions(), [])
+
+    def test_a_limit_older_than_the_blocked_line_is_not_switched(self):
+        self.blocked_wave(limit_lines()[:1], blocked_at="2026-10-10T11:00:00.000Z")
+        self.tick()
+        self.assertEqual(self.new_sessions(), [])
+
+    def test_a_limit_line_without_a_time_is_not_switched(self):
+        line = json.loads(limit_lines()[0])
+        line.pop("timestamp")
+        self.blocked_wave([json.dumps(line)])
+        self.tick()
+        self.assertEqual(self.new_sessions(), [])
+
+    def test_only_the_answers_after_the_blocked_line_are_carried(self):
+        self.blocked_wave([
+            user_line("до вопроса", "2026-10-10T08:30:00.000Z"),
+            user_line("субагент", "2026-10-10T09:20:00.000Z", side=True),
+            user_line("", "2026-10-10T09:25:00.000Z",
+                      content=[{"type": "tool_result", "tool_use_id": "t", "content": "вывод инструмента"}]),
+            user_line("Ответ: B", "2026-10-10T09:30:00.000Z"),
+            user_line("и ещё: без миграции", "2026-10-10T09:31:00.000Z"),
+            limit_lines()[0]])
+        self.tick()
+        text = self.switch_text()
+        self.assertIn("Ответ: B", text)
+        self.assertIn("и ещё: без миграции", text)
+        self.assertLess(text.index("Ответ: B"), text.index("и ещё: без миграции"))
+        for absent in ("до вопроса", "субагент", "вывод инструмента"):
+            self.assertNotIn(absent, text)
+
+    def test_no_answer_found_asks_the_question_again(self):
+        # the limit came after the BLOCKED line without a typed message in this journal (an answer the journal
+        # did not keep): the new session is told to ask again under a new line, so the owner is notified again
+        self.blocked_wave(limit_lines()[:1])
+        self.tick()
+        self.assertEqual(len(self.new_sessions()), 1)
+        text = self.switch_text()
+        self.assertIn(self.BLOCKED, text)
+        self.assertIn(wab.FABLE_BLOCKED_ASK_AGAIN, text)
+
+    def test_a_long_answer_is_cut(self):
+        self.blocked_wave([user_line("Я" * 20000, "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        self.tick()
+        self.assertLess(len(self.switch_text()), 20000)
+
+    def switched(self, lines):
+        self.blocked_wave(lines)
+        self.tick()
+        sid = self.w()["sessions"][-1]
+        self.assertNotEqual(sid, "s1")
+        self.transcript(sid, [asst(inp=10)], marker=wab.session_marker(self.cfg, "W1"))
+        return sid
+
+    def test_the_old_blocked_line_is_not_taken_up_again_after_the_switch(self):
+        # reviewer on #110: the status file still holds the old line while the Opus session reads its message
+        self.switched(limit_lines()[:1])
+        for _ in range(2):
+            self.tick()
+        w = self.w()
+        self.assertNotIn("blocked", w["notified"])  # no notice of the line handed to the Opus session
+        self.assertEqual(len(self.new_sessions()), 1)
+        self.assertEqual(w["fable_blocked_episode"]["status"], self.BLOCKED)
+
+    def test_the_line_asked_again_is_a_new_episode(self):
+        self.switched(limit_lines()[:1])
+        self.set_status(self.cfg, "W1", self.BLOCKED + " (повтор после смены модели)")
+        self.tick()
+        w = self.w()
+        self.assertNotIn("fable_blocked_episode", w)
+        self.assertIn("blocked", w["notified"])  # the owner is asked again
+
+    def test_the_same_line_written_anew_is_a_new_episode(self):
+        self.switched(limit_lines()[:1])
+        self.set_status(self.cfg, "W1", self.BLOCKED)
+        status = wab.wave_dir(self.cfg, "W1") / "status"
+        later = time.time() + 5
+        os.utime(status, (later, later))
+        self.tick()
+        self.assertNotIn("fable_blocked_episode", self.w())
+        self.assertIn("blocked", self.w()["notified"])
+
+    def test_the_same_line_anew_notifies_even_if_the_owner_was_notified_before(self):
+        # CodeRabbit on #111: the owner got the notice of the line before the limit; the dedup by text must not
+        # swallow the notice of the same line written anew by the Opus session
+        self.blocked_wave([user_line("Ответ: B", "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["notified"]["blocked"] = self.BLOCKED  # an earlier tick saw the line and told the owner
+        st["waves"]["W1"]["last_status"] = self.BLOCKED
+        wab.save_state(self.cfg, st)
+        self.tick()
+        self.transcript(self.w()["sessions"][-1], [asst(inp=10)], marker=wab.session_marker(self.cfg, "W1"))
+        self.set_status(self.cfg, "W1", self.BLOCKED)
+        later = time.time() + 5
+        os.utime(wab.wave_dir(self.cfg, "W1") / "status", (later, later))
+        with mock.patch.object(wab, "put_notice", wraps=wab.put_notice) as put:
+            self.tick()
+        self.assertIn("blocked", [c.args[3] for c in put.call_args_list])
+
+    def test_a_gate_failure_is_not_typed_into_the_refused_window(self):
+        # CodeRabbit on #111: the fresh limit is checked before the retry of a gate failure
+        self.BLOCKED = "BLOCKED: merge gate: CI красный"
+        self.blocked_wave([limit_lines()[0]])
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["gate_fail_msg"] = {"text": "сбой гейта: почини CI", "sent": False}
+        wab.save_state(self.cfg, st)
+        self.tick()
+        self.assertEqual(len(self.new_sessions()), 1)
+        self.assertFalse(any("сбой гейта" in str(x[2]) for x in self.sent if len(x) > 2), self.sent)
+
+    def test_a_status_rewritten_during_the_decision_defers_the_switch(self):
+        # Codex and CodeRabbit on #111: the text and the stamp of the switch are one write; a rewrite between the
+        # reads (here: the stamp moves after the first read) is not switched on this tick, but on the next one
+        self.blocked_wave([user_line("Ответ: B", "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        real, calls = wab._status_stamp, []
+
+        def racing(cfg, wave):
+            stamp = real(cfg, wave)
+            calls.append(stamp)
+            return stamp if len(calls) == 1 else [stamp[0], stamp[1] + 1]
+        with mock.patch.object(wab, "_status_stamp", side_effect=racing):
+            self.tick()
+        self.assertEqual(self.new_sessions(), [])
+        self.assertNotIn("fable_blocked_episode", self.w())
+        self.tick()  # stable now: switched, the episode is the write the decision was made on
+        self.assertEqual(len(self.new_sessions()), 1)
+        self.assertEqual(self.w()["fable_blocked_episode"]["stamp"],
+                         wab._status_stamp(self.cfg, "W1"))
+
+    def test_another_line_in_the_file_than_the_tick_read_defers_the_switch(self):
+        self.blocked_wave([user_line("Ответ: B", "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        real_read = wab.read
+
+        def other_text(path, *a, **kw):  # the tick read the BLOCKED line, the snapshot finds another one
+            text = real_read(path, *a, **kw)
+            other_text.n = getattr(other_text, "n", 0) + 1
+            return "BLOCKED: другой вопрос" if str(path).endswith("/status") and other_text.n > 1 else text
+        with mock.patch.object(wab, "read", side_effect=other_text):
+            self.tick()
+        self.assertEqual(self.new_sessions(), [])
+        self.assertNotIn("fable_blocked_episode", self.w())
+
+    def test_an_empty_status_mid_rewrite_keeps_the_episode(self):
+        self.switched(limit_lines()[:1])
+        (wab.wave_dir(self.cfg, "W1") / "status").write_text("", encoding="utf-8")
+        self.tick()
+        self.assertIn("fable_blocked_episode", self.w())
+        self.assertNotIn("blocked", self.w()["notified"])
+
+    def test_a_policy_answer_in_flight_is_charged_and_not_resent(self):
+        self.blocked_wave([user_line("ответ политики", "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"].update(pending_enter="policy answer", policy_pending=self.BLOCKED, auto_answers=1)
+        wab.save_state(self.cfg, st)
+        self.tick()
+        w = self.w()
+        self.assertEqual(w["auto_answers"], 2)
+        self.assertNotIn("policy_pending", w)
+        self.assertNotIn("pending_enter", w)
+
+    def test_a_gate_failure_in_flight_is_not_resent(self):
+        self.BLOCKED = "BLOCKED: merge gate: CI красный"
+        self.blocked_wave([limit_lines()[0]])
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"].update(pending_enter="gate failure", gate_fail_msg={"text": "сбой гейта", "sent": False})
+        wab.save_state(self.cfg, st)
+        with mock.patch.object(wab, "_deliver", return_value=False):  # Enter still not confirmed on this tick
+            self.tick()
+        self.assertTrue(self.w()["gate_fail_msg"]["sent"])
+        self.assertEqual(self.w()["phase"], "switching")
+
+    def test_a_watch_restart_mid_switch_still_carries_the_answer(self):
+        self.blocked_wave([user_line("Ответ: B", "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        with mock.patch.object(wab, "_fable_switch_tick", side_effect=_Crash):
+            with self.assertRaises(_Crash):
+                self.tick()
+        self.assertEqual(self.w()["phase"], "switching")
+        self.tick()  # a fresh watch carries the saved switch on
+        self.assertIn("Ответ: B", self.switch_text())
+
+    def test_service_lines_are_not_an_answer(self):
+        self.blocked_wave([user_line("[Request interrupted by user]", "2026-10-10T09:30:00.000Z"),
+                           user_line("<command-name>/compact</command-name>", "2026-10-10T09:31:00.000Z"),
+                           limit_lines()[0]])
+        self.tick()
+        text = self.switch_text()
+        self.assertIn(wab.FABLE_BLOCKED_ASK_AGAIN, text)
+        self.assertNotIn("Request interrupted", text)
+
+    def test_the_tail_read_drops_the_cut_first_line(self):
+        path = self.transcript("tail", [user_line("Я" * 3000, "2026-10-10T09:30:00.000Z"),
+                                        user_line("последний", "2026-10-10T09:31:00.000Z")])
+        size = path.stat().st_size
+        last = len(path.read_bytes().split(b"\n")[-2]) + 1
+        self.assertEqual(wab._user_texts_since(path, at("2026-10-10T09:00:00.000Z"), tail=last + 100), ["последний"])
+        self.assertEqual(len(wab._user_texts_since(path, at("2026-10-10T09:00:00.000Z"), tail=size)), 2)
+
+    def test_a_running_wave_switches_as_before(self):
+        self.setup_wave()  # RUNNING, limit line older than the status file: the 1.4.0 path, not this one
+        self.tick()
+        self.assertEqual(len(self.new_sessions()), 1)
+        self.assertNotIn("BLOCKED", self.switch_text())
+
+
 # ---------------------------------------------------------------- T5
 NOW = datetime.datetime(2026, 10, 10, 12, 0, 0, tzinfo=datetime.timezone.utc)
 W = fable_usage.WEIGHTS
