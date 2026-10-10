@@ -2190,7 +2190,7 @@ def put_notice(cfg, w, wave, key, value, **fields):
     started/tmux_failed -> window gone; permission/idle/auto_off -> window gone or their screen
     end (SCREEN_EPISODE_ENDS); not_ready, no_prompt,
     checkpoint_timeout, dead, handoff -> their phase is left; sending -> the wave wrote a status;
-    updating -> the new session is bound; blocked -> status not BLOCKED; done/no_next/
+    updating -> the new session is bound (a Fable switch: its step left `unconfirmed`); blocked -> status not BLOCKED; done/no_next/
     launch_refused -> ack only (`done` is information: it opens no ATTENTION, INFO_NOTICES);
     chain_done -> never).
     The caller saves it with the SAME save_state as the change it reports (the phase, the
@@ -2260,6 +2260,12 @@ WINDOW_GONE = ("dead", "done", "awaiting_merge")  # no live window of this wave 
 
 def _gone(w):
     return w.get("phase") in WINDOW_GONE
+
+
+def _switch_unconfirmed(w):
+    """A Fable switch (#108) whose resume message may or may not have reached the new session."""
+    sw = w.get("fable_switch")
+    return w.get("phase") == "switching" and isinstance(sw, dict) and sw.get("step") == "unconfirmed"
 
 
 def _status(w):
@@ -2363,7 +2369,7 @@ NOTICE_EPISODE_ENDS = {
     "not_ready": lambda w: w.get("phase") != "not_ready",
     "no_prompt": lambda w: w.get("phase") != "starting",
     "sending": lambda w: _gone(w) or _status(w) not in ("", "STARTING"),
-    "updating": lambda w: _gone(w) or not w.get("await_session"),
+    "updating": lambda w: _gone(w) or not (w.get("await_session") or _switch_unconfirmed(w)),
     "checkpoint_timeout": lambda w: w.get("phase") != "checkpoint",
     "tmux_failed": _gone,
     "unverified_enter": _gone,  # a delivery of an older-version state pressed Enter unverified
@@ -4499,17 +4505,31 @@ def _fable_switch_done(cfg, st, wave, w, how):
     return True
 
 
+def _fable_switch_unconfirmed_tick(cfg, st, wave, w, sw):
+    """Step `unconfirmed`: the resume message may sit unsent in the input of the new window. Nothing is sent
+    blindly; the switch is done once the marker shows up in the new session's journal (the owner pressed
+    Enter, or the text did arrive). The window gone -> the ordinary dead window."""
+    if session_marker(cfg, wave) in _first_user_text(transcript_path(w["cwd"], sw["sid"])):
+        return _fable_switch_done(cfg, st, wave, w, "resume delivered")
+    if not tmux_alive(w["tmux"]):
+        _mark_dead(cfg, st, wave, read(wave_dir(cfg, wave) / "status"))
+        return False
+    return True
+
+
 def _fable_switch_tick(cfg, st, wave, w):
     """Carry the switch on from its saved step (see above). False only when the chain stops (not_ready)."""
     sw = w.get("fable_switch")
     name, wdir = w["tmux"], wave_dir(cfg, wave)
     if not (isinstance(sw, dict) and isinstance(sw.get("sid"), str) and sw.get("step") in
-            ("closing", "starting", "ready", "sending")):
+            ("closing", "starting", "ready", "sending", "unconfirmed")):
         event(cfg, f"{wave}: fable switch record is broken ({safe_text(sw, 200)}); supervision resumed as running")
         w["phase"] = "running"
         w.pop("fable_switch", None)
         save_state(cfg, st)
         return True
+    if sw["step"] == "unconfirmed":
+        return _fable_switch_unconfirmed_tick(cfg, st, wave, w, sw)
     if sw["step"] == "closing":
         if tmux_alive(name):
             tmux("kill-session", "-t", session_target(name), check=False)
@@ -4555,8 +4575,16 @@ def _fable_switch_tick(cfg, st, wave, w):
         except (subprocess.SubprocessError, OSError) as e:
             why = type(e).__name__
         if why is not None:  # something may sit in the input: neither typed over nor resent
-            event(cfg, f"{wave}: fable switch: unknown whether the resume message arrived ({why}), NOT resent")
-            return _fable_switch_done(cfg, st, wave, w, "resume NOT resent")
+            # not the end of the switch (Codex P2 on #109): the wave waits for a confirmed delivery or the
+            # owner, who is told at once (CodeRabbit on #109); the phase, the step and the notice in ONE save
+            sw["step"] = "unconfirmed"
+            if once_per(w, "updating", f"fable:{sw['sid']}"):
+                put_notice(cfg, w, wave, "updating", f"fable:{sw['sid']}")
+            save_state(cfg, st)
+            event(cfg, f"{wave}: fable switch: unknown whether the resume message arrived ({why}), NOT resent; "
+                       f"waiting for the new session to confirm it")
+            flush_notices(cfg, st, w)
+            return True
     try:
         text = sw.get("text") if isinstance(sw.get("text"), str) else None
         if text is None:  # a record of an older 1.4.0 build: choose now and keep it
@@ -7244,7 +7272,9 @@ def status_cmd(cfg):
         ctx = tokens // 1000 if isinstance(tokens, int) and not isinstance(tokens, bool) else "?"
         print(f"{safe_text(wave, 200)}: tmux={safe_text(w.get('tmux'), 200)} phase={safe_text(w.get('phase'), 200)} ctx={ctx}k "
               f"restarts={safe_text(w.get('restarts', 0), 50)} sessions={len(w.get('sessions') or [])} "
-              + (f"model={safe_text(w['model_override'], 200)} (лимит Fable) " if w.get("model_override") else "") +
+              + (f"model={safe_text(w['model_override'], 200)} (лимит Fable) " if w.get("model_override") else "")
+              + (f"step={safe_text(w['fable_switch'].get('step'), 50)} " if w.get("phase") == "switching"
+                 and isinstance(w.get("fable_switch"), dict) else "") +
               f"started={hum(cfg, num(w.get('started')))} "
               f"status={safe_text(read(cfg['run_dir'] / wave / 'status'), 10 ** 6)}")
         line = manifest_status_line(cfg, wave)

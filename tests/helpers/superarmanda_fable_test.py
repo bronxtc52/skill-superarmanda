@@ -273,6 +273,16 @@ class FableLimitDashboard(FableLimitBase):
         self.tick()
         self.assertIn("claude-opus-5-5 (лимит Fable)", self.render_text())
 
+    def test_unconfirmed_switch_is_shown_as_waiting_for_the_delivery(self):
+        self.setup_wave(phase="switching", fable_switch={"sid": "s2", "step": "unconfirmed", "text": "x"})
+        self.alive = True
+        st = wab.load_state(self.cfg)
+        self.assertEqual(self.dash.wave_state(self.cfg, st, "W1")[0], "switch_unconfirmed")
+        self.assertIn("ждёт подтверждения", self.render_text())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            wab.status_cmd(self.cfg)
+        self.assertIn("step=unconfirmed", out.getvalue())
+
     def test_switching_phase_is_not_shown_as_a_dead_window(self):
         self.setup_wave()
         with mock.patch.object(wab, "_deliver", return_value=False):
@@ -359,21 +369,69 @@ class FableLimitCrashSafety(FableLimitBase):
         self.assertEqual(submit.call_count, 1)  # the Enter only
         self.assertEqual(self.w()["phase"], "running")
 
-    def test_unknown_delivery_with_text_in_the_input_is_not_resent(self):
+    def unknown_delivery(self, why="text in the input line"):
+        """The resume text was pasted, the dispatcher died before it recorded the paste; the restarted tick
+        sees no marker in the new session's journal and `why` from input_empty_reason."""
         self.setup_wave()
 
         def die_before_record(name, text, on_typed=None):
             self.sent.append(("text", name, text))
-            raise _Crash()  # pasted, the dispatcher died before it recorded the paste
+            raise _Crash()
         wab.send_text.side_effect = die_before_record
         with self.assertRaises(_Crash):
             self.tick()
         wab.send_text.side_effect = lambda n, t, **kw: self.sent.append(("text", n, t))
-        with mock.patch.object(wab, "input_empty_reason", return_value="text in the input line"):
+        self.tg.clear()
+        with mock.patch.object(wab, "input_empty_reason", return_value=why):
             self.tick()
+
+    def unconfirmed_notices(self):
+        return [t for t in self.tg if "дошло ли продолжение" in t]
+
+    def test_unknown_delivery_with_text_in_the_input_is_not_resent_and_not_done(self):
+        # Codex P2 / CodeRabbit on #109: «NOT resent» is not the end of the switch, the owner is told at once
+        self.unknown_delivery()
+        w = self.w()
         self.assertEqual(len(self.resumes()), 1)
-        self.assertEqual(self.w()["phase"], "running")
+        self.assertEqual((w["phase"], w["fable_switch"]["step"]), ("switching", "unconfirmed"))
         self.assertIn("NOT resent", self.events())
+        self.assertEqual(len(self.unconfirmed_notices()), 1)
+        self.assertNotIn("updating", w.get("outbox", {}))  # delivered, not dropped as a stale episode
+
+    def test_no_input_box_is_the_same_unconfirmed_delivery(self):
+        self.unknown_delivery(why=wab.NO_INPUT_BOX)
+        w = self.w()
+        self.assertEqual((w["phase"], w["fable_switch"]["step"]), ("switching", "unconfirmed"))
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertEqual(len(self.unconfirmed_notices()), 1)
+
+    def test_unconfirmed_delivery_waits_without_resending_or_renotifying(self):
+        self.unknown_delivery()
+        for why in ("text in the input line", None, wab.NO_INPUT_BOX):
+            with mock.patch.object(wab, "input_empty_reason", return_value=why):
+                self.tick()
+        w = self.w()
+        self.assertEqual((w["phase"], w["fable_switch"]["step"]), ("switching", "unconfirmed"))
+        self.assertEqual(len(self.resumes()), 1)  # never sent blindly, not even into an empty input
+        self.assertEqual(len(self.unconfirmed_notices()), 1)
+
+    def test_marker_in_the_new_journal_completes_the_unconfirmed_switch(self):
+        self.unknown_delivery()
+        sid = self.w()["fable_switch"]["sid"]
+        self.transcript(sid, [asst(inp=10)], marker=wab.session_marker(self.cfg, "W1"))
+        self.tick()
+        w = self.w()
+        self.assertEqual(w["phase"], "running")
+        self.assertNotIn("fable_switch", w)
+        self.assertIn("resume delivered", self.events())
+        self.assertEqual(len(self.resumes()), 1)
+
+    def test_unconfirmed_switch_with_the_window_gone_is_a_dead_window(self):
+        self.unknown_delivery()
+        self.alive = False
+        self.tick()
+        self.assertEqual(self.w()["phase"], "dead")
+        self.assertEqual(len(self.resumes()), 1)
 
     def test_postponed_delivery_with_an_empty_input_is_sent_later(self):
         self.setup_wave()

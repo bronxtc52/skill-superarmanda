@@ -42,6 +42,7 @@ STYLE = {  # phase/status -> (icon, colour, label)
     "RUNNING": ("⚙", "bright_green", "работает"),
     "RESUMING": ("↻", "cyan", "свежая голова"),
     "switching": ("↻", "cyan", "лимит Fable: перезапуск на Opus"),
+    "switch_unconfirmed": ("⏸", "bright_yellow", "лимит Fable: ждёт подтверждения доставки"),
     "checkpoint": ("💾", "yellow", "handoff"),
     "HANDOFF_READY": ("💾", "yellow", "handoff готов"),
     "BLOCKED": ("✋", "bold red", "ждёт тебя"),
@@ -211,7 +212,7 @@ def wave_state(cfg, st, wave):
     if w.get("phase") in TERMINAL_PHASES:
         return TERMINAL_PHASES[w["phase"]], w
     if w.get("phase") == "switching":  # the dispatcher itself closed the window to start it on Opus (#108)
-        return "switching", w
+        return ("switch_unconfirmed" if wab._switch_unconfirmed(w) else "switching"), w
     status = wave_status(cfg, wave, w)
     # the window is gone before the watch noticed it: nobody to answer, no attach
     if st.get("current") == wave and status != "DONE" and not wab.tmux_alive(w["tmux"]):
