@@ -709,6 +709,20 @@ class FableLimitWhileBlocked(FableLimitBase):
         self.assertEqual(len(self.new_sessions()), 1)
         self.assertFalse(any("сбой гейта" in str(x[2]) for x in self.sent if len(x) > 2), self.sent)
 
+    def test_the_episode_is_the_status_write_the_freshness_was_judged_on(self):
+        # Codex P2 on #111: the wave rewrites the same line between two reads of the status stamp; the episode
+        # handed to Opus must be the write the decision was made on, so the newer write is a new episode
+        self.blocked_wave([user_line("Ответ: B", "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        real, calls = wab._status_stamp, []
+
+        def racing(cfg, wave):
+            stamp = real(cfg, wave)
+            calls.append(stamp)
+            return stamp if len(calls) == 1 else [stamp[0], stamp[1] + 1]  # rewritten after the first read
+        with mock.patch.object(wab, "_status_stamp", side_effect=racing):
+            self.tick()
+        self.assertEqual(self.w()["fable_blocked_episode"]["stamp"], calls[0])
+
     def test_an_empty_status_mid_rewrite_keeps_the_episode(self):
         self.switched(limit_lines()[:1])
         (wab.wave_dir(self.cfg, "W1") / "status").write_text("", encoding="utf-8")

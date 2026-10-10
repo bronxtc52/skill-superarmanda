@@ -4509,15 +4509,15 @@ def fable_limit_after_blocked(cfg, wave, w):
     the current session is newer than the status file: the wave got an answer, went on and was refused, or its
     very turn after writing BLOCKED was refused (the window is out of Fable either way). A wave that waits for the
     owner calls nobody, so no new limit line appears and it is not switched; a limit line without a time is not
-    fresh either (fail safe: the owner sees the idle wave, as before). Returns the status file's mtime, or None."""
+    fresh either (fail safe: the owner sees the idle wave, as before). Returns the stamp of the status write the
+    freshness was judged on ([inode, mtime_ns], the one read: Codex P2 on #111), or None."""
     if not fable_limit_hit(cfg, w):
         return None
     stamp = _status_stamp(cfg, wave)
     if stamp is None:
         return None
-    since = stamp[1] / 1e9
     limit_at = CACHE.read(transcript_path(w["cwd"], w["sessions"][-1]))["limit_at"]
-    return since if limit_at > since else None
+    return stamp if limit_at > stamp[1] / 1e9 else None
 
 
 FABLE_BLOCKED_ANSWER_CHARS = 4000
@@ -6468,10 +6468,9 @@ def _tick(cfg, st):
 
     # before any retry typed into the window (a gate failure, an answer): a refused Fable window gets nothing more
     if status.startswith("BLOCKED") and w.get("phase") in ("running", "checkpoint") and not w.get("await_session"):
-        since = fable_limit_after_blocked(cfg, wave, w)  # #110: answered, went on, refused — not a wait
-        if since is not None:
-            begin_fable_switch(cfg, st, wave, w,
-                               blocked={"status": status, "since": since, "stamp": _status_stamp(cfg, wave)})
+        stamp = fable_limit_after_blocked(cfg, wave, w)  # #110: answered, went on, refused — not a wait
+        if stamp is not None:  # one read of the stamp: a rewrite after it is a new episode, not this one
+            begin_fable_switch(cfg, st, wave, w, blocked={"status": status, "since": stamp[1] / 1e9, "stamp": stamp})
             return _fable_switch_tick(cfg, st, wave, w)
 
 
