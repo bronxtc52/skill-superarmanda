@@ -3,6 +3,60 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 1.4.0 — 2026-10-10
+
+Политика моделей «Fable только ревьюит» ([#108](https://github.com/bronxtc52/skill-superarmanda/issues/108), вариант Б).
+Решение владельца 2026-10-10 ([комментарий в #108](https://github.com/bronxtc52/skill-superarmanda/issues/108#issuecomment-6094114489)):
+цепочка `waves-fable-policy` исчерпала недельный лимит Fable за полтора дня, 73% расхода — субагенты-исполнители, а
+ревью плана фазы A с Fable не сошлось за 15 кругов. Fable остаётся вторым ревьюером задачи `high` и ревьюером плана;
+исполнители и координатор уходят на Opus и Sonnet.
+
+### Добавлено
+
+- Политика ролей manifest (`state.py`): модель каждой исполняющей роли — `coder`, `tester`, `architect`,
+  `investigator`, `triage`, `internal_reviewer`, `final_check` — берётся из таблицы `role_models`. Встроенные
+  дефолты: coder `high` — Opus (`claude-opus-5-5`), иначе Sonnet; tester — Sonnet (effort `medium`, при `high` —
+  `high`); субагентские роли — Opus. Порядок силы Sonnet < Opus < Fable: роль принимает модель политики или сильнее,
+  Fable — везде. Переопределение только вверх и только при `init`: `--role-model <роль>[.<риск>]=<модель>`
+  (повторяемый) и env `SUPERARMANDA_ROLE_MODELS` (JSON); итог пишется в manifest и дальше не меняется. Модель ниже
+  дефолта, `coordinator`, неизвестные роль, риск или модель — отказ. Словарь моделей пополнился `claude-opus-5-5` /
+  `opus`. `role-model` отдаёт модель любой из семи ролей и `effort` tester.
+- `review.py run` пишет в каждый отчёт (`pass`, `findings`, `error`) `created_at` — UTC ISO-8601.
+- `chain.json`: `role_models` (политика ролей волн, уходит в окно волны env `SUPERARMANDA_ROLE_MODELS`, входит в
+  идентичность), `plan_review_fable_rounds` (по умолчанию 2), `fable_budget_units` (по умолчанию 80, tunable).
+- Ревью плана фазы A: после `plan_review_fable_rounds` кругов Fable `wab.py launch` принимает `pass` одной Astra.
+  Круги лежат в `plan-review/history/` (пакет и отчёт Fable каждого круга), считаются по разным пакетам, отчёты
+  ошибки не считаются; Astra обязана быть новее каждого круга (`created_at`), `findings` Fable на одобренном пакете —
+  отказ. Событие `plan review: Fable rounds exhausted (N), Astra-only pass accepted; last Fable report: …`.
+- Лимит Fable в окне волны: строка `rate_limit` / 429 основного потока в журнале сессии волны на Fable — диспетчер
+  закрывает окно и запускает ту же волну на Opus с сообщением продолжения (фаза `switching`, `model_override`,
+  счётчик `fable_switches`); перезапуски и `max_runs` не расходуются, цепочка не останавливается. Строки субагентов
+  волну не переключают.
+- `scripts/waves/fable_usage.py`: локальный расход Fable по журналам Claude Code за сутки и 7 дней во взвешенных
+  токенах (дедуп по `message.id`), JSON, rc 3 при недоступных журналах. `launch` пишет строку расхода и при ≥80%
+  бюджета — предупреждение; запуск не отказывает.
+
+### Изменено
+
+- Координатор: строка «координатору рекомендована Fable» убрана; `chain.json` без `model` у новой цепочки — Opus,
+  `ctx_limit` по умолчанию 200 000 (было 300 000).
+- Готовность задачи `high`: coder и tester — модель не слабее политики (было «ровно Fable»); `internal_reviewer` и
+  `final_check` обязательны, как в 1.2.4, но с моделью политики. Два ревью задачи `high` (Astra и Fable) и quota-маршрут
+  `codex-host-opus` — без изменений. Новые manifest — `review_policy.version: "1.4.0"`.
+- Документация: [profiles.md](skills/superarmanda/references/profiles.md) (таблица ролей 1.4.0),
+  [workflow.md](skills/superarmanda/references/workflow.md) и
+  [role-briefs.md](skills/superarmanda/references/role-briefs.md) (раздел «Субагентские роли», бриф берёт модель из
+  `state.py role-model`), [waves.md](skills/superarmanda/references/waves.md) (дефолты, поля `chain.json`, ревью плана,
+  переключение на Opus, чек-лист «остаток Fable»).
+- Граница совместимости:
+  - manifest без `role_models` (1.2.x, 1.3.x) оценивается по дефолтам 1.4.0 — это только ослабление требования
+    модели: записи на Fable остаются годными, незавершённая `high`-задача старой цепочки может дойти до ready на Opus;
+    `version` manifest остаётся `2`;
+  - цепочка, начатая до 1.4.0 (`state.json` с волнами без маркера `defaults: "1.4"`), сохраняет прежние дефолты —
+    модель CLI и `ctx_limit` 300 000; её идентичность не меняется, повторный `watch` и `launch` не отказывают;
+  - `result-codex-host.json` в `plan-review/` по-прежнему обязан быть `pass`; оставшийся `result-codex-host-opus.json`
+    выключает маршрут «только Astra» (принятое ограничение: отказ fail-closed, файл убрать).
+
 ## 1.3.0 — 2026-10-06
 
 Итог цепочки `waves-fable-policy` (W1–W8): Fable по риску, фиксированный ответ политики, время владельца, внешние

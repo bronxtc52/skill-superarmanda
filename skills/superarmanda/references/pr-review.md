@@ -126,10 +126,10 @@ fallback or automatic draft transition.
 
 ## Финальная сверка перед снятием draft (1.2.3, #86)
 
-Для задачи `high` перед снятием draft свежий Fable-субагент (`final_check`, бриф — в
+Для задачи `high` перед снятием draft свежий субагент (`final_check`, модель из `state.py role-model`; бриф — в
 [role-briefs.md](role-briefs.md)) сверяет итоговый diff с ТЗ: каждый пункт приёмки закрыт и доказан
 тестом или командой. Пробелы возвращаются в работу обычным кругом; результат записывается
-`task-result --role final_check --model fable` и попадает в тело PR. С 1.2.4 `pass` сверки на
+`task-result --role final_check --model <модель из role-model>` и попадает в тело PR. С 1.2.4 `pass` сверки на
 финальном HEAD как последнее слово по задаче (после последнего ревью задачи, закрытия последнего круга
 исправлений и любой другой записи ролей готовности и `fix-loop` задачи — `task_epoch`) входит в готовность задачи high и в гейт мерджа
 high-волны (`workflow.md`, «Обязательные роли задачи high»); draft PR и Codex-ревью можно делать до
@@ -148,10 +148,11 @@ high-волны (`workflow.md`, «Обязательные роли задачи
 ## Проверки (HEAD <sha>)
 
 - `<команда>` — <итог>
-- Риск задачи: <low|medium|high>. Модель coder и tester: <claude-fable-5-1 | claude-sonnet-5-5> (из manifest).
+- Риск задачи: <low|medium|high>. Модель coder и tester: <claude-opus-5-5 | claude-sonnet-5-5 | claude-fable-5-1> (из manifest).
+- Переключение волны на Opus по лимиту Fable: <нет | да — с какой сессии>.
 - Ревью задачи: Astra (`claude-host`) — <pass | findings: решение>; для риска high также Fable (`codex-host`) — <pass | findings: решение>.
 - Запасное Opus-ревью (`codex-host-opus`): <нет | да — вместо Fable; подтверждение квоты Fable: отчёт `codex-host` с `error_category: quota` на этом HEAD и пакете, `<путь из quota_evidence>`>.
-- Финальная сверка с ТЗ (`final_check`, Fable): <pass | пробелы: что возвращено в работу | не применялась или пропущена: причина>.
+- Финальная сверка с ТЗ (`final_check`, модель из manifest): <pass | пробелы: что возвращено в работу | не применялась или пропущена: причина>.
 
 ## Принятые ограничения
 

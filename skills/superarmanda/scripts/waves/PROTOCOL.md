@@ -75,11 +75,15 @@
    `fix-loop --outcome failed` в пределах капа 3; кап исчерпан — `BLOCKED: [class=blocked_cap …]`.
    **Второй прогон.** Открывай его `init --from-plan` на новом пути (например, `superarmanda/manifest-run2.json`).
    Файлы manifest не переставляй и не переименовывай: гейт мерджа и дашборд найдут текущий прогон по последней записи `runs.json`.
-   **Fable-субагенты.** Роли `investigator` (задача-баг, до coder), `internal_reviewer` (задача high, до
+   **Модели ролей и субагентские роли (1.4.0).** Модель coder, tester и каждой субагентской роли бери из
+   `state.py role-model --manifest <path> --task <id> --role <роль>` (политика manifest; по умолчанию coder high —
+   Opus, tester — Sonnet, субагентские роли — Opus); Fable обязательна только как второй ревьюер задачи high.
+   Роли `investigator` (задача-баг, до coder), `internal_reviewer` (задача high, до
    внешнего ревью), `triage` (находки внешнего ревью) и `final_check` (задача high, перед `DONE`) обязательны в
-   применимых случаях и идут свежими субагентами на Fable; брифы — `references/role-briefs.md`. Результат:
-   `task-result --role <роль> --model fable`; Fable недоступна — `--status unavailable --model fable`, без
-   подмены. Находки внутреннего ревью: `fix-loop --outcome failed --source internal_reviewer` (кап не тратит,
+   применимых случаях и идут свежими субагентами на модели политики; брифы — `references/role-briefs.md`. Результат:
+   `task-result --role <роль> --model <модель из role-model>`; модель недоступна — `--status unavailable --model
+   <модель из role-model>`, без подмены моделью слабее. Если первое сообщение сессии говорит, что модель переключена
+   на Opus из-за лимита Fable, — отметь это в PR и `result.md`. Находки внутреннего ревью: `fix-loop --outcome failed --source internal_reviewer` (кап не тратит,
    не больше трёх кругов, только до первого внешнего ревью задачи). Пропуск применимой роли — строка с
    причиной в `result.md`. С 1.2.4 `internal_reviewer` и `final_check` задачи high обязательны машинно: запись
    внутреннего ревью — на чистом дереве того HEAD, который уйдёт в пакет (кредит = HEAD + дерево +

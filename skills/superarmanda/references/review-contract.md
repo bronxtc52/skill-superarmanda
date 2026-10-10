@@ -40,13 +40,16 @@ request как `session_id`; не приписывайте сервису кон
 ревьюера), и `sha256:<64 lowercase hex>`, а хранит всегда каноническую форму `sha256:<hex>`; верхний
 регистр, другая длина и другой префикс отвергаются. Отчёт `review.py run` дополнительно несёт поле
 `state_packet_hash` — готовое `sha256:<hex>` для state; `packet_hash` envelope не меняется, старые
-пакеты загружаются как раньше. GitHub Codex `pass` вместо него несёт HTTPS URL evidence artifact.
+пакеты загружаются как раньше. С 1.4.0 (#108) каждый отчёт `review.py run` — `pass`, `findings` и
+`error` — несёт `created_at`: момент записи отчёта в UTC, ISO-8601 со смещением `+00:00`; по нему
+`wab.py launch` проверяет порядок кругов ревью плана волн ([waves.md](waves.md), «Ревью плана»).
+GitHub Codex `pass` вместо него несёт HTTPS URL evidence artifact.
 State хранит эти значения как metadata. Coordinator подтверждает существование артефакта и
 `gate_ready: true` adapter report перед записью pass.
 
 ## Внутреннее ревью — не внешнее (1.2.3, #86)
 
-Внутреннее ревью Fable-субагента (`internal_reviewer`, [role-briefs.md](role-briefs.md)) идёт до пакета
+Внутреннее ревью субагента (`internal_reviewer`, [role-briefs.md](role-briefs.md)) идёт до пакета
 внешнего ревью и его не заменяет: готовность задачи и гейт по-прежнему требуют ревью по этому
 контракту. Отчёт `review.py` (профили `claude-host`, `codex-host`, `codex-host-opus`) как артефакт
 внутреннего ревью не принимается, а источник `fix-loop --source internal_reviewer` закрывается с
@@ -96,8 +99,9 @@ python3 "$SUPERARMANDA_DIR/scripts/state.py" task-result --manifest <path> --tas
 `state.py` проверяет его форму, согласованность и привязку к HEAD и пакету, но не доказывает его
 подлинность.
 
-Задача high готова, когда coder и tester прошли на Fable (`--model`, поле `model` результата —
-`claude-fable-5-1`; при medium и low — `claude-sonnet-5-5` либо без модели), а оба ревью — `pass`
+Задача high готова, когда coder и tester прошли на модели политики ролей для high или сильнее
+(`--model`, поле `model` результата; по умолчанию 1.4.0 coder — `claude-opus-5-5`, tester —
+`claude-sonnet-5-5`, Fable допустима; при medium и low — модель политики либо без модели), а оба ревью — `pass`
 либо `findings`, покрытые `fix-loop --defer`/`--accept` ровно на этот результат, причём пара
 профилей — ровно один `claude-host` и ровно один `codex-host` с одним `packet_hash`. Один Astra,
 два Astra, Fable без Astra, ревью разных пакетов — не pass; причину называет `next_action`
@@ -173,7 +177,7 @@ Opus не откроется — ошибка возможна только в �
 Sonnet, Astra вторым разом или иную модель нет.
 
 **Поля отчёта ошибки.** Отчёт `status: error` несёт `profile`, `attempts`, `error`,
-`error_category`, `gate_ready: false`, а с 1.2.1 ещё `reviewed_head` (полный HEAD пакета) и
+`error_category`, `gate_ready: false`, `created_at` (1.4.0), а с 1.2.1 ещё `reviewed_head` (полный HEAD пакета) и
 `state_packet_hash` (`sha256:<hex>`) — только когда конверт пакета загружен и сверен с
 репозиторием. При ошибке раньше (нечитаемый или изменённый пакет, HEAD ушёл) этих полей нет.
 Сырых диагностик и содержимого пакета в отчёте по-прежнему нет.

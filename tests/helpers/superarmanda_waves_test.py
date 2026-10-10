@@ -18351,7 +18351,7 @@ class W6OwnerTime(Base):
     # ----- docs -----
     def test_release_docs_and_agent_docs(self):
         skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.[23]\.\d+"\s*$')  # the version itself is pinned by the newest release's test
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.[234]\.\d+"\s*$')  # the version itself is pinned by the newest release's test
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         m = re.search(r"(?ms)^## 1\.2\.6 — 2026-10-06\n(.*?)(?=^## )", log)
         self.assertTrue(m, "CHANGELOG.md: the section `## 1.2.6 — 2026-10-06`")
@@ -18962,9 +18962,8 @@ class Release130(unittest.TestCase):
         self.assertTrue(log.index("## 1.3.0") < log.index("## 1.2.7"), "1.3.0 is above 1.2.7")
         return m.group(1)
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.3\.0"\s*$')
+    # the version of SKILL.md moved on to 1.4.0 (#108): Release140 pins it
+
 
     def test_changelog_names_the_issues_and_the_compatibility_boundary(self):
         body = self.section()
@@ -18993,6 +18992,44 @@ class Release130(unittest.TestCase):
         self.assertRegex(waves, r"(?m)^\| Сквозная приёмка 1\.3\.0:[^\n]*реализовано \(1\.3\.0;")
         self.assertRegex(waves, r"(?m)^\| Замер цепочки `scripts/waves/metrics\.py`[^\n]*реализовано \(1\.3\.0;")
         self.assertRegex(waves, r"(?m)^- `metrics\.py <run_dir> \[--json\]`")
+
+
+class Release140(unittest.TestCase):
+    """The release 1.4.0 (#108, variant B «Fable only reviews»): version, the CHANGELOG section on top with the
+    owner's decision and the compatibility boundary, the row of «Что реализовано»."""
+
+    def section(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.0 — 2026-10-10$", "1.4.0 is the first section")
+        self.assertTrue(log.index("## 1.4.0") < log.index("## 1.3.0"), "1.4.0 is above 1.3.0")
+        return re.search(r"(?ms)^## 1\.4\.0 — 2026-10-10\n(.*?)(?=^## )", log).group(1)
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.0"\s*$')
+
+    def test_changelog_names_the_issue_the_decision_and_the_boundary(self):
+        body = self.section()
+        for needle in ("#108", "Решение владельца 2026-10-10", "### Добавлено", "### Изменено", "`role_models`",
+                       "`plan_review_fable_rounds`", "`fable_budget_units`", "fable_usage.py", "`created_at`",
+                       "`fable_switches`", "200 000"):
+            self.assertIn(needle, body)
+        boundary = body[body.index("Граница совместимости"):]
+        for needle in ("без `role_models`", "`defaults: \"1.4\"`", "300 000", "`result-codex-host-opus.json`"):
+            self.assertIn(needle, boundary)
+
+    def test_waves_doc_has_the_row_of_what_is_implemented(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        table = waves.split("## Что реализовано", 1)[1].split("## Фаза A", 1)[0]
+        self.assertRegex(table, r"(?m)^\| Политика моделей 1\.4\.0 [^\n]*\| реализовано \(1\.4\.0; \[#108\]")
+
+    def test_docs_no_longer_ask_fable_of_the_executors(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        refs = ROOT / "skills" / "superarmanda" / "references"
+        self.assertNotIn("координатору рекомендована Fable", skill)
+        self.assertNotIn('"model": "claude-fable-5-1"', (refs / "waves.md").read_text(encoding="utf-8"))
+        self.assertNotRegex((refs / "role-briefs.md").read_text(encoding="utf-8"), r"(?m)^model: fable$")
+        self.assertIn("остаток Fable", (refs / "waves.md").read_text(encoding="utf-8"))
 
 
 class Packaging(unittest.TestCase):

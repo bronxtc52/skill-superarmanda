@@ -7,42 +7,63 @@
 
 | Роль | Claude Code host (проверенный default) | Codex host (проверенный default) |
 |---|---|---|
-| coordinator / planner | доступная явная native-модель (Fable) | доступная явная native-модель (`gpt-6-astra`) |
-| coder | по риску задачи (раздел ниже): `coder@sonnet`, при high — Fable | fresh explicit native model (`coder@gpt-5.6-terra`); задачи high здесь не ведутся (#92) |
-| tester | по риску задачи (раздел ниже): `tester@sonnet`, при high — Fable | fresh explicit native model (`tester@gpt-5.6-terra`); задачи high здесь не ведутся (#92) |
+| coordinator / planner | доступная явная native-модель; координатор волны — `model` в `chain.json`, по умолчанию Opus (`claude-opus-5-5`) | доступная явная native-модель (`gpt-6-astra`) |
+| coder | по политике ролей (раздел ниже): `coder@sonnet`, при high — Opus | fresh explicit native model (`coder@gpt-5.6-terra`); задачи high здесь не ведутся (#92) |
+| tester | по политике ролей (раздел ниже): `tester@sonnet`, effort `high` при high | fresh explicit native model (`tester@gpt-5.6-terra`); задачи high здесь не ведутся (#92) |
 | task reviewer | Codex CLI / fixed adapter; при риске high — оба адаптера | Claude CLI / fixed adapter; при риске high — оба адаптера |
-| Fable-субагенты: `architect`, `internal_reviewer`, `triage`, `investigator`, `final_check` | всегда Fable (`claude-fable-5-1`), свежая сессия | Fable на этом host нет: запись `unavailable`, без подмены (#92) |
+| субагентские роли: `architect`, `internal_reviewer`, `triage`, `investigator`, `final_check` | по политике ролей: Opus (`claude-opus-5-5`), свежая сессия | моделей Claude на этом host нет: запись `unavailable`, без подмены (#92) |
 | context / drafts | `reader`/`drafter@haiku` | `reader`/`drafter@gpt-5.6-luna` |
 | required PR review | GitHub Codex | GitHub Codex |
 | optional PR review | CodeRabbit | CodeRabbit |
 
-## Модель роли по риску (1.2.1, #86)
+## Модель роли по риску (1.4.0, #108)
 
-Модель coder и tester задаёт риск задачи, а не привычка координатора. Источник истины —
-`state.py`: он считает эффективный риск задачи и отдаёт модель командой `role-model`.
+Модель каждой исполняющей роли задаёт политика ролей manifest и риск задачи, а не привычка
+координатора. Источник истины — `state.py`: он считает эффективный риск задачи и отдаёт модель
+командой `role-model --role <роль>` (для tester — ещё и `effort`). Решение владельца 2026-10-10
+(#108, вариант Б): Fable только ревьюит. Встроенные дефолты 1.4.0:
 
-| Риск задачи | coder | tester | Ревью задачи |
+| Роль | low | medium | high |
 |---|---|---|---|
-| high | Fable (`claude-fable-5-1`) | Fable (`claude-fable-5-1`) | два: Astra (`claude-host`) и Fable (`codex-host`) |
-| medium | Sonnet (`claude-sonnet-5-5`) | Sonnet (`claude-sonnet-5-5`) | одно (`cross_provider_reviewer`) |
-| low | Sonnet (`claude-sonnet-5-5`) | Sonnet (`claude-sonnet-5-5`) | одно (`cross_provider_reviewer`) |
+| coder | Sonnet (`claude-sonnet-5-5`) | Sonnet | Opus (`claude-opus-5-5`) |
+| tester | Sonnet, effort `medium` | Sonnet, effort `medium` | Sonnet, effort `high` |
+| `architect`, `investigator`, `triage`, `internal_reviewer`, `final_check` | Opus | Opus | Opus |
+| ревью задачи | одно: Astra (`claude-host`) | одно: Astra | два: Astra (`claude-host`) и Fable (`codex-host`) |
 
+Координатор в политику не входит: в режиме волн его модель — `model` в `chain.json`
+(по умолчанию Opus, [waves.md](waves.md)); ключ `coordinator` — отказ.
+
+- **Порядок силы моделей:** Sonnet < Opus < Fable. Роль принимает модель политики или сильнее:
+  Fable допустима в любой роли, Sonnet у coder high — отказ.
+- **Переопределение — только вверх и только при `init`.** `state.py init --role-model
+  <роль>[.<риск>]=<модель>` (флаг повторяемый) и env `SUPERARMANDA_ROLE_MODELS` с JSON
+  `{"coder.high": "fable", "final_check": "fable"}`; в режиме волн — объект `role_models` в
+  `chain.json`, диспетчер передаёт его окну волны этим env. Слияние по ячейкам: дефолты ← env ←
+  флаги; внутри одного источника `<роль>` применяется раньше `<роль>.<риск>`. Отказ при `init`
+  (manifest не пишется): модель ниже встроенного дефолта, `coordinator`, неизвестные роль, риск
+  или модель, повтор флага, битый JSON. Итоговая полная таблица пишется в manifest полем
+  `role_models` и дальше не меняется: `resume` её сохраняет, env после `init` не читается, ручная
+  правка ниже дефолта — закрытый отказ схемы.
+- **Совместимость.** Manifest без `role_models` (1.2.x, 1.3.x) оценивается по дефолтам 1.4.0: это
+  только ослабление требования модели, записи на Fable остаются годными. Новые manifest получают
+  `review_policy.version: "1.4.0"`; `version` manifest остаётся `2`.
 - **Эффективный риск задачи** — больший из риска прогона (`review_policy.level` manifest:
   риск волны при `init --from-plan`, иначе `init --risk`, по умолчанию `low`) и собственного риска
   задачи (`state.py task-risk --task <id> --risk <low|medium|high>`). Риск волны — нижняя граница
-  для всех её задач, в том числе для модели: задача medium в волне high идёт на Fable и требует
-  двух ревью. Риск задачи можно только поднять.
+  для всех её задач, в том числе для модели: задача medium в волне high идёт на модели политики
+  для high и требует двух ревью. Риск задачи можно только поднять.
 - **Задачи про безопасность и маскировку обязаны иметь `risk: high`**: маскировка секретов,
   границы данных, авторизация, гейты и проверки, которые что-то запрещают. Сомневаешься — high.
-- **Модель обязательна в metadata результата.** `task-result --model <значение>` принимает только
-  закрытый словарь: `claude-fable-5-1`, `claude-sonnet-5-5` и алиасы `fable`, `sonnet`
-  (совпадение точное, без обрезки пробелов и смены регистра); в manifest пишется полный ID.
-  Для задачи с риском high результат coder и tester без `--model`, равной Fable, отклоняется при
-  любом статусе, а готовность задачи дополнительно требует `model: claude-fable-5-1` у обоих
-  результатов (если риск подняли уже после записи — роли переделываются на Fable).
-- **Fable недоступна** (лимит, авторизация, модель не отвечает) — координатор записывает
-  `task-result --role <coder|tester> --status unavailable --model fable` и останавливается:
-  `where` отдаёт `BLOCKED`, задача не pass. Подмены Sonnet или другой моделью слабее нет.
+- **Модель в metadata результата.** `task-result --model <значение>` принимает только
+  закрытый словарь: `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5` и алиасы `fable`,
+  `opus`, `sonnet` (совпадение точное, без обрезки пробелов и смены регистра); в manifest пишется
+  полный ID. Модель обязательна у субагентских ролей при любом риске, у coder и tester при high и
+  там, где переопределение подняло политику выше Sonnet; модель слабее политики для эффективного
+  риска — отказ при любом статусе. Готовность задачи high требует у coder и tester модель не
+  слабее политики для high (если риск подняли уже после записи — роль переделывается).
+- **Модель политики недоступна** (лимит, авторизация, модель не отвечает) — координатор записывает
+  `task-result --role <роль> --status unavailable --model <модель политики>` и останавливается:
+  `where` отдаёт `BLOCKED`, задача не pass. Подмены моделью слабее нет.
 - **Второй ревьюер.** Для задачи high роль `second_reviewer` обязательна наравне с
   `cross_provider_reviewer`: пара отчётов `review.py` — ровно один `claude-host` (Astra) и ровно
   один `codex-host` (Fable) по одному пакету и текущему HEAD. Порядок и команда — в
@@ -56,27 +77,30 @@
   живым событием квоты** (#91): он закреплён тестами на подставных CLI, в том числе в гейте мерджа
   и в проверке ревью плана `wab.py launch`; первый живой отказ по квоте — повод сверить форму
   события и закрыть #91.
-- **Где вести задачи high.** Задача `risk: high` ведётся там, где coder и tester можно запустить
-  на Fable, то есть на Claude Code host. На хосте без Fable (Codex host, где роли идут на
-  `gpt-5.6-terra`) роль записывается `task-result --status unavailable --model fable`: задача не
-  pass, `where` отдаёт `BLOCKED`. Это ожидаемое поведение политики 1.2.1, а не сбой; модель для
+- **Где вести задачи high.** Задача `risk: high` ведётся там, где роли можно запустить
+  на моделях политики (Opus, Sonnet), то есть на Claude Code host. На хосте без моделей Claude
+  (Codex host, где роли идут на `gpt-5.6-terra`) роль записывается `task-result --status
+  unavailable --model <модель политики>`: задача не pass, `where` отдаёт `BLOCKED`. Это ожидаемое
+  поведение политики, а не сбой; модель для
   задач high на Codex-хосте — решение владельца (#92), до него подмены нет. Задачи medium и low на
-  Codex-хосте идут как в 1.2.0: `--model` необязателен, роли работают на моделях хоста;
-  `role-model` для них отдаёт рекомендацию для Claude-хоста (Sonnet) и Codex-хосту её не навязывает.
+  Codex-хосте идут как в 1.2.0: `--model` для coder и tester необязателен, пока политика их не
+  подняла, роли работают на моделях хоста; `role-model` для них отдаёт рекомендацию для
+  Claude-хоста (Sonnet) и Codex-хосту её не навязывает.
 
 Manifest `version: 1` (созданный до 1.2.1) оценивается по правилам 1.2.0: одна модель по таблице
 host-профилей ниже, одно ревью; `role-model`, `task-risk`, `--model`, `second_reviewer`,
-`--quota-evidence`, роли Fable-субагентов и `--source internal_reviewer` на нём — отказ.
+`--quota-evidence`, субагентские роли и `--source internal_reviewer` на нём — отказ.
 
-### Fable-субагенты (1.2.3, #86)
+### Субагентские роли (1.2.3, #86; модель — 1.4.0, #108)
 
-Роли `architect`, `internal_reviewer`, `triage`, `investigator`, `final_check` от риска не зависят:
-их модель — всегда Fable (`claude-fable-5-1`), и `state.py role-model` для них не нужен. Шаблоны
-брифов со строкой `model: fable` — в [role-briefs.md](role-briefs.md); когда роль применима —
-[workflow.md](workflow.md), «Fable-субагенты». Результат записывается `task-result --role <роль>
---model fable`; без модели Fable запись отклоняется при любом статусе и риске. Fable недоступна —
-`task-result --role <роль> --status unavailable --model fable`, без подмены моделью слабее. Роли
-есть только в manifest `version: 2`.
+Роли `architect`, `internal_reviewer`, `triage`, `investigator`, `final_check` ведут свежие
+субагенты на модели политики: по умолчанию Opus (`claude-opus-5-5`) при любом риске; модель
+отдаёт `state.py role-model --role <роль>`. До 1.4.0 они шли только на Fable. Шаблоны брифов — в
+[role-briefs.md](role-briefs.md); когда роль применима — [workflow.md](workflow.md), «Субагентские
+роли». Результат записывается `task-result --role <роль> --model <модель из role-model>`; без
+модели или с моделью слабее политики запись отклоняется при любом статусе и риске. Модель политики
+недоступна — `task-result --role <роль> --status unavailable --model <модель политики>`, без подмены
+моделью слабее. Роли есть только в manifest `version: 2`.
 
 ### Шаблон брифа coder и tester
 
@@ -86,13 +110,14 @@ host-профилей ниже, одно ревью; `role-model`, `task-risk`, 
 Роль: <coder|tester>, задача <id>, свежая сессия.
 Модель: значение поля "model" из вывода
   python3 "$SUPERARMANDA_DIR/scripts/state.py" role-model --manifest <path> --task <id> --role <coder|tester>
-  (риск high -> claude-fable-5-1; medium и low -> claude-sonnet-5-5). Другая модель не подходит;
-  недоступна -> сообщи координатору, не подменяй.
-Риск задачи: <low|medium|high> (поле "risk" того же вывода). Effort: <по таблице ниже>.
+  (по умолчанию coder high -> claude-opus-5-5, остальное -> claude-sonnet-5-5; claude-fable-5-1
+  допустима всегда). Модель слабее не подходит; недоступна -> сообщи координатору, не подменяй.
+Риск задачи: <low|medium|high> (поле "risk" того же вывода). Effort: tester — поле "effort"
+  того же вывода; остальные — по таблице ниже.
 Требования, приёмка, разрешённые файлы, запреты, команды проверок: <...>
 Отчёт: <путь>. В отчёте назови фактическую модель сессии.
 
-Для задачи с риском high в брифе стоит: Модель: claude-fable-5-1
+Для coder задачи с риском high по умолчанию в брифе стоит: Модель: claude-opus-5-5
 Запись результата координатором:
   state.py task-result --manifest <path> --task <id> --role <coder|tester> --status <status> \
     --session-id <id> --head <sha> --artifact <отчёт> --model <model из role-model>
@@ -105,11 +130,11 @@ Effort субагента — параметр брифа координатор
 
 | Роль | Effort по умолчанию | Когда выше |
 |---|---|---|
-| tester | `medium` | `high` для задачи с риском `high` (план или `waves.json`: `risk: high`) |
+| tester | `medium` | `high` для задачи с риском `high` (план или `waves.json`: `risk: high`); то же отдаёт `role-model --role tester` полем `effort`, от модели не зависит |
 | reader | `low` | — (извлекает факты и ссылки `file:line`, не рассуждает) |
 | coder | по выбору координатора | — |
 
-Модель роли effort не меняет: её задаёт риск (раздел выше; `reader@haiku` — всегда). Повод (#15): субагенты coder/tester
+Модель роли effort не меняет: её задаёт политика ролей (раздел выше; `reader@haiku` — всегда). Повод (#15): субагенты coder/tester
 съедали больше половины суточного лимита, перечитывая репозиторий целиком. Поэтому бриф tester по
 умолчанию — дифф и команды проверки, а чтение репозитория идёт через `reader`: выжимка и ссылки
 `file:line`, а не файлы целиком. Если host не умеет задавать effort субагента, координатор
