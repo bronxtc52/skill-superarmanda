@@ -681,6 +681,34 @@ class FableLimitWhileBlocked(FableLimitBase):
         self.assertNotIn("fable_blocked_episode", self.w())
         self.assertIn("blocked", self.w()["notified"])
 
+    def test_the_same_line_anew_notifies_even_if_the_owner_was_notified_before(self):
+        # CodeRabbit on #111: the owner got the notice of the line before the limit; the dedup by text must not
+        # swallow the notice of the same line written anew by the Opus session
+        self.blocked_wave([user_line("Ответ: B", "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["notified"]["blocked"] = self.BLOCKED  # an earlier tick saw the line and told the owner
+        st["waves"]["W1"]["last_status"] = self.BLOCKED
+        wab.save_state(self.cfg, st)
+        self.tick()
+        self.transcript(self.w()["sessions"][-1], [asst(inp=10)], marker=wab.session_marker(self.cfg, "W1"))
+        self.set_status(self.cfg, "W1", self.BLOCKED)
+        later = time.time() + 5
+        os.utime(wab.wave_dir(self.cfg, "W1") / "status", (later, later))
+        with mock.patch.object(wab, "put_notice", wraps=wab.put_notice) as put:
+            self.tick()
+        self.assertIn("blocked", [c.args[3] for c in put.call_args_list])
+
+    def test_a_gate_failure_is_not_typed_into_the_refused_window(self):
+        # CodeRabbit on #111: the fresh limit is checked before the retry of a gate failure
+        self.BLOCKED = "BLOCKED: merge gate: CI красный"
+        self.blocked_wave([limit_lines()[0]])
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["gate_fail_msg"] = {"text": "сбой гейта: почини CI", "sent": False}
+        wab.save_state(self.cfg, st)
+        self.tick()
+        self.assertEqual(len(self.new_sessions()), 1)
+        self.assertFalse(any("сбой гейта" in str(x[2]) for x in self.sent if len(x) > 2), self.sent)
+
     def test_an_empty_status_mid_rewrite_keeps_the_episode(self):
         self.switched(limit_lines()[:1])
         (wab.wave_dir(self.cfg, "W1") / "status").write_text("", encoding="utf-8")

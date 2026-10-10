@@ -6463,7 +6463,17 @@ def _tick(cfg, st):
             save_state(cfg, st)
             return True  # handed to the Opus session: no policy answer, no notice, no gate failure for it again
         w.pop("fable_blocked_episode")  # the wave wrote another line (or the same one anew): a new episode
+        drop_notice(w, "blocked")  # the owner may have been told of the old line: the same text is asked anew
         save_state(cfg, st)
+
+    # before any retry typed into the window (a gate failure, an answer): a refused Fable window gets nothing more
+    if status.startswith("BLOCKED") and w.get("phase") in ("running", "checkpoint") and not w.get("await_session"):
+        since = fable_limit_after_blocked(cfg, wave, w)  # #110: answered, went on, refused — not a wait
+        if since is not None:
+            begin_fable_switch(cfg, st, wave, w,
+                               blocked={"status": status, "since": since, "stamp": _status_stamp(cfg, wave)})
+            return _fable_switch_tick(cfg, st, wave, w)
+
 
     if w.get("pending_clear"):
         _settle_clear(cfg, st, wave, w)  # an earlier clearing that the screen did not confirm: again
@@ -6493,13 +6503,6 @@ def _tick(cfg, st):
         w.pop("policy_pending", None)
         _abandon_input(cfg, st, wave, w, "the wave left the BLOCKED line of the answer")
         save_state(cfg, st)
-
-    if status.startswith("BLOCKED") and w.get("phase") in ("running", "checkpoint") and not w.get("await_session"):
-        since = fable_limit_after_blocked(cfg, wave, w)  # #110: answered, went on, refused — not a wait
-        if since is not None:
-            begin_fable_switch(cfg, st, wave, w,
-                               blocked={"status": status, "since": since, "stamp": _status_stamp(cfg, wave)})
-            return _fable_switch_tick(cfg, st, wave, w)
 
     answered = _policy_answer(cfg, st, wave, w, status, now, attach) if status.startswith("BLOCKED") else False
     if answered is None or answered:
