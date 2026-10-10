@@ -2743,7 +2743,7 @@ def record_internal_round(entry, data, location):
         fail(
             f"--source {INTERNAL_SOURCE} requires an {INTERNAL_SOURCE} findings result on the "
             f"current head: record task-result --role {INTERNAL_SOURCE} --status findings "
-            "--model fable first"
+            "--model <model from state.py role-model> first"
         )
     if current.get("status") != "findings":
         fail(
