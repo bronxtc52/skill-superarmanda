@@ -7840,6 +7840,51 @@ class RolePolicy140(W4Base):
         self.review("second_reviewer", "codex-host")
         self.ready_after_final_check_on("opus")
 
+    # ----- the role policy below high (finding of Astra, state.py:1480) -----
+    def low_ready_on(self, coder_model, tester_model=None):
+        self.record("coder", model=coder_model)
+        self.record("tester", model=tester_model)
+        self.review("cross_provider_reviewer", "claude-host")
+
+    def test_raise_to_medium_with_coder_medium_opus_takes_readiness_away_from_a_sonnet_coder(self):
+        self.init_with("--role-model", "coder.medium=opus", risk="low")
+        self.low_ready_on("sonnet")
+        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertEqual(self.ok("task-risk", "--task", "t1", "--risk", "medium")["status"], "in_progress")
+        action = self.where()["next_action"]
+        self.assertEqual(self.position(), (4, "coder"))
+        self.assertIn(OPUS, action)
+        self.assertIn(SONNET, action)
+        self.assertNotEqual(self.gate_problems(), [])
+        # the gate recomputes: a status kept ready by hand is still refused, with the reason
+        value = self.data()
+        value["tasks"]["t1"]["status"] = "ready_for_pr_review"
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        problems = " ".join(self.gate_problems())
+        self.assertIn("coder", problems)
+        self.assertIn(OPUS, problems)
+        # re-running coder on the model of the policy makes it ready again
+        self.record("coder", model="opus")
+        self.record("tester")
+        self.review("cross_provider_reviewer", "claude-host")
+        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertEqual(self.position(), (7, "github_codex_review"))
+
+    def test_medium_override_counts_an_opus_coder(self):
+        self.init_with("--role-model", "coder.medium=opus", risk="medium")
+        self.low_ready_on("opus")
+        self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertEqual(self.gate_problems(), [])
+
+    def test_low_and_medium_without_override_stay_ready_on_sonnet_or_no_model(self):
+        for level in ("low", "medium"):
+            for coder, tester in (("sonnet", "sonnet"), (None, None)):
+                with self.subTest(level=level, coder=coder):
+                    self.init_with(risk=level)
+                    self.low_ready_on(coder, tester)
+                    self.assertEqual(self.entry()["status"], "ready_for_pr_review")
+                    self.assertEqual(self.gate_problems(), [])
+
     def test_internal_and_final_check_count_on_opus_and_not_on_a_weaker_record(self):
         self.record("coder", model="opus")
         self.record("tester", model="sonnet")

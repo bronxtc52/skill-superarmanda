@@ -1095,6 +1095,37 @@ def required_roles(risk):
     return ("coder", "tester") + (REVIEW_ROLES if risk == "high" else REVIEW_ROLES[:1])
 
 
+def policy_model_gaps(entry, results, risk, models):
+    """Why passed coder/tester results do not count for the effective `risk`: {role: reason}.
+
+    The single model rule of readiness at EVERY risk (task_ready, fix_cycle_closable, current_gaps
+    and so derive_step/where, the merge gate through them): a passed (or covered) coder/tester
+    result ran on the model of the role policy for this risk or a stronger one (`models`,
+    role_models). Below high it applies only where the policy asks more than Sonnet (an override
+    such as coder.medium=opus): results of low/medium without --model, valid since 1.2.x, keep
+    counting under the built-in defaults. On high it always applies (high_risk_gaps). A risk raised
+    after the record (task-risk) is judged by the new risk: the old result counts no more."""
+    gaps = {}
+    if risk not in RISKS:
+        return gaps
+    for role in MODEL_ROLES:
+        required = policy_model(models, role, risk)
+        if risk != "high" and not weaker(SONNET_MODEL, required):
+            continue
+        result = results.get(role)
+        if not isinstance(result, dict):
+            continue
+        if not (result.get("status") == "pass" or is_covered(entry, role, result)):
+            continue
+        if weaker(result.get("model"), required):
+            gaps[role] = (
+                f"{role} result has model {result.get('model') or 'not recorded'}; a {risk}-risk "
+                f"task requires {required} or a stronger model (the role policy): re-run {role} "
+                "on it, no weaker model"
+            )
+    return gaps
+
+
 def high_risk_gaps(entry, results, head, models):
     """Why the passed results of a high-risk task still do not make it ready: {role: reason}.
 
@@ -1117,15 +1148,7 @@ def high_risk_gaps(entry, results, head, models):
             return result
         return None
 
-    for role in MODEL_ROLES:
-        result = passed(role)
-        required = policy_model(models, role, "high")
-        if result is not None and weaker(result.get("model"), required):
-            gaps[role] = (
-                f"{role} result has model {result.get('model') or 'not recorded'}; a high-risk "
-                f"task requires {required} or a stronger model (the role policy): re-run {role} "
-                "on it, no weaker model"
-            )
+    gaps.update(policy_model_gaps(entry, results, "high", models))
     reviews = {}
     for role in REVIEW_ROLES:
         if open_review_findings(entry, head, role):
@@ -1474,11 +1497,12 @@ def task_ready(entry, risk, head, policy, models):
     `risk` and `policy` have no default here or in any caller that recomputes a status: a
     forgotten argument must be an error, never a silent return to older rules. Callers take them
     from `task_risk(data, entry)` and `policy_version(data)`; `head` is the manifest HEAD the
-    entry's results belong to."""
+    entry's results belong to. At every risk coder and tester must have run on the model of the
+    role policy where it asks more than Sonnet (policy_model_gaps)."""
     if not all(effective_status(entry, role) == "pass" for role in required_roles(risk)):
         return False
     if risk != "high":
-        return True
+        return not policy_model_gaps(entry, entry["results"], risk, models)
     return not high_risk_gaps(entry, entry["results"], head, models) and not fable_role_gaps(
         entry, entry["results"], head, policy, models
     )
@@ -1493,7 +1517,9 @@ def fix_cycle_closable(entry, risk, head, models):
     no fix cycle of a high task could ever close."""
     if not all(effective_status(entry, role) == "pass" for role in required_roles(risk)):
         return False
-    return risk != "high" or not high_risk_gaps(entry, entry["results"], head, models)
+    if risk != "high":
+        return not policy_model_gaps(entry, entry["results"], risk, models)
+    return not high_risk_gaps(entry, entry["results"], head, models)
 
 
 def close_fix_cycle(entry, risk, head, policy, models):
@@ -2813,11 +2839,14 @@ def current_results(entry, head, tree):
 
 
 def current_gaps(entry, head, tree, risk, policy, models):
-    """Everything that keeps the passed results of a high-risk task from making it ready:
-    high_risk_gaps plus, under the policy 1.2.4, the gaps of the mandatory Fable roles."""
-    if risk != "high" or not entry:
+    """Everything that keeps the passed results of a task from making it ready: below high the
+    models of the role policy (policy_model_gaps); on high high_risk_gaps plus, under the policy
+    1.2.4, the gaps of the mandatory Fable roles."""
+    if not entry:
         return {}
     results = current_results(entry, head, tree)
+    if risk != "high":
+        return policy_model_gaps(entry, results, risk, models)
     return {
         **high_risk_gaps(entry, results, head, models),
         **fable_role_gaps(entry, results, head, policy, models),

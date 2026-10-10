@@ -521,6 +521,8 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
                     and not (role == "second_reviewer" and (risk == "high" or other.get("status") != "findings"))
                     and not _covered(entry, role, other)):
                 problems.append(f"задача {name}: {role} {other.get('status')}")
+        if version == 2 and risk != "high":
+            problems += _model_problems(name, entry, results, risk, head, cwd_fingerprint, models)
         if risk == "high":
             problems += _high_problems(name, entry, results, head, cwd_fingerprint, wave_risk, review_policy, models)
         elif version == 2 and _high_traces(name, entry, results):
@@ -549,6 +551,19 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
 
 def _as_list(value):
     return value if isinstance(value, list) else []
+
+
+def _model_problems(name, entry, results, risk, head, cwd_fingerprint, models):
+    """Below high: coder/tester on HEAD ran on the model of the role policy for the task's risk where it asks
+    more than Sonnet (state.policy_model_gaps, the rule of task_ready itself, not a copy). Records it cannot
+    read are a reason, never a pass."""
+    try:
+        current = state.current_results(dict(entry, results={r: v for r, v in results.items() if isinstance(v, dict)}),
+                                        head, cwd_fingerprint)
+        return [f"задача {name}: {role} (риск {risk}): {gap}"
+                for role, gap in sorted(state.policy_model_gaps(entry, current, risk, models).items())]
+    except Exception:  # noqa: BLE001 - fail closed
+        return [f"manifest: задача {name}: модели coder/tester не разбираются правилами state.py"]
 
 
 def _ready_by_state(entry, results, risk, head, policy, models):

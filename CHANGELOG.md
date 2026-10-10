@@ -43,6 +43,10 @@
 - Готовность задачи `high`: coder и tester — модель не слабее политики (было «ровно Fable»); `internal_reviewer` и
   `final_check` обязательны, как в 1.2.4, но с моделью политики. Два ревью задачи `high` (Astra и Fable) и quota-маршрут
   `codex-host-opus` — без изменений. Новые manifest — `review_policy.version: "1.4.0"`.
+- Готовность задачи `low`/`medium`: модель coder и tester сверяется с политикой ролей там, где политика для этого
+  риска выше Sonnet (переопределение вроде `coder.medium=opus`). Результат, записанный до `task-risk` на более слабой
+  модели, перестаёт засчитываться; `where` и гейт волны называют причину. При встроенных дефолтах результаты
+  `low`/`medium` без `--model` засчитываются, как в 1.2.x.
 - Документация: [profiles.md](skills/superarmanda/references/profiles.md) (таблица ролей 1.4.0),
   [workflow.md](skills/superarmanda/references/workflow.md) и
   [role-briefs.md](skills/superarmanda/references/role-briefs.md) (раздел «Субагентские роли», бриф берёт модель из
