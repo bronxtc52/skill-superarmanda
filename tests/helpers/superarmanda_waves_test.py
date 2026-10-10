@@ -17833,13 +17833,37 @@ class T2ChainDefaults(PlanReviewBase):
         (value,) = [e for e in envs if e.startswith("SUPERARMANDA_ROLE_MODELS=")]
         self.assertEqual(json.loads(value.partition("=")[2]), table)
 
-    def test_without_role_models_no_env_is_set(self):
+    def test_without_role_models_the_env_is_set_empty(self):
+        # always -e, empty without a policy: a SUPERARMANDA_ROLE_MODELS in the global environment of the tmux
+        # server would otherwise reach the wave window (tmux merges the global and the session env; Codex P2)
         for over in ({}, {"role_models": None}, {"role_models": {}}):
             with self.subTest(over=over):
                 cfg, _ = self.new_chain(run_id=f"r-{len(over)}-{len(str(over))}", **over)
                 self.assertNotIn("role_models", wab._pinned_identity(cfg))
                 self.launched(cfg)
-                self.assertFalse([a for a in self.new_session_args() if "SUPERARMANDA_ROLE_MODELS" in a])
+                args = self.new_session_args()
+                envs = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
+                self.assertEqual([e for e in envs if "SUPERARMANDA_ROLE_MODELS" in e],
+                                 ["SUPERARMANDA_ROLE_MODELS="])
+                self.assertEqual([a for a in args if "SUPERARMANDA_ROLE_MODELS" in a],
+                                 ["SUPERARMANDA_ROLE_MODELS="])
+
+    def test_an_empty_model_of_a_new_chain_is_the_opus_default(self):
+        cfg, _ = self.new_chain(ctx_limit=None, model="")
+        self.assertEqual(cfg["model"], OPUS)
+        self.launched(cfg)
+        args = self.new_session_args()
+        self.assertEqual(args[args.index("--model") + 1], OPUS)
+        self.assertNotIn("has no `model`", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_an_empty_model_of_a_legacy_chain_is_like_none(self):
+        cfg, path = self.new_chain(waves=["W1", "W2", "W3"], model="")
+        before = wab._pinned_identity(cfg)
+        self.put_state(cfg, {"current": "W1", "identity": before,
+                             "waves": {"W1": self.wave_rec("W1", phase="done")}})
+        cfg = wab.load_chain(path)
+        self.assertIsNone(cfg["model"])
+        self.assertEqual(wab._pinned_identity(cfg), before)
 
     def test_role_models_refuses_unknown_and_weaker_entries(self):
         bad = {

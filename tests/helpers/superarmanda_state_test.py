@@ -7930,6 +7930,11 @@ class RolePolicy140(W4Base):
         self.assertEqual(self.data()["role_models"], expected)
         self.record_refused("tester", model="sonnet", needle=OPUS)
 
+    def test_an_empty_env_is_no_override(self):
+        # wab.py passes an empty SUPERARMANDA_ROLE_MODELS to a wave of a chain without role_models (Codex P2)
+        self.init_with(env={"SUPERARMANDA_ROLE_MODELS": ""})
+        self.assertEqual(self.data()["role_models"], DEFAULT_ROLE_MODELS_1_4_0)
+
     def test_override_below_the_default_is_refused(self):
         for flags, env in (
             (["--role-model", "coder.high=sonnet"], None),

@@ -190,6 +190,8 @@ def load_chain(path, create=True):
     for key in OPTIONAL_STRINGS + ("tmux_prefix",):
         if key in cfg and cfg[key] is None:
             del cfg[key]  # an explicit null is the same as leaving the field out (the default)
+    if cfg.get("model") == "":
+        del cfg["model"]  # "" is no model either: the default of the chain (Opus for a new one), not the CLI's (#108)
     for key in ("titles", "role_models"):
         if key in cfg and cfg[key] is None:
             del cfg[key]  # no titles / no role policy of the chain, like leaving it out (dash reads cfg.get("titles", {}))
@@ -3749,9 +3751,11 @@ def start_session(cfg, st, wave, sid=None, phase="starting"):
         cmd += ["--model", model]
     w["session_model"] = model or ""  # saved with the phase below: the limit detection reads it (#108)
     pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
-    if cfg.get("role_models"):  # read by `state.py init` of the wave; no field, no env (the built-in policy)
-        pin += ["-e", f"{gate.state.ROLE_MODELS_ENV}="
-                      f"{json.dumps(cfg['role_models'], sort_keys=True, separators=(',', ':'))}"]
+    # read by `state.py init` of the wave; always set, empty without a policy (= the built-in one): the global
+    # environment of the tmux server could otherwise hand the window someone else's policy (#108)
+    policy = cfg.get("role_models")
+    pin += ["-e", f"{gate.state.ROLE_MODELS_ENV}="
+                  f"{json.dumps(policy, sort_keys=True, separators=(',', ':')) if policy else ''}"]
     made = tmux("new-session", "-d", "-P", "-F", "#{pane_id}", "-s", w["tmux"], "-c", w["cwd"], "-x", "220", "-y", "60",
                 "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", "-e", f"WAB_MAX_RUNS={cfg['max_runs']}",
                 "-e", f"SUPERARMANDA_TZ={humantime.resolve(cfg.get('timezone'))[0]}", *pin, *cmd)

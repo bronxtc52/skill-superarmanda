@@ -22,8 +22,8 @@
   дефолта, флаг ниже env (политики цепочки), `coordinator`, неизвестные роль, риск или модель — отказ. Словарь моделей пополнился `claude-opus-5-5` /
   `opus`. `role-model` отдаёт модель любой из семи ролей и `effort` tester.
 - `review.py run` пишет в каждый отчёт (`pass`, `findings`, `error`) `created_at` — UTC ISO-8601.
-- `chain.json`: `role_models` (политика ролей волн, уходит в окно волны env `SUPERARMANDA_ROLE_MODELS`, входит в
-  идентичность), `plan_review_fable_rounds` (по умолчанию 2), `fable_budget_units` (по умолчанию 80, tunable).
+- `chain.json`: `role_models` (политика ролей волн, уходит в окно волны env `SUPERARMANDA_ROLE_MODELS` — без поля пустым, чтобы не унаследовать глобальный env tmux, входит в
+  идентичность; `model: ""` — как отсутствие поля), `plan_review_fable_rounds` (по умолчанию 2), `fable_budget_units` (по умолчанию 80, tunable).
 - Ревью плана фазы A: после `plan_review_fable_rounds` кругов Fable `wab.py launch` принимает `pass` одной Astra.
   Круги лежат в `plan-review/history/` (пакет и отчёт Fable каждого круга), считаются по разным пакетам, отчёты
   ошибки не считаются; Astra обязана быть новее каждого отчёта Fable в `history/` (`created_at`, любой статус — `pass`, `findings`, `error`/quota), `findings` Fable на одобренном пакете —
