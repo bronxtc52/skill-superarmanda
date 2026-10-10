@@ -48,6 +48,10 @@
 
 Подстановка заглушек — `Journal` в `tests/helpers/superarmanda_waves_e2e_test.py`.
 
+Строку ответа владельца на `BLOCKED` (1.4.1, #110) `user_line()` в `tests/helpers/superarmanda_fable_test.py`
+берёт из живой строки `user` файла `first-session-head.jsonl`: меняются только `message.content`, `timestamp` и
+`isSidechain`; форма строки — живая.
+
 ## `rate-limit-assistant.jsonl` — исчерпанная подписка Claude (1.2.1, #86)
 
 Две живые строки журнала сессии Claude Code, которые CLI записал сам, когда провайдер ответил 429:

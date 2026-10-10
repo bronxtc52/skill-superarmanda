@@ -63,6 +63,7 @@ WAVE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 PREFIX = re.compile(r"[A-Za-z0-9_-]+")
 TAIL_BYTES = 4_000_000       # context is measured from the last 4 MB of a transcript
 FIRST_MESSAGE_BYTES = 256 * 1024
+ANSWER_TAIL_BYTES = 1 << 20  # the answer to a BLOCKED is looked for in the last 1 MB of the old journal (#110)
 HEAD_BYTES = 4096            # transcript identity check: hash of the first 4 KB
 
 
@@ -826,7 +827,7 @@ class TranscriptCache:
     @staticmethod
     def _blank(key):
         return {"key": key, "offset": None, "partial": b"", "discard_first": False, "head": None,
-                "turns": 0, "tools": 0, "out": 0, "read": 0, "ctx": 0, "limit": 0}
+                "turns": 0, "tools": 0, "out": 0, "read": 0, "ctx": 0, "limit": 0, "limit_at": 0.0}
 
     def read(self, path):
         path = str(path)
@@ -873,7 +874,7 @@ class TranscriptCache:
 
     @staticmethod
     def _summary(e):
-        return {k: e[k] for k in ("turns", "tools", "out", "read", "ctx", "limit")}
+        return {k: e[k] for k in ("turns", "tools", "out", "read", "ctx", "limit", "limit_at")}
 
     @staticmethod
     def _count(e, raw):
@@ -896,12 +897,26 @@ class TranscriptCache:
         e["turns"] += 1
         if d.get("error") == "rate_limit" or d.get("apiErrorStatus") == 429:
             e["limit"] += 1  # the provider refused the session itself (#108): by the fields, never by the text
+            e["limit_at"] = max(e["limit_at"], _line_time(d))  # 0 without a readable time (#110)
         if u:
             e["ctx"] = (_num(u.get("input_tokens")) + _num(u.get("cache_creation_input_tokens"))
                         + _num(u.get("cache_read_input_tokens")))
 
 
 CACHE = TranscriptCache(tail_bytes=TAIL_BYTES)
+
+
+def _line_time(d):
+    """`timestamp` of a journal line (ISO-8601 with an offset, Claude Code writes UTC `…Z`) as epoch seconds;
+    0.0 when it is missing or unreadable."""
+    value = d.get("timestamp") if isinstance(d, dict) else None
+    if not isinstance(value, str):
+        return 0.0
+    try:
+        moment = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return moment.timestamp() if moment.tzinfo is not None else 0.0
 
 
 def context_tokens(w):
@@ -1096,6 +1111,40 @@ _CLEAR_SCAFFOLD = re.compile(
     r"|<local-command-stdout>.*</local-command-stdout>"
     r"|<command-name>/clear</command-name>\s*<command-message>clear</command-message>"
     r"\s*<command-args>\s*</command-args>)\s*", re.S)
+
+
+def _user_texts_since(path, since, tail=ANSWER_TAIL_BYTES):
+    """Texts of the main-thread user messages newer than `since` (epoch seconds) in the last `tail` bytes of a
+    journal, in order (#110: the answer to a BLOCKED). tool_result blocks, sidechain and isMeta lines, the /clear
+    scaffolding and lines without a readable time do not count."""
+    try:
+        with open(path, "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - tail))
+            data = fh.read()
+    except OSError:
+        return []
+    lines = data.split(b"\n")
+    if size > tail:
+        lines.pop(0)  # cut mid-line
+    out = []
+    for raw in lines:
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("type") != "user" or d.get("isSidechain") or d.get("isMeta"):
+            continue
+        if _line_time(d) <= since:
+            continue
+        msg = d.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            content = "\n".join(c["text"] for c in content
+                                if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str))
+        if isinstance(content, str) and content.strip() and not _CLEAR_SCAFFOLD.fullmatch(content):
+            out.append(content.strip())
+    return out
 
 
 def _first_user_text(path):
@@ -4453,6 +4502,46 @@ def fable_limit_hit(cfg, w):
     return CACHE.read(transcript_path(w["cwd"], sessions[-1]))["limit"] > 0
 
 
+def fable_limit_after_blocked(cfg, wave, w):
+    """#110: the limit of a Fable wave whose status file says BLOCKED. Fresh only when the newest limit line of
+    the current session is newer than the status file: the wave got an answer, went on and was refused. A wave
+    that only waits for the owner calls nobody, so it is never switched; a limit line without a time is not
+    fresh either (fail safe: the owner sees the idle wave, as before). Returns the status file's mtime, or None."""
+    if not fable_limit_hit(cfg, w):
+        return None
+    stamp = _status_stamp(cfg, wave)
+    if stamp is None:
+        return None
+    since = stamp[1] / 1e9
+    limit_at = CACHE.read(transcript_path(w["cwd"], w["sessions"][-1]))["limit_at"]
+    return since if limit_at > since else None
+
+
+FABLE_BLOCKED_ANSWER_CHARS = 4000
+FABLE_BLOCKED_ASK_AGAIN = "задай вопрос заново"
+
+
+def fable_blocked_note(w, sw):
+    """The part of the switch message for a switch from BLOCKED (#110): the BLOCKED line and the answer typed
+    after it in the old session's journal, or — when the journal holds none — the request to ask again under a
+    new line (the same text would be taken for the episode already notified)."""
+    blocked = sw.get("blocked") if isinstance(sw, dict) else None
+    if not (isinstance(blocked, dict) and isinstance(blocked.get("status"), str)
+            and isinstance(blocked.get("since"), (int, float)) and isinstance(sw.get("from"), str)):
+        return ""
+    line = blocked["status"].strip()
+    answers = _user_texts_since(transcript_path(w["cwd"], sw["from"]), blocked["since"])
+    if not answers:
+        return (f"Перед лимитом волна стояла в «{line}». Ответа на него в журнале прошлой сессии нет: "
+                f"{FABLE_BLOCKED_ASK_AGAIN} — перепиши status той же строкой BLOCKED, добавив в конце "
+                f"« (повтор после смены модели)».")
+    text = "\n---\n".join(answers)
+    if len(text) > FABLE_BLOCKED_ANSWER_CHARS:
+        text = text[:FABLE_BLOCKED_ANSWER_CHARS] + "…"
+    return (f"Перед лимитом волна стояла в «{line}», и в прошлой сессии на него пришёл ответ:\n{text}\n"
+            f"Продолжи по этому ответу и перепиши status.")
+
+
 def fable_switch_message(cfg, wave, w, wdir):
     """The first message of the Opus session; chosen once the old window is closed (nothing writes the wave
     files any more) and saved in `fable_switch.text`, so a resumed dispatcher sends the same text. The limit
@@ -4480,14 +4569,18 @@ def fable_switch_message(cfg, wave, w, wdir):
             except (KeyError, TypeError, OSError, ValueError):
                 prompt = None
             text = first_prompt_head(cfg, wave, w) + prompt if prompt else resume_message(cfg, wave, wdir)
-    return text + "\n" + FABLE_SWITCH_NOTE
+    note = fable_blocked_note(w, w.get("fable_switch"))
+    return text + "\n" + (note + "\n" if note else "") + FABLE_SWITCH_NOTE
 
 
-def begin_fable_switch(cfg, st, wave, w):
-    """The decision, in ONE save: the override, the counter, the new session id and the phase."""
+def begin_fable_switch(cfg, st, wave, w, blocked=None):
+    """The decision, in ONE save: the override, the counter, the new session id and the phase. `blocked`
+    ({status, since}) — the switch comes from a BLOCKED line (#110): its answer goes into the message."""
     w["model_override"] = FABLE_SWITCH_TO
     w["fable_switches"] = (w["fable_switches"] if _count(w.get("fable_switches")) else 0) + 1
     w["fable_switch"] = {"sid": str(uuid.uuid4()), "step": "closing", "from": (w.get("sessions") or [None])[-1]}
+    if blocked:
+        w["fable_switch"]["blocked"] = blocked
     w["phase"] = "switching"
     save_state(cfg, st)
     event(cfg, f"fable limit: {wave} → relaunch on {FABLE_SWITCH_TO}")
@@ -6376,6 +6469,12 @@ def _tick(cfg, st):
         w.pop("policy_pending", None)
         _abandon_input(cfg, st, wave, w, "the wave left the BLOCKED line of the answer")
         save_state(cfg, st)
+
+    if status.startswith("BLOCKED") and w.get("phase") in ("running", "checkpoint") and not w.get("await_session"):
+        since = fable_limit_after_blocked(cfg, wave, w)  # #110: answered, went on, refused — not a wait
+        if since is not None:
+            begin_fable_switch(cfg, st, wave, w, blocked={"status": status, "since": since})
+            return _fable_switch_tick(cfg, st, wave, w)
 
     answered = _policy_answer(cfg, st, wave, w, status, now, attach) if status.startswith("BLOCKED") else False
     if answered is None or answered:

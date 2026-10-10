@@ -536,6 +536,122 @@ class FableSwitchMessage(FableLimitBase):
         self.assertNotIn("--manifest", text)
 
 
+
+def user_line(text, timestamp, side=False, content=None):
+    """The live typed-user line of `first-session-head.jsonl` (Claude Code 2.1.289) with its text and time set."""
+    for raw in FIXTURES.joinpath("first-session-head.jsonl").read_text(encoding="utf-8").splitlines():
+        d = json.loads(raw) if raw.strip() else None
+        if isinstance(d, dict) and d.get("type") == "user":
+            break
+    else:
+        raise AssertionError("first-session-head.jsonl has no user line")
+    d["message"]["content"] = content if content is not None else text
+    d["timestamp"] = timestamp
+    d["isSidechain"] = side
+    return json.dumps(d, ensure_ascii=False)
+
+
+def at(iso):
+    return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+class FableLimitWhileBlocked(FableLimitBase):
+    """#110 (Codex P2 on #109): the wave on Fable got an answer to its BLOCKED (the owner in the window, the
+    decision policy, a merge gate failure), went on working and hit the limit while the status file still says
+    BLOCKED. The limit is fresh when its line is newer than the BLOCKED line of the status file; the answer
+    typed after the BLOCKED goes into the message of the Opus session (the new session does not see the old
+    journal). A wave that only waits for the owner calls nobody: no fresh limit, no switch."""
+
+    BLOCKED = "BLOCKED: выбрать вариант A или B"
+    LIMIT_AT = "2026-10-10T10:00:00.000Z"  # the time limit_lines() puts in the live rate-limit line
+
+    def blocked_wave(self, lines, blocked_at="2026-10-10T09:00:00.000Z"):
+        self.setup_wave(lines=lines)
+        self.set_status(self.cfg, "W1", self.BLOCKED)
+        status = wab.wave_dir(self.cfg, "W1") / "status"
+        os.utime(status, (at(blocked_at), at(blocked_at)))
+
+    def switch_text(self):
+        texts = [s[2] for s in self.sent if s[0] == "text" and SWITCH_NOTE in s[2]]
+        self.assertEqual(len(texts), 1, self.sent)
+        return texts[0]
+
+    def test_limit_after_an_answer_switches_and_carries_the_answer(self):
+        self.blocked_wave([user_line("Ответ владельца: вариант B", "2026-10-10T09:30:00.000Z"),
+                           limit_lines()[0]])
+        self.assertTrue(self.tick())
+        w = self.w()
+        self.assertEqual(w["model_override"], OPUS)
+        self.assertEqual(w["fable_switches"], 1)
+        self.assertEqual(len(self.new_sessions()), 1)
+        text = self.switch_text()
+        self.assertIn("Ответ владельца: вариант B", text)
+        self.assertIn(self.BLOCKED, text)
+        self.assertIn(wab.session_marker(self.cfg, "W1"), text)
+        self.assertIn("fable limit: W1 → relaunch on claude-opus-5-5", self.events())
+
+    def test_waiting_for_the_owner_is_not_switched(self):
+        self.blocked_wave([user_line("ещё до вопроса", "2026-10-10T08:30:00.000Z")])
+        self.tick()
+        self.assertEqual(self.new_sessions(), [])
+        self.assertNotIn("model_override", self.w())
+
+    def test_an_answer_without_a_limit_is_not_switched(self):
+        self.blocked_wave([user_line("Ответ владельца: вариант B", "2026-10-10T09:30:00.000Z")])
+        self.tick()
+        self.assertEqual(self.new_sessions(), [])
+
+    def test_a_limit_older_than_the_blocked_line_is_not_switched(self):
+        self.blocked_wave(limit_lines()[:1], blocked_at="2026-10-10T11:00:00.000Z")
+        self.tick()
+        self.assertEqual(self.new_sessions(), [])
+
+    def test_a_limit_line_without_a_time_is_not_switched(self):
+        line = json.loads(limit_lines()[0])
+        line.pop("timestamp")
+        self.blocked_wave([json.dumps(line)])
+        self.tick()
+        self.assertEqual(self.new_sessions(), [])
+
+    def test_only_the_answers_after_the_blocked_line_are_carried(self):
+        self.blocked_wave([
+            user_line("до вопроса", "2026-10-10T08:30:00.000Z"),
+            user_line("субагент", "2026-10-10T09:20:00.000Z", side=True),
+            user_line("", "2026-10-10T09:25:00.000Z",
+                      content=[{"type": "tool_result", "tool_use_id": "t", "content": "вывод инструмента"}]),
+            user_line("Ответ: B", "2026-10-10T09:30:00.000Z"),
+            user_line("и ещё: без миграции", "2026-10-10T09:31:00.000Z"),
+            limit_lines()[0]])
+        self.tick()
+        text = self.switch_text()
+        self.assertIn("Ответ: B", text)
+        self.assertIn("и ещё: без миграции", text)
+        self.assertLess(text.index("Ответ: B"), text.index("и ещё: без миграции"))
+        for absent in ("до вопроса", "субагент", "вывод инструмента"):
+            self.assertNotIn(absent, text)
+
+    def test_no_answer_found_asks_the_question_again(self):
+        # the limit came after the BLOCKED line without a typed message in this journal (an answer the journal
+        # did not keep): the new session is told to ask again under a new line, so the owner is notified again
+        self.blocked_wave(limit_lines()[:1])
+        self.tick()
+        self.assertEqual(len(self.new_sessions()), 1)
+        text = self.switch_text()
+        self.assertIn(self.BLOCKED, text)
+        self.assertIn(wab.FABLE_BLOCKED_ASK_AGAIN, text)
+
+    def test_a_long_answer_is_cut(self):
+        self.blocked_wave([user_line("Я" * 20000, "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        self.tick()
+        self.assertLess(len(self.switch_text()), 20000)
+
+    def test_a_running_wave_switches_as_before(self):
+        self.setup_wave()  # RUNNING, limit line older than the status file: the 1.4.0 path, not this one
+        self.tick()
+        self.assertEqual(len(self.new_sessions()), 1)
+        self.assertNotIn("BLOCKED", self.switch_text())
+
+
 # ---------------------------------------------------------------- T5
 NOW = datetime.datetime(2026, 10, 10, 12, 0, 0, tzinfo=datetime.timezone.utc)
 W = fable_usage.WEIGHTS
