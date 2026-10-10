@@ -60,7 +60,8 @@ standalone skill не копирует policy и не создаёт обход.
   предполётный чек-лист и мандат, затем запуск диспетчера;
 - `/superarmanda --wave <id> --plan <path>/waves.json` — одна волна: шаг 1 берётся из
   одобренного плана через `state.py init --from-plan`, шаги 3–7 как обычно;
-- `/superarmanda --wave <id> --resume` — продолжение после `/clear` по `state.py where`.
+- `/superarmanda --wave <id> --resume [--manifest <path>]` — продолжение после `/clear` (или после переключения
+  на Opus по лимиту Fable) по `state.py where`; явный `--manifest` важнее `handoff.md`.
 
 С любым из этих флагов [waves.md](references/waves.md) обязателен и имеет приоритет над
 шагами ниже там, где они расходятся: развилки идут в `$WAB_DIR/status` вместо

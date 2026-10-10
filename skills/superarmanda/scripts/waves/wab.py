@@ -4054,11 +4054,22 @@ def _settle_clear(cfg, st, wave, w, locked=False, target=None):
     return False
 
 
+def first_prompt_head(cfg, wave, w):
+    """The dispatcher's head of the first message of a wave (marker, wave dir, admitted clone, restart note)."""
+    head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wave_dir(cfg, wave)} "
+            f"(он же $WAB_DIR). Рабочая копия (admitted clone): {w['cwd']}. "
+            f"Протокол — в системной инструкции.\n\n")
+    n = w.get("restart")
+    if isinstance(n, int) and not isinstance(n, bool) and n > 1:
+        head += RESTART_NOTE.format(wave=wave, n=n) + "\n\n"
+    return head
+
+
 def deliver_first_prompt(cfg, st, wave):
     """starting -> sending -> running. The phase is saved before the paste: a dispatcher
     that dies in between leaves `sending`, which is never resent blindly."""
     w = st["waves"][wave]
-    name, cwd, wdir = w["tmux"], w["cwd"], wave_dir(cfg, wave)
+    name, wdir = w["tmux"], wave_dir(cfg, wave)
     if _plan_pin_refused(cfg, st, wave):
         return False
     if not wait_ready(name):
@@ -4074,12 +4085,7 @@ def deliver_first_prompt(cfg, st, wave):
     if _plan_pin_refused(cfg, st, wave):
         return False
     prompt = pathlib.Path(w["prompt_file"]).read_text(encoding="utf-8").strip()
-    head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wdir} "
-            f"(он же $WAB_DIR). Рабочая копия (admitted clone): {cwd}. "
-            f"Протокол — в системной инструкции.\n\n")
-    n = w.get("restart")
-    if isinstance(n, int) and not isinstance(n, bool) and n > 1:
-        head += RESTART_NOTE.format(wave=wave, n=n) + "\n\n"
+    head = first_prompt_head(cfg, wave, w)
     (wdir / "first-prompt.md").write_text(head + prompt + "\n", encoding="utf-8")
     w["phase"] = "sending"
     save_state(cfg, st)
@@ -4440,8 +4446,34 @@ def fable_limit_hit(cfg, w):
     return CACHE.read(transcript_path(w["cwd"], sessions[-1]))["limit"] > 0
 
 
-def fable_switch_message(cfg, wave, wdir):
-    return resume_message(cfg, wave, wdir) + "\n" + FABLE_SWITCH_NOTE
+def fable_switch_message(cfg, wave, w, wdir):
+    """The first message of the Opus session; chosen once the old window is closed (nothing writes the wave
+    files any more) and saved in `fable_switch.text`, so a resumed dispatcher sends the same text. The limit
+    may come before the first WAB-CHECKPOINT, when handoff.md does not exist (Codex P1 on #109):
+    - a manifest of the current run exists -> resume with its explicit path (`--manifest`), whatever
+      handoff.md says (a checkpoint before `init` leaves a handoff.md without the manifest);
+    - handoff.md exists, or runs.json names a run the choice refused -> the ordinary resume message;
+    - neither: the wave wrote nothing to resume from -> the wave's first message again (same head, same task)."""
+    path, why = current_manifest(cfg, wave)
+    if path is not None and path.is_file():
+        text = (f"/superarmanda --wave {wave} --resume {session_marker(cfg, wave)} --manifest {path} "
+                f"Каталог волны: {wdir}. Manifest волны уже есть: позиция — state.py where --manifest {path}; "
+                f"state.py init не вызывай. handoff.md, если есть, прочитай для контекста.")
+    elif (wdir / "handoff.md").exists() or path is None:
+        text = resume_message(cfg, wave, wdir)
+    else:
+        first = wdir / "first-prompt.md"
+        try:
+            text = first.read_text(encoding="utf-8").strip() if first.is_file() else ""
+        except (OSError, ValueError):
+            text = ""
+        if session_marker(cfg, wave) not in text:
+            try:
+                prompt = pathlib.Path(w["prompt_file"]).read_text(encoding="utf-8").strip()
+            except (KeyError, TypeError, OSError, ValueError):
+                prompt = None
+            text = first_prompt_head(cfg, wave, w) + prompt if prompt else resume_message(cfg, wave, wdir)
+    return text + "\n" + FABLE_SWITCH_NOTE
 
 
 def begin_fable_switch(cfg, st, wave, w):
@@ -4491,6 +4523,7 @@ def _fable_switch_tick(cfg, st, wave, w):
         if sw["sid"] not in w.setdefault("sessions", []):
             w["sessions"].append(sw["sid"])  # known up front: bound by id, not by its marker
         w["cleared_at"] = time.time()  # background shells older than this were the old session's (#68)
+        sw["text"] = fable_switch_message(cfg, wave, w, wdir)  # fixed now: a resumed dispatcher sends the same
         sw["step"] = "starting"
         save_state(cfg, st)
     if sw["step"] == "starting":
@@ -4525,7 +4558,11 @@ def _fable_switch_tick(cfg, st, wave, w):
             event(cfg, f"{wave}: fable switch: unknown whether the resume message arrived ({why}), NOT resent")
             return _fable_switch_done(cfg, st, wave, w, "resume NOT resent")
     try:
-        ok = _deliver(cfg, st, wave, FABLE_SWITCH_WHAT, send_text, fable_switch_message(cfg, wave, wdir))
+        text = sw.get("text") if isinstance(sw.get("text"), str) else None
+        if text is None:  # a record of an older 1.4.0 build: choose now and keep it
+            sw["text"] = text = fable_switch_message(cfg, wave, w, wdir)
+            save_state(cfg, st)
+        ok = _deliver(cfg, st, wave, FABLE_SWITCH_WHAT, send_text, text)
     except _WindowGone:
         return False
     if not ok:

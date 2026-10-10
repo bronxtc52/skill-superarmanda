@@ -786,8 +786,13 @@ state,mergeCommit,headRefOid`. `MERGED` и `headRefOid == gate_sha` — окно
 `model_override: "claude-opus-5-5"` и счётчик `fable_switches`, фаза `switching`. Шаги
 (`fable_switch` = `{sid, step}`: closing → starting → ready → sending) сохраняются до внешнего
 действия: окно закрывается, новая сессия с новым `session_id` стартует с `--model claude-opus-5-5`,
-и в неё уходит обычное сообщение продолжения `/superarmanda --wave <id> --resume …` со строкой
-«модель переключена на Opus из-за лимита Fable; отметь это в PR». Умерший посередине диспетчер
+и в неё уходит сообщение со строкой «модель переключена на Opus из-за лимита Fable; отметь это в PR».
+Лимит может прийти до первой контрольной точки, когда `handoff.md` ещё нет, поэтому текст выбирается
+после закрытия старого окна по файлам волны и сохраняется в `fable_switch.text` (повторная отправка —
+тот же текст): manifest текущего прогона есть — `/superarmanda --wave <id> --resume <метка> --manifest <path> …`
+(путь явный, `state.py init` не вызывать, даже если `handoff.md` нет или в нём нет manifest); manifest нет,
+`handoff.md` есть — обычное продолжение `/superarmanda --wave <id> --resume …`; нет ни того, ни другого —
+волна ещё ничего не записала, и уходит её первое сообщение заново (`first-prompt.md`: та же метка, та же задача). Умерший посередине диспетчер
 продолжает с сохранённого шага без второго окна, второй сессии и слепой повторной отправки (не
 уверен, что ввод дошёл, — событие `NOT resent`). Цепочка не останавливается; перезапуск НЕ
 расходует `restarts`, попытки и `max_runs`. Повторно для той же волны не срабатывает (она уже на
@@ -937,8 +942,10 @@ Stop-хук хоста). Затем выполни `resume` под новый HE
 (метка стоит в аргументах после `--resume`: по ней диспетчер привязывает новую сессию). То же
 сообщение обязано быть единственным источником «куда идти»: позиция — только из manifest.
 
-1. Прочитай `$WAB_DIR/handoff.md`, возьми путь к manifest. Если manifest в нём нет (контрольная
-   точка до `init`) — `state.py init` не запрещён: продолжи «Старт» с записанного в `handoff.md` места.
+1. Сообщение называет `--manifest <path>` (переключение на Opus по лимиту Fable) — бери этот путь,
+   `handoff.md` может не быть, `state.py init` не вызывай. Иначе прочитай `$WAB_DIR/handoff.md`, возьми
+   путь к manifest. Если manifest в нём нет (контрольная точка до `init`) — `state.py init` не запрещён:
+   продолжи «Старт» с записанного в `handoff.md` места.
 2. `python3 "$SUPERARMANDA_DIR/scripts/state.py" where --manifest <path>` — read-only,
    одна строка JSON: `task`, `task_status`, `step`, `role`, `fix_round`, `verdicts`,
    `open_findings`, `artifacts`, `decision_required_for`, `safe_point`, `marked_step`,

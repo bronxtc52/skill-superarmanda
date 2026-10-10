@@ -65,12 +65,25 @@ class FableLimitBase(Base):
             return r
         wab.sh.side_effect = window_appears
 
-    def setup_wave(self, model=FABLE, lines=None, **rec):
+    WAVE_TASK = "Задача волны W1: сделай фичу X."
+
+    def setup_wave(self, model=FABLE, lines=None, handoff=True, **rec):
         self.cfg, self.path = self.chain(model=model)
         self.transcript("s1", [asst(inp=1000)] + list(lines if lines is not None else limit_lines()[:1]))
+        prompt = self.tmp / "w1-prompt.md"
+        prompt.write_text(self.WAVE_TASK + "\n", encoding="utf-8")
+        rec.setdefault("prompt_file", str(prompt))
         w = self.wave_rec(sessions=["s1"], **rec)
         self.put_state(self.cfg, {"current": "W1", "waves": {"W1": w}, "defaults": "1.4"})
         self.set_status(self.cfg, "W1", "RUNNING")
+        if handoff:  # the usual case: the wave already passed a WAB-CHECKPOINT
+            (wab.wave_dir(self.cfg, "W1") / "handoff.md").write_text("# handoff\n", encoding="utf-8")
+
+    def write_manifest(self):
+        path = wab.wave_dir(self.cfg, "W1") / "superarmanda" / "manifest.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"version": 2}\n', encoding="utf-8")
+        return path
 
     def w(self):
         return self.get_state(self.cfg)["waves"]["W1"]
@@ -389,6 +402,61 @@ class FableLimitCrashSafety(FableLimitBase):
             wab.watch(self.cfg, self.path, max_ticks=1)
         self.assertEqual((len(self.new_sessions()), len(self.resumes())), (1, 1))
         self.assertEqual(self.w()["phase"], "running")
+
+
+class FableSwitchMessage(FableLimitBase):
+    """Codex P1 on #109: the Fable limit may come before the first WAB-CHECKPOINT, when handoff.md does not
+    exist. The switch message must not send the new Opus session to a missing handoff.md."""
+
+    def switch_text(self):
+        texts = [s[2] for s in self.sent if s[0] == "text" and SWITCH_NOTE in s[2]]
+        self.assertEqual(len(texts), 1, self.sent)
+        return texts[0]
+
+    def test_handoff_without_manifest_sends_the_ordinary_resume(self):
+        self.setup_wave()
+        self.tick()
+        text = self.switch_text()
+        self.assertTrue(text.startswith("/superarmanda --wave W1 --resume"))
+        self.assertIn("handoff.md", text)
+        self.assertNotIn("--manifest", text)
+
+    def test_manifest_without_handoff_names_the_manifest_explicitly(self):
+        self.setup_wave(handoff=False)
+        path = self.write_manifest()
+        self.tick()
+        text = self.switch_text()
+        self.assertTrue(text.startswith("/superarmanda --wave W1 --resume"))
+        self.assertIn(f"--manifest {path}", text)
+        self.assertIn(wab.session_marker(self.cfg, "W1"), text)
+        self.assertNotIn("по manifest из", text)  # not pointed at the missing handoff.md
+        self.assertIn("state.py init не вызывай", text)
+
+    def test_manifest_and_handoff_still_name_the_manifest(self):
+        self.setup_wave()  # a checkpoint before init, then init: handoff.md may not name the manifest
+        path = self.write_manifest()
+        self.tick()
+        self.assertIn(f"--manifest {path}", self.switch_text())
+
+    def test_nothing_written_yet_resends_the_wave_task(self):
+        self.setup_wave(handoff=False)
+        self.tick()
+        text = self.switch_text()
+        self.assertFalse(text.startswith("/superarmanda"))
+        self.assertIn(self.WAVE_TASK, text)
+        self.assertIn(wab.session_marker(self.cfg, "W1"), text)
+        self.assertEqual(self.w()["phase"], "running")
+
+    def test_the_choice_is_fixed_before_sending(self):
+        self.setup_wave(handoff=False)
+        with mock.patch.object(wab, "_deliver", return_value=False):  # postponed after the window is ready
+            self.tick()
+        self.assertEqual(self.w()["phase"], "switching")
+        self.write_manifest()  # appears afterwards: the saved choice stays
+        self.tick()
+        text = self.switch_text()
+        self.assertIn(self.WAVE_TASK, text)
+        self.assertNotIn("--manifest", text)
 
 
 # ---------------------------------------------------------------- T5
