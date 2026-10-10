@@ -104,3 +104,44 @@ echo 'Reply ok.' | claude --safe-mode -p --model claude-nonexistent-9 --tools ""
   `api_error_status`. Если настоящий поток при исчерпанной подписке окажется другим, `review.py` не даст
   категорию `quota` и запасной Opus не откроется: ошибка возможна только в закрытую сторону. Появится живой снимок
   при 429 — положить рядом и перевести двойник на него.
+
+## `fable-usage-journal.jsonl` — живой образец для счётчика расхода Fable (1.4.0, #108)
+
+Источник: живые журналы Claude Code на Linux-сервере владельца (`~/.claude/projects/**/*.jsonl`), снято 2026-10-10. 26 строк из двух
+журналов, порядок строк внутри каждого сохранён, промежуточные служебные строки (`attachment`, `last-prompt`, …)
+пропущены:
+
+- строки 0–13 — главная ветка одной сессии Claude Code 2.1.263 (2026-09-12, `isSidechain: false`): ответ Opus
+  (`claude-opus-5`, две строки одного `message.id`), затем пять ответов `claude-fable-5-1` (два — по две строки одного
+  `message.id`) и строки `user` между ними;
+- строки 14–25 — журнал субагента-Fable сессии волны (Claude Code 2.1.288, 2026-10-03, `isSidechain: true`,
+  `<session>/subagents/agent-….jsonl`): три ответа, у двух — несколько строк одного `message.id`.
+
+Что показал образец (и что читает `fable_usage.py`): один ответ модели Claude Code пишет строкой на каждый блок
+`content`, все с одним `message.id` и `requestId`. В главной ветке `usage` у всех строк ответа одинаковый, а в журнале
+субагента ранние блоки несут ЧАСТИЧНЫЕ `output_tokens` потока (`7` → `451`, `51, 51, 51` → `465`), итог — у последнего.
+Счётчик берёт на ответ наибольший `usage` (первая редакция 1.4.0 брала первую строку и недосчитывала выход субагентов). По всей машине
+на дату снятия: 13 138 строк Fable, у каждой есть и `message.id`, и `requestId`; 3 830 из них — `isSidechain` (все в
+`subagents/`) и считаются в расход — субагент-Fable тратит тот же лимит; 82 ответа лежат в двух журналах главной ветки
+сразу (возобновлённая сессия копирует историю) — считаются один раз.
+
+Что заменено:
+
+| Было | Стало |
+|---|---|
+| `message.id` | `msg_fxNN` — один исходный id даёт один и тот же номер |
+| `requestId` | `req_fxNN` (так же) |
+| `uuid`, `parentUuid` | `uuid-fx-NN` (так же, связи сохранены) |
+| `sessionId` | `session-fx-1` (главная ветка), `session-fx-2` (субагент) |
+| `agentId` | `agent-fx-1` |
+| `message.content` | список только с `type` каждого блока (`thinking`, `text`, `tool_use`, `tool_result`); строковое содержимое — `{TEXT}` |
+| `cwd`, `gitBranch`, `slug`, `session_id`, `attributionSkill`, `attributionAgent`, `advisorModel`, `perTurnEffort`, `serverClassifierRequest`, `wireToolInputs`, `message.diagnostics`, `message.container`, `message.context_management`, `message.stop_details` | удалены (счётчик их не читает) |
+
+Оставлено как есть: `type`, `isSidechain`, `apiBlockIndex`, `timestamp` (настоящие — тесты задают окна через `--now`),
+`userType`, `entrypoint`, `version`, `effort`, `message.model`, `message.type`, `message.role`, `message.stop_reason`,
+`message.stop_sequence` и весь `message.usage` (числа токенов, `cache_creation`, `iterations`, `service_tier`,
+`inference_geo`, `speed`). Проверено обходом всех строковых значений и grep на пути, e-mail, токены и исходные id.
+
+Синтетика в тестах (`tests/helpers/superarmanda_fable_test.py`) — только производные от названных живых строк: ответ
+`msg_fx07` без `message.id` (и без `requestId`) — такой формы живьём нет; строка `msg_fx04` с подменённым `usage` — для
+арифметики бюджета и строки расхода в `launch`.

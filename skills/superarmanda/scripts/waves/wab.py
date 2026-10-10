@@ -3617,9 +3617,15 @@ def _launch(cfg, wave, prompt_file, by_dispatcher=False):
     save_state(cfg, st)
     if warn_model:  # after every refusal of this launch: a refused and repeated launch does not repeat it
         event(cfg, NO_MODEL_WARNING)
-    fable_usage_event(cfg)
     start_session(cfg, st, wave)
-    return deliver_first_prompt(cfg, st, wave)
+    delivered = deliver_first_prompt(cfg, st, wave)
+    # after the window and its first prompt (#108, Codex P2): the count reads every local journal and is slow on a
+    # big ~/.claude/projects; advisory, so neither its time nor its failure may hold or undo the launch
+    try:
+        fable_usage_event(cfg)
+    except Exception:  # noqa: BLE001 - fable_usage_event catches its own errors; this guards the event itself
+        pass
+    return delivered
 
 
 FABLE_USAGE_WARNING = "Fable ≥80% недельного бюджета: ревью Fable может упереться в лимит"

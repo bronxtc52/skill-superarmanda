@@ -8,7 +8,9 @@ T5: scripts/waves/fable_usage.py counts the weighted Fable tokens of the local C
 launch` writes the count as an event and never refuses on it.
 
 Every tmux/claude interaction goes through the patched module functions of the shared Base (the TMUX guard
-of superarmanda_waves_test is installed by importing it); the journals are synthetic.
+of superarmanda_waves_test is installed by importing it). The journals of the usage count are the live sample
+`tests/fixtures/transcripts/fable-usage-journal.jsonl` (see its README); a synthetic variant is derived from a
+named live line only where the sample lacks the form.
 """
 
 import contextlib
@@ -391,20 +393,49 @@ class FableLimitCrashSafety(FableLimitBase):
 
 # ---------------------------------------------------------------- T5
 NOW = datetime.datetime(2026, 10, 10, 12, 0, 0, tzinfo=datetime.timezone.utc)
+W = fable_usage.WEIGHTS
 
 
-def stamp(hours_ago):
-    return (NOW - datetime.timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+def live_journal():
+    """The live sample of the journals (fixture `fable-usage-journal.jsonl`, see the README): 26 lines of one
+    main-thread session (an Opus answer, then five Fable answers, 2026-09-12) and of one Fable subagent journal
+    (`isSidechain: true`, three answers, 2026-10-03), parsed."""
+    raw = FIXTURES.joinpath("fable-usage-journal.jsonl").read_text(encoding="utf-8").splitlines()
+    return [json.loads(x) for x in raw if x.strip()]
 
 
-def line(hours_ago, model=FABLE, inp=0, create=0, read=0, out=0, mid=None, rid=None, kind="assistant"):
-    msg = {"model": model, "role": "assistant", "usage": {"input_tokens": inp, "cache_creation_input_tokens": create,
-                                                          "cache_read_input_tokens": read, "output_tokens": out}}
-    if mid is not None:
-        msg["id"] = mid
-    d = {"type": kind, "timestamp": stamp(hours_ago), "message": msg}
-    if rid is not None:
-        d["requestId"] = rid
+LIVE = live_journal()
+MAIN_DAY = "2026-09-12T05:00:00Z"  # an hour after the main-thread lines (04:12-04:14)
+SUB_DAY = "2026-10-03T12:00:00Z"  # an hour and a half after the subagent lines (10:36-10:37)
+
+
+def final_units(lines):
+    """Independent expectation: each Fable answer (message.id) by its LAST block (the largest apiBlockIndex), the
+    line Claude Code writes with the final usage, in units."""
+    last = {}
+    for d in lines:
+        m = d.get("message") or {}
+        if d.get("type") == "assistant" and m.get("model") == FABLE:
+            if m["id"] not in last or d["apiBlockIndex"] > last[m["id"]]["apiBlockIndex"]:
+                last[m["id"]] = d
+    return sum(sum(d["message"]["usage"][k] * w for k, w in W.items()) for d in last.values()) / 1_000_000
+
+
+def dump(lines):
+    return [json.dumps(d, ensure_ascii=False) for d in lines]
+
+
+MAIN = [d for d in LIVE if d.get("isSidechain") is False]
+SUB = [d for d in LIVE if d.get("isSidechain") is True]
+
+
+def scaled(units, hours_ago=1):
+    """For the budget arithmetic only: the live Fable line msg_fx04 moved to `hours_ago` before NOW with its usage
+    replaced by output tokens worth `units` (every other key of the live line is kept)."""
+    d = json.loads(json.dumps(next(x for x in MAIN if x["type"] == "assistant" and x["message"]["id"] == "msg_fx04")))
+    d["timestamp"] = (NOW - datetime.timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    d["message"]["usage"].update(input_tokens=0, cache_creation_input_tokens=0, cache_read_input_tokens=0,
+                                 output_tokens=int(units * 1_000_000 / 5))
     return json.dumps(d)
 
 
@@ -421,43 +452,105 @@ class FableUsage(unittest.TestCase):
         p.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return p
 
-    def count(self, **kw):
-        return fable_usage.usage(self.root, now=NOW, **kw)
+    def live(self):
+        """The sample laid out as Claude Code does: the session journal and its subagent journal beside it."""
+        self.journal("p/session-fx-1.jsonl", dump(MAIN))
+        self.journal("p/session-fx-1/subagents/agent-fx-1.jsonl", dump(SUB))
 
-    def test_weights_one_unit_per_million_weighted_tokens(self):
-        self.journal("p/a.jsonl", [line(1, inp=1_000_000, mid="m1"), line(1, create=1_000_000, mid="m2"),
-                                   line(1, read=1_000_000, mid="m3"), line(1, out=1_000_000, mid="m4")])
-        r = self.count()
+    def count(self, now=NOW, **kw):
+        return fable_usage.usage(self.root, now=now, **kw)
+
+    def test_the_live_sample_has_the_shapes_the_tests_rely_on(self):
+        ids = [d["message"]["id"] for d in LIVE if d["type"] == "assistant"]
+        self.assertGreater(len(ids), len(set(ids)))  # repeats of one message.id: one line per content block
+        self.assertTrue(SUB and MAIN)
+        self.assertIn("claude-opus-5", {d["message"].get("model") for d in LIVE if d["type"] == "assistant"})
+        grows = [d["message"]["usage"]["output_tokens"] for d in SUB
+                 if d["type"] == "assistant" and d["message"]["id"] == "msg_fx07"]
+        self.assertEqual(grows, [7, 451])  # the subagent writes the partial output first, the final number last
+
+    def test_weights_on_one_live_line(self):
+        d = next(x for x in MAIN if x["type"] == "assistant" and x["message"]["id"] == "msg_fx04")
+        u = d["message"]["usage"]
+        self.assertAlmostEqual(fable_usage.weighted(u), u["input_tokens"] + 1.25 * u["cache_creation_input_tokens"]
+                               + 0.1 * u["cache_read_input_tokens"] + 5 * u["output_tokens"])
+        self.assertAlmostEqual(fable_usage.weighted(u), 13934.1)
+        self.journal("p/a.jsonl", dump([d]))
+        self.assertAlmostEqual(self.count(now=MAIN_DAY)["day_units"], 0.0139, places=4)
+
+    def test_repeats_of_one_answer_count_once_with_the_final_usage(self):
+        self.live()
+        r = self.count(now=SUB_DAY)
         self.assertTrue(r["valid"])
-        self.assertAlmostEqual(r["day_units"], 1 + 1.25 + 0.1 + 5)
-        self.assertAlmostEqual(r["week_units"], 7.35)
+        # the subagent journal: msg_fx07 is 7 then 451 output tokens, msg_fx08 51, 51, 51 then 465
+        self.assertAlmostEqual(final_units(SUB), 0.0610, places=4)
+        self.assertAlmostEqual(r["day_units"], round(final_units(SUB), 4), places=4)
+        self.assertAlmostEqual(r["week_units"], round(final_units(SUB), 4), places=4)
 
-    def test_other_models_users_and_synthetic_lines_do_not_count(self):
-        self.journal("p/a.jsonl", [line(1, model=OPUS, out=1_000_000, mid="o"),
-                                   line(1, model="<synthetic>", out=1_000_000, mid="s"),
-                                   line(1, out=1_000_000, mid="u", kind="user"),
-                                   "not json", "{broken",
-                                   line(1, out=1_000_000, mid="f")])
-        self.assertAlmostEqual(self.count()["week_units"], 5)
+    def test_sidechain_counts_a_fable_subagent_spends_the_limit_too(self):
+        self.live()
+        week = self.count(now="2026-10-04T12:00:00Z")["week_units"]
+        self.assertGreater(week, 0)
+        self.assertAlmostEqual(week, round(final_units(SUB), 4), places=4)
+
+    def test_other_models_do_not_count(self):
+        # the main-thread sample opens with a live Opus answer (two lines): only the five Fable answers count
+        self.journal("p/a.jsonl", dump(MAIN))
+        r = self.count(now=MAIN_DAY)
+        self.assertAlmostEqual(final_units(MAIN), 0.0610, places=4)
+        self.assertAlmostEqual(r["week_units"], round(final_units(MAIN), 4), places=4)
+        only_opus = [d for d in MAIN if d["type"] != "assistant" or d["message"]["model"] != FABLE]
+        self.journal("p/a.jsonl", dump(only_opus))
+        self.assertEqual(self.count(now=MAIN_DAY)["week_units"], 0)
+
+    def test_synthetic_cli_lines_users_and_junk_do_not_count(self):
+        # `<synthetic>` lines are the live rate-limit fixture; the users are the live tool_result lines
+        users = [d for d in MAIN if d["type"] == "user"]
+        self.journal("p/a.jsonl", limit_lines() + dump(users) + ["not json", "{broken"])
+        self.assertEqual(self.count(now="2026-10-10T11:00:00Z")["week_units"], 0)
 
     def test_windows_day_and_rolling_seven_days(self):
-        self.journal("p/a.jsonl", [line(1, inp=1_000_000, mid="a"), line(23.9, inp=1_000_000, mid="b"),
-                                   line(25, inp=1_000_000, mid="c"), line(24 * 6.9, inp=1_000_000, mid="d"),
-                                   line(24 * 7.1, inp=1_000_000, mid="e"), line(-1, inp=1_000_000, mid="future")])
-        r = self.count()
-        self.assertAlmostEqual(r["day_units"], 2)
-        self.assertAlmostEqual(r["week_units"], 4)
+        self.live()
+        main, sub = round(final_units(MAIN), 4), round(final_units(SUB), 4)
+        cases = {  # --now -> (day, week)
+            MAIN_DAY: (main, main),  # the subagent lines are three weeks in the future: not counted
+            "2026-09-13T04:00:00Z": (main, main),  # 23 h 48 min after the first main-thread answer: inside the day
+            "2026-09-13T04:15:00Z": (0, main),  # 24 h after the last one: out of the day, inside the 7 days
+            "2026-09-19T04:00:00Z": (0, main),  # 6 days 23 h 48 min after the first: still inside the 7 days
+            "2026-09-19T04:15:00Z": (0, 0),  # 7 days after the last: past the window
+            SUB_DAY: (sub, sub),
+            "2026-10-09T12:00:00Z": (0, sub),
+        }
+        for now, (day, week) in cases.items():
+            r = self.count(now=now)
+            self.assertAlmostEqual(r["day_units"], day, places=4, msg=now)
+            self.assertAlmostEqual(r["week_units"], week, places=4, msg=now)
 
-    def test_duplicates_by_message_id_then_request_id(self):
-        self.journal("p/a.jsonl", [line(1, out=1_000_000, mid="m1", rid="r1"), line(1, out=1_000_000, mid="m1", rid="r2"),
-                                   line(1, out=1_000_000, rid="r9"), line(1, out=1_000_000, rid="r9"),
-                                   line(1, out=1_000_000), line(1, out=1_000_000)])
-        # the same message.id in a subagent journal of another directory is the same answer too
-        self.journal("p/s1/subagents/agent-1.jsonl", [line(1, out=1_000_000, mid="m1")])
-        self.assertAlmostEqual(self.count()["week_units"], 5 * 4)  # m1, r9 and the two without a key
+    def test_the_same_answer_in_two_journals_counts_once(self):
+        # live: 82 Fable answers of this machine sit in two session journals each (a resumed session copies them)
+        self.journal("p/session-fx-1.jsonl", dump(MAIN))
+        self.journal("p/session-fx-2.jsonl", dump(MAIN))
+        self.assertAlmostEqual(self.count(now=MAIN_DAY)["week_units"], round(final_units(MAIN), 4), places=4)
+
+    def test_request_id_without_message_id_and_neither(self):
+        # not seen live (every one of 13 138 Fable lines has both keys): derived from the live answer msg_fx07 of
+        # the subagent sample — message.id removed (then requestId too); the usage stays live
+        lines = [d for d in SUB if d["type"] == "assistant" and d["message"]["id"] == "msg_fx07"]
+        no_id = [json.loads(json.dumps(d)) for d in lines]
+        for d in no_id:
+            del d["message"]["id"]
+        neither = [json.loads(json.dumps(d)) for d in no_id]
+        for d in neither:
+            del d["requestId"]
+        final = fable_usage.weighted(lines[-1]["message"]["usage"]) / 1_000_000
+        partial = fable_usage.weighted(lines[0]["message"]["usage"]) / 1_000_000
+        self.journal("p/a.jsonl", dump(no_id))
+        self.assertAlmostEqual(self.count(now=SUB_DAY)["week_units"], round(final, 4), places=4)  # by requestId
+        self.journal("p/a.jsonl", dump(neither))
+        self.assertAlmostEqual(self.count(now=SUB_DAY)["week_units"], round(final + partial, 4), places=4)
 
     def test_budget_and_threshold(self):
-        self.journal("p/a.jsonl", [line(1, out=12_800_000, mid="x")])  # 64 units
+        self.journal("p/a.jsonl", [scaled(64)])  # 64 units
         r = self.count()
         self.assertEqual((r["budget"], r["pct"], r["over_threshold"]), (80, 80.0, True))
         r = self.count(budget=100)
@@ -482,7 +575,7 @@ class FableUsage(unittest.TestCase):
         self.assertFalse(mods - set(sys.stdlib_module_names), mods)
 
     def test_cli_prints_the_json(self):
-        self.journal("p/a.jsonl", [line(1, inp=2_000_000, mid="x")])
+        self.journal("p/a.jsonl", [scaled(2)])
         r = subprocess.run([sys.executable, str(WAVES / "fable_usage.py"), "--root", str(self.root),
                             "--now", "2026-10-10T12:00:00Z", "--budget", "10", "--threshold", "0.1"],
                            capture_output=True, text=True, timeout=60)
@@ -511,9 +604,9 @@ class LaunchFableUsage(Base):
     def journal(self, out_tokens):
         d = self.home / ".claude" / "projects" / "-x"
         d.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 3600))
-        rec = {"type": "assistant", "timestamp": ts,
-               "message": {"id": "m", "model": FABLE, "usage": {"output_tokens": out_tokens}}}
+        # the live Fable line msg_fx04 an hour ago, its usage replaced by `out_tokens` of output only
+        rec = json.loads(scaled(out_tokens * 5 / 1_000_000))
+        rec["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 3600))
         (d / "s.jsonl").write_text(json.dumps(rec) + "\n", encoding="utf-8")
 
     def test_usage_event_on_launch(self):
@@ -544,6 +637,33 @@ class LaunchFableUsage(Base):
         with mock.patch.object(fable_usage, "usage", side_effect=RuntimeError("boom")):
             self.assertTrue(self.launch(cfg))
         self.assertIn("fable-usage: не посчитан (RuntimeError", self.events(cfg))
+
+    def test_the_count_runs_after_the_wave_window_is_started(self):
+        # P2 (Codex on #109): on a machine with big journals the count takes a while; it must not hold the start
+        self.journal(2_000_000)
+        cfg, _ = self.chain()
+        order, start = [], wab.start_session
+        usage = fable_usage.usage
+
+        def started(*a, **kw):
+            order.append("start_session")
+            return start(*a, **kw)
+
+        def counted(*a, **kw):
+            order.append("count")
+            return usage(*a, **kw)
+
+        with mock.patch.object(wab, "start_session", side_effect=started), \
+                mock.patch.object(fable_usage, "usage", side_effect=counted):
+            self.assertTrue(self.launch(cfg))
+        self.assertEqual(order, ["start_session", "count"])
+        self.assertIn("7 дней 10.0 из 80 ед.", self.events(cfg))
+
+    def test_a_failure_of_the_whole_usage_event_does_not_stop_the_launch(self):
+        cfg, _ = self.chain()
+        with mock.patch.object(wab, "fable_usage_event", side_effect=RuntimeError("boom")):
+            self.assertTrue(self.launch(cfg))
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["phase"], "running")
 
     def test_budget_field_is_checked_and_not_defaulted_into_the_config(self):
         cfg, path = self.chain()
