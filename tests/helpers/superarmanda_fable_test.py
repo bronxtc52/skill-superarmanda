@@ -162,6 +162,14 @@ class FableLimitSwitch(FableLimitBase):
         self.assertEqual(w["session_model"], OPUS)  # the new window is on Opus, and it is recorded
         self.assertEqual(len(self.kills()), 1)
 
+    def test_the_short_fable_selector_is_the_fable_session(self):
+        # `"model": "fable"` is an accepted selector of the CLI (Codex P2 on #109): its limit is the Fable limit
+        self.setup_wave(model="fable")
+        self.tick()
+        w = self.w()
+        self.assertEqual((w.get("model_override"), w.get("fable_switches")), (OPUS, 1))
+        self.assertEqual(len(self.kills()), 1)
+
     def test_already_on_opus_by_override_is_left_alone(self):
         self.setup_wave(model_override=OPUS, fable_switches=1)
         self.tick()

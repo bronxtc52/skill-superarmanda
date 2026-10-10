@@ -4425,7 +4425,8 @@ FABLE_SWITCH_NOTE = "модель переключена на Opus из-за л�
 def fable_limit_hit(cfg, w):
     """True when the wave runs on Fable and the transcript of its CURRENT session holds a provider refusal of
     the main thread (TranscriptCache `limit`). Subagents (sidechain lines) run on their own role models."""
-    if session_model(cfg, w) != gate.state.FABLE_MODEL:
+    model = session_model(cfg, w)  # an accepted selector ("fable") is the same model (Codex P2 on #109)
+    if gate.state.MODEL_ALIASES.get(model, model) != gate.state.FABLE_MODEL:
         return False
     sessions = w.get("sessions") or []
     if not sessions:
