@@ -3761,7 +3761,8 @@ def start_session(cfg, st, wave, sid=None, phase="starting"):
     model = wave_model(cfg, w)
     if model:
         cmd += ["--model", model]
-    w["session_model"] = model or ""  # saved with the phase below: the limit detection reads it (#108)
+    w["session_model"] = model or ""  # the limit detection reads it (#108); on disk BEFORE the outside action:
+    save_state(cfg, st)  # a dispatcher that dies right after new-session still knows the model of the live window
     pin = ["-e", f"WAB_PLAN_SHA256={cfg['plan_sha256']}"] if "plan_sha256" in cfg else []
     # read by `state.py init` of the wave; always set, empty without a policy (= the built-in one): the global
     # environment of the tmux server could otherwise hand the window someone else's policy (#108)

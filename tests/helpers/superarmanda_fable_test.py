@@ -160,6 +160,25 @@ class FableLimitSwitch(FableLimitBase):
         self.tick()
         self.assertEqual((self.new_sessions(), self.kills()), ([], []))
 
+    def test_the_session_model_is_saved_before_the_window_is_created(self):
+        # the dispatcher dies right after `tmux new-session` (Codex P2 on #109): the model of the live window
+        # is already on disk, so a later edit of the tunable chain.json `model` cannot hide the Fable session
+        self.setup_wave()
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"].pop("session_model", None)
+        wab.save_state(self.cfg, st)
+        real = wab.mark_owner
+
+        def die(*a, **k):
+            raise KeyboardInterrupt("dispatcher killed after new-session")
+        wab.mark_owner = die
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                wab.start_session(self.cfg, wab.load_state(self.cfg), "W1")
+        finally:
+            wab.mark_owner = real
+        self.assertEqual(self.w().get("session_model"), FABLE)
+
     def test_owner_edit_of_the_chain_model_does_not_hide_the_fable_session(self):
         # the window was started on Fable; the owner sets `model` of chain.json to Opus and restarts watch:
         # the session still runs on Fable, its limit is still the Fable limit (session_model, #108)
