@@ -10852,8 +10852,8 @@ class DecisionPolicy(Base):
         self.set_status(cfg, "W1", self.ASK)
         real = wab.send_text
 
-        def fast_wave(name, text, on_typed=None):  # the wave answers and re-blocks before send_text returns
-            real(name, text, on_typed=on_typed)
+        def fast_wave(name, text, on_typed=None, **kw):  # the wave answers and re-blocks before send_text returns
+            real(name, text, on_typed=on_typed, **kw)
             path.write_text("RUNNING", encoding="utf-8")
             st0 = os.stat(path)
             path.write_text(self.ASK, encoding="utf-8")
@@ -19923,9 +19923,12 @@ class W3PolicyEpisodes(Base):
                          ("attempt", {"attempts": [{"policy_keys": [key], "policy_key_pending": flight}]})):
             with self.subTest(guard=where):  # the valid shape is not refused
                 self.assertTrue(self.decide(cfg, w=w)["ok"], self.decide(cfg, w=w))
-        bad_keys = [["W1"], [*key, "x"], []]
+        cap_key = [*key[:4], "blocked_cap", ""]  # a blocked_cap fork names no source
+        with self.subTest(guard="blocked_cap key"):
+            self.assertTrue(self.decide(cfg, w={"policy_keys": [cap_key]})["ok"])
+        bad_keys = [["W1"], [*key, "x"], [], [*key[:4], "blocked_cap", "tester"]]  # the source follows the class
         for i, values in enumerate([[1, None], [None, 5], ["2", True, False, 0, -1, 2.0, None],
-                                    [5, None], ["nonsense", "question", "merge_gate", 4], ["bogus", None, 1]]):
+                                    [5, None], ["nonsense", "question", "merge_gate", 4], ["bogus", None, 1, ""]]):
             bad_keys += [[*key[:i], v, *key[i + 1:]] for v in values]
         bad_pending = [{"key": key}, {"key": key, "text": flight["text"]}, {"key": key, "status": flight["status"]},
                        dict(flight, status=5), dict(flight, text=None), dict(flight, status=None)]
@@ -19962,6 +19965,111 @@ class W3PolicyEpisodes(Base):
                     self.assertIn(f"fix-loop --accept --source {source}", got["text"])
                 else:  # state.py refuses `--accept` for it: the wave could not execute the answer
                     self.assertFalse(got["ok"], f"accept_limitation sent for source {source}: {got.get('text')}")
+
+    # ----- review of 5d202f9 (Codex P1/P2, Astra): the same invariants, the paths the first tests missed -----
+    def test_i2_the_answer_is_checked_again_between_its_typing_and_its_enter(self):
+        changes = {"no change": None, "role unavailable": dict(base="quota"), "another run (another key)": dict(index=2),
+                   "two forks": dict(edit=self.two), "the wave moved on": "RUNNING"}
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                self.tg.clear()
+                self.sent.clear()
+                self.enters.clear()
+                cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+                shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+                self.fork(cfg)
+                self.set_status(cfg, "W1", self.ND.format(rec="invariant"))
+
+                def send(n, t, on_typed=None, before_enter=None):  # send_text: paste, on_typed, pause, Enter
+                    self.sent.append(("text", n, t))
+                    if on_typed:
+                        on_typed()
+                    if change == "RUNNING":
+                        (cfg["run_dir"] / "W1" / "status").write_text("RUNNING", encoding="utf-8")
+                    elif change:
+                        self.fork(cfg, **change)  # the fork changed during the pause between the paste and the Enter
+                    if before_enter:
+                        before_enter()
+                    self.enters.append(n)
+                try:
+                    with mock.patch.object(wab, "send_text", side_effect=send):
+                        st = self.tick(cfg)
+                    w = st["waves"]["W1"]
+                    if change is None:
+                        self.assertEqual(self.enters, [w["tmux"]], "a fresh answer is entered")
+                        continue
+                    self.assertEqual(self.enters, [], "a fixed answer entered after the fork changed since its typing")
+                    self.assertNotEqual(w.get("pending_enter"), "policy answer", "the stale text waits for an Enter")
+                    self.assertIn("stale before its Enter", self.log(cfg), "the stale text is not given up")
+                    self.assertNotIn("pending_clear", w, "the stale text stays in the input line")
+                    if change == "RUNNING":  # the episode is over: no refusal of it, nobody asked
+                        self.assertNotIn("policy_refusal", w)
+                        self.assertEqual(self.owner_asked(), [])
+                    else:
+                        self.assertTrue(w["policy_refusal"]["reason"].startswith(wab.FORK_CHANGED), w.get("policy_refusal"))
+                        self.assertEqual(len(self.owner_asked()), 1, "the refusal does not reach the owner")
+                finally:
+                    shutil.rmtree(cfg["run_dir"], ignore_errors=True)
+
+    def test_i2_no_refusal_when_the_wave_moves_on_during_the_recheck_under_the_lock(self):
+        cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+        shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+        self.fork(cfg)
+        status = self.ND.format(rec="invariant")
+        path, real, calls = cfg["run_dir"] / "W1" / "status", wab.fixed_answer, []
+
+        def recheck_while_the_wave_moves_on(*a, **kw):
+            calls.append(1)
+            if len(calls) == 2:  # the recheck under the input lock: the fork changed and the wave left the line
+                self.fork(cfg, base="quota")
+                got = real(*a, **kw)
+                path.write_text("RUNNING", encoding="utf-8")
+                return got
+            return real(*a, **kw)
+        self.set_status(cfg, "W1", status)
+        with mock.patch.object(wab, "fixed_answer", recheck_while_the_wave_moves_on):
+            st = self.tick(cfg)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(self.answers(), [])
+        self.assertNotIn("policy_refusal", st["waves"]["W1"])
+        self.assertEqual(self.owner_asked(), [], "a refusal of an episode that is over reached the owner")
+
+    def test_i3_a_corrupt_episode_mark_is_a_refusal_not_a_new_episode(self):
+        good = {"status": wab.eid("x"), "stamp": [1, 2]}
+        for name, episode in (("not an object", "x"), ("a list", [1]), ("status not a string", dict(good, status=5)),
+                              ("no status", {"stamp": [1, 2]}), ("stamp a string", dict(good, stamp="1")),
+                              ("stamp of one", dict(good, stamp=[1])), ("stamp of strings", dict(good, stamp=["1", "2"]))):
+            for rule in (self.WITH, self.WITHOUT):
+                with self.subTest(episode=name, answer="answer" in rule):
+                    self.tg.clear()
+                    self.sent.clear()
+                    cfg, _ = self.mandate(policy=[rule], max_runs=5)
+                    try:
+                        self.fork(cfg)
+                        st = self.tick(cfg)
+                        st["waves"]["W1"]["policy_episode"] = episode
+                        wab.save_state(cfg, st)
+                        self.set_status(cfg, "W1", self.ND.format(rec="invariant"))
+                        st = self.tick(cfg)
+                        self.assertEqual(self.answers(), [], f"an automatic answer over a corrupt policy_episode: {name}")
+                        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["reason"], wab.EPISODE_CORRUPT)
+                        self.assertEqual(len(self.owner_asked()), 1, "the refusal does not reach the owner")
+                    finally:
+                        shutil.rmtree(cfg["run_dir"], ignore_errors=True)
+        for name, episode in (("valid", good), ("no stamp", dict(good, stamp=None))):
+            with self.subTest(guard=name):
+                self.assertTrue(wab._episode_ok(episode))
+
+    def test_i4_every_command_a_fixed_answer_names_is_executable_by_state_py(self):
+        for key, text in wab.FIXED_MEANING.items():
+            for cmd in re.split(r"(?=fix-loop )", text)[1:]:
+                cmd = re.split(r"[)(]|, затем|\. |;", cmd)[0]
+                with self.subTest(key=key, cmd=cmd):
+                    if cmd.startswith("fix-loop --decision"):
+                        self.assertIn("--note", cmd, "state.py refuses --decision without --note")
+                    elif cmd.startswith("fix-loop --accept"):
+                        for flag in ("--source", "--severity", "--note"):
+                            self.assertIn(flag, cmd, f"state.py refuses --accept without {flag}")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

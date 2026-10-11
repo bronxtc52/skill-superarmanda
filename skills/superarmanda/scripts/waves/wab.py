@@ -956,17 +956,20 @@ def submit(name, text):
         press_enter(name)
 
 
-def send_text(name, text, on_typed=None):
+def send_text(name, text, on_typed=None, before_enter=None):
     """Paste text as one bracketed paste, then submit it and check that it left the input line
     (submit). The buffer is private to this dispatcher and session: tmux buffers are global to the
     server. `on_typed` runs once the text is in the window and Enter is still to come (the caller
-    records that step)."""
+    records that step). `before_enter` runs after the pause, right before the Enter: it raises to keep
+    the Enter from being pressed (the text stays in the input line for the caller to handle)."""
     buf = f"wab-{os.getpid()}-{name}"
     tmux("load-buffer", "-b", buf, "-", input=text)
     tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pane_target(name))
     if on_typed:
         on_typed()
     time.sleep(1.5)
+    if before_enter:
+        before_enter()
     submit(name, text)
 
 
@@ -3128,7 +3131,7 @@ READINESS_ROLES = ("coder", "tester", "cross_provider_reviewer", "second_reviewe
                    "final_check", "github_codex_review")
 FIXED_HEAD = "[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант {answer}."
 FIXED_THOROUGH = ("чини класс находки целиком, не латай; находки low/P3 — fix-loop --defer в остаток.")
-FIXED_RECORD = " Решение запиши: fix-loop --decision invariant."
+FIXED_RECORD = " Решение запиши: fix-loop --decision invariant --note \"<что чинишь>\"."
 FIXED_NEW_RUN = " Открой новый прогон (state.py init --from-plan на новом пути), прогон {n} из {max}."
 # THE wording, one entry per (class, answer, «a new run is needed»). The invariant: an answer names only what
 # the wave can execute in the state of its fork, and one decision. state.py takes `fix-loop --decision` only
@@ -3139,17 +3142,18 @@ FIXED_MEANING = {
     ("needs_decision", "invariant", False): " Доделай как следует: ещё один круг, " + FIXED_THOROUGH + FIXED_RECORD,
     ("needs_decision", "invariant", True): " Доделай как следует: " + FIXED_THOROUGH + FIXED_RECORD + FIXED_NEW_RUN,
     ("needs_decision", "cut_surface", False): (" Вырежи поверхность, давшую находку (fix-loop --decision "
-                                               "cut_surface), остаток — в result.md."),
+                                               "cut_surface --note \"<что вырезано>\"), остаток — в result.md."),
     # state.py moves a needs_decision task to needs_fix on `--decision accept_limitation` alone: the limitation is
     # accepted by the following `fix-loop --accept`, which it allows for gate.state.DEFER_SOURCES only
     ("needs_decision", "accept_limitation", False): (
-        " Прими ограничение: fix-loop --decision accept_limitation, затем fix-loop --accept --source {source} "
-        "--severity … --note … (строка в «Принятые ограничения» PR и в остаток)."),
+        " Прими ограничение: fix-loop --decision accept_limitation --note \"<что принято>\", затем fix-loop --accept "
+        "--source {source} --severity <low|medium|high> --note \"<что и почему>\" (строка в «Принятые ограничения» "
+        "PR и в остаток)."),
     ("blocked_cap", "invariant", True): " Доделай как следует: " + FIXED_THOROUGH + FIXED_NEW_RUN,
     ("blocked_cap", "accept_limitation", True): (
         " Прими ограничение: открой новый прогон (state.py init --from-plan на новом пути), прогон {n} из {max}, "
-        "и в нём находку не чини, а прими как ограничение (fix-loop --accept, строка в «Принятые ограничения» PR "
-        "и в остаток)."),
+        "и в нём находку не чини, а прими как ограничение (fix-loop --accept --source <ревьюер> --severity "
+        "<low|medium|high> --note \"<что и почему>\", строка в «Принятые ограничения» PR и в остаток)."),
 }
 FIXED_MEANING["needs_decision", "cut_surface", True] = FIXED_MEANING["needs_decision", "cut_surface", False] + FIXED_NEW_RUN
 FIXED_MEANING["needs_decision", "accept_limitation", True] = (
@@ -3157,6 +3161,7 @@ FIXED_MEANING["needs_decision", "accept_limitation", True] = (
 FIXED_MEANING["blocked_cap", "new_run", True] = FIXED_MEANING["blocked_cap", "invariant", True]
 FORK_MARKS_CORRUPT = "отметки автоответов в state.json испорчены (policy_keys / policy_key_pending)"
 FORK_ATTEMPTS_CORRUPT = "отметки автоответов в state.json испорчены (attempts)"
+EPISODE_CORRUPT = "отметки автоответов в state.json испорчены (policy_episode)"
 FORK_CHANGED = "состояние развилки изменилось после ввода ответа: "  # + the reason of the check as it reads now
 FIXED_TAIL = " Затем запиши RUNNING в status."
 MAX_AUTO_ANSWERS = 3  # chain.json `max_auto_answers` default: automatic answers per wave
@@ -3244,11 +3249,14 @@ def _fork_keys(rec):
 
 
 def _fork_key_ok(k):
-    """Is it a fork key as _fork_decision writes it: [wave, run_id, index, task, class, source]."""
+    """Is it a fork key as _fork_decision writes it: [wave, run_id, index, task, class, source]. The source
+    follows the class: a needs_decision fork names its fix source (decision_required_for), a blocked_cap fork
+    none — any other pair is a corrupt mark, never a fork that was «not answered yet»."""
     return (isinstance(k, list) and len(k) == 6 and isinstance(k[0], str) and isinstance(k[1], str)
             and _count(k[2]) and k[2] > 0 and isinstance(k[3], str)
             and isinstance(k[4], str) and k[4] in POLICY_ANSWERS
-            and isinstance(k[5], str) and (k[5] == "" or k[5] in gate.state.FIX_SOURCES))
+            and isinstance(k[5], str)
+            and (k[5] in gate.state.FIX_SOURCES if k[4] == "needs_decision" else k[5] == ""))
 
 
 def _keep_fork_key(w):
@@ -3277,6 +3285,14 @@ def _refusal_ok(refusal):
     return (isinstance(refusal, dict) and isinstance(refusal.get("status"), str)
             and isinstance(refusal.get("reason"), str)
             and (refusal.get("stamp") is None or isinstance(refusal.get("stamp"), list)))
+
+
+def _episode_ok(episode):
+    """Is it a `policy_episode` mark as _policy_answer writes it: {status: eid, stamp: [inode, mtime_ns] or None}.
+    Anything else under that name is corrupt: a refusal (fail closed), never «a new episode»."""
+    stamp = episode.get("stamp") if isinstance(episode, dict) else None
+    return (isinstance(episode, dict) and isinstance(episode.get("status"), str)
+            and (stamp is None or (isinstance(stamp, list) and len(stamp) == 2 and all(_count(x) for x in stamp))))
 
 
 def fixed_answer(cfg, wave, w, label, rule, status):
@@ -4253,11 +4269,18 @@ class _InputLock:
             self.fh.close()
 
 
-def _deliver(cfg, st, wave, what, send, text, precheck=None):
+class _StaleBeforeEnter(Exception):
+    """The precheck, run again between the typing and the Enter (`recheck_enter`), no longer holds."""
+
+
+def _deliver(cfg, st, wave, what, send, text, precheck=None, recheck_enter=False):
     """Two-step send (text, then Enter) without duplicates: once the text is in the window
     that fact is saved (`pending_enter`), and a retry after a failed Enter presses only Enter.
     A pasted text counts as delivered only when the screen shows it left the input line (submit,
-    inside send_text); otherwise `pending_enter` stays and the retry is Enter-only, checked the same way."""
+    inside send_text); otherwise `pending_enter` stays and the retry is Enter-only, checked the same way.
+    `recheck_enter` (send_text only): the precheck runs once more after the typing, right before the Enter —
+    stale there, the typed text is given up and the input cleared (None); the facts unreadable there, the Enter
+    is held and `pending_enter` stays (False): the retry re-checks before its Enter-only."""
     w = st["waves"][wave]
     name = w["tmux"]
     try:
@@ -4327,7 +4350,24 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None):
                 else:
                     w.pop("pending_text_eid", None)
                 save_state(cfg, st)
-            ok = _act(cfg, st, wave, what, send, name, text, on_typed=typed)
+            kw = {}
+            if recheck_enter and precheck is not None and send is send_text:
+                def before_enter():
+                    try:
+                        fresh_now = precheck()
+                    except gate.CollectError as e:
+                        raise _StaleBeforeEnter(f"facts not collected before the Enter: {_exc_text(e)}") from e
+                    if not fresh_now:
+                        raise _StaleBeforeEnter(None)
+                kw["before_enter"] = before_enter
+            try:
+                ok = _act(cfg, st, wave, what, send, name, text, on_typed=typed, **kw)
+            except _StaleBeforeEnter as e:
+                if e.args[0]:  # unreadable facts: no Enter, the typed text waits for the Enter-only retry
+                    event(cfg, f"{wave}: {what} (Enter) postponed: {e.args[0]}")
+                    return False
+                _abandon_input(cfg, st, wave, w, f"{what}: stale before its Enter", locked=True)
+                return None
     finally:
         lock.__exit__(None, None, None)
     if ok:
@@ -6465,6 +6505,24 @@ def auto_answers_used(w):
             + sum(1 for r in recs if _answer_in_flight(r)))
 
 
+def _policy_refuse(cfg, st, wave, w, es, stamp, reason):
+    """THE machine refusal of a policy episode (False: the usual BLOCKED path). The refusal is this episode's
+    decision and always reaches the owner WITH its reason, whatever `blocked` mark the text of the line already
+    carries (once per episode: later ticks return on `policy_refusal`)."""
+    w["policy_refusal"] = {"status": es, "stamp": stamp, "reason": reason}
+    drop_notice(w, "blocked")
+    if w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es):
+        # a typed answer waits for its Enter, and the check no longer gives it (a corrupt mark, or the fork
+        # changed since the typing: FORK_CHANGED) — the Enter is not pressed, and its text never stays in the
+        # input line of an episode the owner now answers (it may have gone out: charged)
+        w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
+        w.pop("policy_pending", None)
+        _abandon_input(cfg, st, wave, w, "policy answer: refused by the machine check")
+    save_state(cfg, st)
+    event(cfg, f"{wave}: policy answer not sent: {safe_text(reason, 200)}")
+    return False
+
+
 def _policy_answer(cfg, st, wave, w, status, now, attach):
     """Answer a BLOCKED episode by the decision_policy of chain.json. True when it is answered (now
     or earlier in this episode): the owner is then informed (`policy_answer`), not asked. False sends
@@ -6527,6 +6585,10 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     # last_status), is the same episode. No mark at all is a state.json of 1.4.3 (the chain upgraded between waves):
     # the current episode is adopted as it is, its `blocked` mark (if any) was set by that episode — no second notice.
     episode = w.get("policy_episode")
+    if episode is not None and not _episode_ok(episode):
+        # a corrupt mark of the episode is never read as «a new episode» (that would answer automatically after
+        # the corruption): the machine refusal of this episode, to the owner with its reason (fail closed)
+        return _policy_refuse(cfg, st, wave, w, es, stamp, EPISODE_CORRUPT)
     if not (isinstance(episode, dict) and _same(episode.get("status"), es) and (
             episode.get("stamp") == stamp or read(wave_dir(cfg, wave) / "status", on_error=None) != status)):
         w["policy_episode"] = {"status": es, "stamp": stamp}
@@ -6571,20 +6633,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
                 # an episode that is over; the tick ends and the next one decides on the fresh state
                 event(cfg, f"{wave}: policy answer not decided: the status changed during the check")
                 return None
-            w["policy_refusal"] = {"status": es, "stamp": stamp, "reason": fixed["reason"]}
-            # the refusal is this episode's decision and always reaches the owner WITH its reason, whatever
-            # `blocked` mark the text of the line already carries (once per episode: later ticks return above)
-            drop_notice(w, "blocked")
-            if w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es):
-                # a typed answer waits for its Enter, and the check no longer gives it (a corrupt mark, or the
-                # fork changed since the typing: FORK_CHANGED) — the Enter is not pressed, and its text never
-                # stays in the input line of an episode the owner now answers (it may have gone out: charged)
-                w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
-                w.pop("policy_pending", None)
-                _abandon_input(cfg, st, wave, w, "policy answer: refused by the machine check")
-            save_state(cfg, st)
-            event(cfg, f"{wave}: policy answer not sent: {safe_text(fixed['reason'], 200)}")
-            return False
+            return _policy_refuse(cfg, st, wave, w, es, stamp, fixed["reason"])
     seen = {}
     retry = w.get("pending_enter") == "policy answer"  # typed earlier: only its Enter is owed
 
@@ -6603,6 +6652,8 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
             now_fixed = fixed_answer(cfg, wave, view, label, rule, status)
             if not (now_fixed["ok"] and now_fixed["key"] == fixed["key"]
                     and eid(now_fixed["text"]) == eid(fixed["text"])):
+                if read(wave_dir(cfg, wave) / "status", on_error=None) != status:
+                    return False  # the wave moved on during the recheck: no refusal of an episode that is over
                 why = "пересчитанный ответ не совпадает с набранным" if now_fixed["ok"] else now_fixed["reason"]
                 seen["changed"] = why if why.startswith(FORK_CHANGED) else FORK_CHANGED + why  # a retry says it itself
                 return False
@@ -6618,7 +6669,8 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         w["policy_key_pending"] = {"key": fixed["key"], "status": es, "text": eid(fixed["text"])}
     sent = _deliver(cfg, st, wave, "policy answer", send_text,
                     fixed["text"] if fixed else POLICY_ANSWER.format(rec=label["rec"]),
-                    precheck=lambda: still(True))  # re-read again UNDER the input lock: `say` may have answered meanwhile
+                    precheck=lambda: still(True), recheck_enter=True)  # re-read again UNDER the input lock: `say`
+    # may have answered meanwhile; a fresh text is re-checked once more between its typing and its Enter
     if sent is None:
         w.pop("policy_pending", None)
         if fixed and not retry:
