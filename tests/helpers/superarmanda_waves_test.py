@@ -11507,7 +11507,10 @@ class FixedAnswerPolicy(Base):
             ("acc07 fix-loop 3/3, runs left: a new run", ND, "invariant", "x", {"index": 2, "edit": capped}, (True, ["не латай", "новый прогон", "init --from-plan", "прогон 3 из 5"], ["ещё один круг"])),
             ("acc07 fix-loop 3/3 on the last run", ND, "invariant", "x", {"index": 5, "edit": capped}, (False, "потолок прогонов исчерпан (5/5)")),
             ("cut_surface", ND, "cut_surface", "invariant", {}, (True, ["вариант cut_surface.", "--decision cut_surface", "result.md"], ["новый прогон"])),
-            ("accept_limitation", ND, "accept_limitation", "invariant", {}, (True, ["--decision accept_limitation", "Принятые ограничения"], ["новый прогон"])),
+            # state.py takes `--accept` for DEFER_SOURCES only (W3 I4): the answer names both commands, and a source
+            # it does not accept is refused to the owner
+            ("accept_limitation", ND, "accept_limitation", "invariant", {"edit": self.task_edit(decision_required_for="coderabbit")}, (True, ["--decision accept_limitation", "fix-loop --accept --source coderabbit", "Принятые ограничения"], ["новый прогон"])),
+            ("accept_limitation of a source state.py does not accept", ND, "accept_limitation", "invariant", {}, (False, "принять нельзя")),
             ("acc02 blocked_cap invariant over rec new_run", BC, "invariant", "new_run", bl, (True, ["вариант invariant.", "не латай", "новый прогон", "прогон 2 из 5", "(рекомендация волны: new_run)"], ["своей рекомендации", "ещё один круг"])),
             ("acc06 run 4 of 5 is answered", BC, "invariant", "new_run", dict(bl, index=4), (True, ["прогон 5 из 5"], [])),
             ("acc06 acc16 run 5 of 5 is not", BC, "invariant", "new_run", dict(bl, index=5), (False, "потолок прогонов исчерпан (5/5)")),
@@ -11603,7 +11606,7 @@ class FixedAnswerPolicy(Base):
                 ("another run was opened: another key", {"index": 3}, {}, "не совпадает с напечатанным"),
                 ("fix-loop 3/3 on the last run", {"index": 2, "edit": capped}, {"max_runs": 2}, "потолок прогонов исчерпан (2/2)"),
                 ("the typed text is not the decision's", {"index": 2}, {"text": "t"}, "не совпадает с напечатанным"),
-                ("the typed text is not a string", {"index": 2}, {"text": None}, "не совпадает с напечатанным")]:
+                ]:
             with self.subTest(name):
                 shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)
                 self.fork(cfg, **kw)
@@ -11627,6 +11630,10 @@ class FixedAnswerPolicy(Base):
                 for new_run, kw in forks:
                     with self.subTest(cls=cls, answer=answer, new_run=new_run):
                         shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)
+                        if cls == "needs_decision" and answer == "accept_limitation":  # `--accept` needs a DEFER source
+                            kw = dict(kw, edit=lambda doc, kw=kw: ((kw["edit"](doc) if "edit" in kw else None),
+                                                                  doc["tasks"]["T1"].update(
+                                                                      decision_required_for="coderabbit")))
                         self.fork(cfg, index=2, **kw)
                         got = self.decide(cfg, cls, answer, "x")
                         self.assertTrue(got["ok"], got)
@@ -12063,9 +12070,9 @@ class FixedAnswerPolicy(Base):
         self.assertIn("blocked", st["waves"]["W1"].get("attention", {}))  # the local signal of a question
         self.assertTrue((cfg["run_dir"] / "ATTENTION").exists())
 
-    def test_r1_guard_a_rule_without_answer_keeps_the_1_2_0_dedup_of_the_same_line(self):
-        # the 1.2.0 twin of R1 stays as it was (a known remainder of the wave, not fixed here): the same line
-        # rewritten is answered again within the cap, and AT the cap raises no new notice
+    def test_r1_guard_a_rule_without_answer_notifies_the_owner_of_a_new_episode_at_the_cap(self):
+        # W3 I1 (owner's decision): a rule without `answer` too — the same line rewritten is answered again within
+        # the cap, and AT the cap the new episode raises exactly one notice (it used to keep the 1.2.0 dedup by text)
         status = self.ND.format(rec="cut_surface")
         cfg, _ = self.mandate(policy=[{"class": "needs_decision"}], max_auto_answers=2)
         self.tick(cfg, status)
@@ -12074,16 +12081,12 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(len(self.answers()), 2)
         self.assertEqual(self.owner_asked(), [])
         self.rewrite(cfg, status)
-        real = wab.drop_notice
-
-        def drop(w, key):
-            self.assertNotEqual(key, "blocked", "the blocked mark is reset without answer")
-            real(w, key)
-        with mock.patch.object(wab, "drop_notice", drop):
-            st = self.tick(cfg)
+        st = self.tick(cfg)
         self.assertEqual(len(self.answers()), 2)
         self.assertIn("W1: policy cap reached (2/2)", self.log(cfg))
-        self.assertEqual(self.owner_asked(), [])
+        self.assertEqual(len(self.owner_asked()), 1)
+        self.tick(cfg)  # the same stamp: the same episode
+        self.assertEqual(len(self.owner_asked()), 1)
         self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], wab.eid(status))
         self.assertNotIn("policy_refusal", st["waves"]["W1"])
 
@@ -19817,6 +19820,32 @@ class W3PolicyEpisodes(Base):
                         self.assertEqual(got, want, f"notices after each tick, rule {name}, path ({path})")
                     finally:
                         shutil.rmtree(self.cfg["run_dir"], ignore_errors=True)
+
+    def test_i1_a_state_of_1_4_3_without_the_episode_mark_is_not_notified_again(self):
+        # the running chain is upgraded between waves: its state.json has no `policy_episode` yet; the episode the
+        # owner was already told of must not read as a new one on the first tick of the new version
+        for name, rule in (("with answer", self.WITH), ("without answer", self.WITHOUT)):
+            with self.subTest(rule=name):
+                self.tg.clear()
+                self.sent.clear()
+                cfg, _ = self.mandate(policy=[rule], max_runs=5)
+                try:
+                    cfg["max_auto_answers"] = 0
+                    self.fork(cfg)
+                    self.set_status(cfg, "W1", self.ND.format(rec="invariant"))
+                    self.tick(cfg)
+                    self.assertEqual(len(self.owner_asked()), 1)
+                    st = wab.load_state(cfg)
+                    st["waves"]["W1"].pop("policy_episode", None)  # as 1.4.3 wrote it
+                    wab.save_state(cfg, st)
+                    self.tick(cfg)
+                    self.tick(cfg)
+                    self.assertEqual(len(self.owner_asked()), 1, "the episode of a 1.4.3 state was notified again")
+                    self.rewrite(cfg, self.ND.format(rec="invariant"))  # a real new episode still is
+                    self.tick(cfg)
+                    self.assertEqual(len(self.owner_asked()), 2)
+                finally:
+                    shutil.rmtree(cfg["run_dir"], ignore_errors=True)
 
     # ----- I2: decisions by the fresh state -----
     def test_i2_a_refusal_is_recorded_only_while_the_status_reads_as_its_line(self):
