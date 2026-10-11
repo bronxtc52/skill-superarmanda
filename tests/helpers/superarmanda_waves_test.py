@@ -18891,8 +18891,9 @@ class W7NoticeTemplates(Base):
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
                  and n.func.id == "put_notice"]
         # the 25 call sites of 1.2.6; chain_done is put by one helper now (23 keys); +1 not_ready of the Fable switch (#108);
-        # +1 updating of an unconfirmed Fable switch delivery (Codex P2 / CodeRabbit on #109)
-        self.assertEqual(len(calls), 26)
+        # +1 updating of an unconfirmed Fable switch delivery (Codex P2 / CodeRabbit on #109);
+        # +1 blocked of a BLOCKED episode whose line is lost from the store and was never told (1.4.3, круг 2 W2)
+        self.assertEqual(len(calls), 27)
         self.assertEqual({c.args[3].value for c in calls if len(c.args) == 5}, set(wab.NOTICE_TEMPLATES))
         for node in calls:
             self.assertEqual(len(node.args), 5, f"put_notice(cfg, w, wave, key, value, **fields), line {node.lineno}")

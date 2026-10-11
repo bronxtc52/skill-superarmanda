@@ -18,6 +18,7 @@ import datetime
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -26,7 +27,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from superarmanda_waves_test import Base, WAVES, asst, text_holders  # noqa: E402  (installs the TMUX guard)
+from superarmanda_waves_test import (  # noqa: E402  (installs the TMUX guard)
+    EMPTY_ANSI, Base, WAVES, asst, live, text_holders)
 
 import wab  # noqa: E402
 
@@ -824,6 +826,176 @@ class FableLimitWhileBlocked(FableLimitBase):
         self.tick()
         self.assertEqual(len(self.new_sessions()), 1)
         self.assertNotIn("BLOCKED", self.switch_text())
+
+
+class LostTextStore(FableLimitBase):
+    """1.4.3, круг 2 ревью W2 (N1, N4): THE class «the text of an eid is not in the wave's store». ONE table over
+    EVERY reader of the store in wab.py (stash_text's own check, last_status_text -> _tick, outbox_notice,
+    _deliver, fable_blocked_note, the Fable switch message, _question_text), each with the store lost in both ways
+    (`.texts` removed after the write; `.texts` a plain file, so nothing is written at all). For every row:
+    (а) the mechanics of the dispatcher go on, (б) no action is bolder than with the text (no blind Enter, no
+    answer, no lifted suppression by a guess), (в) what the owner needs to decide is not lost silently: it comes
+    from a live source (the status file under the same eid), or the message is made without the quote but says
+    where to look / asks to rewrite `status`, or the episode is raised to the owner again."""
+
+    BLOCKED = "BLOCKED: выбрать вариант A или B"
+    blocked_wave = FableLimitWhileBlocked.blocked_wave
+    switch_text = FableLimitWhileBlocked.switch_text
+
+    def lose(self, how):
+        store = wab.wave_dir(self.cfg, "W1") / ".texts"
+        shutil.rmtree(store, ignore_errors=True)
+        if how == "file":  # every later write fails too (ENOTDIR): the eid is kept, the text never is
+            store.write_text("не каталог", encoding="utf-8")
+
+    def lost_tick(self, how, word, text, **rec):
+        """A wave whose status file is empty (mid-rewrite, or the wave died writing it) and whose last real
+        status is known to state.json by word and eid only."""
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"].update(last_status_word=word, last_status_eid=wab.eid(text), **rec)
+        st["waves"]["W1"].pop("last_status", None)
+        self.put_state(self.cfg, st)
+        self.set_status(self.cfg, "W1", "")
+        self.lose(how)
+
+    def fresh(self, **over):
+        self.cfg, self.path = self.chain(model=FABLE, **over)
+        for old in (self.home / ".claude" / "projects").glob("*/*.jsonl"):
+            old.unlink()  # no journal: the pane alone tells the activity (the idle row), no limit line
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(sessions=["s1"])},
+                                  "defaults": "1.4"})
+        self.tg[:], self.sent[:], self.enters[:], self.clear_keys[:] = [], [], [], []
+
+    # ----- the rows -----
+    def row_stash_text(self, how):  # stash_text reads the store to skip a write: a failed write is an event
+        self.fresh()
+        self.lose(how)
+        e = wab.stash_text(self.cfg, "W1", "BLOCKED: текст")
+        self.assertEqual(e, wab.eid("BLOCKED: текст"))
+        if how == "file":
+            self.assertIn("the wave's text store not written", self.events())
+
+    def row_fable_note_status_file(self, how):  # N1: the line comes from the live status file (same eid)
+        self.blocked_wave([user_line("Ответ владельца: вариант B", "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        if how == "file":
+            self.lose(how)  # before begin_fable_switch: stash_text of the line fails
+            self.tick()
+        else:
+            with mock.patch.object(wab, "_fable_switch_tick", side_effect=_Crash), self.assertRaises(_Crash):
+                self.tick()  # the switch is decided and saved, the store is lost before the message is chosen
+            self.lose(how)
+            self.tick()
+        text = self.switch_text()
+        self.assertIn(self.BLOCKED, text)
+        self.assertIn("Ответ владельца: вариант B", text)
+        self.assertIn("fable_blocked_episode", self.w())
+
+    def row_fable_note_line_gone_with_answer(self, how):  # N1: no live source -> the answers, no quote, rewrite
+        self.blocked_wave([user_line("Ответ владельца: вариант B", "2026-10-10T09:30:00.000Z"), limit_lines()[0]])
+        with mock.patch.object(wab, "_fable_switch_tick", side_effect=_Crash), self.assertRaises(_Crash):
+            self.tick()
+        self.lose(how)
+        self.set_status(self.cfg, "W1", "BLOCKED: другая строка")  # the status file no longer holds the line
+        self.tick()
+        text = self.switch_text()
+        self.assertNotIn(self.BLOCKED, text)
+        self.assertIn("Ответ владельца: вариант B", text)
+        self.assertIn(wab.FABLE_BLOCKED_REWRITE, text)
+
+    def row_fable_note_line_gone_no_answer(self, how):  # N1: neither the line nor an answer -> ask again
+        self.blocked_wave(limit_lines()[:1])
+        with mock.patch.object(wab, "_fable_switch_tick", side_effect=_Crash), self.assertRaises(_Crash):
+            self.tick()
+        self.lose(how)
+        (wab.wave_dir(self.cfg, "W1") / "status").write_text("", encoding="utf-8")
+        self.tick()
+        text = self.switch_text()
+        self.assertIn(wab.FABLE_BLOCKED_ASK_AGAIN, text)
+        self.assertIn(wab.FABLE_BLOCKED_REWRITE, text)
+
+    def row_tick_lost_blocked_raised(self, how):  # last_status_text -> _tick: an episode never told is raised
+        self.fresh()
+        self.lost_tick(how, "BLOCKED", "BLOCKED: вопрос волны?")
+        for _ in range(2):
+            self.assertTrue(self.tick())
+        self.assertEqual(len([t for t in self.tg if "ждёт тебя" in t]), 1, self.tg)
+        self.assertEqual(self.sent, [])  # nothing typed: no answer by the policy
+        self.assertEqual(self.enters, [])
+
+    def row_tick_lost_blocked_told_or_answered(self, how):  # ... but an episode already told/answered is not
+        for mark in ("blocked", "policy_answer"):
+            self.fresh()
+            self.lost_tick(how, "BLOCKED", "BLOCKED: вопрос волны?",
+                           notified={mark: wab.eid("BLOCKED: вопрос волны?")})
+            self.assertTrue(self.tick())
+            self.assertEqual(self.tg, [], mark)
+            self.assertEqual(self.sent, [], mark)
+
+    def row_tick_lost_other(self, how):  # `other` without its text: the idle mechanics go on
+        self.fresh(idle_minutes=1)
+        self.lost_tick(how, "other", "RUNNING: шаг 3", pane_digest="x", pane_changed=time.time() - 3600)
+        self.pane = "a\nb\nc\nd"
+        self.tick()
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["pane_changed"] = time.time() - 3600
+        wab.save_state(self.cfg, st)
+        self.tick()
+        self.assertTrue(any("молчит" in t for t in self.tg), self.tg)
+
+    def row_tick_lost_dead(self, how):  # N4: the dead notice tells the word of the lost status, no quote
+        self.fresh(telegram_quote=True)
+        self.lost_tick(how, "BLOCKED", "BLOCKED: вопрос волны?")
+        self.alive = False
+        self.assertFalse(self.tick())
+        (dead,) = [t for t in self.tg if "закрылось" in t]
+        self.assertIn("Статус волны: ждёт ответа", dead)
+
+    def row_outbox_quote(self, how):  # outbox_notice: the quote lost -> sent without it, the window named
+        self.fresh(telegram_quote=True)
+        self.set_status(self.cfg, "W1", "BLOCKED: вопрос волны?")
+        with mock.patch.object(wab, "_send_telegram", side_effect=OSError("down")):
+            self.tick()
+        self.assertIn("quote_eid", self.w()["outbox"]["blocked"])
+        self.lose(how)
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab.drain_notices(self.cfg)
+        (sent,) = [t for t in self.tg if "ждёт тебя" in t]
+        self.assertNotIn("вопрос волны?", sent)
+        self.assertIn("ответь волне в её окне", sent)
+
+    def row_deliver_head(self, how):  # _deliver: the head of a typed text lost -> no Enter, the input cleared
+        self.fresh()
+        self.lost_tick(how, "RUNNING", "RUNNING", pending_enter="checkpoint request",
+                       pending_text_eid=wab.eid("[wab] WAB-CHECKPOINT"))
+        self.ansi = live("19-folded.ansi")
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok = wab._deliver(self.cfg, wab.load_state(self.cfg), "W1", "checkpoint request", wab.send_text, "")
+        self.assertFalse(ok)
+        self.assertEqual(self.enters, [])
+        self.assertTrue(self.clear_keys)
+
+    def row_question_text(self, how):  # _question_text: chain-result.md says where the question can be read
+        self.fresh()
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["questions"] = [{"at": time.time(), "eid": wab.eid("BLOCKED: вопрос волны?")}]
+        self.put_state(self.cfg, st)
+        self.lose(how)
+        path = wab.write_chain_result(self.cfg, wab.load_state(self.cfg))
+        self.assertIn("events.log", Path(path[0]).read_text(encoding="utf-8"))
+
+    def test_every_reader_of_the_store_with_the_store_lost(self):
+        rows = [self.row_stash_text, self.row_fable_note_status_file, self.row_fable_note_line_gone_with_answer,
+                self.row_fable_note_line_gone_no_answer, self.row_tick_lost_blocked_raised,
+                self.row_tick_lost_blocked_told_or_answered, self.row_tick_lost_other, self.row_tick_lost_dead,
+                self.row_outbox_quote, self.row_deliver_head, self.row_question_text]
+        for row in rows:
+            for how in ("removed", "file"):
+                with self.subTest(row=row.__name__, store=how):
+                    self.sent[:], self.enters[:], self.clear_keys[:], self.tg[:] = [], [], [], []
+                    self.alive, self.ansi, self.pane, self.tmux_calls[:] = True, EMPTY_ANSI, "", []
+                    if hasattr(self, "cfg"):
+                        shutil.rmtree(self.cfg["run_dir"], ignore_errors=True)
+                    row(how)
 
 
 # ---------------------------------------------------------------- T5

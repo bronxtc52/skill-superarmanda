@@ -4163,16 +4163,18 @@ class _WindowGone(Exception):
     """The wave's tmux session vanished while we were acting on it."""
 
 
-def _mark_dead(cfg, st, wave, status=""):
-    """The one `window closed` branch: phase dead, event and a single notice."""
+def _mark_dead(cfg, st, wave, status="", word=None):
+    """The one `window closed` branch: phase dead, event and a single notice. `word` instead of `status`: the
+    status line is not known (its text lost from the store), only its word — told without a quote."""
     w = st["waves"][wave]
     fresh = once_per(w, "dead", "1")
     w["phase"] = "dead"
     if fresh:
-        put_notice(cfg, w, wave, "dead", "1", wave_status=status, question=status)
+        put_notice(cfg, w, wave, "dead", "1", wave_status=status if word is None else word,
+                   question=status if word is None else None)
     save_state(cfg, st)  # the phase, the mark and the notice together
     if fresh:
-        event(cfg, f"{wave}: tmux session {w['tmux']} is gone (status={status})")
+        event(cfg, f"{wave}: tmux session {w['tmux']} is gone (status={status if word is None else word})")
     flush_notices(cfg, st, w)
 
 
@@ -4796,6 +4798,8 @@ def fable_limit_after_blocked(cfg, wave, w, status):
 
 FABLE_BLOCKED_ANSWER_CHARS = 4000
 FABLE_BLOCKED_ASK_AGAIN = "задай вопрос заново"
+FABLE_BLOCKED_REWRITE = ("перепиши status новой строкой BLOCKED со своим вопросом, добавив в конце "
+                         "« (повтор после смены модели)»")
 
 
 def fable_blocked_note(cfg, wave, w, sw):
@@ -4808,16 +4812,28 @@ def fable_blocked_note(cfg, wave, w, sw):
         return ""
     line = wave_text(cfg, wave, w, blocked["status"])  # the line is in the wave's store, state.json has its eid
     if line is None:
-        return ""
-    line = line.strip()
+        # the store lost it (or never got it): the live status file, when it still holds THIS line (same eid)
+        live = read(wave_dir(cfg, wave) / "status", on_error=None)
+        line = live if live and eid(live) == blocked["status"] else None
     answers = _user_texts_since(transcript_path(w["cwd"], sw["from"]), blocked["since"])
+    text = "\n---\n".join(answers)
+    if len(text) > FABLE_BLOCKED_ANSWER_CHARS:
+        text = text[:FABLE_BLOCKED_ANSWER_CHARS] + "…"
+    if line is None:
+        # neither the store nor the status file has the line: never the ordinary resume (the episode is handed to
+        # this session and not raised again until `status` changes) — the answers without the quote, and the
+        # request to write the question into `status` anew, so a new line raises it to the policy or the owner
+        if not answers:
+            return (f"Перед лимитом волна стояла в BLOCKED; текст строки у диспетчера не сохранился, ответа в "
+                    f"журнале прошлой сессии нет: {FABLE_BLOCKED_ASK_AGAIN} — {FABLE_BLOCKED_REWRITE}.")
+        return (f"Перед лимитом волна стояла в BLOCKED (текст строки у диспетчера не сохранился), и в прошлой "
+                f"сессии после неё пришёл ответ:\n{text}\nЕсли ответ закрывает вопрос — продолжи по нему и перепиши "
+                f"status; если нет — {FABLE_BLOCKED_REWRITE}.")
+    line = line.strip()
     if not answers:
         return (f"Перед лимитом волна стояла в «{line}». Ответа на него в журнале прошлой сессии нет: "
                 f"{FABLE_BLOCKED_ASK_AGAIN} — перепиши status той же строкой BLOCKED, добавив в конце "
                 f"« (повтор после смены модели)».")
-    text = "\n---\n".join(answers)
-    if len(text) > FABLE_BLOCKED_ANSWER_CHARS:
-        text = text[:FABLE_BLOCKED_ANSWER_CHARS] + "…"
     return (f"Перед лимитом волна стояла в «{line}», и в прошлой сессии на него пришёл ответ:\n{text}\n"
             f"Продолжи по этому ответу и перепиши status.")
 
@@ -6271,7 +6287,10 @@ def _question_text(cfg, st, wave, q):
     if isinstance(q.get("text"), str):
         return q["text"]
     got = wave_text(cfg, wave, st.get("waves", {}).get(wave), q.get("eid"))
-    return got if got is not None else "(текст вопроса недоступен)"
+    # the store lost it: the line itself was logged when it was asked (events.log), and the window still shows it
+    if got is not None:
+        return got
+    return "(текст вопроса не сохранился в хранилище волны — см. events.log и окно волны)"
 
 
 def write_chain_result(cfg, st):
@@ -6750,7 +6769,10 @@ def _tick(cfg, st):
         return _complete_wave(cfg, st, wave, w, wdir, now)
 
     if not tmux_alive(name):
-        _mark_dead(cfg, st, wave, status)
+        if lost:  # N4: the word of the lost status (BLOCKED -> «ждёт ответа»), never a quote
+            _mark_dead(cfg, st, wave, word=_status_word(w))
+        else:
+            _mark_dead(cfg, st, wave, status)
         return False  # the chain stops; restart the wave by hand, then run watch again
 
     # screen episodes end on screen before any branch below returns or sends the outbox
@@ -6812,6 +6834,16 @@ def _tick(cfg, st):
         save_state(cfg, st)
 
     if lost and _status_word(w) == "BLOCKED":  # a BLOCKED episode whose line is lost: as BLOCKED, nothing decided
+        # nothing typed (no answer, no retry); but an episode the owner was never told of, that the policy did not
+        # answer and that is not handed to an Opus session, is raised to the owner without the quote (the notice
+        # names the window), never left silent
+        e = _status_eid(w)
+        handed = w.get("fable_blocked_episode")
+        if (_answered(w) != e and not _same(w.get("policy_pending"), e)
+                and not (isinstance(handed, dict) and _same(handed.get("status"), e))
+                and once_per(w, "blocked", e)):
+            put_notice(cfg, w, wave, "blocked", e)
+            event(cfg, f"{wave}: BLOCKED without its text: the owner is told without the quote")
         save_state(cfg, st)
         flush_notices(cfg, st, w)
         return True
