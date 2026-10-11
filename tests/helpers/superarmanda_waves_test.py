@@ -20412,6 +20412,31 @@ class W4DashReload(Base):
                 self.dash.reload_cfg(back, path)
                 self.assertEqual(len(self.told(cfg)) - base, 2)
 
+    def test_legacy_defaults_survive_a_changed_identity(self):
+        """Codex P2 on PR #116: a pre-1.4 chain.json without model/ctx_limit takes their defaults from the run
+        (LEGACY for a held pre-1.4 run); a changed run_id must not switch the dashboard to the NEW run's
+        defaults (Opus/200k), while an explicit edit of a tunable field still applies."""
+        cfg, path = self.chain(ctx_limit=None)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})  # pre-1.4: waves, no marker
+        cfg = wab.load_chain(path, create=False)
+        self.assertEqual((cfg.get("model"), cfg["ctx_limit"]), (wab.LEGACY_DEFAULTS["model"],
+                                                                wab.LEGACY_DEFAULTS["ctx_limit"]))
+        self.edit(path, run_id="fresh-run")  # the new run has no state.json: it would get NEW_DEFAULTS
+        got = self.dash.reload_cfg(cfg, path)
+        self.assertEqual(got["run_dir"], cfg["run_dir"])
+        self.assertEqual((got.get("model"), got["ctx_limit"]), (cfg.get("model"), cfg["ctx_limit"]))
+        again = self.dash.reload_cfg(got, path)  # the next frame: still the held run's defaults
+        self.assertEqual((again.get("model"), again["ctx_limit"]), (cfg.get("model"), cfg["ctx_limit"]))
+        self.edit(path, model="claude-sonnet-x", ctx_limit=150000)  # an explicit tunable edit still applies
+        tuned = self.dash.reload_cfg(again, path)
+        self.assertEqual((tuned["model"], tuned["ctx_limit"]), ("claude-sonnet-x", 150000))
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        del data["model"], data["ctx_limit"]
+        Path(path).write_text(json.dumps(data), encoding="utf-8")
+        back = self.dash.reload_cfg(tuned, path)  # removed again: the HELD run's defaults, not the new run's
+        self.assertEqual((back.get("model"), back["ctx_limit"]), (wab.LEGACY_DEFAULTS["model"],
+                                                                  wab.LEGACY_DEFAULTS["ctx_limit"]))
+
     def test_a_broken_file_keeps_the_last_settings(self):
         cfg, path = self.chain()
         Path(path).write_text("{broken", encoding="utf-8")
@@ -20564,7 +20589,6 @@ class W4MaskBoundaries(Base):
                 "bare": ("from wab import redact\ndef out(t):\n    return redact(t)\n", True),
                 "getattr": ('import wab\ndef out(t):\n    return getattr(wab, "redact")(t)\n', False),
                 "globals": ('def out(t):\n    return globals()["re" + "dact"](t)\n', False),
-                "inside_safe_text": ("import wab\ndef safe_text(t):\n    return wab.redact(t)\n", False),
             }
             for name, (src, caught) in cases.items():
                 with self.subTest(item=1, form=name):
@@ -20573,6 +20597,17 @@ class W4MaskBoundaries(Base):
                     (Path(d) / "probe.py").write_text(src, encoding="utf-8")
                     found = [f for f in redact_uses_outside(d) if f[2] == "out"]
                     self.assertEqual(bool(found), caught, (src, found))
+            with self.subTest(item=1, form="inside_safe_text"):
+                # the SAME direct call in safe_text and in out: the guard must be silent on the first and catch the
+                # second, so the allowance is by the enclosing function, not a blind spot for the construction
+                for old in Path(d).glob("*.py"):
+                    old.unlink()
+                src = ("import wab\ndef safe_text(t):\n    return wab.redact(t)\n"
+                       "def out(t):\n    return wab.redact(t)\n")
+                (Path(d) / "probe.py").write_text(src, encoding="utf-8")
+                found = redact_uses_outside(d)
+                self.assertEqual([f[2] for f in found], ["out"], (src, found))
+                self.assertEqual(found[0][1], 5, found)  # the line of the call in out, not the one in safe_text
 
     def test_item1_the_doc_names_what_holds_the_line(self):
         para = self.boundaries_paragraph()

@@ -176,11 +176,13 @@ def chain_started_before_defaults(run_dir):
     return isinstance(st, dict) and "defaults" not in st and isinstance(st.get("waves"), dict) and bool(st["waves"])
 
 
-def load_chain(path, create=True):
+def load_chain(path, create=True, defaults_from=None):
     """Read chain.json. The run directory is <base>/<chain>/<run_id>, where base is
     `run_dir` from chain.json or <directory of chain.json>/runs. run_id is mandatory and is
     always the last path segment: a reused chain name must never pick up an older run's
-    mandate.md."""
+    mandate.md. `defaults_from` (a run directory) picks the run-dependent defaults of `model`
+    and `ctx_limit` by THAT run instead of the one chain.json names now: the dashboard holds its
+    run and must not switch to another run's defaults when the identity is edited (PR #116)."""
     path = pathlib.Path(path)
     try:
         cfg = json.loads(path.read_text(encoding="utf-8"))
@@ -302,7 +304,8 @@ def load_chain(path, create=True):
             cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     except (OSError, RuntimeError, ValueError) as e:  # symlink loop, no permission, a file in the way
         raise SystemExit(f"chain.json: run_dir/workdir cannot be used: {_exc_text(e)}")
-    defaults = LEGACY_DEFAULTS if chain_started_before_defaults(cfg["run_dir"]) else NEW_DEFAULTS
+    by_run = cfg["run_dir"] if defaults_from is None else defaults_from
+    defaults = LEGACY_DEFAULTS if chain_started_before_defaults(by_run) else NEW_DEFAULTS
     for key, value in defaults.items():
         cfg.setdefault(key, value)
     return cfg

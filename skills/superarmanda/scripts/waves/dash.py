@@ -790,7 +790,9 @@ def reload_cfg(cfg, path):
     identity of the run is held from the start, like `watch` does: a changed identity is ignored and told ONCE
     in events.log. A broken or missing file keeps the last working settings (the frame must not fail)."""
     try:
-        new = wab.load_chain(path, create=False)
+        # the defaults of the tunable model/ctx_limit by the HELD run: an edited run_id must not bring
+        # the defaults of the new run (Opus/200k) to a pre-1.4 run (None/300k) (Codex P2, PR #116)
+        new = wab.load_chain(path, create=False, defaults_from=cfg.get("run_dir"))
     except (Exception, SystemExit):  # noqa: BLE001 - a half-written edit costs nothing
         return cfg
     out = dict(cfg)
