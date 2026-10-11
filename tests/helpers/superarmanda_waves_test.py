@@ -1765,7 +1765,7 @@ class Episodes(Base):
         w["pane_digest"] = wab.pane_digest(self.pane)
         w["pane_changed"] = t[0] - 1000  # 0.13.0 raised «молчит» at pane_changed + 60 s
         wab.once_per(w, "idle", w["pane_digest"])
-        wab.put_notice(self.cfg, w, "W1", "idle", w["pane_digest"], n=1)
+        wab.put_notice(self.cfg, w, "W1", "idle", w["pane_digest"], minutes=1)
         self.put_state(self.cfg, st)
         os.utime(main, (t[0] - 3600, t[0] - 3600))
         os.utime(agent, (t[0] - 10, t[0] - 10))  # the subagent wrote after that notice
@@ -10536,7 +10536,7 @@ class LocalAttention(Base):
 
     def test_attention_is_rewritten_with_the_remaining_signal(self):
         cfg, st, w = self.blocked()
-        wab.put_notice(cfg, w, "W2", "idle", "d1", n=30)
+        wab.put_notice(cfg, w, "W2", "idle", "d1", minutes=30)
         wab.save_state(cfg, st)
         wab.flush_notices(cfg, st, w)
         att = cfg["run_dir"] / "ATTENTION"
@@ -18150,10 +18150,15 @@ class W6OwnerTime(Base):
         super().setUp()
         try:
             import dash
-        except ImportError as exc:
-            self.skipTest(f"rich is not installed: {exc}")
-        self.dash = dash
-        dash.MANIFEST_CACHE.clear()
+        except ImportError:  # without rich only the dashboard paths are skipped (#102 item 4), not the whole class
+            self.dash = None
+        else:
+            self.dash = dash
+            dash.MANIFEST_CACHE.clear()
+
+    def need_dash(self):
+        if self.dash is None:
+            self.skipTest("rich is not installed: the dashboard path is skipped")
 
     # ----- the drivers: (zone, moment) -> everything a human reads on that path -----
     def cfg_for(self, zone, **over):
@@ -18167,11 +18172,13 @@ class W6OwnerTime(Base):
         return con.export_text()
 
     def drv_dash_header(self, zone, ts):
+        self.need_dash()
         cfg = self.cfg_for(zone)
         with mock.patch("time.time", return_value=ts):
             return self.rich_text(self.dash.header(cfg, {"current": "W1", "waves": {}}))
 
     def drv_dash_events(self, zone, ts):
+        self.need_dash()
         cfg = self.cfg_for(zone)
         line = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + "Z W1: say: ok\n"
         cfg["run_dir"].mkdir(parents=True, exist_ok=True)
@@ -18209,7 +18216,7 @@ class W6OwnerTime(Base):
 
     def drv_idle(self, zone, ts):
         cfg = self.cfg_for(zone)
-        return wab.notice_text(cfg, "W1", "idle", ts, n=15, time=ts, wave_status="RUNNING")
+        return wab.notice_text(cfg, "W1", "idle", ts, minutes=15, time=ts, wave_status="RUNNING")
 
     # ----- the zone reaches the processes outside the watch loop (round 3) -----
     def _session_env(self, **over):
@@ -18231,6 +18238,7 @@ class W6OwnerTime(Base):
         self.assertIn("SUPERARMANDA_TZ=Asia/Dubai", env)
 
     def test_dash_follows_a_live_zone_change(self):
+        self.need_dash()
         cfg, path = self.chain(timezone="Asia/Dubai")
         st = {"current": "W1", "waves": {}}
         with mock.patch("time.time", return_value=self.T):
@@ -18255,7 +18263,8 @@ class W6OwnerTime(Base):
                "idle_notice": "drv_idle", "human_time": None}
 
     def drivers(self):
-        return {k: getattr(self, v) for k, v in self.DRIVERS.items() if v}
+        return {k: getattr(self, v) for k, v in self.DRIVERS.items()
+                if v and not (self.dash is None and k.startswith("dash_"))}
 
     @staticmethod
     def local(ts, zone):
@@ -18549,6 +18558,8 @@ class W7NoticeTemplates(Base):
                 out[name] = self.NOW - 300
             elif name == "duration":
                 out[name] = 3700
+            elif name == "minutes":
+                out[name] = self.POISON if poison else 12
             elif name == "severity":
                 out[name] = self.POISON if poison else "P1"
             elif name == "cls":
@@ -18729,7 +18740,7 @@ class W7NoticeTemplates(Base):
             self.assertTrue(desc, name)
             if name in vocab:
                 continue  # the vocabularies: a neutral phrase, see the next test
-            for value in bad if name == "red" else [*bad, 1.5] if name not in ("time", "duration") else bad:
+            for value in bad if name == "red" else [*bad, 1.5] if name not in ("time", "duration", "minutes") else bad:
                 if name == "red" and value is True:
                     continue  # a real boolean is the one valid value of `red`
                 with self.subTest(field=name, value=value):
@@ -19220,13 +19231,12 @@ class Release143(unittest.TestCase):
 class Release144(unittest.TestCase):
     """The release 1.4.4 (#100; wave W3 of waves-remnants): version, the CHANGELOG section on top."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.4"\s*$')
+    # the version of SKILL.md moved on to 1.4.5 (#102, #105, #103): Release145 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.4 — 2026-10-11$", "1.4.4 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.4\.4 — 2026-10-11$", "CHANGELOG.md: the section of 1.4.4")
+        self.assertTrue(log.index("## 1.4.4") < log.index("## 1.4.3"), "1.4.4 is above 1.4.3")
         body = re.search(r"(?ms)^## 1\.4\.4 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
         for needle in ("#100", "### Изменено", "### Исправлено", "`policy_episode`", "fix-loop --accept --source"):
             self.assertIn(needle, body)
@@ -20348,6 +20358,333 @@ class W3PolicyEpisodes(Base):
                     elif cmd.startswith("fix-loop --accept"):
                         for flag in ("--source", "--severity", "--note"):
                             self.assertIn(flag, cmd, f"state.py refuses --accept without {flag}")
+
+
+# ---------------------------------------------------------------- W4 dash-texts: live reload, minutes in notices, one gate event
+class W4DashReload(Base):
+    """#102 item 6: the dashboard holds the identity of the run from its start, like `watch`; a live edit of
+    chain.json changes only the TUNABLE fields and a changed identity is told once in events.log."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        self.dash = dash
+
+    def edit(self, path, **over):
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data.update(over)
+        Path(path).write_text(json.dumps(data), encoding="utf-8")
+
+    def told(self, cfg):
+        return [l for l in self.log(cfg).splitlines() if "dash: chain.json identity changed" in l]
+
+    def log(self, cfg):
+        f = cfg["run_dir"] / "events.log"
+        return f.read_text(encoding="utf-8") if f.exists() else ""
+
+    def test_identity_fields_are_ignored_and_told_once_each_change(self):
+        cases = {"run_id": "other-run", "run_dir": "/nowhere/else", "waves": ["W1", "W2", "W3"]}
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                cfg, path = self.chain()
+                base = len(self.told(cfg))  # the log is shared by the subtests: count only what this one adds
+                run_dir, ident = cfg["run_dir"], wab._identity(cfg)
+                raw = json.loads(Path(path).read_text(encoding="utf-8")).get(field)  # as the file has it
+                self.edit(path, **{field: value}, timezone="Asia/Tashkent")
+                got = self.dash.reload_cfg(cfg, path)
+                self.assertEqual(wab._identity(got), ident)
+                self.assertEqual(got["run_dir"], run_dir)
+                self.assertEqual(got["timezone"], "Asia/Tashkent")  # the tunable field applied
+                again = self.dash.reload_cfg(got, path)  # the same change on the next frame: no new event
+                self.assertEqual(wab._identity(again), ident)
+                lines = self.told(cfg)[base:]
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn(field, lines[0])
+                self.assertIn(f"keeping {run_dir}", lines[0])
+                self.edit(path, **{field: raw})
+                back = self.dash.reload_cfg(again, path)  # back to the original: silence
+                self.assertEqual(wab._identity(back), ident)
+                self.assertEqual(len(self.told(cfg)) - base, 1)
+                self.edit(path, **{field: value})  # a new change after the return: told again
+                self.dash.reload_cfg(back, path)
+                self.assertEqual(len(self.told(cfg)) - base, 2)
+
+    def test_legacy_defaults_survive_a_changed_identity(self):
+        """Codex P2 on PR #116: a pre-1.4 chain.json without model/ctx_limit takes their defaults from the run
+        (LEGACY for a held pre-1.4 run); a changed run_id must not switch the dashboard to the NEW run's
+        defaults (Opus/200k), while an explicit edit of a tunable field still applies."""
+        cfg, path = self.chain(ctx_limit=None)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})  # pre-1.4: waves, no marker
+        cfg = wab.load_chain(path, create=False)
+        self.assertEqual((cfg.get("model"), cfg["ctx_limit"]), (wab.LEGACY_DEFAULTS["model"],
+                                                                wab.LEGACY_DEFAULTS["ctx_limit"]))
+        self.edit(path, run_id="fresh-run")  # the new run has no state.json: it would get NEW_DEFAULTS
+        got = self.dash.reload_cfg(cfg, path)
+        self.assertEqual(got["run_dir"], cfg["run_dir"])
+        self.assertEqual((got.get("model"), got["ctx_limit"]), (cfg.get("model"), cfg["ctx_limit"]))
+        again = self.dash.reload_cfg(got, path)  # the next frame: still the held run's defaults
+        self.assertEqual((again.get("model"), again["ctx_limit"]), (cfg.get("model"), cfg["ctx_limit"]))
+        self.edit(path, model="claude-sonnet-x", ctx_limit=150000)  # an explicit tunable edit still applies
+        tuned = self.dash.reload_cfg(again, path)
+        self.assertEqual((tuned["model"], tuned["ctx_limit"]), ("claude-sonnet-x", 150000))
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        del data["model"], data["ctx_limit"]
+        Path(path).write_text(json.dumps(data), encoding="utf-8")
+        back = self.dash.reload_cfg(tuned, path)  # removed again: the HELD run's defaults, not the new run's
+        self.assertEqual((back.get("model"), back["ctx_limit"]), (wab.LEGACY_DEFAULTS["model"],
+                                                                  wab.LEGACY_DEFAULTS["ctx_limit"]))
+
+    def test_a_broken_file_keeps_the_last_settings(self):
+        cfg, path = self.chain()
+        Path(path).write_text("{broken", encoding="utf-8")
+        self.assertIs(self.dash.reload_cfg(cfg, path), cfg)
+        Path(path).unlink()
+        self.assertIs(self.dash.reload_cfg(cfg, path), cfg)
+
+
+class W4NoticeMinutes(Base):
+    """#105 item 3 (+ item 2): the minutes of `idle` and `checkpoint_timeout` are ONE registry field with a
+    duration formatter: 0.5 is «30 с», never «0 мин»; an older outbox entry still renders without «?»."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_key(self, key, minutes, **tg):
+        cfg_key = "idle_minutes" if key == "idle" else "handoff_timeout_minutes"
+        over = {cfg_key: minutes, **tg}
+        if key == "idle":
+            over["handoff_timeout_minutes"] = 25
+        cfg, _ = self.chain(**over)
+        if key == "idle":
+            self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+            self.set_status(cfg, "W1", "RUNNING")
+            t = [1000.0]
+            with mock.patch("time.time", side_effect=lambda: t[0]):
+                for i in range(3):
+                    self.pane = f"work\nmore work\nthe end {i}\n"
+                    wab.tick(cfg, wab.load_state(cfg))
+                    t[0] += max(120, minutes * 60 + 60)
+        else:
+            self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+                phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time() - 3600 * 24)}})
+            self.set_status(cfg, "W1", "RUNNING")
+            wab.tick(cfg, wab.load_state(cfg))
+        return cfg
+
+    WANT = {0.5: "30 с", 1.5: "1 мин 30 с", 12: "12 мин"}
+
+    def test_tick_path_shows_the_duration_not_a_truncated_number(self):
+        for key in ("idle", "checkpoint_timeout"):
+            values = dict(self.WANT)
+            if key == "idle":
+                values[0] = "0 мин"
+            for minutes, shown in values.items():
+                with self.subTest(key=key, minutes=minutes):
+                    self.tg.clear()
+                    self.run_key(key, minutes)
+                    text = "\n".join(self.tg)
+                    self.assertTrue(self.tg, "the notification must go out")
+                    self.assertIn(shown, text)
+                    self.assertNotIn("?", text)
+                    if minutes == 0.5:
+                        self.assertNotIn("0 мин", text)
+
+    def test_notifications_without_telegram_carry_the_duration_too(self):
+        for key in ("idle", "checkpoint_timeout"):
+            with self.subTest(key=key):
+                shown = []
+                with mock.patch.object(wab, "display_all", side_effect=shown.append):
+                    cfg = self.run_key(key, 0.5, telegram=None)
+                text = "\n".join(shown) + (cfg["run_dir"] / "ATTENTION").read_text(encoding="utf-8")
+                self.assertIn("30 с", text)
+                self.assertNotIn("0 мин", text)
+
+    def test_the_formatter(self):
+        fmt = wab.NOTICE_FIELDS["minutes"][1]
+        for value, want in [(12, "12 мин"), (12.0, "12 мин"), (0, "0 мин"), (0.5, "30 с"), (1.5, "1 мин 30 с"),
+                            (0.005, "<1 с"), (0.008, "<1 с"), (1e-9, "<1 с"), (0.009, "1 с"),
+                            (True, "?"), (-1, "?"), ("5", "?"), (None, "?"), (float("nan"), "?"),
+                            (float("inf"), "?"), (10 ** 6, "?"), (10 ** 6 + 0.5, "?")]:
+            with self.subTest(value=value):
+                self.assertEqual(fmt({}, value), want)
+
+    def test_an_older_outbox_entry_renders_without_a_question_mark(self):
+        cfg, _ = self.chain(idle_minutes=15, handoff_timeout_minutes=30)
+        w = self.wave_rec()
+        for key, stored, want in [("idle", {"n": 7}, "7 мин"), ("idle", {}, "15 мин"),
+                                  ("checkpoint_timeout", {"n": 9}, "9 мин"), ("checkpoint_timeout", {}, "30 мин")]:
+            with self.subTest(key=key, stored=stored):
+                text = wab.outbox_notice(cfg, "W1", w, key, {"value": "x", "fields": dict(stored), "next_at": 0})
+                self.assertIn(want, text)
+                self.assertNotIn("?", text)
+        text = wab.outbox_notice(cfg, "W1", w, "idle", {"value": "x", "next_at": 0})  # 1.2.6: no fields at all
+        self.assertNotIn("?", text)
+
+    def test_attention_signal_has_no_question_mark(self):
+        cfg, _ = self.chain(idle_minutes=15)
+        for key in ("idle", "checkpoint_timeout"):
+            with self.subTest(key=key):
+                self.assertNotIn("?", wab.attention_signal(cfg, "W1", key))
+
+    def test_the_callers_pass_the_raw_number(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        self.assertNotIn('n=int(cfg["idle_minutes"])', src)
+        self.assertNotIn('n=int(cfg["handoff_timeout_minutes"])', src)
+
+
+class W4GateEventOnce(GateBase):
+    """#105 item 4: «merge gate passed with N open threads» is ONE event, after the state is saved."""
+
+    def test_the_open_threads_event_is_written_once(self):
+        self.start()
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False},
+                                          {"id": "PRRT_b", "isResolved": False}])
+        self.assertTrue(self.tick())
+        self.assertEqual(self.log().count("merge gate passed with 2 open threads"), 1, self.log())
+
+
+class W4OwnerTimeWithoutRich(Base):
+    """#102 item 4: without rich only the dashboard paths of W6OwnerTime are skipped, the rest runs."""
+
+    def test_a_non_dashboard_test_runs_when_dash_cannot_be_imported(self):
+        sys.modules.pop("dash", None)
+        with mock.patch.dict(sys.modules, {"dash": None}):  # `import dash` raises ImportError
+            suite = unittest.TestSuite(
+                [unittest.defaultTestLoader.loadTestsFromName("test_registry_and_drivers_are_the_same_set", W6OwnerTime),
+                 unittest.defaultTestLoader.loadTestsFromName("test_wave_session_gets_the_chain_zone", W6OwnerTime)])
+            res = unittest.TestResult()
+            suite.run(res)
+        self.assertEqual(res.skipped, [], res.skipped)
+        self.assertEqual((res.errors, res.failures), ([], []))
+        self.assertEqual(res.testsRun, 2)
+
+
+class W4MaskBoundaries(Base):
+    """#103: the known boundaries of the masking behave exactly as documented, and each one is named in the
+    «Известные границы» paragraph of references/waves.md. Decision «не будем» for each: the masking code stays."""
+    SECRET = "Zx9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk0Lm9Nb7Vc5Xz3Wq"
+    # the boundary -> a key phrase that names it in the «Известные границы» paragraph
+    DOC = {"static": "обфускация `redact`", "pairs": "[[k, v]]", "spaces": "U+00A0",
+           "opaque_path": "непрозрачным сегментом", "emoji": "U+FE0F", "over": "с запасом"}
+
+    def boundaries_paragraph(self):
+        text = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        start = text.index("Известные границы (не маскируется)")
+        end = text.find("\n- `", start)
+        return text[start:end if end != -1 else len(text)]
+
+    def test_item1_the_static_guard_sees_a_name_not_an_obfuscated_call(self):
+        """The guard «redact only inside safe_text» (redact_uses_outside) is an ast walk over Name/Attribute: a direct
+        call by name is caught, a call that names redact only in a string (getattr/globals) is not. That is the boundary
+        the doc names; what holds the line beyond it is code review and the OUTPUT_PATHS registry with its tests."""
+        with tempfile.TemporaryDirectory() as d:
+            cases = {
+                "direct": ("import wab\ndef out(t):\n    return wab.redact(t)\n", True),
+                "bare": ("from wab import redact\ndef out(t):\n    return redact(t)\n", True),
+                "getattr": ('import wab\ndef out(t):\n    return getattr(wab, "redact")(t)\n', False),
+                "globals": ('def out(t):\n    return globals()["re" + "dact"](t)\n', False),
+            }
+            for name, (src, caught) in cases.items():
+                with self.subTest(item=1, form=name):
+                    for old in Path(d).glob("*.py"):
+                        old.unlink()
+                    (Path(d) / "probe.py").write_text(src, encoding="utf-8")
+                    found = [f for f in redact_uses_outside(d) if f[2] == "out"]
+                    self.assertEqual(bool(found), caught, (src, found))
+            with self.subTest(item=1, form="inside_safe_text"):
+                # the SAME direct call in safe_text and in out: the guard must be silent on the first and catch the
+                # second, so the allowance is by the enclosing function, not a blind spot for the construction
+                for old in Path(d).glob("*.py"):
+                    old.unlink()
+                src = ("import wab\ndef safe_text(t):\n    return wab.redact(t)\n"
+                       "def out(t):\n    return wab.redact(t)\n")
+                (Path(d) / "probe.py").write_text(src, encoding="utf-8")
+                found = redact_uses_outside(d)
+                self.assertEqual([f[2] for f in found], ["out"], (src, found))
+                self.assertEqual(found[0][1], 5, found)  # the line of the call in out, not the one in safe_text
+
+    def test_item1_the_doc_names_what_holds_the_line(self):
+        para = self.boundaries_paragraph()
+        for phrase in ("страж разработки", "`getattr`", "ревью кода", "`OUTPUT_PATHS`"):
+            with self.subTest(item=1, phrase=phrase):
+                self.assertIn(phrase, para)
+        self.assertNotIn("всё равно маскирует", para)
+
+    def test_the_quoted_question_carries_the_same_boundaries_outside(self):
+        """telegram_quote: true is the only path of the wave's free text to an external output (_question_field ->
+        quote -> safe_text): a secret torn by U+00A0 shows both parts THERE too. Without the flag no question at all."""
+        head, tail = self.SECRET[:22], self.SECRET[22:]
+        q = f"ключ {head}\u00a0{tail}\nвторая строка {self.SECRET}"
+        cfg, _ = self.chain(telegram_quote=True)
+        text = str(wab.notice_text(cfg, "W1", "idle", question=q))
+        self.assertIn(head, text)
+        self.assertIn(tail, text)
+        self.assertNotIn("вторая строка", text)  # only the first line goes out
+        cfg, _ = self.chain(telegram_quote=False)
+        text = str(wab.notice_text(cfg, "W1", "idle", question=q))
+        for part in (head, tail, "ключ"):
+            self.assertNotIn(part, text)
+        cfg, _ = self.chain()
+        self.assertNotIn(head, str(wab.notice_text(cfg, "W1", "idle", question=q)))
+
+    def test_the_doc_says_the_quote_flag_is_under_the_same_boundaries(self):
+        para = self.boundaries_paragraph()
+        for phrase in ("`telegram_quote: true`", "`_question_field`", "без секретов и персональных данных"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, para)
+        self.assertNotIn("их не касаются", para)
+
+    def test_item2_a_pair_does_not_bind_the_key_to_the_value(self):
+        for raw in ([["api_key", "hunter2value"]], {"name": "api_key", "value": "hunter2value"}):
+            with self.subTest(item=2, shape=type(raw).__name__):
+                self.assertIn("hunter2value", wab.safe_text(raw, 10 ** 6))
+        self.assertNotIn("hunter2value", wab.safe_text({"api_key": "hunter2value"}, 10 ** 6))  # a real key: masked
+
+    def test_item4_a_secret_torn_by_a_unicode_space_is_not_masked(self):
+        head, tail = self.SECRET[:22], self.SECRET[22:]
+        for ch in ("\u00a0", "\u2003"):
+            with self.subTest(item=4, ch=f"U+{ord(ch):04X}"):
+                self.assertEqual(wab.safe_text(f"{head}{ch}{tail}", 10 ** 6), f"{head}{ch}{tail}")
+
+    def test_item5_a_path_with_an_opaque_segment_is_masked(self):
+        for owner_paths in (False, True):
+            with self.subTest(item=5, owner_paths=owner_paths):
+                out = wab.safe_text(f"см. /tmp/run/{self.SECRET}/y.log", 10 ** 6, owner_paths)
+                self.assertNotIn(self.SECRET[:8], out)
+                self.assertIn("[скрыто]", out)
+
+    def test_item6_a_word_with_an_emoji_and_fe0f_is_masked_whole(self):
+        with self.subTest(item=6):
+            self.assertEqual(wab.safe_text("готово \u2705\ufe0f дальше", 10 ** 6), "готово [скрыто] дальше")
+            self.assertEqual(wab.safe_text("готово \u2705 дальше", 10 ** 6), "готово \u2705 дальше")
+
+    def test_each_boundary_is_named_in_the_doc(self):
+        para = self.boundaries_paragraph()
+        for name, phrase in self.DOC.items():
+            with self.subTest(boundary=name):
+                self.assertIn(phrase, para)
+
+
+class Release145(unittest.TestCase):
+    """The release 1.4.5 (#102 пп.4,6, #105 пп.2-4, #103; wave W4 of waves-remnants): version, the CHANGELOG section
+    on top."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.5"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.5 — 2026-10-11$", "1.4.5 is the first section")
+        body = re.search(r"(?ms)^## 1\.4\.5 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
+        for needle in ("#102", "#105", "#103", "`waves-remnants`", "`wab.TUNABLE`", "`minutes`", "`W4MaskBoundaries`"):
+            self.assertIn(needle, body)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

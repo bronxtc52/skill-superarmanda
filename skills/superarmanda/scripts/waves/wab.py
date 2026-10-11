@@ -176,11 +176,13 @@ def chain_started_before_defaults(run_dir):
     return isinstance(st, dict) and "defaults" not in st and isinstance(st.get("waves"), dict) and bool(st["waves"])
 
 
-def load_chain(path, create=True):
+def load_chain(path, create=True, defaults_from=None):
     """Read chain.json. The run directory is <base>/<chain>/<run_id>, where base is
     `run_dir` from chain.json or <directory of chain.json>/runs. run_id is mandatory and is
     always the last path segment: a reused chain name must never pick up an older run's
-    mandate.md."""
+    mandate.md. `defaults_from` (a run directory) picks the run-dependent defaults of `model`
+    and `ctx_limit` by THAT run instead of the one chain.json names now: the dashboard holds its
+    run and must not switch to another run's defaults when the identity is edited (PR #116)."""
     path = pathlib.Path(path)
     try:
         cfg = json.loads(path.read_text(encoding="utf-8"))
@@ -302,7 +304,8 @@ def load_chain(path, create=True):
             cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     except (OSError, RuntimeError, ValueError) as e:  # symlink loop, no permission, a file in the way
         raise SystemExit(f"chain.json: run_dir/workdir cannot be used: {_exc_text(e)}")
-    defaults = LEGACY_DEFAULTS if chain_started_before_defaults(cfg["run_dir"]) else NEW_DEFAULTS
+    by_run = cfg["run_dir"] if defaults_from is None else defaults_from
+    defaults = LEGACY_DEFAULTS if chain_started_before_defaults(by_run) else NEW_DEFAULTS
     for key, value in defaults.items():
         cfg.setdefault(key, value)
     return cfg
@@ -2234,6 +2237,22 @@ def _duration_field(cfg, value):
     return "?" if isinstance(value, bool) else _human_dur(value)
 
 
+def _minutes_field(cfg, value):
+    """A duration given in minutes (may be fractional): «12 мин», «30 с», «1 мин 30 с»; a positive value that rounds
+    to 0 s is «<1 с» (only 0 itself is «0 мин»); anything else «?»."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "?"
+    if value != value or value < 0 or value >= 10 ** 6:
+        return "?"
+    secs = int(round(value * 60))
+    if secs == 0 and value > 0:
+        return "<1 с"
+    m, sec = divmod(secs, 60)
+    if sec == 0:
+        return f"{m} мин"
+    return f"{m} мин {sec} с" if m else f"{sec} с"
+
+
 def _status_field(cfg, value):
     """A status of the wave (or its line `BLOCKED: ...`): only the word before the colon, only from the table."""
     word = str(value).split(":", 1)[0].strip() if isinstance(value, str) else ""
@@ -2274,6 +2293,9 @@ def _question_field(cfg, value):
     return quote(lines[0], TG_LIMIT) if lines else ""
 
 
+# template -> the chain.json setting that is the default of its `minutes` (an entry kept without the number)
+NOTICE_MINUTES_DEFAULT = {"idle": "idle_minutes", "checkpoint_timeout": "handoff_timeout_minutes"}
+
 # field -> (what it is, the check/formatter: (cfg, value) -> the text that goes in). The ONLY things a template may use.
 NOTICE_FIELDS = {
     "chain": ("имя цепочки как в chain.json", _name_field(NAME)),
@@ -2283,7 +2305,8 @@ NOTICE_FIELDS = {
     "event": ("ключ уведомления из таблицы эпизодов",
               lambda cfg, v: v if isinstance(v, str) and v in NOTICE_EPISODE_ENDS else "?"),
     "pr": ("номер PR", _count_field(1)),
-    "n": ("счётчик или число минут", _count_field()),
+    "n": ("счётчик", _count_field()),
+    "minutes": ("длительность в минутах (может быть дробной)", _minutes_field),
     "threads": ("число незакрытых тредов ревью", _count_field()),
     "p01": ("число из них с P0/P1 из прошлых коммитов", _count_field()),
     "attempts": ("число попыток", _count_field()),
@@ -2321,8 +2344,8 @@ NOTICE_TEMPLATES = {
                     ("Повторно задачу не слал.",), "проверь окно волны."),
     "updating": _tpl("❗ {chain}: после перезапуска диспетчера неизвестно, дошло ли продолжение волне {wave}",
                      ("Команду /superarmanda --resume повторно не слал.",), "проверь окно волны."),
-    "checkpoint_timeout": _tpl("❗ {chain}: волна {wave} не записала handoff вовремя",
-                               ("Прошло {n} мин после запроса.",), "посмотри окно волны.", ("n",)),
+    "checkpoint_timeout": _tpl("❗ {chain}: волна {wave} не записала handoff вовремя (прошло {minutes})",
+                               (), "посмотри окно волны.", ("minutes",)),
     "tmux_failed": _tpl("❗ {chain}: волна {wave}: не удалось выполнить действие в окне",
                         ("Что не вышло: {reason}. Окно живо.",), "посмотри окно волны, диспетчер повторит попытку.",
                         ("reason",)),
@@ -2340,9 +2363,9 @@ NOTICE_TEMPLATES = {
                           None, ("cls", "variant", *_ASK)),
     "permission": _tpl("🔐 {chain}: волна {wave} ждёт подтверждения на экране", (),
                        "подтверди или отклони запрос в окне волны."),
-    "idle": _tpl("💤 {chain}: волна {wave} молчит {n}+ мин",
+    "idle": _tpl("💤 {chain}: волна {wave} молчит {minutes}+",
                  ("Молчит с {time}; статус волны: {wave_status}. Возможно, ждёт тебя.",),
-                 "посмотри окно волны.", ("n", "time", "wave_status", *_ASK)),
+                 "посмотри окно волны.", ("minutes", "time", "wave_status", *_ASK)),
     "auto_off": _tpl("❗ {chain}: волна {wave} вышла из режима auto", ("Теперь она будет спрашивать подтверждения.",),
                      "верни режим: в окне Shift+Tab до «auto mode on»."),
     "handoff": _tpl("📬 {chain}: волна {wave} сдала PR", ("Гейт: {reason}.", "Мердж и следующий шаг — за координатором."),
@@ -2383,8 +2406,11 @@ def external_attach(name):
     return f"tmux{flags} attach -t {name}"
 
 
-def _notice_values(cfg, wave, tpl, fields):
+def _notice_values(cfg, wave, tpl, fields, key=None):
     given = dict(fields, chain=cfg.get("chain"), wave=wave)
+    default = NOTICE_MINUTES_DEFAULT.get(key)
+    if "minutes" in tpl["fields"] and given.get("minutes") is None and default:
+        given["minutes"] = cfg.get(default)  # an entry without the number: the chain.json setting
     if "tmux" in tpl["fields"] and given.get("tmux") is None:
         given["tmux"] = f"{cfg.get('tmux_prefix') or 'wab-'}{str(wave).lower()}"
     return {n: NOTICE_FIELDS[n][1](cfg, given.get(n)) for n in tpl["fields"]}, given
@@ -2404,7 +2430,7 @@ def notice_text(cfg, wave, key, now=None, **fields):
             raise ValueError(f"notice_text: field {name!r} is not in NOTICE_FIELDS")
         if name not in tpl["fields"]:
             raise ValueError(f"notice_text: field {name!r} is not a field of the template {key!r}")
-    values, given = _notice_values(cfg, wave, tpl, fields)
+    values, given = _notice_values(cfg, wave, tpl, fields, key)
     head = _clip(safe_text(tpl["head"].format(**values), 10 ** 9, True), NOTICE_HEAD_LIMIT)
     lines = [str(head)]
     for note in tpl["notes"]:
@@ -2511,6 +2537,9 @@ def outbox_notice(cfg, wave, w, key, item):
     of the registry that are still known (chain, wave, session): its free text is dropped."""
     stored = item.get("fields") if isinstance(item.get("fields"), dict) else {}
     tpl = NOTICE_TEMPLATES[key]
+    stored = dict(stored)
+    if "minutes" in tpl["fields"] and "minutes" not in stored and "n" in stored:
+        stored["minutes"] = stored["n"]  # an entry of 1.4.3 and older kept the minutes as `n`
     fields = {k: v for k, v in stored.items() if k in tpl["fields"] and k in NOTICE_FIELDS}
     if "tmux" in tpl["fields"] and isinstance(w.get("tmux"), str):
         fields["tmux"] = w["tmux"]
@@ -5700,7 +5729,6 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
             wdir, f"BLOCKED: merge gate passed; {len(unresolved)} unresolved review threads; owner runs {home_form(path)}"))
         note_question(cfg, wave, w, line, time.time())
         put_notice(cfg, w, wave, "merge_owner", sha, pr=number, threads=len(unresolved), p01=v["old_p01"])
-        event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}")
         save_state(cfg, st)
         event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}")
         flush_notices(cfg, st, w)
@@ -7088,7 +7116,7 @@ def _tick(cfg, st):
     elif w.get("phase") == "checkpoint" and now - (w.get("checkpoint_at") or now) > cfg["handoff_timeout_minutes"] * 60:
         if once_per(w, "checkpoint_timeout", str(w.get("checkpoint_at"))):
             put_notice(cfg, w, wave, "checkpoint_timeout", str(w.get("checkpoint_at")),
-                       n=int(cfg["handoff_timeout_minutes"]))
+                       minutes=cfg["handoff_timeout_minutes"])
             save_state(cfg, st)
             flush_notices(cfg, st, w)
 
@@ -7116,7 +7144,7 @@ def _tick(cfg, st):
     active = max(w.get("pane_changed", now), w.get("activity_at") or 0)
     if now - active > cfg["idle_minutes"] * 60:
         if once_per(w, "idle", digest):
-            put_notice(cfg, w, wave, "idle", digest, n=int(cfg["idle_minutes"]), time=active, wave_status=status,
+            put_notice(cfg, w, wave, "idle", digest, minutes=cfg["idle_minutes"], time=active, wave_status=status,
                        question=status)
             save_state(cfg, st)
             event(cfg, f"{wave}: pane idle {cfg['idle_minutes']}+ min, status={status}")

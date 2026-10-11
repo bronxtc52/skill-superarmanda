@@ -782,13 +782,39 @@ def safe_render(cfg):
                           style="yellow"), title="dash", border_style="yellow")
 
 
+_IDENTITY_TOLD = {}  # chain.json path -> the identity change already told (one event per change, not per frame)
+
+
 def reload_cfg(cfg, path):
-    """The owner's zone is tunable live: re-read chain.json each frame. A broken or missing file keeps
-    the last working settings (the frame must not fail)."""
+    """The owner's zone is tunable live: re-read chain.json each frame, but take only wab.TUNABLE from it. The
+    identity of the run is held from the start, like `watch` does: a changed identity is ignored and told ONCE
+    in events.log. A broken or missing file keeps the last working settings (the frame must not fail)."""
     try:
-        return wab.load_chain(path, create=False)
+        # the defaults of the tunable model/ctx_limit by the HELD run: an edited run_id must not bring
+        # the defaults of the new run (Opus/200k) to a pre-1.4 run (None/300k) (Codex P2, PR #116)
+        new = wab.load_chain(path, create=False, defaults_from=cfg.get("run_dir"))
     except (Exception, SystemExit):  # noqa: BLE001 - a half-written edit costs nothing
         return cfg
+    out = dict(cfg)
+    for key in wab.TUNABLE:
+        if key in new:
+            out[key] = new[key]
+        else:
+            out.pop(key, None)
+    have, want = wab._identity(cfg), wab._identity(new)
+    changed = sorted(k for k in set(have) | set(want) if have.get(k) != want.get(k))
+    mark = str(path)
+    if not changed:
+        _IDENTITY_TOLD.pop(mark, None)
+    else:
+        sig = json.dumps([[k, want.get(k)] for k in changed], default=str, sort_keys=True)
+        if _IDENTITY_TOLD.get(mark) != sig:
+            _IDENTITY_TOLD[mark] = sig
+            try:
+                wab.event(cfg, f"dash: chain.json identity changed ({', '.join(changed)}); keeping {cfg.get('run_dir')}")
+            except Exception:  # noqa: BLE001 - a log failure never fails the frame
+                pass
+    return out
 
 
 def own_session():
