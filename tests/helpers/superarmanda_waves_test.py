@@ -38,6 +38,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import stat
 import tempfile
 import time
 import unittest
@@ -624,7 +625,7 @@ class Supervision(Base):
         self.assertEqual(len(self.tg), 1)
         self.assertIn("ждёт тебя", self.tg[0])
         self.assertNotIn("need a decision", self.tg[0])  # #83: the wave's question is not in the notice (no telegram_quote)
-        self.assertIn("need a decision", json.dumps(self.get_state(cfg)["waves"]["W1"]["notified"]))
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["notified"]["blocked"], wab.eid("BLOCKED: need a decision"))
         # a different question is a new notification
         self.set_status(cfg, "W1", "BLOCKED: another one")
         wab.tick(cfg, wab.load_state(cfg))
@@ -3249,7 +3250,7 @@ class W4Round23Notices(Base):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
         self.tick()
         self.assertEqual(self.rec()["phase"], "running")
-        self.assertEqual(self.rec()["last_status"], "BLOCKED: q")
+        self.assertEqual(last_text(self.cfg, "W1", self.rec()), "BLOCKED: q")
 
     def test_episode_over_before_delivery_drops_the_stale_notice(self):
         self.set_status(self.cfg, "W1", "BLOCKED: q")
@@ -3986,7 +3987,7 @@ class W4Round28(Base):
     def test_started(self):
         cfg, path = self.chain()
         self.alive = False
-        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("started") == "1"
+        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("started") == wab.eid("1")
         self.crash(wab.launch, cfg, "W1", self.prompt())
         self.alive = True
         self.set_status(cfg, "W1", "RUNNING")
@@ -4018,7 +4019,7 @@ class W4Round28(Base):
         cfg, path = self.chain(merge_gate="external")
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "DONE")
-        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("no_next") == "1"
+        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("no_next") == wab.eid("1")
         self.crash(wab.watch, cfg, path, max_ticks=1)
         wab.watch(cfg, path, max_ticks=1)
         wab.watch(cfg, path, max_ticks=1)
@@ -4029,7 +4030,7 @@ class W4Round28(Base):
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
-        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("done") == "1"
+        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("done") == wab.eid("1")
         self.crash(wab.watch, cfg, path, max_ticks=1)
         self.alive = False  # the old window closed; W2 gets a new one
         wab.watch(cfg, path, max_ticks=1)
@@ -5008,7 +5009,7 @@ def _outbox_violations(src):
     """Writers of the outbox outside the notice functions, and put_notice used as a value."""
     import ast
     allowed = {"put_notice", "drop_notice", "drop_ended_episodes", "ack_wave_notices", "flush_notices",
-               "pending_notices", "_launch"}
+               "pending_notices", "_launch", "upgrade_outbox"}
     tree = ast.parse(src)
     parent = {}
     for node in ast.walk(tree):
@@ -5107,7 +5108,7 @@ class W4Round30PendingEnterStarted(Base):
         self.assertEqual(len(self.enters), 1)
         rec = self.get_state(cfg)["waves"]["W1"]
         self.assertEqual(rec["phase"], "running")
-        self.assertEqual(rec["notified"].get("started"), "1")
+        self.assertEqual(rec["notified"].get("started"), wab.eid("1"))
         self.assertEqual(len([t for t in self.tg if "стартовала волна W1" in t]), 1, self.tg)
         self.assertIn("W1: launched in tmux", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
@@ -5220,7 +5221,7 @@ class W4Round31StatusRead(Base):
         cfg = self.setup_wave()
         (wab.wave_dir(cfg, "W1") / "status").mkdir()
         self.assertEqual(len(self.run_ticks(cfg)), 1)
-        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["last_status"], "BLOCKED: q?")
+        self.assertEqual(last_text(cfg, "W1", self.get_state(cfg)["waves"]["W1"]), "BLOCKED: q?")
         self.assertTrue(any("ждёт тебя" in t for t in self.tg), "the last known status still drives the tick")
 
     def test_status_is_unreadable(self):
@@ -8379,7 +8380,7 @@ class MergeGate(GateBase):
         self.assertIn(shown, self.log())
         self.assertTrue((self.home / ".cache" / "wab" / wab.owner_script_name(self.cfg, "W1", HEAD)).is_file())
         self.assertEqual(self.log().count("merge result unknown"), 1)
-        self.assertEqual([q["text"] for q in self.rec()["questions"]],
+        self.assertEqual(q_texts(self.cfg, "W1", self.rec()),
                          [f"BLOCKED: merge gate passed; merge result unknown; owner runs {shown}"])
         # the owner merges: the wave completes as usual
         self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
@@ -8572,7 +8573,7 @@ class MergeGate(GateBase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.status(), f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {shown}")
         self.assertEqual(self.rec()["phase"], "merging")
-        self.assertEqual([q["text"] for q in self.rec()["questions"]],
+        self.assertEqual(q_texts(self.cfg, "W1", self.rec()),
                          [f"BLOCKED: merge gate passed; 2 unresolved review threads; owner runs {shown}"])
         said = [t for t in self.tg if "незакрытые треды" in t]
         self.assertEqual(len(said), 1)
@@ -8740,7 +8741,7 @@ class MergeGate(GateBase):
         self.assertEqual(self.rec()["phase"], "awaiting_merge")
         self.assertTrue(self.status().startswith("BLOCKED: merge gate: PR #7 закрыт без мерджа"))
         self.assertEqual(len(self.rec()["questions"]), 1)
-        self.assertIn("закрыт без мерджа", self.rec()["questions"][0]["text"])
+        self.assertIn("закрыт без мерджа", q_texts(self.cfg, "W1", self.rec())[0])
 
     def test_an_unreadable_pr_state_waits(self):
         self.start()
@@ -10177,7 +10178,8 @@ class ChainResult(Base):
         wab.watch(cfg, path, max_ticks=1)
         qs = self.get_state(cfg)["waves"]["W1"]["questions"]
         self.assertEqual(len(qs), 1)
-        self.assertIn("need a decision", qs[0]["text"])
+        self.assertIn("need a decision", q_texts(cfg, "W1", self.get_state(cfg)["waves"]["W1"])[0])
+        self.assertNotIn("text", qs[0])
 
     def render(self, cfg, st):
         return wab.write_chain_result(cfg, st)[0].read_text(encoding="utf-8")
@@ -10221,7 +10223,8 @@ class ChainResult(Base):
         with mock.patch.object(wab, "write_chain_result", return_value=(fake / "chain-result.md", "сводка", counts)):
             wab._put_chain_done(cfg, {"waves": {}}, w, "W1")
         # #83: the notice says THAT chain-result.md was written, in words; the directory is in events.log only
-        sent = wab.redact(w["outbox"]["chain_done"]["text"], wab.TG_MESSAGE_LIMIT)
+        sent = wab.redact(str(wab.outbox_notice(cfg, "W1", w, "chain_done", w["outbox"]["chain_done"])),
+                          wab.TG_MESSAGE_LIMIT)
         self.assertIn("chain-result.md", sent)
         self.assertIn("цепочка завершена", sent)
         self.assertNotIn("/var/folders", sent)
@@ -10251,8 +10254,9 @@ class ChainResult(Base):
         w = {}
         with mock.patch.object(wab, "write_chain_result", side_effect=RuntimeError("boom")):
             wab._put_chain_done(cfg, {"waves": {}}, w, "W1")
-        self.assertIn("цепочка завершена", w["outbox"]["chain_done"]["text"])
-        self.assertIn("chain-result.md не записан", w["outbox"]["chain_done"]["text"])
+        text = str(wab.outbox_notice(cfg, "W1", w, "chain_done", w["outbox"]["chain_done"]))
+        self.assertIn("цепочка завершена", text)
+        self.assertIn("chain-result.md не записан", text)
 
     def test_pure_helpers_live_in_wab(self):
         w = self.wave_rec(restarts=1, attempts=[self.wave_rec(restarts=2)])
@@ -10669,7 +10673,8 @@ class Submit(Base):
             self.assertFalse(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, self.TEXT))
         w = st["waves"]["W1"]
         self.assertEqual(w.get("pending_enter"), "/update")
-        self.assertTrue(w.get("pending_text_head"))
+        self.assertTrue(self.m.stashed_text(cfg, "W1", w.get("pending_text_eid")))  # the head: in the store (#103 п.3)
+        self.assertNotIn("pending_text_head", w)
         # a restarted dispatcher no longer has the text (advance_pending / recover_update pass "")
         self.m_enters.clear()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -10678,7 +10683,7 @@ class Submit(Base):
         self.m_enters.clear()
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, ""))
-        self.assertNotIn("pending_text_head", st["waves"]["W1"])
+        self.assertNotIn("pending_text_eid", st["waves"]["W1"])
 
     def hold_input_lock(self, cfg, wave="W1"):
         import fcntl
@@ -11735,7 +11740,7 @@ class FixedAnswerPolicy(Base):
                 self.tick(cfg, self.ND.format(rec="invariant"))
         w = wab.load_state(cfg)["waves"]["W1"]  # a new watch reads state.json
         self.assertEqual(w["policy_key_pending"]["key"], ["W1", cfg["run_id"], 1, "T1", "needs_decision", "tester"])
-        self.assertEqual(w["policy_pending"], self.ND.format(rec="invariant"))
+        self.assertEqual(w["policy_pending"], wab.eid(self.ND.format(rec="invariant")))
         self.assertNotIn("policy_keys", w)
         self.tick(cfg, "RUNNING")  # the wave took the typed answer (or not): charged, the key counts as answered
         st = self.tick(cfg, self.ND.format(rec="cut_surface"))  # the same fork, a new episode
@@ -11760,7 +11765,7 @@ class FixedAnswerPolicy(Base):
             with self.assertRaises(KeyboardInterrupt):
                 self.tick(cfg, status)
         w = wab.load_state(cfg)["waves"]["W1"]
-        self.assertEqual((w["pending_enter"], w["policy_pending"]), ("policy answer", status))
+        self.assertEqual((w["pending_enter"], w["policy_pending"]), ("policy answer", wab.eid(status)))
         self.ansi = live("19-folded.ansi")
         return cfg, w["policy_key_pending"]["key"]
 
@@ -11930,7 +11935,7 @@ class FixedAnswerPolicy(Base):
         self.fork(cfg, "blocked", index=5)
         status = self.BC.format(rec="new_run")
         st = self.tick(cfg, status)
-        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], status)
+        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], wab.eid(status))
         self.assertEqual(st["waves"]["W1"]["policy_refusal"]["stamp"], wab._status_stamp(cfg, "W1"))
         cfg["max_runs"] = 6  # the owner raised the ceiling: the reason of the refusal is gone...
         self.assertTrue(self.decide(cfg, "blocked_cap", rec="new_run")["ok"])
@@ -11940,7 +11945,7 @@ class FixedAnswerPolicy(Base):
             self.assertEqual(self.answers(), [])
         self.assertEqual(len(self.owner_asked()), 1)
         self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
-        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], status)
+        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], wab.eid(status))
         self.assertNotIn("auto_answers", st["waves"]["W1"])
         self.rewrite(cfg, status)  # the wave wrote the line again: a new episode, decided anew
         st = self.tick(cfg)
@@ -12003,8 +12008,8 @@ class FixedAnswerPolicy(Base):
                 self.assertIn("Автоответ по политике не отправлен", ask)
                 self.assertIn("уже получила автоответ", self.log(cfg))  # #83: the reason is in events.log, not in the notice
                 self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
-                self.assertEqual(st["waves"]["W1"]["questions"][-1]["text"], wab.safe_text(status, 300))
-                self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], status)
+                self.assertEqual(q_texts(cfg, "W1", st["waves"]["W1"])[-1], wab.safe_text(status, 300))
+                self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], wab.eid(status))
                 st = self.tick(cfg)  # the same episode: nothing new
                 self.assertEqual(len(self.answers()), 1)
                 self.assertEqual(len(self.owner_asked()), 1)
@@ -12045,7 +12050,7 @@ class FixedAnswerPolicy(Base):
         (ask,) = self.owner_asked()  # the cap stands before the machine check: the usual BLOCKED, no reason
         self.assertNotIn("Автоответ по политике", ask)
         self.assertIn("W1: policy cap reached (1/1): class=needs_decision rec=invariant goes to the owner", self.log(cfg))
-        self.assertEqual(st["waves"]["W1"]["questions"][-1]["text"], wab.safe_text(status, 300))
+        self.assertEqual(q_texts(cfg, "W1", st["waves"]["W1"])[-1], wab.safe_text(status, 300))
         self.tick(cfg)
         self.assertEqual(len(self.owner_asked()), 1)
         self.assertEqual(self.log(cfg).count("policy cap reached"), 1)
@@ -12079,7 +12084,7 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(len(self.answers()), 2)
         self.assertIn("W1: policy cap reached (2/2)", self.log(cfg))
         self.assertEqual(self.owner_asked(), [])
-        self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], status)
+        self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], wab.eid(status))
         self.assertNotIn("policy_refusal", st["waves"]["W1"])
 
     def test_f2_corrupt_marks_in_state_json_go_to_the_owner(self):
@@ -12188,7 +12193,9 @@ class FixedAnswerPolicy(Base):
                     else:
                         with mock.patch.object(wab, "_deliver", return_value=failed):
                             w = self.tick(cfg, self.QN)["waves"]["W1"]
-                    self.assertEqual(w["policy_key_pending"], mark)
+                    # 1.4.3: the mark is kept with the eids of its line and text (load_state migrates a 1.4.x one)
+                    kept = dict(mark, status=wab.eid(mark["status"]), text=wab.eid("t")) if isinstance(mark, dict) else mark
+                    self.assertEqual(w["policy_key_pending"], kept)
                     self.assertNotIn("policy_keys", w)
 
     def test_n4_a_refusal_stays_while_the_status_file_does_not_read_as_its_line(self):
@@ -12202,7 +12209,7 @@ class FixedAnswerPolicy(Base):
         for step in ("empty", "missing"):
             with mock.patch.object(wab, "fixed_answer", side_effect=AssertionError(f"re-checked on a {step} status")):
                 st = self.tick(cfg)
-            self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], status)
+            self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], wab.eid(status))
             self.assertEqual(self.answers(), [])
             self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
             self.assertEqual(len(self.owner_asked()), 1)
@@ -13009,7 +13016,7 @@ class W3NextLaunchClosesDone(Base):
         self.assertEqual(st["current"], "W2")
         self.assertNotIn("done", st["waves"]["W1"].get("attention") or {})
         self.assertEqual(_attention_exit(cfg), 0)
-        self.assertEqual(st["waves"]["W1"].get("notified", {}).get("done"), "1")  # the dedup mark stays
+        self.assertEqual(st["waves"]["W1"].get("notified", {}).get("done"), wab.eid("1"))  # the dedup mark stays
 
     def test_a_coordinator_launch_still_acknowledges(self):
         cfg, _ = self.chain(telegram=None, merge_gate="auto")
@@ -16012,6 +16019,8 @@ _allow("wab.py", "_alarm_tick", _DEDUP, "_exc_text(e)[:150]", "str(facts['error'
 _allow("wab.py", "_alarm_tick", _SHA, "head[:12]")
 _allow("wab.py", "_pending_alarm_enter", _DEDUP, "_exc_text(e)[:150]")
 _allow("wab.py", "note_question", _LIST, "qs[:-QUESTIONS_CAP]")
+_allow("wab.py", "eid", "the opaque id of a text (32 hex characters of its sha256): a name, no outside text",
+       "hashlib.sha256(text.encode('utf-8')).hexdigest()[:32]")
 _allow("wab.py", "write_chain_result", _SHA, "str(sha)[:12]")
 _allow("wab.py", "blocked_fields", "the question was masked by safe_text above; it is split at `Варианты:`", "question[:m.start()]")
 _allow("dash.py", "fold_events", "the time of an events.log line `HH:MM:SS`", "line[11:19]", "ts[:5]")
@@ -16765,9 +16774,10 @@ class W2OutputPaths(Base):
         return wab._short_command(f"bash -c eval '{raw}' < /dev/null", limit=1000)
 
     def out_note_question(self, raw):
+        cfg, _ = self.chain()
         w = {}
-        wab.note_question(w, raw, 1.0)
-        return w["questions"][-1]["text"]
+        wab.note_question(cfg, "W1", w, raw, 1.0)
+        return wab.stashed_text(cfg, "W1", w["questions"][-1]["eid"])
 
     def out_chain_result(self, raw):
         cfg, _ = self.chain()
@@ -17211,12 +17221,13 @@ class W2SafeText(Base):
         spec = importlib.util.spec_from_file_location("wab_mutant", tmp / "wab.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        cfg, _ = self.chain()
         w = {}
-        mod.note_question(w, "password​=Hunter2SecretValue99", 1.0)
-        self.assertIsNotNone(leaked(w["questions"][-1]["text"], ["Hunter2SecretValue99"]))
+        mod.note_question(cfg, "W1", w, "password​=Hunter2SecretValue99", 1.0)
+        self.assertIsNotNone(leaked(mod.stashed_text(cfg, "W1", w["questions"][-1]["eid"]), ["Hunter2SecretValue99"]))
         w = {}
-        wab.note_question(w, "password​=Hunter2SecretValue99", 1.0)  # the real one stays clean
-        self.assertIsNone(leaked(w["questions"][-1]["text"], ["Hunter2SecretValue99"]))
+        wab.note_question(cfg, "W1", w, "password​=Hunter2SecretValue99", 1.0)  # the real one stays clean
+        self.assertIsNone(leaked(wab.stashed_text(cfg, "W1", w["questions"][-1]["eid"]), ["Hunter2SecretValue99"]))
 
     def test_a_replaced_safe_text_in_the_dashboard_is_caught_by_the_static_check(self):
         tmp = self.tmp / "mut2"
@@ -18801,7 +18812,10 @@ class W7NoticeTemplates(Base):
         cfg = self.fx_cfg(quote=True)
         w = {}
         wab.put_notice(cfg, w, self.WAVE, "blocked", "q", question=self.POISON, cls="question")
-        self.assertIn(self.MARK, json.dumps(w, ensure_ascii=False))
+        # 1.4.3: with the flag the quote is kept too, in the wave's store and not in the record (#105 п.1)
+        self.assertNotIn(self.MARK, json.dumps(w, ensure_ascii=False))
+        self.assertIn(self.MARK, wab.stashed_text(cfg, self.WAVE, w["outbox"]["blocked"]["quote_eid"]))
+        self.assertIn(self.MARK, str(wab.outbox_notice(cfg, self.WAVE, w, "blocked", w["outbox"]["blocked"])))
 
     # ----- the local outputs keep the question (the owner needs it to answer) -----
     def test_status_and_dashboard_still_show_the_wave_question(self):
@@ -18877,8 +18891,9 @@ class W7NoticeTemplates(Base):
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
                  and n.func.id == "put_notice"]
         # the 25 call sites of 1.2.6; chain_done is put by one helper now (23 keys); +1 not_ready of the Fable switch (#108);
-        # +1 updating of an unconfirmed Fable switch delivery (Codex P2 / CodeRabbit on #109)
-        self.assertEqual(len(calls), 26)
+        # +1 updating of an unconfirmed Fable switch delivery (Codex P2 / CodeRabbit on #109);
+        # +1 blocked of a BLOCKED episode whose line is lost from the store and was never told (1.4.3, круг 2 W2)
+        self.assertEqual(len(calls), 27)
         self.assertEqual({c.args[3].value for c in calls if len(c.args) == 5}, set(wab.NOTICE_TEMPLATES))
         for node in calls:
             self.assertEqual(len(node.args), 5, f"put_notice(cfg, w, wave, key, value, **fields), line {node.lineno}")
@@ -19133,13 +19148,12 @@ class Release142(unittest.TestCase):
     """The release 1.4.2 (#98, #95; wave W1 of waves-remnants): version, the CHANGELOG section on top, workflow.md
     naming the semantics of the fix cycles, the marker of the external review and the 1.2.1 boundary."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.2"\s*$')
+    # the version of SKILL.md moved on to 1.4.3 (#105, #103, #102): Release143 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.2 — 2026-10-11$", "1.4.2 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.4\.2 — 2026-10-11$", "CHANGELOG.md: the section of 1.4.2")
+        self.assertTrue(log.index("## 1.4.2") < log.index("## 1.4.1"), "1.4.2 is above 1.4.1")
         body = re.search(r"(?ms)^## 1\.4\.2 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
         for needle in ("#98", "#95", "### Исправлено", "### Документация", "`task_epoch`", "witness:",
                        "п.1", "п.2", "п.4", "п.6", "`1.2.1`"):
@@ -19154,6 +19168,29 @@ class Release142(unittest.TestCase):
         self.assertIn("запись\n  `github_codex_review` (Codex на draft PR) раньше первого пакета `review.py`", flow)
         self.assertIn("эпоха равна текущей\n  `task_epoch`", flow)
         self.assertNotIn("причина свидетеля не называет (остаток, issue #95)", flow)
+
+class Release143(unittest.TestCase):
+    """The release 1.4.3 (#105 п.1, #103 п.3, #102 п.5; wave W2 of waves-remnants): version, the CHANGELOG section on
+    top, the paragraph of waves.md about the texts of the wave outside state.json."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.3"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.3 — 2026-10-11$", "1.4.3 is the first section")
+        body = re.search(r"(?ms)^## 1\.4\.3 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
+        for needle in ("#105", "#103", "#102", "### Исправлено", "### Совместимость", "`pending_text_eid`", ".texts/",
+                       "eid **той же** строки"):
+            self.assertIn(needle, body)
+
+    def test_waves_doc(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        for needle in ("**Тексты волны вне `state.json` (1.4.3,", "**Миграция 1.4.x.**", "`last_status_eid`",
+                       "`quote_eid`", "`pending_text_eid`", "`upgrade_outbox`"):
+            self.assertIn(needle, waves)
+
 
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):
@@ -19172,6 +19209,536 @@ class Packaging(unittest.TestCase):
         self.assertIn("--waves", text)
         self.assertIn("manifest", text)
         self.assertIn("result.md", text)
+
+
+# ---------- W2 (#105 п.1, #103 п.3, #102 п.5): state.json holds no text of the wave ----------
+
+W2_MARK = "W2ТЕКСТВОЛНЫ7Q"  # a unique piece of the wave's own text; 14 chars, inside the 20-char head of a typed text
+W2_LEGACY = ROOT / "tests" / "fixtures" / "waves" / "w2-legacy-1.4"
+
+
+def q_texts(cfg, wave, w):
+    """The texts of the questions of a record (state.json keeps their eids, the texts are in the wave's store)."""
+    return [wab.stashed_text(cfg, wave, q.get("eid")) for q in w.get("questions", [])]
+
+
+def last_text(cfg, wave, w):
+    """The text of the last real status of a record (its eid in state.json, the text in the store)."""
+    return wab.stashed_text(cfg, wave, w.get("last_status_eid"))
+
+
+def json_strings(node, path="$"):
+    """Every key and every string leaf of a JSON document with its path: the «перебор по всем полям»."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield f"{path}.<key {k}>", str(k)
+            yield from json_strings(v, f"{path}.{k}")
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from json_strings(v, f"{path}[{i}]")
+    elif isinstance(node, str):
+        yield path, node
+
+
+def text_holders(doc, needle):
+    return sorted({p for p, s in json_strings(doc) if needle in s})
+
+
+def raw_state(cfg):
+    return json.loads(wab.state_path(cfg).read_text(encoding="utf-8"))
+
+
+class W2StateHoldsNoWaveText(Base):
+    """THE invariant of 1.4.3: state.json (every wave record and every attempts[i]) holds no free text of the wave
+    and no other text that came from outside the dispatcher — only an opaque eid, words of the vocabularies,
+    numbers, moments and the dispatcher's fixed strings. ONE table over the real paths of wab.py with the Telegram
+    transport down (the notice waits in the outbox), then a walk over EVERY key and string of state.json."""
+
+    def setUp(self):
+        super().setUp()
+        self.down = True
+
+        def flaky(cfg, text):
+            if self.down:
+                raise OSError("telegram down")
+            self.tg.append(text)
+        p = mock.patch.object(wab, "_send_telegram", side_effect=flaky)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def fresh(self, **over):
+        self.cfg, self.path = self.chain(**over)
+        shutil.rmtree(self.cfg["run_dir"] / "W1", ignore_errors=True)
+        self.down, self.tg[:], self.alive = True, [], True
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(sessions=["s1"])}})
+
+    def tick(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return wab.tick(self.cfg, wab.load_state(self.cfg))
+
+    # ----- the paths -----
+    def blocked_plain(self):
+        self.set_status(self.cfg, "W1", f"BLOCKED: {W2_MARK} вопрос?")
+        self.tick()
+        return "blocked"
+
+    def blocked_label(self):
+        self.set_status(self.cfg, "W1", f"BLOCKED: [class=question rec=A red=no] {W2_MARK} вопрос? variants: A) x")
+        self.tick()
+        return "blocked"
+
+    def dead(self):
+        self.set_status(self.cfg, "W1", f"RUNNING {W2_MARK}")
+        self.alive = False
+        self.tick()
+        return "dead"
+
+    def idle(self):
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"].update(pane_digest="x", pane_changed=time.time() - 3600)
+        wab.save_state(self.cfg, st)
+        self.set_status(self.cfg, "W1", f"RUNNING {W2_MARK}")
+        self.pane = "a\nb\nc\nd"
+        self.tick()
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["pane_changed"] = time.time() - 3600
+        wab.save_state(self.cfg, st)
+        self.tick()
+        return "idle"
+
+    def policy_answer(self):
+        self.set_status(self.cfg, "W1", f"BLOCKED: [class=needs_decision rec=A red=no] {W2_MARK} вопрос?")
+        self.tick()
+        self.assertTrue(any("РЕШЕНИЕ ПО ПОЛИТИКЕ" in t for _, _, t in self.sent), self.sent)
+        return "policy_answer"
+
+    def policy_refusal(self):
+        self.set_status(self.cfg, "W1", f"BLOCKED: [class=needs_decision rec=A red=no] {W2_MARK} вопрос?")
+        self.tick()
+        self.assertIn("policy_refusal", raw_state(self.cfg)["waves"]["W1"])
+        return "blocked"
+
+    def launch_refused(self):
+        st = wab.load_state(self.cfg)
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab._launch_refused(self.cfg, st, "W1", "W2", f"next-prompt.md: {W2_MARK} не годится")
+        return "launch_refused"
+
+    def merge_stopped(self):
+        st = wab.load_state(self.cfg)
+        w = st["waves"]["W1"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab._merge_stopped(self.cfg, st, "W1", w, wab.wave_dir(self.cfg, "W1"), f"PR закрыт: {W2_MARK}",
+                               time.time())
+        return "merge_stopped"
+
+    def handoff(self):
+        wdir = wab.wave_dir(self.cfg, "W1")
+        (wdir / "result.md").write_text(f"Итог волны: {W2_MARK} сделано\n", encoding="utf-8")
+        (wdir / "next-prompt.md").write_text("Задача следующей волны: продолжить.\n", encoding="utf-8")
+        self.set_status(self.cfg, "W1", "DONE")
+        self.tick()
+        return "handoff"
+
+    def typed(self):  # a text typed into the window, its Enter not confirmed (the watch died after the paste)
+        def typed_then_watch_dies(name, text, on_typed=None, **kw):
+            self.sent.append(("text", name, text))
+            on_typed()
+            raise KeyboardInterrupt
+        st = wab.load_state(self.cfg)
+        with mock.patch.object(wab, "send_text", typed_then_watch_dies), self.assertRaises(KeyboardInterrupt):
+            wab._deliver(self.cfg, st, "W1", "checkpoint request", wab.send_text, f"{W2_MARK} контекст велик")
+        self.assertEqual(raw_state(self.cfg)["waves"]["W1"]["pending_enter"], "checkpoint request")
+        return None
+
+    def relaunched(self):  # the wave asked, died and is started again: its record goes to attempts[]
+        self.blocked_plain()
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"]["phase"] = "dead"
+        wab.save_state(self.cfg, st)
+        self.alive = False
+        p = self.tmp / "p.md"
+        p.write_text("do it\n", encoding="utf-8")
+        with mock.patch.object(wab, "prepare_clone", return_value=self.cwd), \
+                contextlib.redirect_stdout(io.StringIO()):
+            wab.launch(self.cfg, "W1", p)
+        self.assertTrue(raw_state(self.cfg)["waves"]["W1"]["attempts"])
+        return None
+
+    def test_no_text_of_the_wave_anywhere_in_state_json(self):
+        ND = [{"class": "needs_decision"}]
+        FIXED = [{"class": "needs_decision", "answer": "invariant"}]
+        rows = [  # name, chain.json over, the path
+            ("blocked, no label", {}, self.blocked_plain),
+            ("blocked, no label, telegram_quote", {"telegram_quote": True}, self.blocked_plain),
+            ("blocked, label", {}, self.blocked_label),
+            ("blocked, label, telegram_quote", {"telegram_quote": True}, self.blocked_label),
+            ("dead, telegram_quote", {"telegram_quote": True}, self.dead),
+            ("idle, telegram_quote", {"telegram_quote": True, "idle_minutes": 1}, self.idle),
+            ("policy answer, telegram_quote", {"telegram_quote": True, "decision_policy": ND}, self.policy_answer),
+            ("final refusal of the policy", {"telegram_quote": True, "decision_policy": FIXED}, self.policy_refusal),
+            ("launch_refused with why", {"telegram_quote": True}, self.launch_refused),
+            ("merge_stopped with why", {"telegram_quote": True}, self.merge_stopped),
+            ("handoff with result.md", {"telegram_quote": True}, self.handoff),
+            ("typed text, Enter pending", {}, self.typed),
+            ("relaunch: attempts[]", {"telegram_quote": True}, self.relaunched),
+        ]
+        for name, over, path in rows:
+            with self.subTest(name):
+                self.fresh(**over)
+                key = path()
+                raw = raw_state(self.cfg)
+                if key is not None:
+                    self.assertIn(key, raw["waves"]["W1"].get("outbox") or {}, "the notice waits in the outbox")
+                self.assertEqual(text_holders(raw, W2_MARK), [], f"{name}: the wave's text is in state.json")
+                if key is not None and over.get("telegram_quote"):  # the quote is still told, from the store
+                    self.down = False
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        wab.drain_notices(self.cfg)
+                    self.assertTrue(any(W2_MARK in t for t in self.tg), (name, self.tg))
+                    self.assertEqual(text_holders(raw_state(self.cfg), W2_MARK), [], name)
+
+    def test_without_the_flag_the_quote_is_not_told(self):
+        self.fresh()
+        self.blocked_label()
+        self.down = False
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab.drain_notices(self.cfg)
+        self.assertEqual(len([t for t in self.tg if "ждёт тебя" in t]), 1, self.tg)
+        self.assertFalse(any(W2_MARK in t for t in self.tg), self.tg)
+
+    def test_the_store_is_private_and_checked(self):
+        self.fresh()
+        e = wab.stash_text(self.cfg, "W1", f"{W2_MARK} текст")
+        self.assertRegex(e, r"^sha256:[0-9a-f]{32}$")
+        self.assertEqual(e, wab.eid(f"{W2_MARK} текст"))
+        self.assertEqual(wab.eid(e), e)  # idempotent: an eid is recognised, never hashed again
+        self.assertEqual(wab.stashed_text(self.cfg, "W1", e), f"{W2_MARK} текст")
+        store = wab.wave_dir(self.cfg, "W1") / ".texts"
+        self.assertEqual(stat.S_IMODE(store.stat().st_mode), 0o700)
+        (f,) = list(store.iterdir())
+        self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600)
+        f.write_text("подменённый текст", encoding="utf-8")
+        self.assertIsNone(wab.stashed_text(self.cfg, "W1", e))  # the eid of the text must match
+        self.assertIsNone(wab.stashed_text(self.cfg, "W1", "sha256:" + "0" * 32))
+        self.assertIsNone(wab.stashed_text(self.cfg, "W1", "../../state.json"))
+
+    def test_the_last_status_of_an_unreadable_file_comes_from_the_store(self):
+        self.fresh()
+        self.blocked_plain()
+        self.tg[:] = []
+        self.set_status(self.cfg, "W1", "")  # the wave mid-rewrite: the tick decides on the last real status
+        self.tick()
+        w = raw_state(self.cfg)["waves"]["W1"]
+        self.assertEqual(w["last_status_word"], "BLOCKED")
+        self.assertEqual(wab.stashed_text(self.cfg, "W1", w["last_status_eid"]), f"BLOCKED: {W2_MARK} вопрос?")
+        self.assertIn("blocked", w["outbox"])  # the same episode: not dropped, not asked twice
+        self.assertEqual(len([e for e in (self.cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+                              .splitlines() if "вопрос?" in e and "W1: BLOCKED" in e]), 1)
+        shutil.rmtree(wab.wave_dir(self.cfg, "W1") / ".texts")  # the store is lost: the tick decides nothing
+        self.tick()
+        w2 = raw_state(self.cfg)["waves"]["W1"]
+        self.assertEqual((w2["last_status_eid"], set(w2.get("outbox") or {})), (w["last_status_eid"], {"blocked"}))
+
+    # ----- круг 1 (R1, F1): a text lost from the store never skips the mechanics, never makes an action bolder -----
+    def lost(self, word, text=None, **rec):
+        """The record knows its last status only by word and eid, the store has no text (lost, never written)."""
+        self.fresh(**rec.pop("over", {}))
+        text = text if text is not None else f"BLOCKED: {W2_MARK} вопрос?"
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"].update(last_status_word=word, last_status_eid=wab.eid(text), **rec)
+        self.put_state(self.cfg, st)
+        self.set_status(self.cfg, "W1", "")  # the wave died mid-rewrite: the file stays empty
+        shutil.rmtree(wab.wave_dir(self.cfg, "W1") / ".texts", ignore_errors=True)
+
+    def test_a_lost_store_never_skips_the_mechanics(self):
+        def log():
+            p = self.cfg["run_dir"] / "events.log"
+            return p.read_text(encoding="utf-8") if p.exists() else ""
+
+        def dead_window():
+            self.lost("BLOCKED")
+            self.alive = False
+            self.assertFalse(self.tick())
+            self.assertEqual(raw_state(self.cfg)["waves"]["W1"]["phase"], "dead")
+            self.assertIn("dead", raw_state(self.cfg)["waves"]["W1"]["outbox"])
+
+        def awaiting_merge():
+            self.lost("BLOCKED", phase="awaiting_merge")
+            self.assertFalse(self.tick())  # the watch ends and frees the run lock
+
+        def one_word_status():  # RUNNING is its own text: the tick decides on it (here: the idle notice)
+            self.lost("RUNNING", text="RUNNING", over={"idle_minutes": 1}, pane_digest="x",
+                      pane_changed=time.time() - 3600)
+            self.pane = "a\nb\nc\nd"
+            self.tick()
+            st = wab.load_state(self.cfg)
+            st["waves"]["W1"]["pane_changed"] = time.time() - 3600
+            wab.save_state(self.cfg, st)
+            self.tick()
+            self.assertIn("idle", raw_state(self.cfg)["waves"]["W1"]["outbox"])
+
+        def blocked_without_text():  # the episode decisions that need the text are off, the refusal stays
+            refusal = {"status": wab.eid(f"BLOCKED: {W2_MARK} вопрос?"), "stamp": None, "reason": "r"}
+            self.lost("BLOCKED", over={"decision_policy": [{"class": "needs_decision", "answer": "invariant"}]},
+                      policy_refusal=refusal, tokens=10 ** 6, phase="running")
+            before = log().count("not in the store")
+            for _ in range(2):
+                self.assertTrue(self.tick())
+            w = raw_state(self.cfg)["waves"]["W1"]
+            self.assertEqual(w["policy_refusal"], refusal)
+            self.assertEqual(self.sent, [])  # nothing typed into the window: no answer, no checkpoint request
+            self.assertEqual(log().count("not in the store") - before, 1)  # one event per episode
+
+        def pending_enter_with_lost_head():  # F1: never an unverified Enter over what may be the owner's draft
+            self.lost("RUNNING", text="RUNNING", pending_enter="checkpoint request",
+                      pending_text_eid=wab.eid("[wab] WAB-CHECKPOINT"))
+            self.ansi = live("19-folded.ansi")  # something sits in the input line
+            st = wab.load_state(self.cfg)
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok = wab._deliver(self.cfg, st, "W1", "checkpoint request", wab.send_text, "")
+            self.assertFalse(ok)
+            self.assertEqual(self.enters, [])
+            self.assertTrue(self.clear_keys)  # the input is cleared instead (_abandon_input)
+            w = raw_state(self.cfg)["waves"]["W1"]
+            self.assertNotIn("pending_enter", w)
+            self.assertNotIn("unverified_enter", w.get("notified", {}))
+
+        for name, row in [("dead window in running", dead_window), ("awaiting_merge", awaiting_merge),
+                          ("one-word status", one_word_status), ("BLOCKED without text", blocked_without_text),
+                          ("pending Enter with eid", pending_enter_with_lost_head)]:
+            with self.subTest(name):
+                self.sent[:], self.enters[:], self.clear_keys[:] = [], [], []
+                row()
+
+    # ----- #102 п.5: a notice queued under one zone and sent under another -----
+    def test_idle_queued_before_a_zone_change_is_sent_in_one_zone(self):
+        self.fresh(telegram_quote=True, idle_minutes=1, timezone="Asia/Dubai")
+        self.idle()
+        item = raw_state(self.cfg)["waves"]["W1"]["outbox"]["idle"]
+        self.assertNotIn("text", item)  # the outbox keeps the moment, not a text made in the zone of the queueing
+        dubai = wab.hum(self.cfg, time.time()).split()[-1]
+        self.assertNotIn(dubai, json.dumps(item, ensure_ascii=False))
+        doc = json.loads(self.path.read_text(encoding="utf-8"))
+        doc["timezone"] = "Europe/Moscow"
+        self.path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        self.cfg = wab.load_chain(self.path)
+        self.down = False
+        with contextlib.redirect_stdout(io.StringIO()):
+            wab.drain_notices(self.cfg)
+        (sent,) = [t for t in self.tg if "молчит" in t.lower() or "Молчит" in t]
+        moscow = wab.hum(self.cfg, time.time()).split()[-1]
+        self.assertNotEqual(dubai, moscow)
+        self.assertNotIn(dubai, sent)
+        self.assertGreaterEqual(sent.count(moscow), 2, sent)  # «молчит с …» and «Время: …», both of Moscow
+
+
+class W2TypedHead(Base):
+    """#103 п.3: the head of a typed text is not kept in clear in state.json (`pending_text_eid`, the head in the
+    wave's text store); the Enter-only retry after a restart (the caller passes "") still tells TYPED (unsent)
+    from EMPTY (sent), exactly as before."""
+    screen, say = Submit.screen, Submit.say
+
+    def setUp(self):
+        Base.setUp(self)
+        self.m = load_orig("wab_submit")  # the same unpatched module as Submit (tmux itself is faked below)
+        self.screens, self.m_enters, self.m_calls = [], [], []
+
+        def fake_sh(*args, **kw):
+            self.m_calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        for name, kw in (("sh", {"side_effect": fake_sh}),
+                         ("press_enter", {"side_effect": lambda n: self.m_enters.append(n)}),
+                         ("pane_text", {"side_effect": self.screen}),
+                         ("tmux_alive", {"side_effect": lambda n: True})):
+            p = mock.patch.object(self.m, name, **kw)
+            p.start()
+            self.addCleanup(p.stop)
+    TEXT, RULE, TYPED, EMPTY = Submit.TEXT, Submit.RULE, Submit.TYPED, Submit.EMPTY
+
+    def test_the_head_is_not_in_clear_and_recovery_still_checks(self):
+        cfg, path, f = self.say()
+        self.screens = [self.TYPED]
+        st = self.m.load_state(cfg)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, self.TEXT))
+        raw = raw_state(cfg)
+        head = " ".join(self.TEXT.split())[:20]
+        for n in (5, 10, 20):
+            self.assertEqual(text_holders(raw, head[:n]), [], f"{n} chars of the typed text in state.json")
+        self.assertEqual(raw["waves"]["W1"]["pending_enter"], "/update")
+        st = self.m.load_state(cfg)  # a restarted dispatcher without the text: checked against the stored head
+        self.m_enters.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, ""))
+        self.assertNotIn("unverified_enter", raw_state(cfg)["waves"]["W1"].get("notified", {}))
+        self.screens = [self.EMPTY]
+        self.m_enters.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, ""))
+        self.assertNotIn("pending_text_eid", st["waves"]["W1"])
+
+    def test_a_legacy_head_in_clear_is_moved_to_the_store_and_still_checks(self):
+        cfg, path, f = self.say()
+        st = self.m.load_state(cfg)
+        st["waves"]["W1"].update(pending_enter="/update", pending_text_head=" ".join(self.TEXT.split())[:20])
+        self.put_state(cfg, st)  # the shape 1.4.x wrote
+        self.screens = [self.TYPED]
+        st = self.m.load_state(cfg)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(self.m._deliver(cfg, st, "W1", "/update", self.m.send_text, ""))
+        raw = raw_state(cfg)
+        self.assertEqual(text_holders(raw, self.TEXT[:5]), [])
+        self.assertNotIn("unverified_enter", raw["waves"]["W1"].get("notified", {}))
+        self.screens = [self.EMPTY]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(self.m._deliver(cfg, self.m.load_state(cfg), "W1", "/update", self.m.send_text, ""))
+
+
+class W2LegacyStateMigration(Base):
+    """A state.json of 1.4.x with the wave's text in its fields (tests/fixtures/waves/w2-legacy-1.4, written by the
+    1.4.2 dispatcher on the in-flight paths of a running chain — an answered fork, a final refusal, a typed answer
+    waiting for its Enter — with notices unsent; see its README) loads without a refusal, keeps every decision, and
+    after the first write holds no text. By hand in this test, named here: the placeholders @RUN_DIR@/@REPO@/@TMP@
+    of the fixture are this test's directories, the status file is written with the record's own last line, and
+    the stamps of that file ([inode, mtime], an identity of a file on the machine that wrote it) are the new file's."""
+    ND = FixedAnswerPolicy.ND
+    BOTH = FixedAnswerPolicy.BOTH
+    mandate, tick, answers = DecisionPolicy.mandate, DecisionPolicy.tick, DecisionPolicy.answers
+    log, owner_asked = DecisionPolicy.log, DecisionPolicy.owner_asked
+    forge, fork = FixedAnswerPolicy.__dict__["forge"], FixedAnswerPolicy.fork
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with mock.patch.dict(os.environ):
+            cls.bases = cls.forge()
+
+    def legacy(self, name):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        self.fork(cfg)
+        raw = (W2_LEGACY / f"{name}.state.json").read_text(encoding="utf-8")
+        raw = raw.replace("@RUN_DIR@", str(cfg["run_dir"])).replace("@REPO@", self.cwd).replace("@TMP@", str(self.tmp))
+        st = json.loads(raw)
+        w = st["waves"]["W1"]
+        self.set_status(cfg, "W1", w["last_status"])
+        stamp = wab._status_stamp(cfg, "W1")
+        for holder in (w, w.get("policy_refusal") or {}):
+            for k in ("policy_answered_stamp", "stamp"):
+                if k in holder:
+                    holder[k] = stamp
+        for item in (w.get("outbox") or {}).values():
+            item["next_at"] = 0  # the retry moment of the unsent notice is due now
+        self.put_state(cfg, st)
+        texts = sorted({s for p, s in json_strings(json.loads(raw)) if "<key " not in p
+                        and (p.endswith(".last_status") or ".text" in p or p.endswith(".value") or ".notified." in p
+                            or p.endswith(".pending_text_head") or p.endswith(".status") or ".questions[" in p)
+                        and len(s) >= 5 and not s.startswith("sha256:") and s not in wab.STATUS_KINDS})
+        return cfg, st, texts
+
+    def assert_text_free(self, cfg, texts):
+        raw = raw_state(cfg)
+        for t in texts:
+            self.assertEqual(text_holders(raw, t), [], f"legacy text {t[:40]!r} still in state.json")
+        for needle in ("гонка", "вопрос владельцу", "Дубай", "РЕШЕНИЕ"):
+            self.assertEqual(text_holders(raw, needle), [], needle)
+
+    def test_every_fixture_loads_and_after_the_first_write_holds_no_text(self):
+        for name in ("answered", "refused", "typed"):
+            with self.subTest(name):
+                cfg, st, texts = self.legacy(name)
+                self.assertTrue(texts)
+                loaded = wab.load_state(cfg)  # no refusal
+                wab.save_state(cfg, loaded)
+                self.assert_text_free(cfg, texts)
+                w = raw_state(cfg)["waves"]["W1"]
+                old = st["waves"]["W1"]
+                for k in ("policy_keys", "auto_answers", "restarts", "phase", "pending_enter"):
+                    self.assertEqual(w.get(k), old.get(k), k)
+                if "policy_key_pending" in old:
+                    self.assertEqual(w["policy_key_pending"]["key"], old["policy_key_pending"]["key"])
+                self.assertEqual(len(w["attempts"]), 1)
+                self.assertEqual(len(w["attempts"][0]["questions"]), 1)
+                # chain-result.md still tells the questions, from the store
+                wab.write_chain_result(cfg, wab.load_state(cfg))
+                result = (cfg["run_dir"] / "chain-result.md").read_text(encoding="utf-8")
+                self.assertIn("вопрос владельцу ранней попытки", result)
+
+    def test_answered_episode_gets_no_second_answer_after_the_restart(self):
+        cfg, st, texts = self.legacy("answered")
+        status = st["waves"]["W1"]["last_status"]
+        w = self.tick(cfg)["waves"]["W1"]  # a restarted watch on the migrated file, the same line
+        self.tick(cfg)
+        self.assertEqual(self.answers(), [])  # no second automatic answer
+        self.assertEqual(self.blocked_told(), [])  # and no BLOCKED notice for the answered line
+        self.assertEqual(len([t for t in self.tg if "W1" in t]), 1, self.tg)  # the unsent notice of the answer, once
+        self.assertEqual((w["auto_answers"], w["policy_keys"]), (1, st["waves"]["W1"]["policy_keys"]))
+        self.assertEqual(w["notified"]["policy_answer"], wab.eid(status))
+        self.assert_text_free(cfg, texts)
+        self.new_episode(cfg)
+
+    def test_a_final_refusal_stays_final_after_the_restart(self):
+        cfg, st, texts = self.legacy("refused")
+        w = self.tick(cfg)["waves"]["W1"]
+        self.tick(cfg)
+        self.assertEqual(self.answers(), [])
+        self.assertIn("policy_refusal", w)
+        self.assertEqual(w["policy_refusal"]["status"], wab.eid(st["waves"]["W1"]["last_status"]))
+        self.assertEqual(len(self.blocked_told()), 1, self.tg)  # the unsent BLOCKED notice, once; not asked again
+        self.assertNotIn("policy answer not sent", self.log(cfg))  # never re-checked
+        self.assertEqual((w["auto_answers"], w["policy_keys"]), (1, st["waves"]["W1"]["policy_keys"]))
+        self.assert_text_free(cfg, texts)
+        self.new_episode(cfg)
+
+    def test_a_typed_answer_gets_only_its_enter_after_the_restart(self):
+        cfg, st, texts = self.legacy("typed")
+        self.ansi = live("19-folded.ansi")
+        w = self.tick(cfg)["waves"]["W1"]
+        self.tick(cfg)
+        self.assertEqual(self.answers(), [])  # nothing typed again
+        self.assertEqual(self.enters, ["wv-w1"])  # the Enter-only retry of the same fork
+        self.assertNotIn("policy_key_pending", w)
+        self.assertEqual(w["policy_keys"], [st["waves"]["W1"]["policy_key_pending"]["key"]])
+        self.assertEqual(wab.auto_answers_used(w), 1)
+        self.assert_text_free(cfg, texts)
+        self.new_episode(cfg)
+
+    def blocked_told(self):  # the BLOCKED notices only (an idle notice also says «возможно, ждёт тебя»)
+        return [t for t in self.tg if t.startswith("⏸")]
+
+    def new_episode(self, cfg):
+        asked = len(self.blocked_told())
+        self.tick(cfg, "RUNNING")
+        self.tick(cfg, "BLOCKED: новый вопрос волны после перезапуска")
+        self.tick(cfg)
+        self.assertEqual(len(self.blocked_told()), asked + 1, self.tg)  # a really new episode is told, once
+
+    def test_the_live_fixtures_of_older_chains_load_and_lose_their_text(self):
+        for fixture in ("gate-redact-run", "w7-notices"):
+            with self.subTest(fixture):
+                cfg, _ = self.chain()
+                raw = (ROOT / "tests" / "fixtures" / "waves" / fixture / "state.json").read_text(encoding="utf-8")
+                doc = json.loads(raw)
+                texts = sorted({s for p, s in json_strings(doc) if (p.endswith(".last_status") or ".questions[" in p)
+                                and p.endswith((".last_status", ".text")) and len(s) >= 5
+                                and s not in wab.STATUS_KINDS})
+                self.assertTrue(texts or fixture == "w7-notices")  # w7: one-word statuses and dedup marks only
+                wab.state_path(cfg).write_text(raw, encoding="utf-8")
+                st = wab.load_state(cfg)
+                wab.save_state(cfg, st)
+                saved = raw_state(cfg)
+                for t in texts:
+                    self.assertEqual(text_holders(saved, t), [], t)
+                for wave, w in doc["waves"].items():
+                    if isinstance(w.get("last_status"), str):
+                        got = saved["waves"][wave]
+                        self.assertEqual(got["last_status_eid"], wab.eid(w["last_status"]))
+                        self.assertEqual(wab.stashed_text(cfg, wave, got["last_status_eid"]), w["last_status"])
+                    for key, value in (w.get("notified") or {}).items():
+                        self.assertEqual(saved["waves"][wave]["notified"][key], wab.eid(value))
 
 
 if __name__ == "__main__":

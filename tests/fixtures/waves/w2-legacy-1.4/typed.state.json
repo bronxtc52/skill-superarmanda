@@ -1,0 +1,64 @@
+{
+  "current": "W1",
+  "waves": {
+    "W1": {
+      "tmux": "wv-w1",
+      "cwd": "@REPO@",
+      "started": 1791695650.6731002,
+      "restarts": 0,
+      "phase": "running",
+      "notified": {},
+      "sessions": [],
+      "attempts": [
+        {
+          "tmux": "wv-w1",
+          "cwd": "@REPO@",
+          "started": 1791695650.6536577,
+          "restarts": 0,
+          "phase": "running",
+          "notified": {
+            "blocked": "BLOCKED: вопрос владельцу ранней попытки"
+          },
+          "sessions": [],
+          "last_status": "BLOCKED: вопрос владельцу ранней попытки",
+          "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+          "pane_changed": 1791695710.654054,
+          "activity_files": {},
+          "activity_session": null,
+          "questions": [
+            {
+              "at": 1791695710.654054,
+              "text": "BLOCKED: вопрос владельцу ранней попытки"
+            }
+          ]
+        }
+      ],
+      "last_status": "BLOCKED: [class=needs_decision rec=invariant red=no] needs_decision T1: гонка; варианты: invariant | cut_surface",
+      "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+      "pane_changed": 1791695710.6733272,
+      "activity_files": {},
+      "activity_session": null,
+      "tokens": 0,
+      "peak": 0,
+      "ctx_hist": [
+        0
+      ],
+      "alarm_at": 1791695710.6733272,
+      "policy_pending": "BLOCKED: [class=needs_decision rec=invariant red=no] needs_decision T1: гонка; варианты: invariant | cut_surface",
+      "policy_key_pending": {
+        "key": [
+          "W1",
+          "2026-10-01",
+          1,
+          "T1",
+          "needs_decision",
+          "tester"
+        ],
+        "status": "BLOCKED: [class=needs_decision rec=invariant red=no] needs_decision T1: гонка; варианты: invariant | cut_surface",
+        "text": "[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант invariant. Доделай как следует: ещё один круг, чини класс находки целиком, не латай; находки low/P3 — fix-loop --defer в остаток. Решение запиши: fix-loop --decision invariant. Затем запиши RUNNING в status."
+      },
+      "pending_enter": "policy answer",
+      "pending_text_head": "[wab] РЕШЕНИЕ ПО ПОЛ"
+    }
+  }
+}

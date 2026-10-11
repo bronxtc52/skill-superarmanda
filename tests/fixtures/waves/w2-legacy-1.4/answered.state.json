@@ -1,0 +1,78 @@
+{
+  "current": "W1",
+  "waves": {
+    "W1": {
+      "tmux": "wv-w1",
+      "cwd": "@REPO@",
+      "started": 1791695650.5630777,
+      "restarts": 0,
+      "phase": "running",
+      "notified": {
+        "policy_answer": "BLOCKED: [class=needs_decision rec=invariant red=no] needs_decision T1: гонка; варианты: invariant | cut_surface",
+        "blocked": "BLOCKED: [class=needs_decision rec=invariant red=no] needs_decision T1: гонка; варианты: invariant | cut_surface"
+      },
+      "sessions": [],
+      "attempts": [
+        {
+          "tmux": "wv-w1",
+          "cwd": "@REPO@",
+          "started": 1791695650.5441754,
+          "restarts": 0,
+          "phase": "running",
+          "notified": {
+            "blocked": "BLOCKED: вопрос владельцу ранней попытки"
+          },
+          "sessions": [],
+          "last_status": "BLOCKED: вопрос владельцу ранней попытки",
+          "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+          "pane_changed": 1791695710.544618,
+          "activity_files": {},
+          "activity_session": null,
+          "questions": [
+            {
+              "at": 1791695710.544618,
+              "text": "BLOCKED: вопрос владельцу ранней попытки"
+            }
+          ]
+        }
+      ],
+      "last_status": "BLOCKED: [class=needs_decision rec=invariant red=no] needs_decision T1: гонка; варианты: invariant | cut_surface",
+      "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+      "pane_changed": 1791695710.5632875,
+      "activity_files": {},
+      "activity_session": null,
+      "tokens": 0,
+      "peak": 0,
+      "ctx_hist": [
+        0
+      ],
+      "alarm_at": 1791695710.5632875,
+      "policy_keys": [
+        [
+          "W1",
+          "2026-10-01",
+          1,
+          "T1",
+          "needs_decision",
+          "tester"
+        ]
+      ],
+      "policy_answered_stamp": [
+        5777546,
+        1791695710575649711
+      ],
+      "auto_answers": 1,
+      "outbox": {
+        "policy_answer": {
+          "value": "BLOCKED: [class=needs_decision rec=invariant red=no] needs_decision T1: гонка; варианты: invariant | cut_surface",
+          "fields": {
+            "cls": "needs_decision",
+            "variant": "invariant"
+          },
+          "text": "🤖 demo: волна W1: развилка закрыта по политике\nТип вопроса: нужно решение; выбрано: исправить целиком. Ответ не нужен.\nВремя: 09:15 Дубай",
+          "next_at": 1791696010.5827954
+        }
+      }
+    }
+  }
+}

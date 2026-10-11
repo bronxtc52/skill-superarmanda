@@ -187,9 +187,11 @@ def wave_status(cfg, wave, w):
     """The status of a wave as the watch decides on it: the file, else (unreadable or mid-rewrite)
     the last known status from the record. One function for the table and the current panel."""
     status = wab.read(cfg["run_dir"] / wave / "status", on_error=None)
-    if not status:
-        status = w.get("last_status") or ""
-        status = status if isinstance(status, str) else ""
+    if not status:  # state.json keeps the eid and the word (1.4.3): the text is in the wave's store
+        status = wab.last_status_text(cfg, wave, w)
+        if status is None:  # the store lost it: the word of the record, never a guess
+            status = w.get("last_status_word") if isinstance(w.get("last_status_word"), str) else ""
+            status = "" if status == "other" else status
     return status
 
 

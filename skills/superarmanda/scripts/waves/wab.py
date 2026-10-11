@@ -361,6 +361,11 @@ def load_state(cfg):
     except (OSError, ValueError) as e:
         raise SystemExit(f"wab: cannot read state.json: {_exc_text(e)}")
     st.setdefault("waves", {})
+    for rec in st["waves"].values():  # 1.4.x: the wave's text out of the record, in memory (save_state stores it)
+        legacy = {}
+        upgrade_record(rec, legacy)
+        if legacy:
+            rec.setdefault(LEGACY_TEXTS, {}).update(legacy)
     return st
 
 
@@ -391,7 +396,9 @@ def head_rev(cwd):
 def save_state(cfg, st):
     waves = st.get("waves")
     if isinstance(waves, dict):  # an episode that ended with this save loses its stale notice here
-        for rec in waves.values():
+        for wave, rec in waves.items():
+            if isinstance(rec, dict):  # THE invariant: no text of the wave reaches state.json (1.4.3)
+                _store_legacy_texts(cfg, wave, rec)
             drop_ended_episodes(rec)
             if isinstance(rec, dict):  # `finished`: the end of the wave's work (dash counts commits up to it)
                 if rec.get("phase") in ENDED_PHASES:
@@ -448,6 +455,214 @@ def wave_dir(cfg, wave):
     d = cfg["run_dir"] / wave
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+# ---------- the wave's texts: outside state.json (1.4.3, #105 п.1, #103 п.3) ----------
+#
+# THE invariant: state.json (every wave record and every attempts[i]) holds no free text of the wave and no
+# other text that came from outside the dispatcher (a status line, a question, result.md, a reason `why` with a
+# quote, the owner's answers out of a journal, the text of the task, a text typed into the window). It holds
+# an opaque eid, words of the vocabularies, numbers, moments and the dispatcher's own strings only. The strings of
+# the dispatcher that stay there, by name: gate_fail_msg.text and alarm_msg.text (its messages to the window, built
+# from the facts of the gate and the PR, needed verbatim for a retry), policy_refusal.reason (its fixed wording with
+# a task name and numbers of the manifest), pending_clear.why, bg_tails[].why and attention.<key>.line (the first
+# line of a template). A lost or corrupt text of the store never skips the mechanics of the dispatcher and never
+# makes an action bolder than the text would: it only switches off the decisions that need the text itself. A text
+# that must outlive a restart lives in ONE store per wave, `<wave_dir>/.texts/<hex>` (0600, the directory 0700),
+# named by its eid and checked against it when read. The store stays in the wave's directory on a relaunch (it
+# is not moved into attempts/<N>/): an eid of an archived attempt resolves there too. Nothing cleans it up.
+
+EID = re.compile(r"sha256:[0-9a-f]{32}")
+TEXTS_DIR = ".texts"
+LEGACY_TEXTS = "_legacy_texts"  # in memory only: the texts of a 1.4.x record until save_state stores them
+
+
+def eid(text):
+    """The opaque id of a text: `sha256:` + 32 hex. Idempotent: an eid is its own eid (a migrated field stays)."""
+    text = "" if text is None else str(text)
+    if EID.fullmatch(text):
+        return text
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
+def stash_text(cfg, wave, text):
+    """Keep `text` of the wave in its store (atomically, 0600) and return its eid. A failure to write is an event,
+    never a stop: the eid is still the episode's identity, only the text cannot be told later."""
+    text = "" if text is None else str(text)
+    e = eid(text)
+    if e == text:
+        return e  # an eid is not a text
+    try:
+        d = wave_dir(cfg, wave) / TEXTS_DIR
+        d.mkdir(mode=0o700, exist_ok=True)
+        if stat.S_IMODE(d.stat().st_mode) != 0o700:
+            os.chmod(d, 0o700)
+        target = d / e.split(":", 1)[1]
+        if stashed_text(cfg, wave, e) is None:
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".text.", suffix=".tmp")  # mkstemp: 0600
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, target)
+            except BaseException:
+                pathlib.Path(tmp).unlink(missing_ok=True)
+                raise
+    except OSError as err:
+        event(cfg, f"{wave}: the wave's text store not written: {_exc_text(err)}")
+    return e
+
+
+def stashed_text(cfg, wave, e):
+    """The text of the wave stored under eid `e`, or None (no such eid, no file, unreadable, or its content is
+    not the text of this eid)."""
+    if not isinstance(e, str) or not EID.fullmatch(e) or not isinstance(wave, str) or not WAVE_NAME.fullmatch(wave):
+        return None
+    try:
+        text = (cfg["run_dir"] / wave / TEXTS_DIR / e.split(":", 1)[1]).read_bytes().decode("utf-8")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return text if eid(text) == e else None
+
+
+def wave_text(cfg, wave, w, e):
+    """The text behind eid `e` of a record of `wave`: the in-memory text of a 1.4.x record not saved yet, else the
+    store. None when it is not known."""
+    legacy = w.get(LEGACY_TEXTS) if isinstance(w, dict) else None
+    if isinstance(legacy, dict) and isinstance(legacy.get(e), str):
+        return legacy[e]
+    return stashed_text(cfg, wave, e)
+
+
+STATUS_KINDS = ("", "STARTING", "RUNNING", "DONE", "HANDOFF_READY")
+
+
+def status_word(text):
+    """The word of a status line a decision of the dispatcher needs (state.json `last_status_word`): BLOCKED for
+    any line that starts with it, the exact one-word statuses, else `other`."""
+    text = text if isinstance(text, str) else ""
+    if text.startswith("BLOCKED"):
+        return "BLOCKED"
+    return text if text in STATUS_KINDS else "other"
+
+
+def set_last_status(cfg, wave, w, text):
+    """The last real status of the wave: its word and eid in the record, its text in the store. Returns `text`."""
+    w.pop("last_status", None)
+    w["last_status_word"] = status_word(text)
+    w["last_status_eid"] = stash_text(cfg, wave, text)
+    return text
+
+
+def last_status_text(cfg, wave, w):
+    """The text of the last real status of a record (the store, or a 1.4.x record in memory); None = not known."""
+    if not isinstance(w, dict):
+        return None
+    if isinstance(w.get("last_status"), str):
+        return w["last_status"]
+    e = w.get("last_status_eid")
+    return wave_text(cfg, wave, w, e) if isinstance(e, str) else ""
+
+
+def _same(mark, e):
+    """Is a mark of state.json (an eid; a 1.4.x line in a record built in memory) the episode of eid `e`."""
+    return isinstance(mark, str) and eid(mark) == e
+
+
+def _keep_legacy(legacy, text):
+    if isinstance(text, str) and text and not EID.fullmatch(text):
+        legacy[eid(text)] = text
+    return eid(text)
+
+
+def upgrade_outbox(w, legacy):
+    """The outbox entries of a 1.4.x record without the wave's text: `value` -> eid, the prerendered `text`
+    (made in the zone of the queueing, #102 п.5) dropped, `fields.wave_status` -> its word, `fields.question` ->
+    `quote_eid` (the text kept in `legacy` for the store). Idempotent."""
+    box = w.get("outbox")
+    if not isinstance(box, dict):
+        return
+    for item in box.values():
+        if not isinstance(item, dict):
+            continue
+        if "value" in item and item["value"] is not None:
+            item["value"] = eid(item["value"])
+        item.pop("text", None)
+        fields = item.get("fields")
+        if isinstance(fields, dict):
+            if isinstance(fields.get("wave_status"), str):
+                fields["wave_status"] = wave_status_word(fields["wave_status"])
+            q = fields.pop("question", None)
+            if isinstance(q, str) and q:
+                item["quote_eid"] = _keep_legacy(legacy, q)
+
+
+def upgrade_record(w, legacy):
+    """A wave record (or one of its attempts) of 1.4.x without the wave's text, IN MEMORY: every old text becomes
+    the eid of THAT SAME string, so every dedup comparison of the dispatcher (once_per, the answered and refused
+    episodes, the key in flight) decides as before; a text needed later goes into `legacy` (save_state stores
+    it). Idempotent: a record of 1.4.3 is left as it is."""
+    if not isinstance(w, dict):
+        return
+    if "last_status" in w:
+        text = w.pop("last_status")
+        text = text if isinstance(text, str) else ""
+        if text:
+            w["last_status_word"] = status_word(text)
+            w["last_status_eid"] = _keep_legacy(legacy, text)
+        else:
+            w.setdefault("last_status_word", "")
+    notified = w.get("notified")
+    if isinstance(notified, dict):
+        for k, v in list(notified.items()):
+            if isinstance(v, str):
+                notified[k] = eid(v)
+    qs = w.get("questions")
+    if isinstance(qs, list):
+        for q in qs:
+            if isinstance(q, dict) and "text" in q:
+                text = q.pop("text")
+                q["eid"] = _keep_legacy(legacy, text if isinstance(text, str) else "")
+    if isinstance(w.get("policy_pending"), str):
+        w["policy_pending"] = eid(w["policy_pending"])
+    for holder in (w.get("policy_key_pending"), w.get("policy_refusal"), w.get("fable_blocked_episode")):
+        if isinstance(holder, dict) and isinstance(holder.get("status"), str):
+            holder["status"] = eid(holder["status"])
+    pend = w.get("policy_key_pending")
+    if isinstance(pend, dict) and isinstance(pend.get("text"), str):
+        pend["text"] = eid(pend["text"])
+    sw = w.get("fable_switch")
+    if isinstance(sw, dict):
+        blocked = sw.get("blocked")
+        if isinstance(blocked, dict) and isinstance(blocked.get("status"), str):
+            blocked["status"] = _keep_legacy(legacy, blocked["status"])
+        if isinstance(sw.get("text"), str):
+            sw["text_eid"] = _keep_legacy(legacy, sw.pop("text"))
+    if "pending_text_head" in w:
+        head = w.pop("pending_text_head")
+        if isinstance(head, str) and head:
+            w["pending_text_eid"] = _keep_legacy(legacy, head)
+    upgrade_outbox(w, legacy)
+    attempts = w.get("attempts")
+    if isinstance(attempts, list):
+        for a in attempts:
+            upgrade_record(a, legacy)
+
+
+def _store_legacy_texts(cfg, wave, w):
+    """save_state: the 1.4.x texts of a record (and of its attempts) go into the wave's store; the private field
+    never reaches state.json."""
+    legacy = {}
+    for rec in [w, *(w.get("attempts") if isinstance(w.get("attempts"), list) else [])]:
+        if isinstance(rec, dict):
+            got = rec.pop(LEGACY_TEXTS, None)
+            if isinstance(got, dict):
+                legacy.update(got)
+    upgrade_record(w, legacy)
+    for text in legacy.values():
+        if isinstance(text, str):
+            stash_text(cfg, wave, text)
 
 
 def read(p, on_error=""):
@@ -2015,6 +2230,13 @@ def _status_field(cfg, value):
     return STATUS_WORDS.get(word, STATUS_OTHER)
 
 
+def wave_status_word(value):
+    """The status of the wave as the outbox keeps it (`fields.wave_status`): the word of STATUS_WORDS that
+    _status_field shows for this line, else `other` — never the line itself."""
+    word = str(value).split(":", 1)[0].strip() if isinstance(value, str) else ""
+    return word if word in STATUS_WORDS else "other"
+
+
 def severity_word(value):
     """A severity (a finding's `severity|priority`, dash.finding_counts keeps the raw key) for an external text."""
     return SEVERITY_WORDS.get(value, SEVERITY_OTHER) if isinstance(value, str) else SEVERITY_OTHER
@@ -2259,12 +2481,18 @@ def put_notice(cfg, w, wave, key, value, **fields):
         fields["tmux"] = w["tmux"]
     if cfg.get("telegram_quote") is not True:
         fields.pop("question", None)  # no flag: the wave's text is not put into the outbox at all
+    if "wave_status" in fields:
+        fields["wave_status"] = wave_status_word(fields["wave_status"])  # the word, never the wave's line
     stored = _stored_fields(fields)
-    text = str(notice_text(cfg, wave, key, **stored))  # also refuses a field outside the registry / the template
+    notice_text(cfg, wave, key, **stored)  # refuses a field outside the registry / the template; nothing is kept
+    question = stored.pop("question", None)
+    item = {"value": eid(value), "fields": stored, "next_at": 0}
+    if isinstance(question, str) and question:  # telegram_quote: the quote is in the wave's store, here its eid
+        item["quote_eid"] = stash_text(cfg, wave, question)
     box = w.setdefault("outbox", {})
     cur = box.get(key)
-    if cur is None or cur.get("value") != value:
-        box[key] = {"value": value, "fields": stored, "text": text, "next_at": 0}
+    if cur is None or eid(cur.get("value")) != item["value"]:
+        box[key] = item
 
 
 def outbox_notice(cfg, wave, w, key, item):
@@ -2276,8 +2504,11 @@ def outbox_notice(cfg, wave, w, key, item):
     fields = {k: v for k, v in stored.items() if k in tpl["fields"] and k in NOTICE_FIELDS}
     if "tmux" in tpl["fields"] and isinstance(w.get("tmux"), str):
         fields["tmux"] = w["tmux"]
-    if cfg.get("telegram_quote") is not True:
-        fields.pop("question", None)
+    fields.pop("question", None)  # a 1.4.x entry: its text is not taken from the record
+    if cfg.get("telegram_quote") is True and "question" in tpl["fields"] and isinstance(item.get("quote_eid"), str):
+        text = wave_text(cfg, wave, w, item["quote_eid"])  # the wave's quote, from its store, checked by its eid
+        if text:
+            fields["question"] = text
     return notice_text(cfg, wave, key, **fields)
 
 
@@ -2319,8 +2550,20 @@ def _switch_unconfirmed(w):
     return w.get("phase") == "switching" and isinstance(sw, dict) and sw.get("step") == "unconfirmed"
 
 
-def _status(w):
-    return str(w.get("last_status") or "")
+def _status_word(w):
+    """The word of the last real status of the record (a 1.4.x record not migrated: of its line)."""
+    if isinstance(w.get("last_status"), str):
+        return status_word(w["last_status"])
+    word = w.get("last_status_word")
+    return word if isinstance(word, str) else ""
+
+
+def _status_eid(w):
+    """The eid of the last real status of the record; the eid of "" when there is none."""
+    if isinstance(w.get("last_status"), str):
+        return eid(w["last_status"])
+    e = w.get("last_status_eid")
+    return e if isinstance(e, str) else eid("")
 
 
 def _status_stamp(cfg, wave):
@@ -2387,9 +2630,10 @@ def owner_answered(cfg, wave, status):
 
 
 def _answered(w):
-    """The BLOCKED line the dispatcher answered by the decision policy (the episode's mark), or None."""
+    """The eid of the BLOCKED line the dispatcher answered by the decision policy (the episode's mark), or None."""
     notified = w.get("notified")
-    return notified.get("policy_answer") if isinstance(notified, dict) else None
+    got = notified.get("policy_answer") if isinstance(notified, dict) else None
+    return eid(got) if isinstance(got, str) else None
 
 
 # Every notice is about an episode, and it is stale once the episode is over. Key -> the end of
@@ -2419,14 +2663,14 @@ NOTICE_EPISODE_ENDS = {
     "started": _gone,
     "not_ready": lambda w: w.get("phase") != "not_ready",
     "no_prompt": lambda w: w.get("phase") != "starting",
-    "sending": lambda w: _gone(w) or _status(w) not in ("", "STARTING"),
+    "sending": lambda w: _gone(w) or _status_word(w) not in ("", "STARTING"),
     "updating": lambda w: _gone(w) or not (w.get("await_session") or _switch_unconfirmed(w)),
     "checkpoint_timeout": lambda w: w.get("phase") != "checkpoint",
     "tmux_failed": _gone,
     "unverified_enter": _gone,  # a delivery of an older-version state pressed Enter unverified
     "dead": lambda w: w.get("phase") != "dead",
-    "blocked": lambda w: _gone(w) or not _status(w).startswith("BLOCKED"),
-    "policy_answer": lambda w: _gone(w) or _status(w) != _answered(w),
+    "blocked": lambda w: _gone(w) or _status_word(w) != "BLOCKED",
+    "policy_answer": lambda w: _gone(w) or _status_eid(w) != _answered(w),
     "permission": _gone,
     "idle": _gone,
     "auto_off": _gone,
@@ -3051,10 +3295,11 @@ def _fixed_answer(cfg, wave, w, label, rule, status):
     # the Enter-only retry of THIS episode: the answer is typed, its Enter is owed — and is pressed only when
     # the check below passes now and gives the same decision (a role may have failed, the run or `max_runs`
     # changed since the text was typed)
-    retry = bool(pend and pend.get("status") == status and w.get("pending_enter") == "policy answer"
-                 and w.get("policy_pending") == status)
+    es = eid(status)
+    retry = bool(pend and _same(pend.get("status"), es) and w.get("pending_enter") == "policy answer"
+                 and _same(w.get("policy_pending"), es))
     got = _fork_decision(cfg, wave, label, rule, marks, pend if retry else None)
-    if retry and not (got["ok"] and got["key"] == pend["key"] and got["text"] == pend.get("text")):
+    if retry and not (got["ok"] and got["key"] == pend["key"] and eid(got["text"]) == eid(pend.get("text"))):
         return _refuse(FORK_CHANGED + ("пересчитанный ответ не совпадает с напечатанным" if got["ok"]
                                        else got["reason"]))
     return got
@@ -3853,7 +4098,7 @@ def _plan_pin_refused(cfg, st, wave, drop_pending=False):
                 _abandon_input(cfg, st, wave, w, "the plan pin refused, the session was not closed")
             else:  # no session: nothing to clear
                 w.pop("pending_enter", None)
-                w.pop("pending_text_head", None)
+                w.pop("pending_text_eid", None)
         extra = f" ({closed or left})" if closed or left else ""
         if once_per(w, "not_ready", "plan_pin"):
             put_notice(cfg, w, wave, "not_ready", "plan_pin", reason="plan_pin", question=why)
@@ -3918,16 +4163,18 @@ class _WindowGone(Exception):
     """The wave's tmux session vanished while we were acting on it."""
 
 
-def _mark_dead(cfg, st, wave, status=""):
-    """The one `window closed` branch: phase dead, event and a single notice."""
+def _mark_dead(cfg, st, wave, status="", word=None):
+    """The one `window closed` branch: phase dead, event and a single notice. `word` instead of `status`: the
+    status line is not known (its text lost from the store), only its word — told without a quote."""
     w = st["waves"][wave]
     fresh = once_per(w, "dead", "1")
     w["phase"] = "dead"
     if fresh:
-        put_notice(cfg, w, wave, "dead", "1", wave_status=status, question=status)
+        put_notice(cfg, w, wave, "dead", "1", wave_status=status if word is None else word,
+                   question=status if word is None else None)
     save_state(cfg, st)  # the phase, the mark and the notice together
     if fresh:
-        event(cfg, f"{wave}: tmux session {w['tmux']} is gone (status={status})")
+        event(cfg, f"{wave}: tmux session {w['tmux']} is gone (status={status if word is None else word})")
     flush_notices(cfg, st, w)
 
 
@@ -4035,26 +4282,39 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None):
             if send is send_text:
                 # after a restart the caller may not have the text any more: check against the head
                 # saved together with `pending_enter`, so recovery validates the same way
-                check = text or str(w.get("pending_text_head") or "")
-                if not check and once_per(w, "unverified_enter", what):
-                    # state of an older version: nothing to compare with — the Enter is pressed as
-                    # before, and the owner is told that this delivery is NOT verified
-                    put_notice(cfg, w, wave, "unverified_enter", what, reason=action_reason(what))
-                    event(cfg, f"{wave}: {what} (Enter): delivery NOT verified (no saved text head)")
-                ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, check)
+                head_eid = w.get("pending_text_eid")
+                check = text or (wave_text(cfg, wave, w, head_eid) if head_eid else "") or ""
+                if not check and head_eid:
+                    # the head was saved, but its text is lost (the store): the screen cannot be checked, and
+                    # an Enter may submit the owner's draft — the typed text is given up and the input cleared,
+                    # as on a mismatch; never an unverified Enter
+                    event(cfg, f"{wave}: {what} (Enter): the saved head of the typed text is not in the store")
+                    _abandon_input(cfg, st, wave, w, f"{what}: the head of the typed text is lost", locked=True)
+                    ok = None
+                else:
+                    if not check and once_per(w, "unverified_enter", what):
+                        # state of an older version (no head, no eid): nothing to compare with — the Enter is
+                        # pressed as before, and the owner is told that this delivery is NOT verified
+                        put_notice(cfg, w, wave, "unverified_enter", what, reason=action_reason(what))
+                        event(cfg, f"{wave}: {what} (Enter): delivery NOT verified (no saved text head)")
+                    ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, check)
             else:
                 ok = _act(cfg, st, wave, f"{what} (Enter)", press_enter, name)
         else:
             def typed():
                 w["pending_enter"] = what
-                w["pending_text_head"] = _text_head(text)  # what unsent_reason compares; short
+                head = _text_head(text)  # what unsent_reason compares; short, and in the wave's store (#103 п.3)
+                if head:
+                    w["pending_text_eid"] = stash_text(cfg, wave, head)
+                else:
+                    w.pop("pending_text_eid", None)
                 save_state(cfg, st)
             ok = _act(cfg, st, wave, what, send, name, text, on_typed=typed)
     finally:
         lock.__exit__(None, None, None)
     if ok:
         w.pop("pending_enter", None)
-        w.pop("pending_text_head", None)
+        w.pop("pending_text_eid", None)
     return ok
 
 
@@ -4069,7 +4329,7 @@ def _abandon_input(cfg, st, wave, w, why, locked=False, target=None):
             _keep_fork_key(w)  # a fixed answer (#89) given up, possibly submitted: its fork counts as answered
         w["pending_clear"] = {"what": what, "why": why}
         w.pop("pending_enter", None)
-        w.pop("pending_text_head", None)
+        w.pop("pending_text_eid", None)
         save_state(cfg, st)
     return _settle_clear(cfg, st, wave, w, locked=locked, target=target)
 
@@ -4171,9 +4431,11 @@ def _started(cfg, st, wave):
 # ---------- supervision ----------
 
 def once_per(w, key, value):
-    """True the first time `value` is seen under `key` (dedup for notifications)."""
+    """True the first time `value` is seen under `key` (dedup for notifications). state.json keeps its eid only:
+    a reason may hold the wave's text or a path (#105 п.1)."""
     notified = w.setdefault("notified", {})
-    if notified.get(key) == value:
+    value = eid(value)
+    if notified.get(key) is not None and eid(notified.get(key)) == value:
         return False
     notified[key] = value
     return True
@@ -4536,9 +4798,11 @@ def fable_limit_after_blocked(cfg, wave, w, status):
 
 FABLE_BLOCKED_ANSWER_CHARS = 4000
 FABLE_BLOCKED_ASK_AGAIN = "задай вопрос заново"
+FABLE_BLOCKED_REWRITE = ("перепиши status новой строкой BLOCKED со своим вопросом, добавив в конце "
+                         "« (повтор после смены модели)»")
 
 
-def fable_blocked_note(w, sw):
+def fable_blocked_note(cfg, wave, w, sw):
     """The part of the switch message for a switch from BLOCKED (#110): the BLOCKED line and the answer typed
     after it in the old session's journal, or — when the journal holds none — the request to ask again under a
     new line (the same text would be taken for the episode already notified)."""
@@ -4546,15 +4810,30 @@ def fable_blocked_note(w, sw):
     if not (isinstance(blocked, dict) and isinstance(blocked.get("status"), str)
             and isinstance(blocked.get("since"), (int, float)) and isinstance(sw.get("from"), str)):
         return ""
-    line = blocked["status"].strip()
+    line = wave_text(cfg, wave, w, blocked["status"])  # the line is in the wave's store, state.json has its eid
+    if line is None:
+        # the store lost it (or never got it): the live status file, when it still holds THIS line (same eid)
+        live = read(wave_dir(cfg, wave) / "status", on_error=None)
+        line = live if live and eid(live) == blocked["status"] else None
     answers = _user_texts_since(transcript_path(w["cwd"], sw["from"]), blocked["since"])
+    text = "\n---\n".join(answers)
+    if len(text) > FABLE_BLOCKED_ANSWER_CHARS:
+        text = text[:FABLE_BLOCKED_ANSWER_CHARS] + "…"
+    if line is None:
+        # neither the store nor the status file has the line: never the ordinary resume (the episode is handed to
+        # this session and not raised again until `status` changes) — the answers without the quote, and the
+        # request to write the question into `status` anew, so a new line raises it to the policy or the owner
+        if not answers:
+            return (f"Перед лимитом волна стояла в BLOCKED; текст строки у диспетчера не сохранился, ответа в "
+                    f"журнале прошлой сессии нет: {FABLE_BLOCKED_ASK_AGAIN} — {FABLE_BLOCKED_REWRITE}.")
+        return (f"Перед лимитом волна стояла в BLOCKED (текст строки у диспетчера не сохранился), и в прошлой "
+                f"сессии после неё пришёл ответ:\n{text}\nЕсли ответ закрывает вопрос — продолжи по нему и перепиши "
+                f"status; если нет — {FABLE_BLOCKED_REWRITE}.")
+    line = line.strip()
     if not answers:
         return (f"Перед лимитом волна стояла в «{line}». Ответа на него в журнале прошлой сессии нет: "
                 f"{FABLE_BLOCKED_ASK_AGAIN} — перепиши status той же строкой BLOCKED, добавив в конце "
                 f"« (повтор после смены модели)».")
-    text = "\n---\n".join(answers)
-    if len(text) > FABLE_BLOCKED_ANSWER_CHARS:
-        text = text[:FABLE_BLOCKED_ANSWER_CHARS] + "…"
     return (f"Перед лимитом волна стояла в «{line}», и в прошлой сессии на него пришёл ответ:\n{text}\n"
             f"Продолжи по этому ответу и перепиши status.")
 
@@ -4586,7 +4865,7 @@ def fable_switch_message(cfg, wave, w, wdir):
             except (KeyError, TypeError, OSError, ValueError):
                 prompt = None
             text = first_prompt_head(cfg, wave, w) + prompt if prompt else resume_message(cfg, wave, wdir)
-    note = fable_blocked_note(w, w.get("fable_switch"))
+    note = fable_blocked_note(cfg, wave, w, w.get("fable_switch"))
     return text + "\n" + (note + "\n" if note else "") + FABLE_SWITCH_NOTE
 
 
@@ -4597,6 +4876,7 @@ def begin_fable_switch(cfg, st, wave, w, blocked=None):
     w["fable_switches"] = (w["fable_switches"] if _count(w.get("fable_switches")) else 0) + 1
     w["fable_switch"] = {"sid": str(uuid.uuid4()), "step": "closing", "from": (w.get("sessions") or [None])[-1]}
     if blocked:
+        blocked = dict(blocked, status=stash_text(cfg, wave, blocked["status"]))  # the line: its eid, the text stored
         w["fable_switch"]["blocked"] = blocked
         # the BLOCKED line the switch came from is handled: its answer (or the request to ask again) goes into
         # the Opus session; neither the policy nor the owner's notice take this line up again (reviewer on #110)
@@ -4660,12 +4940,13 @@ def _fable_switch_tick(cfg, st, wave, w):
                 event(cfg, f"{wave}: fable switch: session {name} is not closed yet; retried next tick")
             save_state(cfg, st)
             return True
-        for key in ("pending_enter", "pending_text_head", "pending_clear", "await_session"):
+        for key in ("pending_enter", "pending_text_eid", "pending_clear", "await_session"):
             w.pop(key, None)  # the old window is gone with whatever was in its input
         if sw["sid"] not in w.setdefault("sessions", []):
             w["sessions"].append(sw["sid"])  # known up front: bound by id, not by its marker
         w["cleared_at"] = time.time()  # background shells older than this were the old session's (#68)
-        sw["text"] = fable_switch_message(cfg, wave, w, wdir)  # fixed now: a resumed dispatcher sends the same
+        # fixed now: a resumed dispatcher sends the same; the text (the owner's answers, the task) is in the store
+        sw["text_eid"] = stash_text(cfg, wave, fable_switch_message(cfg, wave, w, wdir))
         sw["step"] = "starting"
         save_state(cfg, st)
     if sw["step"] == "starting":
@@ -4708,9 +4989,10 @@ def _fable_switch_tick(cfg, st, wave, w):
             flush_notices(cfg, st, w)
             return True
     try:
-        text = sw.get("text") if isinstance(sw.get("text"), str) else None
-        if text is None:  # a record of an older 1.4.0 build: choose now and keep it
-            sw["text"] = text = fable_switch_message(cfg, wave, w, wdir)
+        text = wave_text(cfg, wave, w, sw.get("text_eid")) if isinstance(sw.get("text_eid"), str) else None
+        if text is None:  # a record of an older 1.4.0 build, or the store lost it: choose now and keep it
+            text = fable_switch_message(cfg, wave, w, wdir)
+            sw["text_eid"] = stash_text(cfg, wave, text)
             save_state(cfg, st)
         ok = _deliver(cfg, st, wave, FABLE_SWITCH_WHAT, send_text, text)
     except _WindowGone:
@@ -5237,7 +5519,8 @@ def _still_done(cfg, st, wave, w, wdir, what):
     if again == "DONE":
         return True
     if again:
-        w["last_status"], w["phase"] = again, "running"
+        set_last_status(cfg, wave, w, again)
+        w["phase"] = "running"
         w.pop("done_head", None)  # its next DONE starts afresh
     save_state(cfg, st)
     event(cfg, f"{wave}: {what}, but the status is «{safe_text(again or '', 80)}» now: nothing done")
@@ -5260,7 +5543,7 @@ def _gate_failed(cfg, st, wave, w, wdir, reasons):
     if gate.MERGED_OUTSIDE in reasons:  # the gate can never pass again: the owner's way out, ready to run
         blocked += (f"; если PR смержил владелец — останови watch и выполни: "
                     f"{owner_handover_cmd(cfg, wave)}")
-    w["last_status"] = _write_status(wdir, blocked)
+    set_last_status(cfg, wave, w, _write_status(wdir, blocked))
     w["phase"] = "running"  # the wave goes on; its next DONE is gated again
     w.pop("done_head", None)  # fixing after a failed gate is lawful: not an after-DONE edit
     if w.get("pending_enter") == "gate failure":
@@ -5306,9 +5589,9 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
             path = write_owner_script(cfg, wave, sha)
         except (OSError, ValueError) as e:
             return _gate_failed(cfg, st, wave, w, wdir, f"скрипт владельца не записан: {_exc_text(e)}")
-        w["last_status"] = _write_status(
-            wdir, f"BLOCKED: merge gate passed; {len(unresolved)} unresolved review threads; owner runs {home_form(path)}")
-        note_question(w, w["last_status"], time.time())
+        line = set_last_status(cfg, wave, w, _write_status(
+            wdir, f"BLOCKED: merge gate passed; {len(unresolved)} unresolved review threads; owner runs {home_form(path)}"))
+        note_question(cfg, wave, w, line, time.time())
         put_notice(cfg, w, wave, "merge_owner", sha, pr=number, threads=len(unresolved), p01=v["old_p01"])
         event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}")
         save_state(cfg, st)
@@ -5369,8 +5652,8 @@ def _hand_to_owner(cfg, st, wave, w, wdir, number, sha, reason, log_text, questi
         command = home_form(write_owner_script(cfg, wave, sha))
     except (OSError, ValueError) as e:
         command = f"(скрипт владельца не записан: {_masked_line(e, 100)}; проверь PR #{number} вручную)"
-    w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate passed; {log_text}; owner runs {command}")
-    note_question(w, w["last_status"], time.time())
+    line = set_last_status(cfg, wave, w, _write_status(wdir, f"BLOCKED: merge gate passed; {log_text}; owner runs {command}"))
+    note_question(cfg, wave, w, line, time.time())
     put_notice(cfg, w, wave, "merge_refused", sha, pr=number, reason=reason, question=question)
     save_state(cfg, st)
     event(cfg, f"{wave}: merge gate passed, {log_text}; owner runs {command}")
@@ -5381,8 +5664,8 @@ def _hand_to_owner(cfg, st, wave, w, wdir, number, sha, reason, log_text, questi
 def _merge_stopped(cfg, st, wave, w, wdir, why, now, reason="other"):
     """The PR was merged with another head or closed: the next wave is not launched by the
     dispatcher; the coordinator takes over (awaiting_merge) and decides."""
-    w["last_status"] = _write_status(wdir, f"BLOCKED: merge gate: {why}")
-    note_question(w, w["last_status"], now)
+    line = set_last_status(cfg, wave, w, _write_status(wdir, f"BLOCKED: merge gate: {why}"))
+    note_question(cfg, wave, w, line, now)
     w["phase"] = "awaiting_merge"
     w["finished"] = now
     w["pending_exit"] = True
@@ -5404,7 +5687,7 @@ def _regate(cfg, st, wave, w, wdir, old, new):
     for key in ("merge_unknown", "gate_wait"):
         w.get("notified", {}).pop(key, None)
     w["phase"] = "gate"  # the save drops the merge_owner / merge_refused notices
-    w["last_status"] = _write_status(wdir, "DONE")  # the gate runs on DONE; the BLOCKED line was ours
+    set_last_status(cfg, wave, w, _write_status(wdir, "DONE"))  # the gate runs on DONE; the BLOCKED line was ours
     _note_done_head(cfg, wave, w, new if new != old else None)
     save_state(cfg, st)
     event(cfg, f"{wave}: HEAD сменился после гейта: {str(old)[:12]}→{str(new)[:12]}, гейт заново")
@@ -5647,9 +5930,9 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         except (OSError, ValueError) as e:
             command = f"(скрипт владельца не записан: {_masked_line(e, 100)}; проверь PR #{number} вручную)"
         w["merge_rc"] = None  # marker: handed to the owner
-        w["last_status"] = _write_status(
-            wdir, f"BLOCKED: merge gate passed; merge result unknown; owner runs {command}")
-        note_question(w, w["last_status"], now)
+        line = set_last_status(cfg, wave, w, _write_status(
+            wdir, f"BLOCKED: merge gate passed; merge result unknown; owner runs {command}"))
+        note_question(cfg, wave, w, line, now)
         put_notice(cfg, w, wave, "merge_unknown", sha, pr=number)
         save_state(cfg, st)
         event(cfg, f"{wave}: PR #{number} merge result unknown; handed to the owner: {command}")
@@ -5680,7 +5963,7 @@ def _drop_nudge(cfg, st, wave, w):
     """Forget a typed idle nudge WITHOUT touching the input line: it now holds another text (the owner's
     draft). No keys, no `pending_clear`, no Enter."""
     w.pop("pending_enter", None)
-    w.pop("pending_text_head", None)
+    w.pop("pending_text_eid", None)
     save_state(cfg, st)
     event(cfg, f"{wave}: idle nudge dropped: the input holds another text (left untouched)")
 
@@ -5747,7 +6030,7 @@ def _idle_nudge_tick(cfg, st, wave, w, status, now, screen, children):
     if not retry:
         if not minutes or status != "RUNNING" or w.get("pending_enter") or w.get("pending_clear"):
             return
-        if w.get("notified", {}).get("nudge") == digest:
+        if eid(w.get("notified", {}).get("nudge")) == eid(digest):
             return  # this idle episode was nudged
         latest = max(transcript_activity(w).values(), default=0)  # read here: a write after the tick began
         if now - max(w.get("pane_changed") or now, w.get("activity_at") or 0, latest) < minutes * 60:
@@ -5769,7 +6052,7 @@ def _idle_nudge_tick(cfg, st, wave, w, status, now, screen, children):
     sent = _deliver(cfg, st, wave, IDLE_NUDGE_WHAT, send_text, idle_nudge_text(minutes or IDLE_NUDGE_DEFAULT),
                     precheck=_nudge_precheck(cfg, st, wave, w, digest, minutes or IDLE_NUDGE_DEFAULT))
     if sent:
-        w.setdefault("notified", {})["nudge"] = digest
+        w.setdefault("notified", {})["nudge"] = eid(digest)
         save_state(cfg, st)
         event(cfg, f"{wave}: idle nudge sent ({minutes:g} min, no live background work)")
     elif sent is None:
@@ -5962,13 +6245,16 @@ def _say_first(text):
     return _clip(lines[0], 120) if lines else ""
 
 
-def note_question(w, text, now):
+def note_question(cfg, wave, w, text, now):
     """Record a question to the owner (an owner-facing BLOCKED line) for the chain result: redacted,
-    the same text twice in a row once, capped. In memory only: the caller saves it with its change."""
+    the same text twice in a row once, capped. The record keeps the moment and the eid; the text is in the
+    wave's store (1.4.3). The caller saves it with its change."""
     qs = w.setdefault("questions", [])
     text = safe_text(text, 300)
-    if not qs or qs[-1].get("text") != text:
-        qs.append({"at": now, "text": text})
+    e = stash_text(cfg, wave, text)  # already masked (safe_text): the store keeps the masked text
+    last = qs[-1] if qs and isinstance(qs[-1], dict) else {}
+    if not qs or eid(last.get("eid") or last.get("text") or "") != e:
+        qs.append({"at": now, "eid": e})
         del qs[:-QUESTIONS_CAP]
 
 
@@ -5994,6 +6280,17 @@ def _wave_pr(w):
         if isinstance(v, int) and not isinstance(v, bool):
             return v
     return None
+
+
+def _question_text(cfg, st, wave, q):
+    """The text of a recorded question: the wave's store by its eid (a 1.4.x entry in memory: its own text)."""
+    if isinstance(q.get("text"), str):
+        return q["text"]
+    got = wave_text(cfg, wave, st.get("waves", {}).get(wave), q.get("eid"))
+    # the store lost it: the line itself was logged when it was asked (events.log), and the window still shows it
+    if got is not None:
+        return got
+    return "(текст вопроса не сохранился в хранилище волны — см. events.log и окно волны)"
 
 
 def write_chain_result(cfg, st):
@@ -6046,7 +6343,7 @@ def write_chain_result(cfg, st):
              f"- волн: {len(cfg['waves'])}, PR: {prs}, перезапусков голов: {restarts_heads}, "
              f"перезапусков волн: {restarts_waves}, вопросов: {len(questions)}\n", "## Волны\n", *rows,
              "## Вопросы к владельцу\n"]
-    lines += ([f"- {hum(cfg, num(q.get('at')), date=True)} {wave}: {safe_text(q.get('text') or '', 300)}"
+    lines += ([f"- {hum(cfg, num(q.get('at')), date=True)} {wave}: {safe_text(_question_text(cfg, st, wave, q), 300)}"
                for wave, q in questions] or ["нет"])
     path = cfg["run_dir"] / "chain-result.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -6177,8 +6474,9 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     only when nothing reached the window. The path of a rule without `answer` in this function neither
     reads nor writes `policy_key_pending` / `policy_keys`."""
     stamp = _status_stamp(cfg, wave)
+    es = eid(status)  # every mark of an episode in state.json is the eid of its line (1.4.3)
     anew = False  # the very line of the last decision under another stamp: a new episode of the same text
-    if _answered(w) == status:
+    if _answered(w) == es:
         if w.get("policy_answered_stamp") in (None, stamp):
             return True
         # the same text, but the file was rewritten since the answer (e.g. RUNNING in between, unseen by
@@ -6188,7 +6486,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         anew = True
     refusal = w.get("policy_refusal")
     if refusal is not None:
-        if not _refusal_ok(refusal) or (refusal["status"] == status and (
+        if not _refusal_ok(refusal) or (_same(refusal["status"], es) and (
                 refusal.get("stamp") == stamp or read(wave_dir(cfg, wave) / "status", on_error=None) != status)):
             # one decision per episode: this one was refused and stays with the owner. Another stamp alone
             # is not a new episode: the file must read as this very line again (not empty or unreadable)
@@ -6209,7 +6507,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         # new one without an auto-answer (a machine refusal, the cap) must still raise BLOCKED to the owner
         drop_notice(w, "blocked")
     if owner_answered(cfg, wave, status):  # the owner answered this very episode with `say`
-        if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
+        if w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es):
             # our answer is typed and waits for its Enter, the owner's came after: clear it (it may
             # have gone out already: charged to the cap)
             w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
@@ -6221,10 +6519,10 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
             save_state(cfg, st)
         return None
     used = auto_answers_used(w)
-    if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
+    if w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es):
         used -= 1  # the Enter-only retry of THIS answer: it is the one in flight, already charged
     cap = cfg.get("max_auto_answers", MAX_AUTO_ANSWERS)
-    if used >= cap and w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
+    if used >= cap and w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es):
         # the cap was lowered under an answer that is typed and waits for its Enter: it may already be
         # submitted (charged, like on a status change); never leave its text in the input line
         w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
@@ -6241,11 +6539,11 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     if rule.get("answer") is not None:
         fixed = fixed_answer(cfg, wave, w, label, rule, status)
         if not fixed["ok"]:  # a machine refusal: the usual BLOCKED path with the reason, the cap untouched
-            w["policy_refusal"] = {"status": status, "stamp": stamp, "reason": fixed["reason"]}
+            w["policy_refusal"] = {"status": es, "stamp": stamp, "reason": fixed["reason"]}
             # the refusal is this episode's decision and always reaches the owner WITH its reason, whatever
             # `blocked` mark the text of the line already carries (once per episode: later ticks return above)
             drop_notice(w, "blocked")
-            if w.get("pending_enter") == "policy answer" and w.get("policy_pending") == status:
+            if w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es):
                 # a typed answer waits for its Enter, and the check no longer gives it (a corrupt mark, or the
                 # fork changed since the typing: FORK_CHANGED) — the Enter is not pressed, and its text never
                 # stays in the input line of an episode the owner now answers (it may have gone out: charged)
@@ -6267,12 +6565,12 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         event(cfg, f"{wave}: policy answer not sent: the status changed before delivery")
         return None
     retry = w.get("pending_enter") == "policy answer"  # typed earlier: only its Enter is owed
-    w["policy_pending"] = status
+    w["policy_pending"] = es
     if fixed:  # the intent, saved by the same save as policy_pending (before typing): the key is in flight
         old = _fork_keys(w)[1]
         if old and old.get("key") != fixed["key"]:  # an earlier answer given up, possibly submitted
             w["policy_keys"] = [*_fork_keys(w)[0], old.get("key")]
-        w["policy_key_pending"] = {"key": fixed["key"], "status": status, "text": fixed["text"]}
+        w["policy_key_pending"] = {"key": fixed["key"], "status": es, "text": eid(fixed["text"])}
     sent = _deliver(cfg, st, wave, "policy answer", send_text,
                     fixed["text"] if fixed else POLICY_ANSWER.format(rec=label["rec"]),
                     precheck=still)  # re-read again UNDER the input lock: `say` may have answered meanwhile
@@ -6300,13 +6598,13 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         w.pop("policy_key_pending", None)
         w["policy_keys"] = [*_fork_keys(w)[0], fixed["key"]]
     tokens = f"class={label['class']} " + (f"answer={fixed['answer']} " if fixed else "") + f"rec={label['rec']}"
-    w.setdefault("notified", {})["policy_answer"] = status
+    w.setdefault("notified", {})["policy_answer"] = es
     # the stamp of the status the answer was for, taken BEFORE typing: a fast wave may already have
     # rewritten the same line by now, and that rewrite must read as a new episode
     w["policy_answered_stamp"] = seen.get("stamp", stamp)
     w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
     drop_notice(w, "blocked")  # a usual BLOCKED signal of a failed first try asks nothing any more
-    w.setdefault("notified", {})["blocked"] = status  # ...and is not raised again in this episode
+    w.setdefault("notified", {})["blocked"] = es  # ...and is not raised again in this episode
     question = _policy_question(label)
     try:
         with open(wave_dir(cfg, wave) / "policy-decisions.log", "a", encoding="utf-8") as f:
@@ -6375,20 +6673,35 @@ def _tick(cfg, st):
     name, wdir = w["tmux"], wave_dir(cfg, wave)
     status = read(wdir / "status", on_error=None)
     read_ok = bool(status)  # False: unreadable or empty mid-rewrite, decided on the last known status below
+    last = None if status else last_status_text(cfg, wave, w)  # the store (1.4.3): state.json holds its eid
     if status is None:  # unreadable: decide on the last known status, one event per episode
         if once_per(w, "status_unreadable", "1"):
-            event(cfg, f"{wave}: status unreadable ({wdir / 'status'}), keeping «{w.get('last_status', '')}»")
+            event(cfg, f"{wave}: status unreadable ({wdir / 'status'}), keeping «{last or ''}»")
         status = ""
     else:
         w.get("notified", {}).pop("status_unreadable", None)  # readable again: the episode is over
+    # `lost`: the last real status is a BLOCKED (or another free) line whose text is not in the store. A lost text
+    # never skips the mechanics (the phases, the window, idle) and never makes an action bolder than the text would:
+    # it only switches off the decisions that need the text itself (the episode: policy, answer, notice, retries)
+    lost = False
     if status:
-        w["last_status"] = status
+        set_last_status(cfg, wave, w, status)
+        w.get("notified", {}).pop("status_text_lost", None)
+    elif last is None:
+        word = _status_word(w)
+        if word in STATUS_KINDS:  # a one-word status is its own text
+            status = word
+        else:
+            lost = True
+            if once_per(w, "status_text_lost", _status_eid(w)):
+                event(cfg, f"{wave}: status empty or unreadable and the text of the last status ({word}) is not in "
+                           f"the store: the episode is not decided on, the rest of the tick goes on")
     else:  # an empty read is the wave mid-rewrite: decide on the last real status
-        status = w.get("last_status", "")
+        status = last
     now = time.time()
     attach = f"{attach_cmd(name)}  (выйти: Ctrl-b d)"
     refusal = w.get("policy_refusal")
-    if refusal is not None and (refusal["status"] != status if _refusal_ok(refusal)
+    if not lost and refusal is not None and (not _same(refusal["status"], eid(status)) if _refusal_ok(refusal)
                                 else not status.startswith("BLOCKED")):
         w.pop("policy_refusal")  # the refused episode is over (whatever comes next, DONE included): its mark goes with it
         save_state(cfg, st)
@@ -6456,7 +6769,10 @@ def _tick(cfg, st):
         return _complete_wave(cfg, st, wave, w, wdir, now)
 
     if not tmux_alive(name):
-        _mark_dead(cfg, st, wave, status)
+        if lost:  # N4: the word of the lost status (BLOCKED -> «ждёт ответа»), never a quote
+            _mark_dead(cfg, st, wave, word=_status_word(w))
+        else:
+            _mark_dead(cfg, st, wave, status)
         return False  # the chain stops; restart the wave by hand, then run watch again
 
     # screen episodes end on screen before any branch below returns or sends the outbox
@@ -6470,9 +6786,9 @@ def _tick(cfg, st):
         advance_pending(cfg, st)
         return True
 
-    episode = w.get("fable_blocked_episode")
+    episode = None if lost else w.get("fable_blocked_episode")
     if episode is not None:  # #110: the BLOCKED line the switch to Opus came from
-        same = isinstance(episode, dict) and episode.get("status") == status
+        same = isinstance(episode, dict) and _same(episode.get("status"), eid(status))
         if same and (not read_ok or episode.get("stamp") == _status_stamp(cfg, wave)):
             save_state(cfg, st)
             return True  # handed to the Opus session: no policy answer, no notice, no gate failure for it again
@@ -6491,7 +6807,7 @@ def _tick(cfg, st):
     if w.get("pending_clear"):
         _settle_clear(cfg, st, wave, w)  # an earlier clearing that the screen did not confirm: again
 
-    if isinstance(w.get("gate_fail_msg"), dict):
+    if isinstance(w.get("gate_fail_msg"), dict) and not lost:
         if status.startswith("BLOCKED: merge gate:"):
             _send_gate_failure(cfg, st, wave, w)  # a retry of a delivery that failed or was cut short
         else:  # the wave has moved on: an outdated failure is not sent
@@ -6509,7 +6825,7 @@ def _tick(cfg, st):
         _abandon_nudge(cfg, st, wave, w, "the wave left RUNNING")  # an idle nudge is about a silent RUNNING wave
         save_state(cfg, st)
 
-    if w.get("pending_enter") == "policy answer" and w.get("policy_pending") != status:
+    if not lost and w.get("pending_enter") == "policy answer" and not _same(w.get("policy_pending"), eid(status)):
         # the wave left that BLOCKED line: the half-sent answer is outdated. It may already have been
         # submitted (watch died before its final save), so it is charged to the cap: never one free
         w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
@@ -6517,6 +6833,20 @@ def _tick(cfg, st):
         _abandon_input(cfg, st, wave, w, "the wave left the BLOCKED line of the answer")
         save_state(cfg, st)
 
+    if lost and _status_word(w) == "BLOCKED":  # a BLOCKED episode whose line is lost: as BLOCKED, nothing decided
+        # nothing typed (no answer, no retry); but an episode the owner was never told of, that the policy did not
+        # answer and that is not handed to an Opus session, is raised to the owner without the quote (the notice
+        # names the window), never left silent
+        e = _status_eid(w)
+        handed = w.get("fable_blocked_episode")
+        if (_answered(w) != e and not _same(w.get("policy_pending"), e)
+                and not (isinstance(handed, dict) and _same(handed.get("status"), e))
+                and once_per(w, "blocked", e)):
+            put_notice(cfg, w, wave, "blocked", e)
+            event(cfg, f"{wave}: BLOCKED without its text: the owner is told without the quote")
+        save_state(cfg, st)
+        flush_notices(cfg, st, w)
+        return True
     answered = _policy_answer(cfg, st, wave, w, status, now, attach) if status.startswith("BLOCKED") else False
     if answered is None or answered:
         flush_notices(cfg, st, w)
@@ -6525,9 +6855,9 @@ def _tick(cfg, st):
         fresh = once_per(w, "blocked", status)
         if fresh:
             if not status.startswith("BLOCKED: merge gate:"):  # the wave fixes a gate failure itself
-                note_question(w, status, now)
+                note_question(cfg, wave, w, status, now)
             refusal = w.get("policy_refusal") if _refusal_ok(w.get("policy_refusal")) else {}
-            asked = blocked_fields(status, refusal.get("reason") if refusal.get("status") == status else None)
+            asked = blocked_fields(status, refusal.get("reason") if _same(refusal.get("status"), eid(status)) else None)
             put_notice(cfg, w, wave, "blocked", status, cls=asked["cls"], red=asked["red"],
                        variant=asked["variant"], reason=asked["reason"], question=asked["question"])
         save_state(cfg, st)

@@ -1,0 +1,95 @@
+{
+  "current": "W1",
+  "waves": {
+    "W1": {
+      "tmux": "wv-w1",
+      "cwd": "@REPO@",
+      "started": 1791695650.6073675,
+      "restarts": 0,
+      "phase": "running",
+      "notified": {
+        "blocked": "BLOCKED: [class=needs_decision rec=cut_surface red=no] needs_decision T1: гонка; варианты: invariant | cut_surface"
+      },
+      "sessions": [],
+      "attempts": [
+        {
+          "tmux": "wv-w1",
+          "cwd": "@REPO@",
+          "started": 1791695650.5900903,
+          "restarts": 0,
+          "phase": "running",
+          "notified": {
+            "blocked": "BLOCKED: вопрос владельцу ранней попытки"
+          },
+          "sessions": [],
+          "last_status": "BLOCKED: вопрос владельцу ранней попытки",
+          "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+          "pane_changed": 1791695710.5905113,
+          "activity_files": {},
+          "activity_session": null,
+          "questions": [
+            {
+              "at": 1791695710.5905113,
+              "text": "BLOCKED: вопрос владельцу ранней попытки"
+            }
+          ]
+        }
+      ],
+      "last_status": "BLOCKED: [class=needs_decision rec=cut_surface red=no] needs_decision T1: гонка; варианты: invariant | cut_surface",
+      "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+      "pane_changed": 1791695710.6075687,
+      "activity_files": {},
+      "activity_session": null,
+      "tokens": 0,
+      "peak": 0,
+      "ctx_hist": [
+        0,
+        0
+      ],
+      "alarm_at": 1791695710.6075687,
+      "policy_keys": [
+        [
+          "W1",
+          "2026-10-01",
+          1,
+          "T1",
+          "needs_decision",
+          "tester"
+        ]
+      ],
+      "policy_answered_stamp": [
+        5777546,
+        1791695710621386127
+      ],
+      "auto_answers": 1,
+      "policy_refusal": {
+        "status": "BLOCKED: [class=needs_decision rec=cut_surface red=no] needs_decision T1: гонка; варианты: invariant | cut_surface",
+        "stamp": [
+          5777546,
+          1791695710636678193
+        ],
+        "reason": "развилка задачи T1 уже получила автоответ в прогоне 1"
+      },
+      "questions": [
+        {
+          "at": 1791695710.636782,
+          "text": "BLOCKED: [class=needs_decision rec=cut_surface red=no] needs_decision T1: гонка; варианты: invariant | cut_surface"
+        }
+      ],
+      "outbox": {
+        "blocked": {
+          "value": "BLOCKED: [class=needs_decision rec=cut_surface red=no] needs_decision T1: гонка; варианты: invariant | cut_surface",
+          "fields": {
+            "cls": "needs_decision",
+            "red": false,
+            "variant": "cut_surface",
+            "reason": "policy_refused",
+            "tmux": "wv-w1"
+          },
+          "text": "⏸ demo: волна W1 ждёт тебя\nТип вопроса: нужно решение; красная зона: нет; рекомендация волны: вырезать поверхность находки.\nАвтоответ по политике не отправлен: автоответ по политике не отправлен: проверка отказала.\nВремя: 09:15 Дубай\nНужно: ответь волне в её окне или текстом командой say.\ntmux attach -t wv-w1",
+          "next_at": 1791696010.6465538
+        }
+      }
+    }
+  }
+}
