@@ -19142,6 +19142,30 @@ class MetricsScript(unittest.TestCase):
         self.assertIsNone(w1["fix_cycles"])
         self.assertTrue(w1["problems"])
 
+    def test_manifest_with_a_broken_run_identity_is_not_counted(self):
+        """Codex P2 на #118: manifest без `run` — старый формат и засчитывается; manifest, который заявляет
+        прогон, но с испорченным `run`/`run.index`, — испорченный ввод, а не «свой» прогон."""
+        def with_run(run_value):
+            run, _ = self._lone_wave()
+            m = run / "W1" / "superarmanda" / "manifest.json"
+            d = json.loads(m.read_text(encoding="utf-8"))
+            d["run"] = run_value
+            m.write_text(json.dumps(d), encoding="utf-8")
+            return run
+
+        broken = [{"index": v} for v in (False, True, [], {}, 0, -1, "1", 1.5, None)] + [{}, [], "1", 1, None]
+        for value in broken:
+            with self.subTest(run=value):
+                r = self.cli(with_run(value), "--json")
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                w1 = json.loads(r.stdout)["waves"][0]
+                self.assertIsNone(w1["fix_cycles"], w1)
+                self.assertTrue(w1["problems"], w1)
+        r = self.cli(with_run({"index": 1}), "--json")  # исправное заявление — засчитывается
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["waves"][0]["fix_cycles"], 2)
+
     def test_a_broken_or_missing_file_is_named_not_skipped(self):
         def break_it(run):
             (run / "W1" / "runs.json").write_text("{", encoding="utf-8")                      # corrupt

@@ -14,7 +14,8 @@
     внутри (файлы переименовывают: так в живых каталогах manifest.json держит второй прогон), затем по пути из
     runs.json, затем по его имени рядом; путь принимается только внутри каталога волны (после разрешения
     симлинков), ведущий наружу заменяется именем файла в `superarmanda/`; файл, называющий себя другим
-    прогоном, не подставляется;
+    прогоном, не подставляется; manifest с испорченным `run` (есть, но без положительного целого `index`) —
+    «нет данных», manifest без `run` (старый формат) засчитывается;
   * без `runs.json` — один прогон по `W*/superarmanda/manifest.json` (цепочки до 1.2.0 его не вели);
   * `events.log` — развилки blocked_cap.
 
@@ -153,6 +154,10 @@ def _fix_cycles(path, problems):
     tasks = data.get("tasks") if isinstance(data, dict) else None
     if why or not isinstance(tasks, dict):
         problems.append(why or f"{path.name}: нет tasks")
+        return None
+    if "run" in data and not (isinstance(data["run"], dict) and _is_index(data["run"].get("index"))):
+        # без `run` — manifest старого формата; заявленный, но испорченный номер прогона — испорченный ввод
+        problems.append(f"{path.name}: неверный номер прогона в run")
         return None
     total = 0
     for name, entry in tasks.items():
