@@ -3,6 +3,45 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 1.4.3 — 2026-10-11
+
+Остаток outbox ([#105](https://github.com/bronxtc52/skill-superarmanda/issues/105) п.1,
+[#103](https://github.com/bronxtc52/skill-superarmanda/issues/103) п.3,
+[#102](https://github.com/bronxtc52/skill-superarmanda/issues/102) п.5), волна W2 цепочки `waves-remnants`.
+
+### Исправлено
+
+- `state.json` больше не хранит свободный текст волны ни в одном поле — ни в записи волны, ни в `attempts[i]`
+  (#105 п.1). Раньше строка статуса после реальных эпизодов `blocked`, `dead` и `idle` при недоступном Telegram лежала
+  в `last_status`, `notified.*`, `outbox.*.value`, `outbox.*.fields.wave_status`, `questions[].text`, отметках политики
+  (`policy_pending`, `policy_key_pending.status`, `policy_refusal.status`, `fable_blocked_episode.status`) и с
+  `telegram_quote` ещё в `fields.question` и готовом `text`. Теперь в `state.json` только непрозрачный eid
+  (`sha256:` + 32 hex), слова словарей, числа и моменты времени. Тексты, которые нужны после перезапуска (последний
+  статус, вопросы для `chain-result.md`, цитата `telegram_quote`, сообщение переключения на Opus с ответами владельца,
+  начало набранного текста), лежат в одном хранилище волны `<каталог волны>/.texts/` (файлы 0600, каталог 0700) и при
+  чтении сверяются со своим eid.
+- `pending_text_head` заменён на `pending_text_eid`: начало набранного в окно текста не лежит в `state.json` в открытом
+  виде (#103 п.3). Повтор Enter после перезапуска сверяет экран с тем же началом из хранилища, поведение не изменилось;
+  без текста в хранилище — прежний путь `unverified_enter`.
+- Outbox не хранит готовый текст уведомления (`outbox.*.text`): текст собирается при отправке, момент «молчит с …»
+  хранится числом, и уведомление, поставленное в очередь до смены `timezone` и отправленное после, показывает время в
+  одном поясе во всём тексте (#102 п.5).
+- `notified.<ключ>` хранит eid значения `once_per`: причины диспетчера с путями и текстами исключений в файл не попадают.
+
+### Совместимость
+
+- `state.json` 1.4.x загружается без отказа: `load_state` переводит каждую старую строку в eid **той же** строки
+  (в памяти), поэтому отвеченный эпизод не получает второго автоответа, окончательный отказ политики остаётся
+  окончательным, `policy_keys`, `policy_key_pending` и счётчики сохраняются, а новый эпизод распознаётся. Первый
+  `save_state` кладёт старые тексты в хранилище волны; после первой записи текста в файле нет. Фикстуры 1.4.2 —
+  `tests/fixtures/waves/w2-legacy-1.4/`.
+- Не переведены (текст диспетчера, собранный из фактов гейта и PR, нужен дословно для повтора доставки):
+  `gate_fail_msg.text`, `alarm_msg.text`.
+
+### Документация
+
+- `references/waves.md`: раздел «Тексты волны вне state.json» — инвариант, хранилище, поля и миграция 1.4.x.
+
 ## 1.4.2 — 2026-10-11
 
 Остаток W4 ([#98](https://github.com/bronxtc52/skill-superarmanda/issues/98), [#95](https://github.com/bronxtc52/skill-superarmanda/issues/95)), волна W1 цепочки `waves-remnants`.

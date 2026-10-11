@@ -26,7 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from superarmanda_waves_test import Base, WAVES, asst  # noqa: E402  (installs the TMUX guard)
+from superarmanda_waves_test import Base, WAVES, asst, text_holders  # noqa: E402  (installs the TMUX guard)
 
 import wab  # noqa: E402
 
@@ -590,6 +590,29 @@ class FableLimitWhileBlocked(FableLimitBase):
         self.assertIn(wab.session_marker(self.cfg, "W1"), text)
         self.assertIn("fable limit: W1 → relaunch on claude-opus-5-5", self.events())
 
+    def test_the_switch_keeps_no_text_of_the_wave_in_state_json(self):
+        # #105 п.1, the Fable row of the invariant table (W2StateHoldsNoWaveText): the BLOCKED line, the owner's
+        # answer out of the old journal and the task are in the switch message, and the message waits for its
+        # delivery (the watch died right before the paste) — state.json keeps their eids, the store the texts
+        mark = "W2ТЕКСТВОЛНЫ7Q"
+        self.BLOCKED = f"BLOCKED: {mark} выбрать вариант A или B"
+        self.blocked_wave([user_line(f"Ответ владельца {mark}: вариант B", "2026-10-10T09:30:00.000Z"),
+                           limit_lines()[0]])
+
+        def die(*a, **kw):
+            raise KeyboardInterrupt
+        with mock.patch.object(wab, "send_text", side_effect=die), self.assertRaises(KeyboardInterrupt):
+            self.tick()
+        raw = json.loads(wab.state_path(self.cfg).read_text(encoding="utf-8"))
+        self.assertEqual(text_holders(raw, mark), [])
+        sw = raw["waves"]["W1"]["fable_switch"]
+        self.assertNotIn("text", sw)
+        text = wab.stashed_text(self.cfg, "W1", sw["text_eid"])
+        self.assertIn(f"Ответ владельца {mark}: вариант B", text)
+        self.assertIn(self.BLOCKED, text)
+        self.tick()  # a restarted watch sends the very same message, out of the store
+        self.assertEqual(self.switch_text(), text)
+
     def test_waiting_for_the_owner_is_not_switched(self):
         self.blocked_wave([user_line("ещё до вопроса", "2026-10-10T08:30:00.000Z")])
         self.tick()
@@ -661,7 +684,7 @@ class FableLimitWhileBlocked(FableLimitBase):
         w = self.w()
         self.assertNotIn("blocked", w["notified"])  # no notice of the line handed to the Opus session
         self.assertEqual(len(self.new_sessions()), 1)
-        self.assertEqual(w["fable_blocked_episode"]["status"], self.BLOCKED)
+        self.assertEqual(w["fable_blocked_episode"]["status"], wab.eid(self.BLOCKED))  # 1.4.3: the eid of the line
 
     def test_the_line_asked_again_is_a_new_episode(self):
         self.switched(limit_lines()[:1])
