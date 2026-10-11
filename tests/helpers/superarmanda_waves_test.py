@@ -12098,7 +12098,10 @@ class FixedAnswerPolicy(Base):
                            ("attempts-item", {"attempts": ["x"]}),
                            # N3: a refusal object with corrupt fields is a refusal too, never dropped and re-decided
                            ("refusal-empty", {"policy_refusal": {}}), ("refusal-fields", {"policy_refusal": {"status": 5}}),
-                           ("refusal-stamp", {"policy_refusal": {"status": "s", "stamp": "x", "reason": "r"}})]:
+                           ("refusal-stamp", {"policy_refusal": {"status": "s", "stamp": "x", "reason": "r"}}),
+                           # C4: an empty status is never written (a refusal stores the eid of its line); after the
+                           # load it is not an eid of anything and stays corrupt, never «another episode's refusal»
+                           ("refusal-status-empty", {"policy_refusal": {"status": "", "stamp": None, "reason": "r"}})]:
             with self.subTest(name):
                 self.tg.clear()
                 self.sent.clear()
@@ -20109,7 +20112,10 @@ class W3PolicyEpisodes(Base):
         good = {"status": wab.eid("x"), "stamp": [1, 2]}
         for name, episode in (("not an object", "x"), ("a list", [1]), ("status not a string", dict(good, status=5)),
                               ("no status", {"stamp": [1, 2]}), ("stamp a string", dict(good, stamp="1")),
-                              ("stamp of one", dict(good, stamp=[1])), ("stamp of strings", dict(good, stamp=["1", "2"]))):
+                              ("stamp of one", dict(good, stamp=[1])), ("stamp of strings", dict(good, stamp=["1", "2"])),
+                              # C4: the status is the eid of the line, nothing else (an empty or arbitrary string is corrupt)
+                              ("status empty", dict(good, status="")), ("status arbitrary", dict(good, status="garbage")),
+                              ("status a short eid", dict(good, status="sha256:abc"))):
             for rule in (self.WITH, self.WITHOUT):
                 with self.subTest(episode=name, answer="answer" in rule):
                     self.tg.clear()

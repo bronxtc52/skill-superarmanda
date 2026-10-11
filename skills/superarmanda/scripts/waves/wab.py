@@ -627,7 +627,9 @@ def upgrade_record(w, legacy):
     if isinstance(w.get("policy_pending"), str):
         w["policy_pending"] = eid(w["policy_pending"])
     for holder in (w.get("policy_key_pending"), w.get("policy_refusal"), w.get("fable_blocked_episode")):
-        if isinstance(holder, dict) and isinstance(holder.get("status"), str):
+        # an empty status is never written (a mark holds the line of its episode): it stays as it is and reads as
+        # corrupt, never as the eid of an empty line, i.e. a mark of «another episode» that is dropped (C4)
+        if isinstance(holder, dict) and isinstance(holder.get("status"), str) and holder["status"]:
             holder["status"] = eid(holder["status"])
     pend = w.get("policy_key_pending")
     if isinstance(pend, dict) and isinstance(pend.get("text"), str):
@@ -3308,7 +3310,7 @@ def _forget_fork_key(w, fixed):
 def _refusal_ok(refusal):
     """Is it a `policy_refusal` mark as _policy_answer writes it. Anything else under that name is corrupt
     and reads as a refusal for as long as the wave is BLOCKED (fail closed), never as «decide anew»."""
-    return (isinstance(refusal, dict) and isinstance(refusal.get("status"), str)
+    return (isinstance(refusal, dict) and isinstance(refusal.get("status"), str) and EID.fullmatch(refusal["status"])
             and isinstance(refusal.get("reason"), str)
             and (refusal.get("stamp") is None or isinstance(refusal.get("stamp"), list)))
 
@@ -3317,7 +3319,7 @@ def _episode_ok(episode):
     """Is it a `policy_episode` mark as _policy_answer writes it: {status: eid, stamp: [inode, mtime_ns] or None}.
     Anything else under that name is corrupt: a refusal (fail closed), never «a new episode»."""
     stamp = episode.get("stamp") if isinstance(episode, dict) else None
-    return (isinstance(episode, dict) and isinstance(episode.get("status"), str)
+    return (isinstance(episode, dict) and isinstance(episode.get("status"), str) and EID.fullmatch(episode["status"])
             and (stamp is None or (isinstance(stamp, list) and len(stamp) == 2 and all(_count(x) for x in stamp))))
 
 
