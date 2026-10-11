@@ -1765,7 +1765,7 @@ class Episodes(Base):
         w["pane_digest"] = wab.pane_digest(self.pane)
         w["pane_changed"] = t[0] - 1000  # 0.13.0 raised «молчит» at pane_changed + 60 s
         wab.once_per(w, "idle", w["pane_digest"])
-        wab.put_notice(self.cfg, w, "W1", "idle", w["pane_digest"], n=1)
+        wab.put_notice(self.cfg, w, "W1", "idle", w["pane_digest"], minutes=1)
         self.put_state(self.cfg, st)
         os.utime(main, (t[0] - 3600, t[0] - 3600))
         os.utime(agent, (t[0] - 10, t[0] - 10))  # the subagent wrote after that notice
@@ -10536,7 +10536,7 @@ class LocalAttention(Base):
 
     def test_attention_is_rewritten_with_the_remaining_signal(self):
         cfg, st, w = self.blocked()
-        wab.put_notice(cfg, w, "W2", "idle", "d1", n=30)
+        wab.put_notice(cfg, w, "W2", "idle", "d1", minutes=30)
         wab.save_state(cfg, st)
         wab.flush_notices(cfg, st, w)
         att = cfg["run_dir"] / "ATTENTION"
@@ -18150,10 +18150,15 @@ class W6OwnerTime(Base):
         super().setUp()
         try:
             import dash
-        except ImportError as exc:
-            self.skipTest(f"rich is not installed: {exc}")
-        self.dash = dash
-        dash.MANIFEST_CACHE.clear()
+        except ImportError:  # without rich only the dashboard paths are skipped (#102 item 4), not the whole class
+            self.dash = None
+        else:
+            self.dash = dash
+            dash.MANIFEST_CACHE.clear()
+
+    def need_dash(self):
+        if self.dash is None:
+            self.skipTest("rich is not installed: the dashboard path is skipped")
 
     # ----- the drivers: (zone, moment) -> everything a human reads on that path -----
     def cfg_for(self, zone, **over):
@@ -18167,11 +18172,13 @@ class W6OwnerTime(Base):
         return con.export_text()
 
     def drv_dash_header(self, zone, ts):
+        self.need_dash()
         cfg = self.cfg_for(zone)
         with mock.patch("time.time", return_value=ts):
             return self.rich_text(self.dash.header(cfg, {"current": "W1", "waves": {}}))
 
     def drv_dash_events(self, zone, ts):
+        self.need_dash()
         cfg = self.cfg_for(zone)
         line = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + "Z W1: say: ok\n"
         cfg["run_dir"].mkdir(parents=True, exist_ok=True)
@@ -18209,7 +18216,7 @@ class W6OwnerTime(Base):
 
     def drv_idle(self, zone, ts):
         cfg = self.cfg_for(zone)
-        return wab.notice_text(cfg, "W1", "idle", ts, n=15, time=ts, wave_status="RUNNING")
+        return wab.notice_text(cfg, "W1", "idle", ts, minutes=15, time=ts, wave_status="RUNNING")
 
     # ----- the zone reaches the processes outside the watch loop (round 3) -----
     def _session_env(self, **over):
@@ -18231,6 +18238,7 @@ class W6OwnerTime(Base):
         self.assertIn("SUPERARMANDA_TZ=Asia/Dubai", env)
 
     def test_dash_follows_a_live_zone_change(self):
+        self.need_dash()
         cfg, path = self.chain(timezone="Asia/Dubai")
         st = {"current": "W1", "waves": {}}
         with mock.patch("time.time", return_value=self.T):
@@ -18255,7 +18263,8 @@ class W6OwnerTime(Base):
                "idle_notice": "drv_idle", "human_time": None}
 
     def drivers(self):
-        return {k: getattr(self, v) for k, v in self.DRIVERS.items() if v}
+        return {k: getattr(self, v) for k, v in self.DRIVERS.items()
+                if v and not (self.dash is None and k.startswith("dash_"))}
 
     @staticmethod
     def local(ts, zone):
@@ -18549,6 +18558,8 @@ class W7NoticeTemplates(Base):
                 out[name] = self.NOW - 300
             elif name == "duration":
                 out[name] = 3700
+            elif name == "minutes":
+                out[name] = self.POISON if poison else 12
             elif name == "severity":
                 out[name] = self.POISON if poison else "P1"
             elif name == "cls":
@@ -18729,7 +18740,7 @@ class W7NoticeTemplates(Base):
             self.assertTrue(desc, name)
             if name in vocab:
                 continue  # the vocabularies: a neutral phrase, see the next test
-            for value in bad if name == "red" else [*bad, 1.5] if name not in ("time", "duration") else bad:
+            for value in bad if name == "red" else [*bad, 1.5] if name not in ("time", "duration", "minutes") else bad:
                 if name == "red" and value is True:
                     continue  # a real boolean is the one valid value of `red`
                 with self.subTest(field=name, value=value):
@@ -20368,6 +20379,9 @@ class W4DashReload(Base):
         data.update(over)
         Path(path).write_text(json.dumps(data), encoding="utf-8")
 
+    def told(self, cfg):
+        return [l for l in self.log(cfg).splitlines() if "dash: chain.json identity changed" in l]
+
     def log(self, cfg):
         f = cfg["run_dir"] / "events.log"
         return f.read_text(encoding="utf-8") if f.exists() else ""
@@ -20377,7 +20391,9 @@ class W4DashReload(Base):
         for field, value in cases.items():
             with self.subTest(field=field):
                 cfg, path = self.chain()
+                base = len(self.told(cfg))  # the log is shared by the subtests: count only what this one adds
                 run_dir, ident = cfg["run_dir"], wab._identity(cfg)
+                raw = json.loads(Path(path).read_text(encoding="utf-8")).get(field)  # as the file has it
                 self.edit(path, **{field: value}, timezone="Asia/Tashkent")
                 got = self.dash.reload_cfg(cfg, path)
                 self.assertEqual(wab._identity(got), ident)
@@ -20385,17 +20401,17 @@ class W4DashReload(Base):
                 self.assertEqual(got["timezone"], "Asia/Tashkent")  # the tunable field applied
                 again = self.dash.reload_cfg(got, path)  # the same change on the next frame: no new event
                 self.assertEqual(wab._identity(again), ident)
-                lines = [l for l in self.log(cfg).splitlines() if "dash: chain.json identity changed" in l]
+                lines = self.told(cfg)[base:]
                 self.assertEqual(len(lines), 1, lines)
                 self.assertIn(field, lines[0])
                 self.assertIn(f"keeping {run_dir}", lines[0])
-                self.edit(path, **{field: cfg[field] if field != "run_dir" else str(run_dir)})
+                self.edit(path, **{field: raw})
                 back = self.dash.reload_cfg(again, path)  # back to the original: silence
                 self.assertEqual(wab._identity(back), ident)
-                self.assertEqual(len([l for l in self.log(cfg).splitlines() if "dash: chain.json" in l]), 1)
+                self.assertEqual(len(self.told(cfg)) - base, 1)
                 self.edit(path, **{field: value})  # a new change after the return: told again
                 self.dash.reload_cfg(back, path)
-                self.assertEqual(len([l for l in self.log(cfg).splitlines() if "dash: chain.json" in l]), 2)
+                self.assertEqual(len(self.told(cfg)) - base, 2)
 
     def test_a_broken_file_keeps_the_last_settings(self):
         cfg, path = self.chain()
@@ -20429,7 +20445,7 @@ class W4NoticeMinutes(Base):
                 for i in range(3):
                     self.pane = f"work\nmore work\nthe end {i}\n"
                     wab.tick(cfg, wab.load_state(cfg))
-                    t[0] += 120
+                    t[0] += max(120, minutes * 60 + 60)
         else:
             self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
                 phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time() - 3600 * 24)}})
