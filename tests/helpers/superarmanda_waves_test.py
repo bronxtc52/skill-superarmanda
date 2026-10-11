@@ -19741,5 +19741,184 @@ class W2LegacyStateMigration(Base):
                         self.assertEqual(saved["waves"][wave]["notified"][key], wab.eid(value))
 
 
+
+class W3PolicyEpisodes(Base):
+    """W3 (#100, remainder): ONE invariant per test, a brute force over its cases. Red until the fix.
+    I1 an episode BLOCKED (the line AND the stamp of the status write that reads as it) that a policy rule fits
+       but does not auto-answer (the cap, a machine refusal) raises exactly one `blocked` notice — for a rule with
+       and without `answer`; an empty/unreadable status between episodes is no episode.
+    I2 decisions are taken on the fresh state: a refusal is recorded only while the status still reads as its
+       line; a fixed answer is typed / entered only when fixed_answer recomputed UNDER the input lock gives the
+       same key and text.
+    I3 the full schema of the fork marks (this try and the archived ones): any deviation refuses with
+       FORK_MARKS_CORRUPT; a corrupt `attempts` names `attempts`.
+    I4 answer=accept_limitation on needs_decision is executable by state.py: `--decision accept_limitation`
+       and `--accept --source <s>` for s in DEFER_SOURCES; any other source is refused to the owner."""
+    HEAD_B, ND, BC, BOTH = FixedAnswerPolicy.HEAD_B, FixedAnswerPolicy.ND, FixedAnswerPolicy.BC, FixedAnswerPolicy.BOTH
+    mandate, tick, answers = DecisionPolicy.mandate, DecisionPolicy.tick, DecisionPolicy.answers
+    log, owner_asked = DecisionPolicy.log, DecisionPolicy.owner_asked
+    forge = FixedAnswerPolicy.__dict__["forge"]
+    task_edit = FixedAnswerPolicy.__dict__["task_edit"]
+    two = FixedAnswerPolicy.__dict__["two"]
+    fork, decide, rewrite = FixedAnswerPolicy.fork, FixedAnswerPolicy.decide, FixedAnswerPolicy.rewrite
+    typed_awaiting_enter = FixedAnswerPolicy.typed_awaiting_enter
+    CORRUPT = wab.FORK_MARKS_CORRUPT.split(" (")[0]  # «отметки автоответов в state.json испорчены»
+    WITH = {"class": "needs_decision", "answer": "invariant"}
+    WITHOUT = {"class": "needs_decision"}
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with mock.patch.dict(os.environ):
+            cls.bases = cls.forge()
+
+    # ----- I1: one notice per episode without an auto-answer -----
+    def episodes(self, rule, path):
+        """The notices to the owner after each step, and the expected list (one per episode without an answer)."""
+        cfg, _ = self.mandate(policy=[rule], max_runs=5)
+        self.cfg = cfg
+        cfg["max_auto_answers"] = 1 if path == "a" else 0
+        self.fork(cfg)
+        status = self.ND.format(rec="invariant")
+        got = []
+
+        def step():
+            self.tick(cfg)
+            got.append(len(self.owner_asked()))
+        self.set_status(cfg, "W1", status)
+        step()  # (a) answered; (b)/(c) at the cap: notified
+        if path == "a":
+            self.assertEqual(len(self.answers()), 1)
+            self.rewrite(cfg, status)  # the same line, no RUNNING in between, the cap is spent now
+            step()
+            step()  # the same stamp: the same episode
+            return got, [0, 1, 1]
+        if path == "b":
+            step()  # the same stamp: the same episode
+            self.rewrite(cfg, status)  # a new episode at the cap
+            step()
+            step()
+            return got, [1, 1, 2, 2]
+        self.rewrite(cfg, "")  # (c) the tick meets the wave mid-rewrite: not an episode
+        step()
+        self.rewrite(cfg, status)  # the line is written: a new episode
+        step()
+        step()
+        return got, [1, 1, 2, 2]
+
+    def test_i1_every_episode_without_an_auto_answer_notifies_the_owner_once(self):
+        for name, rule in (("with answer", self.WITH), ("without answer", self.WITHOUT)):
+            for path in ("a", "b", "c"):
+                with self.subTest(rule=name, path=path):
+                    self.tg.clear()
+                    self.sent.clear()
+                    try:
+                        got, want = self.episodes(rule, path)
+                        self.assertEqual(got, want, f"notices after each tick, rule {name}, path ({path})")
+                    finally:
+                        shutil.rmtree(self.cfg["run_dir"], ignore_errors=True)
+
+    # ----- I2: decisions by the fresh state -----
+    def test_i2_a_refusal_is_recorded_only_while_the_status_reads_as_its_line(self):
+        cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+        self.fork(cfg, runs="missing")  # the machine check refuses (runs.json)
+        status = self.ND.format(rec="invariant")
+        path = cfg["run_dir"] / "W1" / "status"
+        real = wab.fixed_answer
+
+        def decide_while_the_wave_moves_on(*a, **kw):
+            got = real(*a, **kw)
+            path.write_text("RUNNING", encoding="utf-8")  # the wave left the line during the check
+            return got
+        self.set_status(cfg, "W1", status)
+        with mock.patch.object(wab, "fixed_answer", decide_while_the_wave_moves_on):
+            st = self.tick(cfg)
+        self.assertEqual(self.answers(), [])
+        self.assertNotIn("policy_refusal", st["waves"]["W1"])
+        self.assertNotIn("policy answer not sent: runs.json", self.log(cfg))
+        self.assertEqual(self.owner_asked(), [], "a refusal of a line the wave already left reached the owner")
+
+    def test_i2_the_answer_is_decided_again_under_the_input_lock(self):
+        changes = {"role unavailable": dict(base="quota"), "another run (another key)": dict(index=2),
+                   "two forks": dict(edit=self.two)}
+        for step in ("typing", "enter-only retry"):
+            for name, change in changes.items():
+                with self.subTest(step=step, change=name):
+                    self.tg.clear()
+                    self.sent.clear()
+                    self.enters.clear()
+                    if step == "typing":
+                        cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+                        shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+                        self.fork(cfg)
+                        self.set_status(cfg, "W1", self.ND.format(rec="invariant"))
+                    else:
+                        cfg, _ = self.typed_awaiting_enter()
+                        self.sent.clear()
+                    real_lock = wab._InputLock.__enter__
+
+                    def enter_and_the_fork_changes(lock):  # manifest/runs.json changed while waiting for the lock
+                        got = real_lock(lock)
+                        self.fork(cfg, **change)
+                        return got
+                    try:
+                        with mock.patch.object(wab._InputLock, "__enter__", enter_and_the_fork_changes):
+                            self.tick(cfg)
+                        self.assertEqual(self.answers(), [], "a fixed answer typed after the fork changed under the lock")
+                        self.assertEqual(self.enters, [], "a fixed answer entered after the fork changed under the lock")
+                    finally:
+                        shutil.rmtree(cfg["run_dir"], ignore_errors=True)
+
+    # ----- I3: the full schema of the fork marks -----
+    def test_i3_any_deviation_of_the_fork_marks_refuses_as_corrupt(self):
+        key = ["W1", RUN_ID, 2, "T1", "needs_decision", "tester"]  # a valid key of ANOTHER fork (run 2)
+        status = self.ND.format(rec="invariant")
+        flight = {"key": key, "status": wab.eid(status), "text": wab.eid("t")}
+        cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+        self.fork(cfg)
+        for where, w in (("keys", {"policy_keys": [key]}), ("pending", {"policy_key_pending": flight}),
+                         ("attempt", {"attempts": [{"policy_keys": [key], "policy_key_pending": flight}]})):
+            with self.subTest(guard=where):  # the valid shape is not refused
+                self.assertTrue(self.decide(cfg, w=w)["ok"], self.decide(cfg, w=w))
+        bad_keys = [["W1"], [*key, "x"], []]
+        for i, values in enumerate([[1, None], [None, 5], ["2", True, False, 0, -1, 2.0, None],
+                                    [5, None], ["nonsense", "question", "merge_gate", 4], ["bogus", None, 1]]):
+            bad_keys += [[*key[:i], v, *key[i + 1:]] for v in values]
+        bad_pending = [{"key": key}, {"key": key, "text": flight["text"]}, {"key": key, "status": flight["status"]},
+                       dict(flight, status=5), dict(flight, text=None), dict(flight, status=None)]
+        bad_pending += [dict(flight, key=k) for k in bad_keys]
+        cases = []
+        for k in bad_keys:
+            cases += [(f"policy_keys {k!r}", {"policy_keys": [k]}),
+                      (f"attempts[0].policy_keys {k!r}", {"attempts": [{"policy_keys": [k]}]})]
+        for p in bad_pending:
+            cases += [(f"policy_key_pending {p!r}", {"policy_key_pending": p}),
+                      (f"attempts[0].policy_key_pending {p!r}", {"attempts": [{"policy_key_pending": p}]})]
+        for name, w in cases:
+            with self.subTest(name):
+                got = self.decide(cfg, w=w)
+                self.assertFalse(got["ok"], f"an automatic answer over a corrupt mark: {name}")
+                self.assertTrue(got["reason"].startswith(self.CORRUPT), got["reason"])
+        for name, attempts in (("string", "x"), ("null", None), ("an item not an object", ["x"]), ("object", {})):
+            with self.subTest(attempts=name):
+                got = self.decide(cfg, w={"attempts": attempts})
+                self.assertFalse(got["ok"])
+                self.assertTrue(got["reason"].startswith(self.CORRUPT), got["reason"])
+                self.assertIn("attempts", got["reason"], "the reason does not name the corrupt `attempts`")
+
+    # ----- I4: the fixed accept_limitation is executable by state.py -----
+    def test_i4_accept_limitation_names_what_state_py_accepts_for_the_source(self):
+        cfg, _ = self.mandate(policy=[{"class": "needs_decision", "answer": "accept_limitation"}], max_runs=5)
+        for source in sorted(wab.gate.state.FIX_SOURCES):
+            with self.subTest(source=source):
+                self.fork(cfg, edit=self.task_edit(decision_required_for=source))
+                got = self.decide(cfg, answer="accept_limitation", rec="invariant")
+                if source in wab.gate.state.DEFER_SOURCES:
+                    self.assertTrue(got["ok"], got)
+                    self.assertIn("fix-loop --decision accept_limitation", got["text"])
+                    self.assertIn(f"fix-loop --accept --source {source}", got["text"])
+                else:  # state.py refuses `--accept` for it: the wave could not execute the answer
+                    self.assertFalse(got["ok"], f"accept_limitation sent for source {source}: {got.get('text')}")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
