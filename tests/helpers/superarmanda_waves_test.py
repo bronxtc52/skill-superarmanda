@@ -20194,6 +20194,121 @@ class W3PolicyEpisodes(Base):
                     wab.press_enter.side_effect = None
                     shutil.rmtree(cfg["run_dir"], ignore_errors=True)
 
+    def test_i5_a_refusal_is_written_only_on_a_status_that_reads_as_the_episode_now(self):
+        # Astra on f614ede (#100): a corrupt episode mark refuses on the status read at the tick; the file is EMPTY mid-rewrite
+        # (the tick decides on last_status) — no refusal and no notice; the same line written anew is refused exactly once
+        cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+        try:
+            self.fork(cfg)
+            status = self.ND.format(rec="invariant")
+            st = self.tick(cfg, status)
+            self.assertEqual(len(self.answers()), 1)
+            st["waves"]["W1"]["policy_episode"] = "garbage"
+            wab.save_state(cfg, st)
+            self.rewrite(cfg, "")
+            w = self.tick(cfg)["waves"]["W1"]
+            self.assertNotIn("policy_refusal", w, "a refusal written over an empty status")
+            self.assertEqual(self.owner_asked(), [])
+            self.rewrite(cfg, status)
+            for _ in range(3):
+                w = self.tick(cfg)["waves"]["W1"]
+            self.assertEqual(w["policy_refusal"]["reason"], wab.EPISODE_CORRUPT)
+            self.assertEqual(len(self.owner_asked()), 1, "the refusal reached the owner more than once")
+        finally:
+            shutil.rmtree(cfg["run_dir"], ignore_errors=True)
+
+    def test_i5_the_refusal_after_a_clearing_that_did_not_move_the_status_reaches_the_owner_once(self):
+        # D: the status did not change while the input was cleared — the refusal is written, one notice over two ticks
+        cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+        try:
+            self.fork(cfg)
+            status = self.ND.format(rec="invariant")
+            self.set_status(cfg, "W1", status)
+
+            def typed_then_watch_dies(name, text, on_typed=None, **kw):
+                self.sent.append(("text", name, text))
+                on_typed()
+                raise KeyboardInterrupt
+            with mock.patch.object(wab, "send_text", typed_then_watch_dies):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.tick(cfg)
+            st = wab.load_state(cfg)
+            st["waves"]["W1"]["policy_key_pending"] = {"status": status, "text": "x"}  # the key is lost
+            self.put_state(cfg, st)
+            for _ in range(2):
+                w = self.tick(cfg)["waves"]["W1"]
+            self.assertIn("policy_refusal", w)
+            self.assertEqual(len(self.owner_asked()), 1)
+            self.assertEqual(w.get("auto_answers"), 1, "the given-up answer is charged exactly once")
+        finally:
+            shutil.rmtree(cfg["run_dir"], ignore_errors=True)
+
+    def test_i5_the_precheck_runs_right_before_the_first_enter_of_the_enter_only_retry(self):
+        # B: the fork changes between the precheck at the start of _deliver and the first Enter of the retry
+        cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+        try:
+            shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+            self.fork(cfg)
+            self.set_status(cfg, "W1", self.ND.format(rec="invariant"))
+
+            def send(n, t, on_typed=None, before_enter=None):
+                self.sent.append(("text", n, t))
+                if on_typed:
+                    on_typed()
+                raise wab.NotSubmitted("the Enter is lost")
+            with mock.patch.object(wab, "send_text", side_effect=send):
+                st = self.tick(cfg)
+            self.assertEqual(st["waves"]["W1"].get("pending_enter"), "policy answer")
+            real, calls = wab.fixed_answer, []
+
+            def change_before_the_enter(*a, **kw):
+                calls.append(1)
+                if len(calls) == 3:  # decision, precheck under the lock, then the check right before the Enter
+                    self.fork(cfg, index=2)
+                return real(*a, **kw)
+            with mock.patch.object(wab, "fixed_answer", change_before_the_enter), \
+                    mock.patch.object(wab, "unsent_reason", return_value=None):
+                w = self.tick(cfg)["waves"]["W1"]
+            self.assertGreaterEqual(len(calls), 3)
+            self.assertEqual(self.enters, [], "an Enter of a stale answer was pressed")
+            self.assertNotEqual(w.get("pending_enter"), "policy answer")
+        finally:
+            shutil.rmtree(cfg["run_dir"], ignore_errors=True)
+
+    def test_i5_a_fresh_answer_given_up_after_its_first_enter_is_charged_once(self):
+        # C: the first Enter left the text visible, the fork changed before the repeated Enter: abandoned, +1 exactly
+        cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+        try:
+            shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+            self.fork(cfg)
+            self.set_status(cfg, "W1", self.ND.format(rec="invariant"))
+            unsent = iter(["the text is still in the input line"] + [None] * 5)
+
+            def enter(n):
+                self.enters.append(n)
+                if len(self.enters) == 1:
+                    self.fork(cfg, index=2)
+
+            def send(n, t, on_typed=None, before_enter=None):
+                self.sent.append(("text", n, t))
+                if on_typed:
+                    on_typed()
+                if before_enter:
+                    before_enter()
+                wab.submit(n, t, before_enter=before_enter)
+            try:
+                with mock.patch.object(wab, "send_text", side_effect=send), \
+                        mock.patch.object(wab, "unsent_reason", side_effect=lambda *a: next(unsent)):
+                    wab.press_enter.side_effect = enter
+                    w = self.tick(cfg)["waves"]["W1"]
+            finally:
+                wab.press_enter.side_effect = lambda n: self.enters.append(n)
+            self.assertEqual(len(self.enters), 1)
+            self.assertEqual(w.get("auto_answers"), 1, "a given-up answer must be charged to the cap exactly once")
+            self.assertEqual(wab.auto_answers_used(w), 1)
+        finally:
+            shutil.rmtree(cfg["run_dir"], ignore_errors=True)
+
     def test_i3_a_corrupt_episode_mark_is_a_refusal_not_a_new_episode(self):
         good = {"status": wab.eid("x"), "stamp": [1, 2]}
         for name, episode in (("not an object", "x"), ("a list", [1]), ("status not a string", dict(good, status=5)),

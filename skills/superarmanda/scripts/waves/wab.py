@@ -4382,7 +4382,9 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None, recheck_enter=False
                         # pressed as before, and the owner is told that this delivery is NOT verified
                         put_notice(cfg, w, wave, "unverified_enter", what, reason=action_reason(what))
                         event(cfg, f"{wave}: {what} (Enter): delivery NOT verified (no saved text head)")
-                    try:  # the precheck above held right now; every REPEATED Enter is checked again
+                    try:  # the precheck is run right before EVERY Enter of the typed text: the first one here, the repeats in submit
+                        if before_enter:
+                            before_enter()
                         ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, check,
                                   **({"before_enter": before_enter} if before_enter else {}))
                     except _StaleBeforeEnter as e:
@@ -4426,8 +4428,12 @@ def _abandon_input(cfg, st, wave, w, why, locked=False, target=None):
     into this window (_deliver, `say`). `locked`: the caller already holds the window's input lock."""
     what = w.get("pending_enter")
     if what:
-        if what == "policy answer" and "policy_key_pending" in w:
-            _keep_fork_key(w)  # a fixed answer (#89) given up, possibly submitted: its fork counts as answered
+        if what == "policy answer":
+            # THE charge of a given-up policy answer, once and only here: it may have been submitted, never one free
+            w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
+            w.pop("policy_pending", None)
+            if "policy_key_pending" in w:
+                _keep_fork_key(w)  # a fixed answer (#89) given up, possibly submitted: its fork counts as answered
         w["pending_clear"] = {"what": what, "why": why}
         w.pop("pending_enter", None)
         w.pop("pending_text_eid", None)
@@ -6548,31 +6554,32 @@ def auto_answers_used(w):
             + sum(1 for r in recs if _answer_in_flight(r)))
 
 
-def _moved_on_while_cleared(cfg, st, wave, w, status):
+def _moved_on_while_cleared(cfg, st, wave, w, status, cleared=True):
     """The input line was just cleared (rounds of clear_input, the wait for the paste footer): the wave may have
     left the line meanwhile. Then nothing of this episode is decided — no refusal, no `cap reached`, no notice of
     an episode that is over; the tick ends (None) and the next one decides on the fresh state (#100 p.12)."""
     if read(wave_dir(cfg, wave) / "status", on_error=None) == status:
         return False
     save_state(cfg, st)
-    event(cfg, f"{wave}: policy answer not decided: the status changed while the input was cleared")
+    event(cfg, f"{wave}: policy answer not decided: the status changed "
+               + ("while the input was cleared" if cleared else "before the refusal was written"))
     return True
 
 
-def _policy_refuse(cfg, st, wave, w, es, stamp, reason, status):
+def _policy_refuse(cfg, st, wave, w, es, stamp, reason, status, was_typed=False):
     """THE machine refusal of a policy episode (False: the usual BLOCKED path). The refusal is this episode's
     decision and always reaches the owner WITH its reason, whatever `blocked` mark the text of the line already
     carries (once per episode: later ticks return on `policy_refusal`). None: the wave left the line while a
     typed answer was cleared — no refusal of an episode that is over."""
-    if w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es):
+    typed = w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es)
+    cleared = was_typed or typed  # an input line was cleared on the way here: the event says so
+    if typed:
         # a typed answer waits for its Enter, and the check no longer gives it (a corrupt mark, or the fork
         # changed since the typing: FORK_CHANGED) — the Enter is not pressed, and its text never stays in the
-        # input line of an episode the owner now answers (it may have gone out: charged)
-        w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
-        w.pop("policy_pending", None)
+        # input line of an episode the owner now answers (it may have gone out: charged by _abandon_input)
         _abandon_input(cfg, st, wave, w, "policy answer: refused by the machine check")
-        if _moved_on_while_cleared(cfg, st, wave, w, status):
-            return None
+    if _moved_on_while_cleared(cfg, st, wave, w, status, cleared):
+        return None  # THE invariant: a refusal is written only on a status that reads as this episode's line NOW
     w["policy_refusal"] = {"status": es, "stamp": stamp, "reason": reason}
     drop_notice(w, "blocked")
     save_state(cfg, st)
@@ -6655,9 +6662,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     if owner_answered(cfg, wave, status):  # the owner answered this very episode with `say`
         if w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es):
             # our answer is typed and waits for its Enter, the owner's came after: clear it (it may
-            # have gone out already: charged to the cap)
-            w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
-            w.pop("policy_pending", None)
+            # have gone out already: charged to the cap by _abandon_input)
             _abandon_input(cfg, st, wave, w, "policy answer: the owner answered this episode (say)")
             save_state(cfg, st)
         if once_per(w, "owner_answered", f"{status}|{_status_stamp(cfg, wave)}"):
@@ -6671,8 +6676,6 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     if used >= cap and w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es):
         # the cap was lowered under an answer that is typed and waits for its Enter: it may already be
         # submitted (charged, like on a status change); never leave its text in the input line
-        w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
-        w.pop("policy_pending", None)
         _abandon_input(cfg, st, wave, w, "policy answer: the cap was lowered")
         if _moved_on_while_cleared(cfg, st, wave, w, status):
             return None
@@ -6737,18 +6740,11 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         w.pop("policy_pending", None)
         if fixed and not retry:
             _forget_fork_key(w, fixed)  # nothing was typed: this fork key is not in flight
-        if retry:  # the typed answer was given up, possibly already submitted: charged to the cap
-            w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
-        if seen.get("changed") and _moved_on_while_cleared(cfg, st, wave, w, status):
-            return None  # a typed answer was cleared and the wave left the line meanwhile: nothing to refuse
+        # a typed answer given up inside _deliver (possibly already submitted) was charged by _abandon_input
         if seen.get("changed"):
             # the fork changed under the input lock: nothing was typed / entered, and this is the machine refusal of
             # the episode (like any other), not a silent skip: the owner is told with the reason
-            w["policy_refusal"] = {"status": es, "stamp": stamp, "reason": seen["changed"]}
-            drop_notice(w, "blocked")
-            save_state(cfg, st)
-            event(cfg, f"{wave}: policy answer not sent: {safe_text(seen['changed'], 200)}")
-            return False
+            return _policy_refuse(cfg, st, wave, w, es, stamp, seen["changed"], status, was_typed=True)
         save_state(cfg, st)
         if seen.get("owner"):
             event(cfg, f"{wave}: policy answer not sent: the owner answered this episode (say)")
@@ -6997,8 +6993,6 @@ def _tick(cfg, st):
     if not lost and w.get("pending_enter") == "policy answer" and not _same(w.get("policy_pending"), eid(status)):
         # the wave left that BLOCKED line: the half-sent answer is outdated. It may already have been
         # submitted (watch died before its final save), so it is charged to the cap: never one free
-        w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
-        w.pop("policy_pending", None)
         _abandon_input(cfg, st, wave, w, "the wave left the BLOCKED line of the answer")
         save_state(cfg, st)
 
