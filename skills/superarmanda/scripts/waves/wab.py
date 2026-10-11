@@ -3159,6 +3159,26 @@ FIXED_MEANING["needs_decision", "cut_surface", True] = FIXED_MEANING["needs_deci
 FIXED_MEANING["needs_decision", "accept_limitation", True] = (
     FIXED_MEANING["needs_decision", "accept_limitation", False] + FIXED_NEW_RUN)
 FIXED_MEANING["blocked_cap", "new_run", True] = FIXED_MEANING["blocked_cap", "invariant", True]
+# THE wording of 1.4.3 for the entries 1.4.4 changed (commands without --note/--source/--severity): an answer
+# typed by the dispatcher of 1.4.3 waits for its Enter in a state.json the chain carries over the upgrade between
+# waves; its Enter-only retry checks the same decision (key, answer, run) and accepts this wording as typed.
+FIXED_MEANING_143 = {
+    ("needs_decision", "invariant", False): " Доделай как следует: ещё один круг, " + FIXED_THOROUGH
+    + " Решение запиши: fix-loop --decision invariant.",
+    ("needs_decision", "invariant", True): " Доделай как следует: " + FIXED_THOROUGH
+    + " Решение запиши: fix-loop --decision invariant." + FIXED_NEW_RUN,
+    ("needs_decision", "cut_surface", False): (" Вырежи поверхность, давшую находку (fix-loop --decision "
+                                               "cut_surface), остаток — в result.md."),
+    ("needs_decision", "accept_limitation", False): (" Прими ограничение (fix-loop --decision accept_limitation): "
+                                                     "строка в «Принятые ограничения» PR и в остаток."),
+    ("blocked_cap", "accept_limitation", True): (
+        " Прими ограничение: открой новый прогон (state.py init --from-plan на новом пути), прогон {n} из {max}, "
+        "и в нём находку не чини, а прими как ограничение (fix-loop --accept, строка в «Принятые ограничения» PR "
+        "и в остаток)."),
+}
+FIXED_MEANING_143["needs_decision", "cut_surface", True] = FIXED_MEANING_143["needs_decision", "cut_surface", False] + FIXED_NEW_RUN
+FIXED_MEANING_143["needs_decision", "accept_limitation", True] = (
+    FIXED_MEANING_143["needs_decision", "accept_limitation", False] + FIXED_NEW_RUN)
 FORK_MARKS_CORRUPT = "отметки автоответов в state.json испорчены (policy_keys / policy_key_pending)"
 FORK_ATTEMPTS_CORRUPT = "отметки автоответов в state.json испорчены (attempts)"
 EPISODE_CORRUPT = "отметки автоответов в state.json испорчены (policy_episode)"
@@ -3330,7 +3350,7 @@ def _fixed_answer(cfg, wave, w, label, rule, status):
     retry = bool(pend and _same(pend.get("status"), es) and w.get("pending_enter") == "policy answer"
                  and _same(w.get("policy_pending"), es))
     got = _fork_decision(cfg, wave, label, rule, marks, pend if retry else None)
-    if retry and not (got["ok"] and got["key"] == pend["key"] and eid(got["text"]) == eid(pend.get("text"))):
+    if retry and not (got["ok"] and got["key"] == pend["key"] and eid(pend.get("text")) in got["typed"]):
         return _refuse(FORK_CHANGED + ("пересчитанный ответ не совпадает с напечатанным" if got["ok"]
                                        else got["reason"]))
     return got
@@ -3390,10 +3410,15 @@ def _fork_decision(cfg, wave, label, rule, marks, own):
     for keys, pend in marks:
         if key in keys or (pend and pend is not own and pend.get("key") == key):
             return _refuse(f"развилка задачи {task} уже получила автоответ в прогоне {index}")
-    text = FIXED_HEAD.format(answer=answer) + FIXED_MEANING[cls, answer, new_run].format(n=index + 1, max=cap, source=source)
-    if label["rec"] != answer:
-        text += f" (рекомендация волны: {label['rec']})"
-    return {"ok": True, "text": text + FIXED_TAIL, "key": key, "answer": answer, "rec": label["rec"]}
+    def wording(meaning):
+        text = FIXED_HEAD.format(answer=answer) + meaning.format(n=index + 1, max=cap, source=source)
+        if label["rec"] != answer:
+            text += f" (рекомендация волны: {label['rec']})"
+        return text + FIXED_TAIL
+    text = wording(FIXED_MEANING[cls, answer, new_run])
+    # the same decision as typed by 1.4.3 (the Enter-only retry of an answer carried over the upgrade)
+    typed = [eid(text)] + [eid(wording(FIXED_MEANING_143[k])) for k in [(cls, answer, new_run)] if k in FIXED_MEANING_143]
+    return {"ok": True, "text": text, "typed": typed, "key": key, "answer": answer, "rec": label["rec"]}
 
 
 def system_prompt(cfg):
