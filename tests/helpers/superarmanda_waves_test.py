@@ -19026,6 +19026,12 @@ class MetricsScript(unittest.TestCase):
             "other wave interleaved does not reset": ([blocked, other, blocked, other], 1),
             "phase status is a truncated prefix": ([blocked, f"{t} W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=blocked_cap rec=new_run red"], 1),
             "bare RUNNING between": ([blocked, f"{t} W1: RUNNING", blocked], 2),
+            "successful say answers the fork": ([blocked, f"{t} W1: say: [координатор] ответ", blocked], 2),
+            "say of another wave does not": ([blocked, f"{t} W2: say: ответ", blocked], 1),
+            "say FAILED does not answer": ([blocked, f"{t} W1: say FAILED (no window x): ответ", blocked], 1),
+            "say service lines answer nothing": ([
+                blocked, f"{t} W1: say: owner-answered marker not written (disk full)",
+                f"{t} W1: say: status rewritten while the marker was taken; the marker answers no episode", blocked], 1),
         }
         for name, (lines, want) in cases.items():
             with self.subTest(name):
@@ -19038,6 +19044,103 @@ class MetricsScript(unittest.TestCase):
         shutil.copytree(self.FIXTURE, run)
         mutate(run)
         return run
+
+    def test_bad_input_is_no_data_not_traceback(self):
+        """#107: испорченный и чужой ввод — «нет данных», код 1, никогда traceback."""
+        def runs(run, **patch):
+            f = run / "W1" / "runs.json"
+            d = json.loads(f.read_text(encoding="utf-8"))
+            d.update(patch)
+            f.write_text(json.dumps(d), encoding="utf-8")
+
+        def bad_index(value):
+            def mutate(run):
+                f = run / "W1" / "runs.json"
+                d = json.loads(f.read_text(encoding="utf-8"))
+                d["runs"][0]["index"] = value
+                f.write_text(json.dumps(d), encoding="utf-8")
+            return mutate
+
+        deep = "[" * 100000
+
+        def deep_runs(run):
+            (run / "W1" / "runs.json").write_text(deep, encoding="utf-8")
+
+        def deep_manifest(run):
+            for m in (run / "W1" / "superarmanda").glob("manifest*.json"):
+                m.write_text(deep, encoding="utf-8")
+
+        cases = {f"index {v!r}": bad_index(v) for v in ([], {}, True, 0, -1, "1", 1.5)}
+        cases.update({
+            "deep runs.json": deep_runs,
+            "deep manifest": deep_manifest,
+            "runs.json of another wave": lambda run: runs(run, wave="W2"),
+            "runs.json of a wrong version": lambda run: runs(run, version=2),
+            "runs.json without a version": lambda run: runs(run, version=None),
+        })
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                run = self.make(mutate)
+                r = self.cli(run, "--json")
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                w1 = {w["wave"]: w for w in json.loads(r.stdout)["waves"]}["W1"]
+                self.assertTrue(w1["problems"], w1)
+                self.assertIsNone(w1["fix_cycles"], w1)
+
+    def _lone_wave(self, copy_cycles=2, outside_cycles=7, in_copy=True):
+        """Каталог прогона с одной волной W1: runs.json называет manifest по абсолютному пути ВНЕ каталога волны
+        (оригинал, fix_cycles=outside_cycles); в копии рядом manifest без run.index (по индексу его не найти)."""
+        base = Path(tempfile.mkdtemp(prefix="wab-metrics-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        manifest = lambda n: json.dumps({"version": 1, "wave": "W1", "tasks": {"t": {"fix_cycles": n}}})  # noqa: E731
+        outside = base / "original" / "manifest.json"
+        outside.parent.mkdir()
+        outside.write_text(manifest(outside_cycles), encoding="utf-8")
+        run = base / "run"
+        (run / "W1" / "superarmanda").mkdir(parents=True)
+        (run / "events.log").write_text("", encoding="utf-8")
+        (run / "W1" / "runs.json").write_text(json.dumps({"version": 1, "wave": "W1", "runs": [
+            {"index": 1, "manifest": str(outside)}]}), encoding="utf-8")
+        if in_copy:
+            (run / "W1" / "superarmanda" / "manifest.json").write_text(manifest(copy_cycles), encoding="utf-8")
+        return run, outside
+
+    def test_manifest_outside_the_wave_dir_is_never_read(self):
+        run, _ = self._lone_wave()
+        r = self.cli(run, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        w1 = json.loads(r.stdout)["waves"][0]
+        self.assertEqual((w1["runs"], w1["fix_cycles"]), (1, 2))  # числа копии, а не оригинала
+        run, _ = self._lone_wave(in_copy=False)
+        r = self.cli(run, "--json")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        w1 = json.loads(r.stdout)["waves"][0]
+        self.assertIsNone(w1["fix_cycles"])
+        self.assertTrue(w1["problems"])
+
+    def test_symlink_manifest_pointing_out_is_never_read(self):
+        run, outside = self._lone_wave(in_copy=False)
+        outside.write_text(json.dumps({"version": 1, "wave": "W1", "run": {"index": 1},
+                                       "tasks": {"t": {"fix_cycles": 7}}}), encoding="utf-8")
+        (run / "W1" / "superarmanda" / "manifest-run1.json").symlink_to(outside)
+        (run / "W1" / "superarmanda" / "manifest.json").symlink_to(outside)
+        r = self.cli(run, "--json")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        w1 = json.loads(r.stdout)["waves"][0]
+        self.assertIsNone(w1["fix_cycles"])
+        self.assertTrue(w1["problems"])
+
+    def test_manifest_of_another_run_is_not_substituted(self):
+        run, _ = self._lone_wave()
+        (run / "W1" / "superarmanda" / "manifest.json").write_text(json.dumps(
+            {"version": 1, "wave": "W1", "run": {"index": 2}, "tasks": {"t": {"fix_cycles": 2}}}), encoding="utf-8")
+        r = self.cli(run, "--json")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        w1 = json.loads(r.stdout)["waves"][0]
+        self.assertIsNone(w1["fix_cycles"])
+        self.assertTrue(w1["problems"])
 
     def test_a_broken_or_missing_file_is_named_not_skipped(self):
         def break_it(run):
