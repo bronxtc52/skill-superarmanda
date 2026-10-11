@@ -20483,6 +20483,7 @@ class W4NoticeMinutes(Base):
     def test_the_formatter(self):
         fmt = wab.NOTICE_FIELDS["minutes"][1]
         for value, want in [(12, "12 мин"), (12.0, "12 мин"), (0, "0 мин"), (0.5, "30 с"), (1.5, "1 мин 30 с"),
+                            (0.005, "<1 с"), (0.008, "<1 с"), (1e-9, "<1 с"), (0.009, "1 с"),
                             (True, "?"), (-1, "?"), ("5", "?"), (None, "?"), (float("nan"), "?"),
                             (float("inf"), "?"), (10 ** 6, "?"), (10 ** 6 + 0.5, "?")]:
             with self.subTest(value=value):
@@ -20553,12 +20554,56 @@ class W4MaskBoundaries(Base):
         end = text.find("\n- `", start)
         return text[start:end if end != -1 else len(text)]
 
-    def test_item1_formatting_at_the_input_is_masked_the_boundary_is_only_static(self):
-        s = self.SECRET
-        for name, raw in (("percent", "ключ %s" % (s,)), ("format", "ключ {}".format(s)), ("fstring", f"ключ {s}")):
-            with self.subTest(item=1, form=name):
-                self.assertNotIn(s[:8], wab.redact(raw))
-                self.assertNotIn(s[:8], wab.safe_text(raw, 10 ** 6))
+    def test_item1_the_static_guard_sees_a_name_not_an_obfuscated_call(self):
+        """The guard «redact only inside safe_text» (redact_uses_outside) is an ast walk over Name/Attribute: a direct
+        call by name is caught, a call that names redact only in a string (getattr/globals) is not. That is the boundary
+        the doc names; what holds the line beyond it is code review and the OUTPUT_PATHS registry with its tests."""
+        with tempfile.TemporaryDirectory() as d:
+            cases = {
+                "direct": ("import wab\ndef out(t):\n    return wab.redact(t)\n", True),
+                "bare": ("from wab import redact\ndef out(t):\n    return redact(t)\n", True),
+                "getattr": ('import wab\ndef out(t):\n    return getattr(wab, "redact")(t)\n', False),
+                "globals": ('def out(t):\n    return globals()["re" + "dact"](t)\n', False),
+                "inside_safe_text": ("import wab\ndef safe_text(t):\n    return wab.redact(t)\n", False),
+            }
+            for name, (src, caught) in cases.items():
+                with self.subTest(item=1, form=name):
+                    for old in Path(d).glob("*.py"):
+                        old.unlink()
+                    (Path(d) / "probe.py").write_text(src, encoding="utf-8")
+                    found = [f for f in redact_uses_outside(d) if f[2] == "out"]
+                    self.assertEqual(bool(found), caught, (src, found))
+
+    def test_item1_the_doc_names_what_holds_the_line(self):
+        para = self.boundaries_paragraph()
+        for phrase in ("страж разработки", "`getattr`", "ревью кода", "`OUTPUT_PATHS`"):
+            with self.subTest(item=1, phrase=phrase):
+                self.assertIn(phrase, para)
+        self.assertNotIn("всё равно маскирует", para)
+
+    def test_the_quoted_question_carries_the_same_boundaries_outside(self):
+        """telegram_quote: true is the only path of the wave's free text to an external output (_question_field ->
+        quote -> safe_text): a secret torn by U+00A0 shows both parts THERE too. Without the flag no question at all."""
+        head, tail = self.SECRET[:22], self.SECRET[22:]
+        q = f"ключ {head}\u00a0{tail}\nвторая строка {self.SECRET}"
+        cfg, _ = self.chain(telegram_quote=True)
+        text = str(wab.notice_text(cfg, "W1", "idle", question=q))
+        self.assertIn(head, text)
+        self.assertIn(tail, text)
+        self.assertNotIn("вторая строка", text)  # only the first line goes out
+        cfg, _ = self.chain(telegram_quote=False)
+        text = str(wab.notice_text(cfg, "W1", "idle", question=q))
+        for part in (head, tail, "ключ"):
+            self.assertNotIn(part, text)
+        cfg, _ = self.chain()
+        self.assertNotIn(head, str(wab.notice_text(cfg, "W1", "idle", question=q)))
+
+    def test_the_doc_says_the_quote_flag_is_under_the_same_boundaries(self):
+        para = self.boundaries_paragraph()
+        for phrase in ("`telegram_quote: true`", "`_question_field`", "без секретов и персональных данных"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, para)
+        self.assertNotIn("их не касаются", para)
 
     def test_item2_a_pair_does_not_bind_the_key_to_the_value(self):
         for raw in ([["api_key", "hunter2value"]], {"name": "api_key", "value": "hunter2value"}):

@@ -2235,12 +2235,15 @@ def _duration_field(cfg, value):
 
 
 def _minutes_field(cfg, value):
-    """A duration given in minutes (may be fractional): «12 мин», «30 с», «1 мин 30 с»; anything else «?»."""
+    """A duration given in minutes (may be fractional): «12 мин», «30 с», «1 мин 30 с»; a positive value that rounds
+    to 0 s is «<1 с» (only 0 itself is «0 мин»); anything else «?»."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "?"
     if value != value or value < 0 or value >= 10 ** 6:
         return "?"
     secs = int(round(value * 60))
+    if secs == 0 and value > 0:
+        return "<1 с"
     m, sec = divmod(secs, 60)
     if sec == 0:
         return f"{m} мин"
