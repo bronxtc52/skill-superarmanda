@@ -19176,13 +19176,12 @@ class Release143(unittest.TestCase):
     """The release 1.4.3 (#105 п.1, #103 п.3, #102 п.5; wave W2 of waves-remnants): version, the CHANGELOG section on
     top, the paragraph of waves.md about the texts of the wave outside state.json."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.3"\s*$')
+    # the version of SKILL.md moved on to 1.4.4 (#100): Release144 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.3 — 2026-10-11$", "1.4.3 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.4\.3 — 2026-10-11$", "CHANGELOG.md: the section of 1.4.3")
+        self.assertTrue(log.index("## 1.4.3") < log.index("## 1.4.2"), "1.4.3 is above 1.4.2")
         body = re.search(r"(?ms)^## 1\.4\.3 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
         for needle in ("#105", "#103", "#102", "### Исправлено", "### Совместимость", "`pending_text_eid`", ".texts/",
                        "eid **той же** строки"):
@@ -19193,6 +19192,21 @@ class Release143(unittest.TestCase):
         for needle in ("**Тексты волны вне `state.json` (1.4.3,", "**Миграция 1.4.x.**", "`last_status_eid`",
                        "`quote_eid`", "`pending_text_eid`", "`upgrade_outbox`"):
             self.assertIn(needle, waves)
+
+
+class Release144(unittest.TestCase):
+    """The release 1.4.4 (#100; wave W3 of waves-remnants): version, the CHANGELOG section on top."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.4"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.4 — 2026-10-11$", "1.4.4 is the first section")
+        body = re.search(r"(?ms)^## 1\.4\.4 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
+        for needle in ("#100", "### Изменено", "### Исправлено", "`policy_episode`", "fix-loop --accept --source"):
+            self.assertIn(needle, body)
 
 
 class Packaging(unittest.TestCase):
