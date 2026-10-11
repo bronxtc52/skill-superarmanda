@@ -19927,8 +19927,8 @@ class W3PolicyEpisodes(Base):
         with self.subTest(guard="blocked_cap key"):
             self.assertTrue(self.decide(cfg, w={"policy_keys": [cap_key]})["ok"])
         bad_keys = [["W1"], [*key, "x"], [], [*key[:4], "blocked_cap", "tester"]]  # the source follows the class
-        for i, values in enumerate([[1, None], [None, 5], ["2", True, False, 0, -1, 2.0, None],
-                                    [5, None], ["nonsense", "question", "merge_gate", 4], ["bogus", None, 1, ""]]):
+        for i, values in enumerate([[1, None, "", "W 1"], [None, 5, "", "a/b"], ["2", True, False, 0, -1, 2.0, None],
+                                    [5, None, "", "T 1"], ["nonsense", "question", "merge_gate", 4], ["bogus", None, 1, ""]]):
             bad_keys += [[*key[:i], v, *key[i + 1:]] for v in values]
         bad_pending = [{"key": key}, {"key": key, "text": flight["text"]}, {"key": key, "status": flight["status"]},
                        dict(flight, status=5), dict(flight, text=None), dict(flight, status=None)]
@@ -20033,6 +20033,77 @@ class W3PolicyEpisodes(Base):
         self.assertEqual(self.answers(), [])
         self.assertNotIn("policy_refusal", st["waves"]["W1"])
         self.assertEqual(self.owner_asked(), [], "a refusal of an episode that is over reached the owner")
+
+    def test_i2_every_repeated_enter_of_the_answer_is_checked_again(self):
+        # Astra on c18d0d9 (high): submit() repeats the Enter when the text did not leave the input line; the fork may
+        # change during its pause — the repeated Enter is checked like the first, at the first delivery and at the
+        # Enter-only retry
+        for path in ("first delivery", "enter-only retry"):
+            with self.subTest(path=path):
+                self.tg.clear()
+                self.sent.clear()
+                self.enters.clear()
+                cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+                shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+                self.fork(cfg)
+                self.set_status(cfg, "W1", self.ND.format(rec="invariant"))
+                unsent = iter(["the text is still in the input line"] + [None] * 5)
+
+                def enter(n):  # the first Enter does not submit, and the fork changes during the pause after it
+                    self.enters.append(n)
+                    if len(self.enters) == 1:
+                        self.fork(cfg, index=2)
+
+                def send(n, t, on_typed=None, before_enter=None):  # send_text: paste, on_typed, pause, submit
+                    self.sent.append(("text", n, t))
+                    if on_typed:
+                        on_typed()
+                    if path == "enter-only retry":
+                        raise wab.NotSubmitted("the Enter is lost")  # the text is typed, its Enter is owed
+                    if before_enter:
+                        before_enter()
+                    wab.submit(n, t, before_enter=before_enter)
+                try:
+                    with mock.patch.object(wab, "send_text", side_effect=send), \
+                            mock.patch.object(wab, "unsent_reason", side_effect=lambda *a: next(unsent)):
+                        wab.press_enter.side_effect = enter
+                        st = self.tick(cfg)
+                        asked = 0  # a failed delivery goes the usual BLOCKED path once (the 1.2.0 behaviour)
+                        if path == "enter-only retry":
+                            asked = len(self.owner_asked())
+                            self.assertEqual(st["waves"]["W1"].get("pending_enter"), "policy answer")
+                            self.assertEqual(self.enters, [])
+                            st = self.tick(cfg)  # the Enter-only retry: real submit()
+                    w = st["waves"]["W1"]
+                    self.assertEqual(self.enters, [w["tmux"]], "a repeated Enter of a stale answer was pressed")
+                    self.assertIn("stale before its Enter", self.log(cfg))
+                    self.assertNotEqual(w.get("pending_enter"), "policy answer")
+                    self.assertTrue(w["policy_refusal"]["reason"].startswith(wab.FORK_CHANGED), w.get("policy_refusal"))
+                    self.assertEqual(len(self.owner_asked()), asked + 1, "the refusal does not reach the owner")
+                finally:
+                    wab.press_enter.side_effect = lambda n: self.enters.append(n)
+                    shutil.rmtree(cfg["run_dir"], ignore_errors=True)
+
+    def test_i2_the_same_decision_is_not_typed_when_the_wave_moves_on_during_the_recheck(self):
+        # Astra on c18d0d9 (medium): the recheck under the lock gives the same answer, but the wave wrote RUNNING meanwhile
+        cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+        shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+        self.fork(cfg)
+        path, real, calls = cfg["run_dir"] / "W1" / "status", wab.fixed_answer, []
+
+        def recheck_while_the_wave_moves_on(*a, **kw):
+            calls.append(1)
+            got = real(*a, **kw)
+            if len(calls) == 2:  # the recheck under the input lock: the same decision, the wave left the line
+                path.write_text("RUNNING", encoding="utf-8")
+            return got
+        self.set_status(cfg, "W1", self.ND.format(rec="invariant"))
+        with mock.patch.object(wab, "fixed_answer", recheck_while_the_wave_moves_on):
+            st = self.tick(cfg)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(self.answers(), [], "the answer was typed into an episode that is over")
+        self.assertNotIn("policy_refusal", st["waves"]["W1"])
+        self.assertEqual(self.owner_asked(), [])
 
     def test_i3_a_corrupt_episode_mark_is_a_refusal_not_a_new_episode(self):
         good = {"status": wab.eid("x"), "stamp": [1, 2]}

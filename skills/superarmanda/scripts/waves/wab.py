@@ -941,10 +941,11 @@ def clear_input(name):
     return None
 
 
-def submit(name, text):
+def submit(name, text, before_enter=None):
     """Press Enter and check on the screen that `text` left the input line; up to SUBMIT_RETRIES
     more Enters with a pause, then NotSubmitted with the reason. The one «was it sent» check of the
-    dispatcher (send_text, the Enter-only retry of _deliver) and of `say`."""
+    dispatcher (send_text, the Enter-only retry of _deliver) and of `say`. `before_enter` runs before
+    EVERY repeated Enter too (the text is still in the input line): it raises to keep that Enter back."""
     press_enter(name)
     for attempt in range(SUBMIT_RETRIES + 1):
         time.sleep(SUBMIT_PAUSE)
@@ -953,6 +954,8 @@ def submit(name, text):
             return
         if attempt == SUBMIT_RETRIES:
             raise NotSubmitted(f"{why} after {SUBMIT_RETRIES + 1} Enter presses")
+        if before_enter:
+            before_enter()
         press_enter(name)
 
 
@@ -970,7 +973,7 @@ def send_text(name, text, on_typed=None, before_enter=None):
     time.sleep(1.5)
     if before_enter:
         before_enter()
-    submit(name, text)
+    submit(name, text, before_enter=before_enter)
 
 
 def send_command(name, cmd, on_typed=None):
@@ -3269,11 +3272,14 @@ def _fork_keys(rec):
 
 
 def _fork_key_ok(k):
-    """Is it a fork key as _fork_decision writes it: [wave, run_id, index, task, class, source]. The source
+    """Is it a fork key as _fork_decision writes it: [wave, run_id, index, task, class, source] — the wave, run and
+    task in the formats _fork_decision takes them (WAVE_NAME, gate.RUN_ID, REC_TOKEN). The source
     follows the class: a needs_decision fork names its fix source (decision_required_for), a blocked_cap fork
     none — any other pair is a corrupt mark, never a fork that was «not answered yet»."""
-    return (isinstance(k, list) and len(k) == 6 and isinstance(k[0], str) and isinstance(k[1], str)
-            and _count(k[2]) and k[2] > 0 and isinstance(k[3], str)
+    return (isinstance(k, list) and len(k) == 6
+            and isinstance(k[0], str) and WAVE_NAME.fullmatch(k[0]) is not None
+            and isinstance(k[1], str) and gate.RUN_ID.fullmatch(k[1]) is not None
+            and _count(k[2]) and k[2] > 0 and isinstance(k[3], str) and REC_TOKEN.fullmatch(k[3]) is not None
             and isinstance(k[4], str) and k[4] in POLICY_ANSWERS
             and isinstance(k[5], str)
             and (k[5] in gate.state.FIX_SOURCES if k[4] == "needs_decision" else k[5] == ""))
@@ -4308,6 +4314,15 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None, recheck_enter=False
     is held and `pending_enter` stays (False): the retry re-checks before its Enter-only."""
     w = st["waves"][wave]
     name = w["tmux"]
+    before_enter = None
+    if recheck_enter and precheck is not None and send is send_text:
+        def before_enter():  # the precheck again right before an Enter of the typed text (every one of them)
+            try:
+                fresh_now = precheck()
+            except gate.CollectError as e:
+                raise _StaleBeforeEnter(f"facts not collected before the Enter: {_exc_text(e)}") from e
+            if not fresh_now:
+                raise _StaleBeforeEnter(None)
     try:
         lock = _InputLock(cfg, wave).__enter__()
     except NotSubmitted as e:  # `say` is typing right now: nothing sent, the next tick retries
@@ -4363,7 +4378,15 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None, recheck_enter=False
                         # pressed as before, and the owner is told that this delivery is NOT verified
                         put_notice(cfg, w, wave, "unverified_enter", what, reason=action_reason(what))
                         event(cfg, f"{wave}: {what} (Enter): delivery NOT verified (no saved text head)")
-                    ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, check)
+                    try:  # the precheck above held right now; every REPEATED Enter is checked again
+                        ok = _act(cfg, st, wave, f"{what} (Enter)", submit, name, check,
+                                  **({"before_enter": before_enter} if before_enter else {}))
+                    except _StaleBeforeEnter as e:
+                        if e.args[0]:  # unreadable facts: no further Enter, the retry re-checks
+                            event(cfg, f"{wave}: {what} (Enter) postponed: {e.args[0]}")
+                            return False
+                        _abandon_input(cfg, st, wave, w, f"{what}: stale before its Enter", locked=True)
+                        return None
             else:
                 ok = _act(cfg, st, wave, f"{what} (Enter)", press_enter, name)
         else:
@@ -4375,16 +4398,7 @@ def _deliver(cfg, st, wave, what, send, text, precheck=None, recheck_enter=False
                 else:
                     w.pop("pending_text_eid", None)
                 save_state(cfg, st)
-            kw = {}
-            if recheck_enter and precheck is not None and send is send_text:
-                def before_enter():
-                    try:
-                        fresh_now = precheck()
-                    except gate.CollectError as e:
-                        raise _StaleBeforeEnter(f"facts not collected before the Enter: {_exc_text(e)}") from e
-                    if not fresh_now:
-                        raise _StaleBeforeEnter(None)
-                kw["before_enter"] = before_enter
+            kw = {"before_enter": before_enter} if before_enter else {}
             try:
                 ok = _act(cfg, st, wave, what, send, name, text, on_typed=typed, **kw)
             except _StaleBeforeEnter as e:
@@ -6682,6 +6696,9 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
                 why = "пересчитанный ответ не совпадает с набранным" if now_fixed["ok"] else now_fixed["reason"]
                 seen["changed"] = why if why.startswith(FORK_CHANGED) else FORK_CHANGED + why  # a retry says it itself
                 return False
+            if (read(wave_dir(cfg, wave) / "status", on_error=None) != status
+                    or owner_answered(cfg, wave, status)):
+                return False  # the same decision, but the episode ended (or the owner answered) during the recheck
         return True
     if not still():  # the wave (or the owner in its window) moved on since the tick read it
         event(cfg, f"{wave}: policy answer not sent: the status changed before delivery")
