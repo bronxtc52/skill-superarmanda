@@ -19231,13 +19231,12 @@ class Release143(unittest.TestCase):
 class Release144(unittest.TestCase):
     """The release 1.4.4 (#100; wave W3 of waves-remnants): version, the CHANGELOG section on top."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.4"\s*$')
+    # the version of SKILL.md moved on to 1.4.5 (#102, #105, #103): Release145 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.4 — 2026-10-11$", "1.4.4 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.4\.4 — 2026-10-11$", "CHANGELOG.md: the section of 1.4.4")
+        self.assertTrue(log.index("## 1.4.4") < log.index("## 1.4.3"), "1.4.4 is above 1.4.3")
         body = re.search(r"(?ms)^## 1\.4\.4 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
         for needle in ("#100", "### Изменено", "### Исправлено", "`policy_episode`", "fix-loop --accept --source"):
             self.assertIn(needle, body)
@@ -20538,6 +20537,74 @@ class W4OwnerTimeWithoutRich(Base):
         self.assertEqual(res.skipped, [], res.skipped)
         self.assertEqual((res.errors, res.failures), ([], []))
         self.assertEqual(res.testsRun, 2)
+
+
+class W4MaskBoundaries(Base):
+    """#103: the known boundaries of the masking behave exactly as documented, and each one is named in the
+    «Известные границы» paragraph of references/waves.md. Decision «не будем» for each: the masking code stays."""
+    SECRET = "Zx9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk0Lm9Nb7Vc5Xz3Wq"
+    # the boundary -> a key phrase that names it in the «Известные границы» paragraph
+    DOC = {"static": "обфускация `redact`", "pairs": "[[k, v]]", "spaces": "U+00A0",
+           "opaque_path": "непрозрачным сегментом", "emoji": "U+FE0F", "over": "с запасом"}
+
+    def boundaries_paragraph(self):
+        text = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        start = text.index("Известные границы (не маскируется)")
+        end = text.find("\n- `", start)
+        return text[start:end if end != -1 else len(text)]
+
+    def test_item1_formatting_at_the_input_is_masked_the_boundary_is_only_static(self):
+        s = self.SECRET
+        for name, raw in (("percent", "ключ %s" % (s,)), ("format", "ключ {}".format(s)), ("fstring", f"ключ {s}")):
+            with self.subTest(item=1, form=name):
+                self.assertNotIn(s[:8], wab.redact(raw))
+                self.assertNotIn(s[:8], wab.safe_text(raw, 10 ** 6))
+
+    def test_item2_a_pair_does_not_bind_the_key_to_the_value(self):
+        for raw in ([["api_key", "hunter2value"]], {"name": "api_key", "value": "hunter2value"}):
+            with self.subTest(item=2, shape=type(raw).__name__):
+                self.assertIn("hunter2value", wab.safe_text(raw, 10 ** 6))
+        self.assertNotIn("hunter2value", wab.safe_text({"api_key": "hunter2value"}, 10 ** 6))  # a real key: masked
+
+    def test_item4_a_secret_torn_by_a_unicode_space_is_not_masked(self):
+        head, tail = self.SECRET[:22], self.SECRET[22:]
+        for ch in ("\u00a0", "\u2003"):
+            with self.subTest(item=4, ch=f"U+{ord(ch):04X}"):
+                self.assertEqual(wab.safe_text(f"{head}{ch}{tail}", 10 ** 6), f"{head}{ch}{tail}")
+
+    def test_item5_a_path_with_an_opaque_segment_is_masked(self):
+        for owner_paths in (False, True):
+            with self.subTest(item=5, owner_paths=owner_paths):
+                out = wab.safe_text(f"см. /tmp/run/{self.SECRET}/y.log", 10 ** 6, owner_paths)
+                self.assertNotIn(self.SECRET[:8], out)
+                self.assertIn("[скрыто]", out)
+
+    def test_item6_a_word_with_an_emoji_and_fe0f_is_masked_whole(self):
+        with self.subTest(item=6):
+            self.assertEqual(wab.safe_text("готово \u2705\ufe0f дальше", 10 ** 6), "готово [скрыто] дальше")
+            self.assertEqual(wab.safe_text("готово \u2705 дальше", 10 ** 6), "готово \u2705 дальше")
+
+    def test_each_boundary_is_named_in_the_doc(self):
+        para = self.boundaries_paragraph()
+        for name, phrase in self.DOC.items():
+            with self.subTest(boundary=name):
+                self.assertIn(phrase, para)
+
+
+class Release145(unittest.TestCase):
+    """The release 1.4.5 (#102 пп.4,6, #105 пп.2-4, #103; wave W4 of waves-remnants): version, the CHANGELOG section
+    on top."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.5"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.5 — 2026-10-11$", "1.4.5 is the first section")
+        body = re.search(r"(?ms)^## 1\.4\.5 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
+        for needle in ("#102", "#105", "#103", "`waves-remnants`", "`wab.TUNABLE`", "`minutes`", "`W4MaskBoundaries`"):
+            self.assertIn(needle, body)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
