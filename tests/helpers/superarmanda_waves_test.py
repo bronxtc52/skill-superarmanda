@@ -12777,6 +12777,26 @@ class InputClearPolicy(Base):
         self.assertIn("input cleared: policy answer", self.log(cfg))
         self.assertIn("policy cap reached", self.log(cfg))
 
+    def test_lowered_cap_with_the_wave_moving_on_while_cleared_does_not_reach_the_owner(self):
+        # Astra on 339865a (#100 p.12): the cap was lowered under a typed answer, the wave wrote RUNNING while the input
+        # was cleared — no «cap reached» of an episode that is over
+        cfg, _ = self.mandate(max_auto_answers=1)
+        self.pend(cfg, auto_answers=1)
+        self.set_status(cfg, "W1", self.ASK)
+        real = wab._settle_clear
+
+        def settle(*a, **kw):
+            self.set_status(cfg, "W1", "RUNNING")
+            return real(*a, **kw)
+        with mock.patch.object(wab, "_settle_clear", side_effect=settle):
+            w = self.tick(cfg)["waves"]["W1"]
+        self.assertEqual(self.enters, [])
+        self.assertNotIn("pending_enter", w)
+        self.assertEqual(wab.auto_answers_used(w), 2)  # it may have gone: charged
+        self.assertNotIn("policy cap reached", self.log(cfg))
+        self.assertNotIn("policy_cap_reached", w)
+        self.assertIn("input was cleared", self.log(cfg))
+
     def test_precheck_runs_on_the_enter_only_retry(self):  # #53
         cfg, _ = self.mandate()
         self.pend(cfg)
@@ -20107,6 +20127,72 @@ class W3PolicyEpisodes(Base):
         self.assertEqual(self.answers(), [], "the answer was typed into an episode that is over")
         self.assertNotIn("policy_refusal", st["waves"]["W1"])
         self.assertEqual(self.owner_asked(), [])
+
+    def moving_on_while_cleared(self, cfg):
+        """_settle_clear that lets the wave write RUNNING while the input line is cleared (clear_input pauses)."""
+        real = wab._settle_clear
+
+        def settle(*a, **kw):
+            self.set_status(cfg, "W1", "RUNNING")
+            return real(*a, **kw)
+        return mock.patch.object(wab, "_settle_clear", side_effect=settle)
+
+    def test_i4_no_refusal_when_the_wave_moves_on_while_the_input_is_cleared(self):
+        # Astra on 339865a (medium, #100 p.12): the input is cleared AFTER the check that refuses; the wave may leave
+        # the line meanwhile — no refusal and no notice of an episode that is over (the next tick decides afresh)
+        for path in ("stale before the enter", "a corrupt mark under a typed answer"):
+            with self.subTest(path=path):
+                self.tg.clear()
+                self.sent.clear()
+                self.enters.clear()
+                cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
+                shutil.rmtree(cfg["run_dir"] / "W1" / "run1", ignore_errors=True)
+                self.fork(cfg)
+                status = self.ND.format(rec="invariant")
+                self.set_status(cfg, "W1", status)
+                try:
+                    if path == "stale before the enter":
+                        unsent = iter(["the text is still in the input line"] + [None] * 5)
+
+                        def enter(n):  # the first Enter does not submit, the fork changes during the pause after it
+                            self.enters.append(n)
+                            if len(self.enters) == 1:
+                                self.fork(cfg, index=2)
+
+                        def send(n, t, on_typed=None, before_enter=None):
+                            self.sent.append(("text", n, t))
+                            if on_typed:
+                                on_typed()
+                            if before_enter:
+                                before_enter()
+                            wab.submit(n, t, before_enter=before_enter)
+                        with mock.patch.object(wab, "send_text", side_effect=send), \
+                                mock.patch.object(wab, "unsent_reason", side_effect=lambda *a: next(unsent)), \
+                                self.moving_on_while_cleared(cfg):
+                            wab.press_enter.side_effect = enter
+                            st = self.tick(cfg)
+                        self.assertEqual(self.enters, [st["waves"]["W1"]["tmux"]], "a stale Enter was pressed")
+                    else:
+                        def typed_then_watch_dies(name, text, on_typed=None, **kw):
+                            self.sent.append(("text", name, text))
+                            on_typed()
+                            raise KeyboardInterrupt
+                        with mock.patch.object(wab, "send_text", typed_then_watch_dies):
+                            with self.assertRaises(KeyboardInterrupt):
+                                self.tick(cfg)
+                        st = wab.load_state(cfg)
+                        st["waves"]["W1"]["policy_key_pending"] = {"status": status, "text": "x"}  # the key is lost
+                        self.put_state(cfg, st)
+                        with self.moving_on_while_cleared(cfg):
+                            st = self.tick(cfg)
+                    w = st["waves"]["W1"]
+                    self.assertNotIn("policy_refusal", w, "a refusal of an episode that ended while the input was cleared")
+                    self.assertNotEqual(w.get("pending_enter"), "policy answer")
+                    self.assertEqual(self.owner_asked(), [], "the owner is told about an episode that is over")
+                    self.assertIn("input was cleared", self.log(cfg))
+                finally:
+                    wab.press_enter.side_effect = None
+                    shutil.rmtree(cfg["run_dir"], ignore_errors=True)
 
     def test_i3_a_corrupt_episode_mark_is_a_refusal_not_a_new_episode(self):
         good = {"status": wab.eid("x"), "stamp": [1, 2]}

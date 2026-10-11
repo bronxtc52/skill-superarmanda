@@ -627,8 +627,10 @@ def upgrade_record(w, legacy):
     if isinstance(w.get("policy_pending"), str):
         w["policy_pending"] = eid(w["policy_pending"])
     for holder in (w.get("policy_key_pending"), w.get("policy_refusal"), w.get("fable_blocked_episode")):
-        # an empty status is never written (a mark holds the line of its episode): it stays as it is and reads as
-        # corrupt, never as the eid of an empty line, i.e. a mark of «another episode» that is dropped (C4)
+        # an empty status is never written (a mark holds the line of its episode): it stays as it is, never the eid
+        # of an empty line. policy_refusal reads it as corrupt (C4); in policy_key_pending and fable_blocked_episode
+        # it only never matches an episode (no Enter-only retry; the key is kept as answered) — the schema there
+        # checks types, not values (accepted limitation, PR #115)
         if isinstance(holder, dict) and isinstance(holder.get("status"), str) and holder["status"]:
             holder["status"] = eid(holder["status"])
     pend = w.get("policy_key_pending")
@@ -6546,12 +6548,22 @@ def auto_answers_used(w):
             + sum(1 for r in recs if _answer_in_flight(r)))
 
 
-def _policy_refuse(cfg, st, wave, w, es, stamp, reason):
+def _moved_on_while_cleared(cfg, st, wave, w, status):
+    """The input line was just cleared (rounds of clear_input, the wait for the paste footer): the wave may have
+    left the line meanwhile. Then nothing of this episode is decided — no refusal, no `cap reached`, no notice of
+    an episode that is over; the tick ends (None) and the next one decides on the fresh state (#100 p.12)."""
+    if read(wave_dir(cfg, wave) / "status", on_error=None) == status:
+        return False
+    save_state(cfg, st)
+    event(cfg, f"{wave}: policy answer not decided: the status changed while the input was cleared")
+    return True
+
+
+def _policy_refuse(cfg, st, wave, w, es, stamp, reason, status):
     """THE machine refusal of a policy episode (False: the usual BLOCKED path). The refusal is this episode's
     decision and always reaches the owner WITH its reason, whatever `blocked` mark the text of the line already
-    carries (once per episode: later ticks return on `policy_refusal`)."""
-    w["policy_refusal"] = {"status": es, "stamp": stamp, "reason": reason}
-    drop_notice(w, "blocked")
+    carries (once per episode: later ticks return on `policy_refusal`). None: the wave left the line while a
+    typed answer was cleared — no refusal of an episode that is over."""
     if w.get("pending_enter") == "policy answer" and _same(w.get("policy_pending"), es):
         # a typed answer waits for its Enter, and the check no longer gives it (a corrupt mark, or the fork
         # changed since the typing: FORK_CHANGED) — the Enter is not pressed, and its text never stays in the
@@ -6559,6 +6571,10 @@ def _policy_refuse(cfg, st, wave, w, es, stamp, reason):
         w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
         w.pop("policy_pending", None)
         _abandon_input(cfg, st, wave, w, "policy answer: refused by the machine check")
+        if _moved_on_while_cleared(cfg, st, wave, w, status):
+            return None
+    w["policy_refusal"] = {"status": es, "stamp": stamp, "reason": reason}
+    drop_notice(w, "blocked")
     save_state(cfg, st)
     event(cfg, f"{wave}: policy answer not sent: {safe_text(reason, 200)}")
     return False
@@ -6629,7 +6645,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     if episode is not None and not _episode_ok(episode):
         # a corrupt mark of the episode is never read as «a new episode» (that would answer automatically after
         # the corruption): the machine refusal of this episode, to the owner with its reason (fail closed)
-        return _policy_refuse(cfg, st, wave, w, es, stamp, EPISODE_CORRUPT)
+        return _policy_refuse(cfg, st, wave, w, es, stamp, EPISODE_CORRUPT, status)
     if not (isinstance(episode, dict) and _same(episode.get("status"), es) and (
             episode.get("stamp") == stamp or read(wave_dir(cfg, wave) / "status", on_error=None) != status)):
         w["policy_episode"] = {"status": es, "stamp": stamp}
@@ -6658,6 +6674,8 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
         w.pop("policy_pending", None)
         _abandon_input(cfg, st, wave, w, "policy answer: the cap was lowered")
+        if _moved_on_while_cleared(cfg, st, wave, w, status):
+            return None
         used = auto_answers_used(w)
     if used >= cap:
         if not w.get("policy_cap_reached"):
@@ -6674,7 +6692,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
                 # an episode that is over; the tick ends and the next one decides on the fresh state
                 event(cfg, f"{wave}: policy answer not decided: the status changed during the check")
                 return None
-            return _policy_refuse(cfg, st, wave, w, es, stamp, fixed["reason"])
+            return _policy_refuse(cfg, st, wave, w, es, stamp, fixed["reason"], status)
     seen = {}
     retry = w.get("pending_enter") == "policy answer"  # typed earlier: only its Enter is owed
 
@@ -6721,6 +6739,8 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
             _forget_fork_key(w, fixed)  # nothing was typed: this fork key is not in flight
         if retry:  # the typed answer was given up, possibly already submitted: charged to the cap
             w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
+        if seen.get("changed") and _moved_on_while_cleared(cfg, st, wave, w, status):
+            return None  # a typed answer was cleared and the wave left the line meanwhile: nothing to refuse
         if seen.get("changed"):
             # the fork changed under the input lock: nothing was typed / entered, and this is the machine refusal of
             # the episode (like any other), not a silent skip: the owner is told with the reason
