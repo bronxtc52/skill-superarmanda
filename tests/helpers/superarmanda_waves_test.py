@@ -20778,16 +20778,39 @@ class Release145(unittest.TestCase):
     """The release 1.4.5 (#102 пп.4,6, #105 пп.2-4, #103; wave W4 of waves-remnants): version, the CHANGELOG section
     on top."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.5"\s*$')
+    # the version of SKILL.md moved on to 1.5.0 (#107): Release150 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.5 — 2026-10-11$", "1.4.5 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.4\.5 — 2026-10-11$", "CHANGELOG.md: the section of 1.4.5")
+        self.assertTrue(log.index("## 1.4.5") < log.index("## 1.4.4"), "1.4.5 is above 1.4.4")
         body = re.search(r"(?ms)^## 1\.4\.5 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
         for needle in ("#102", "#105", "#103", "`waves-remnants`", "`wab.TUNABLE`", "`minutes`", "`W4MaskBoundaries`"):
             self.assertIn(needle, body)
+
+
+class Release150(unittest.TestCase):
+    """The release 1.5.0 (#107, the summary of the chain waves-remnants; wave W5): version, the CHANGELOG section on top
+    with the PRs of the waves and the remnant issue, the rows of what is implemented."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.0"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.0 — 2026-10-11$", "1.5.0 is the first section")
+        body = re.search(r"(?ms)^## 1\.5\.0 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
+        for needle in ("#107", "`waves-remnants`", "pull/112", "pull/114", "pull/115", "pull/116", "issues/113",
+                       "`RemnantsChain`", "e2e-1.4.1-state", "`RecursionError`", "`say:`"):
+            self.assertIn(needle, body)
+
+    def test_waves_doc_has_the_rows_of_what_is_implemented(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
+        self.assertRegex(table, r"(?m)^\| Замер `metrics\.py` устойчив[^\n]*реализовано \(1\.5\.0; \[#107\]")
+        self.assertRegex(table, r"(?m)^\| Сквозная приёмка цепочки `waves-remnants`[^\n]*`RemnantsChain` \|$")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
