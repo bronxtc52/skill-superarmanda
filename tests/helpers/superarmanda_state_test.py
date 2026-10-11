@@ -7492,6 +7492,68 @@ class W4GateRoles(W4Base):
                 self.assertEqual(self.problems(HIGH_PLAN), [])
                 self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
 
+    def test_internal_review_credit_before_the_packet_is_bound_to_the_epoch_too(self):
+        """#98 п.5: before the first packet the credit was compared with HEAD, models, result and tree, not
+        with the epoch of the task — `where` led into a packet after which the credit fell into NEW_RUN. One
+        invariant: the credit counts only on the HEAD, tree and epoch it judged; before the packet any
+        difference is recoverable (record internal_reviewer again), after it a new run."""
+        for event in ("fix_tester", "fix_internal", "risk_raised", "role_record"):
+            with self.subTest(event=event):
+                self.init(risk="medium" if event == "risk_raised" else "high")
+                self.built()
+                if event == "fix_internal":
+                    self.internal("findings")
+                    self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "internal_reviewer")
+                    self.assertEqual(self.entry()["status"], "needs_fix")
+                    self.built()  # out of needs_fix
+                else:
+                    self.internal()
+                    if event == "fix_tester":
+                        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "tester")
+                        self.ok("fix-loop", "--task", "t1", "--outcome", "pass")
+                    elif event == "risk_raised":
+                        self.ok("task-risk", "--task", "t1", "--risk", "high")
+                    else:
+                        self.record("tester", model="fable")
+                self.assertEqual(self.position(), (5, "internal_reviewer"))
+                action = self.where()["next_action"]
+                self.assertFalse(action.startswith("BLOCKED"), action)
+                self.assertNotIn("new run", action)
+                self.assertIn("epoch", action)
+                self.internal()
+                self.assertEqual(self.position(), (5, "cross_provider_reviewer"))
+                self.reviews()
+                self.assertEqual(self.final()["status"], "ready_for_pr_review")
+                if event != "risk_raised":  # the manifest of a medium run keeps level medium for the gate
+                    self.assertEqual(self.problems(HIGH_PLAN), [])
+                    self.assertEqual(self.verdict(HIGH_PLAN)["verdict"], "pass")
+
+    def test_new_run_reason_names_the_witness_of_the_first_external_packet(self):
+        """#95 п.3: NEW_RUN_REQUIRED names the witness by which the packet is known, not only the role."""
+        self.init()
+        self.built()
+        self.internal()
+        self.ok("fix-loop", "--task", "t1", "--outcome", "failed", "--source", "cross_provider_reviewer")
+        action = self.where()["next_action"]
+        self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
+        self.assertIn("new run", action)
+        self.assertIn("witness: fix-loop record", action)
+        # a repeated internal review cannot earn the credit in this run
+        proc = self.state("task-result", *self.result_args("internal_reviewer", "pass", model="fable"))
+        if proc.returncode == 0:
+            self.assertNotEqual(self.entry()["status"], "ready_for_pr_review")
+        self.assertIn("new run", self.where()["next_action"])
+        self.assertNotEqual(self.entry()["status"], "ready_for_pr_review")
+        # the marker is the witness of a packet recorded by task-result
+        self.init()
+        self.complete()
+        value = self.data()
+        value["tasks"]["t1"]["internal_review"]["epoch"] = 0
+        self.manifest.write_text(json.dumps(value), encoding="utf-8")
+        action = self.where()["next_action"]
+        self.assertIn("new run", action)
+        self.assertIn("witness: marker", action)
+
     def test_internal_review_before_the_packet_counts_only_as_a_current_result_of_this_tree(self):
         """Before the packet the requirement is still open: the credit of a dirty tree does not count on
         the clean one (or the other way round) — record the internal review again, no new run needed."""
