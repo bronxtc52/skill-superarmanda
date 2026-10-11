@@ -19112,13 +19112,12 @@ class Release140(unittest.TestCase):
 class Release141(unittest.TestCase):
     """The release 1.4.1 (#110): version, the CHANGELOG section on top, the paragraph of waves.md, the renamed row."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.1"\s*$')
+    # the version of SKILL.md moved on to 1.4.2 (#98): Release142 pins it
 
-    def test_changelog_section_on_top(self):
+    def test_changelog_section(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.1 — 2026-10-10$", "1.4.1 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.4\.1 — 2026-10-10$", "CHANGELOG.md: the section of 1.4.1")
+        self.assertTrue(log.index("## 1.4.1") < log.index("## 1.4.0"), "1.4.1 is above 1.4.0")
         body = re.search(r"(?ms)^## 1\.4\.1 — 2026-10-10\n(.*?)(?=^## )", log).group(1)
         for needle in ("#110", "### Исправлено", "`BLOCKED`", "`fable_switch.blocked`"):
             self.assertIn(needle, body)
@@ -19128,6 +19127,33 @@ class Release141(unittest.TestCase):
         self.assertIn("**Лимит после ответа на `BLOCKED` (1.4.1, #110).**", waves)
         self.assertNotIn("| Обязательные Fable-роли задачи high", waves)
 
+
+
+class Release142(unittest.TestCase):
+    """The release 1.4.2 (#98, #95; wave W1 of waves-remnants): version, the CHANGELOG section on top, workflow.md
+    naming the semantics of the fix cycles, the marker of the external review and the 1.2.1 boundary."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.2"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.2 — 2026-10-11$", "1.4.2 is the first section")
+        body = re.search(r"(?ms)^## 1\.4\.2 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
+        for needle in ("#98", "#95", "### Исправлено", "### Документация", "`task_epoch`", "witness:",
+                       "п.1", "п.2", "п.4", "п.6", "`1.2.1`"):
+            self.assertIn(needle, body)
+
+    def test_workflow_names_the_semantics(self):
+        flow = (ROOT / "skills" / "superarmanda" / "references" / "workflow.md").read_text(encoding="utf-8")
+        self.assertNotIn("manifest политики `1.2.1` судится как раньше", flow)
+        self.assertIn("`1.2.1` `state.py` судит как 1.2.3, а гейт", flow)
+        self.assertIn("Закрывает круг запись ЛЮБОЙ такой\n  роли, не обязательно источника, открывшего круг", flow)
+        self.assertIn("запись PR-гейта (`github_codex_review` или `coderabbit`, любой статус) в `needs_fix`", flow)
+        self.assertIn("запись\n  `github_codex_review` (Codex на draft PR) раньше первого пакета `review.py`", flow)
+        self.assertIn("эпоха равна текущей\n  `task_epoch`", flow)
+        self.assertNotIn("причина свидетеля не называет (остаток, issue #95)", flow)
 
 class Packaging(unittest.TestCase):
     def test_wab_py_is_stdlib_only(self):

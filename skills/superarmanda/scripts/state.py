@@ -1239,10 +1239,13 @@ def internal_review_gap(entry, results, head, models):
     three equal the marker's, so the internal review read exactly the diff that went out and
     nothing (a readiness role result, a fix-loop record, a change of the risk or of the tree)
     happened in between; the reason names what differs. Before the packet the requirement is
-    open: the credit counts only as the current internal_reviewer result of this HEAD and tree
-    (`results`, the results `resume` left on the current tree; `result_id`) — record it again
-    otherwise. After the packet a missing credit cannot be earned in this run: the reason starts
-    with NEW_RUN_REQUIRED. A credit or marker without the binding fields (written before they
+    open: the credit counts only as the current internal_reviewer result of this HEAD, tree and
+    epoch (`results`, the results `resume` left on the current tree; `result_id`; `epoch` equal to
+    task_epoch now) — record it again otherwise. One invariant for both sides of the packet: the
+    credit counts only on the HEAD, tree and epoch it judged; before the packet any difference is
+    recoverable, after it NEW_RUN_REQUIRED, naming the witness by which the packet is known. After
+    the packet a missing credit cannot be earned in this run: the reason starts with
+    NEW_RUN_REQUIRED. A credit or marker without the binding fields (written before they
     existed) is not counted: no live manifest carries one honestly."""
     record = entry.get("internal_review")
     record = record if isinstance(record, dict) else {}
@@ -1263,6 +1266,8 @@ def internal_review_gap(entry, results, head, models):
             and record.get("result_id") is not None
             and current.get("result_id") == record.get("result_id")
             and current.get("tree_fingerprint") == record.get("tree_fingerprint")
+            and type(record.get("epoch")) is int
+            and record.get("epoch") == task_epoch(entry)
         ):
             return None
         if status is None:
@@ -1273,6 +1278,16 @@ def internal_review_gap(entry, results, head, models):
             what = f"the last {INTERNAL_SOURCE} result is {status}"
         elif weaker(model, required):
             what = f"the {INTERNAL_SOURCE} record carries model {model or 'not recorded'}"
+        elif (
+            current.get("result_id") == record.get("result_id")
+            and current.get("tree_fingerprint") == record.get("tree_fingerprint")
+            and record.get("result_id") is not None
+        ):
+            what = (
+                f"the {INTERNAL_SOURCE} result is of another epoch of the task "
+                f"({record.get('epoch')} vs {task_epoch(entry)}): a readiness role result, a "
+                "fix-loop record or a change of the risk came after it"
+            )
         else:
             what = (
                 f"the {INTERNAL_SOURCE} result is not a current result of this tree (the tree "
@@ -2714,7 +2729,9 @@ def record_fix_outcome(args, entry, data, location, risk, policy):
 
 
 def external_review_started(entry):
-    """The role of the first external review recorded for the task in this run, or None.
+    """The role of the first external review recorded for the task in this run, with the witness
+    by which it is known ("cross_provider_reviewer (witness: fix-loop record, fix_sources)"), or None.
+    Callers use it as truthy and in texts; none compares it with a role name.
     The marker `external_review` is written by task-result since 1.2.3; a manifest of 1.2.2 has
     none, so every record that survives `resume` is read as a witness as well: the session
     ownership of the task, its per-source fix counters, its deferrals and acceptances, the
@@ -2726,22 +2743,30 @@ def external_review_started(entry):
     is left when that source had neither a fix-loop round nor a --defer/--accept."""
     marker = entry.get("external_review")
     if isinstance(marker, dict):
-        return marker.get("role") or "an external review"
-    used = [role for role in (entry.get("session_roles") or {}).values() if isinstance(role, str)]
-    used += list(entry.get("fix_sources") or {})
-    used += [role for role in (entry.get("results") or {}) if isinstance(role, str)]
-    used += [
-        item.get("role")
+        return f"{marker.get('role') or 'an external review'} (witness: marker external_review)"
+    witnesses = []  # (role, witness) in the fixed order of the witnesses
+    witnesses += [
+        (role, "session of the role")
+        for role in (entry.get("session_roles") or {}).values()
+        if isinstance(role, str)
+    ]
+    witnesses += [(role, "fix-loop record, fix_sources") for role in (entry.get("fix_sources") or {})]
+    witnesses += [(role, "current result") for role in (entry.get("results") or {}) if isinstance(role, str)]
+    witnesses += [
+        (item.get("role"), "review history")
         for item in (entry.get("review_history") or ())
         if isinstance(item, dict) and isinstance(item.get("role"), str)
     ]
-    for kind in ("deferrals", "acceptances"):
-        used += [
-            item.get("source")
+    for kind, name in (("deferrals", "fix-loop --defer record"), ("acceptances", "fix-loop --accept record")):
+        witnesses += [
+            (item.get("source"), name)
             for item in (entry.get(kind) or ())
             if isinstance(item, dict) and isinstance(item.get("source"), str)
         ]
-    return next((role for role in sorted(used) if role in EXTERNAL_REVIEW_ROLES), None)
+    roles = sorted({role for role, _ in witnesses if role in EXTERNAL_REVIEW_ROLES})
+    if not roles:
+        return None
+    return f"{roles[0]} (witness: {next(name for role, name in witnesses if role == roles[0])})"
 
 
 def record_internal_round(entry, data, location):

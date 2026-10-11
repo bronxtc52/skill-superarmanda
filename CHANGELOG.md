@@ -3,6 +3,33 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 1.4.2 — 2026-10-11
+
+Остаток W4 ([#98](https://github.com/bronxtc52/skill-superarmanda/issues/98), [#95](https://github.com/bronxtc52/skill-superarmanda/issues/95)), волна W1 цепочки `waves-remnants`.
+
+### Исправлено
+
+- До первого внешнего пакета кредит внутреннего ревью сверяется и с эпохой задачи (`task_epoch`), а не только с HEAD,
+  деревом и `result_id`. Запись роли готовности, `fix-loop` (источник `tester` или `internal_reviewer`) или смена
+  риска после внутреннего ревью теперь ведут `where` к повтору `internal_reviewer` с восстановимой причиной; раньше
+  `where` пускал координатора в пакет, после которого кредит закрыто падал в «new run required» (#98 п.5, Codex P2
+  на #97).
+- Причина `new run required` называет роль и вид свидетеля первого внешнего пакета (`witness: marker
+  external_review`, `fix-loop record`, `fix-loop --defer record`, `fix-loop --accept record`, `session of the role`,
+  `current result`, `review history`). Ошибочный `fix-loop --outcome failed` под внешним источником до результата этой
+  роли по-прежнему закрывает кредит внутреннего ревью в этом прогоне (fail-closed), но теперь это видно из причины
+  (#95, #98 п.3).
+
+### Документация
+
+- `references/workflow.md` называет действующую семантику, без её изменения: круг исправлений закрывает запись любой
+  роли, после которой все требуемые роли pass или покрыты, а не только источника круга (#98 п.1); запись PR-гейта
+  (`github_codex_review`, `coderabbit`) в `needs_fix` при всех ролях pass закрывает круг тем же правилом (#98 п.2);
+  запись `github_codex_review` раньше первого пакета `review.py` становится маркером `external_review` и закрывает
+  внутренний источник (#98 п.4).
+- Граница совместимости manifest политики `1.2.1` названа точно: `state.py` судит его как 1.2.3, а гейт мерджа
+  high-волны или задачи с эффективным риском high требует новый прогон (#98 п.6, Codex P2 на #97).
+
 ## 1.4.1 — 2026-10-10
 
 Остаток 1.4.0 ([#110](https://github.com/bronxtc52/skill-superarmanda/issues/110), Codex P2 на #109).
