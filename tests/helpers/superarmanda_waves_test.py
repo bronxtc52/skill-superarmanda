@@ -20349,5 +20349,179 @@ class W3PolicyEpisodes(Base):
                         for flag in ("--source", "--severity", "--note"):
                             self.assertIn(flag, cmd, f"state.py refuses --accept without {flag}")
 
+
+# ---------------------------------------------------------------- W4 dash-texts: live reload, minutes in notices, one gate event
+class W4DashReload(Base):
+    """#102 item 6: the dashboard holds the identity of the run from its start, like `watch`; a live edit of
+    chain.json changes only the TUNABLE fields and a changed identity is told once in events.log."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        self.dash = dash
+
+    def edit(self, path, **over):
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data.update(over)
+        Path(path).write_text(json.dumps(data), encoding="utf-8")
+
+    def log(self, cfg):
+        f = cfg["run_dir"] / "events.log"
+        return f.read_text(encoding="utf-8") if f.exists() else ""
+
+    def test_identity_fields_are_ignored_and_told_once_each_change(self):
+        cases = {"run_id": "other-run", "run_dir": "/nowhere/else", "waves": ["W1", "W2", "W3"]}
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                cfg, path = self.chain()
+                run_dir, ident = cfg["run_dir"], wab._identity(cfg)
+                self.edit(path, **{field: value}, timezone="Asia/Tashkent")
+                got = self.dash.reload_cfg(cfg, path)
+                self.assertEqual(wab._identity(got), ident)
+                self.assertEqual(got["run_dir"], run_dir)
+                self.assertEqual(got["timezone"], "Asia/Tashkent")  # the tunable field applied
+                again = self.dash.reload_cfg(got, path)  # the same change on the next frame: no new event
+                self.assertEqual(wab._identity(again), ident)
+                lines = [l for l in self.log(cfg).splitlines() if "dash: chain.json identity changed" in l]
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn(field, lines[0])
+                self.assertIn(f"keeping {run_dir}", lines[0])
+                self.edit(path, **{field: cfg[field] if field != "run_dir" else str(run_dir)})
+                back = self.dash.reload_cfg(again, path)  # back to the original: silence
+                self.assertEqual(wab._identity(back), ident)
+                self.assertEqual(len([l for l in self.log(cfg).splitlines() if "dash: chain.json" in l]), 1)
+                self.edit(path, **{field: value})  # a new change after the return: told again
+                self.dash.reload_cfg(back, path)
+                self.assertEqual(len([l for l in self.log(cfg).splitlines() if "dash: chain.json" in l]), 2)
+
+    def test_a_broken_file_keeps_the_last_settings(self):
+        cfg, path = self.chain()
+        Path(path).write_text("{broken", encoding="utf-8")
+        self.assertIs(self.dash.reload_cfg(cfg, path), cfg)
+        Path(path).unlink()
+        self.assertIs(self.dash.reload_cfg(cfg, path), cfg)
+
+
+class W4NoticeMinutes(Base):
+    """#105 item 3 (+ item 2): the minutes of `idle` and `checkpoint_timeout` are ONE registry field with a
+    duration formatter: 0.5 is «30 с», never «0 мин»; an older outbox entry still renders without «?»."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(wab, "drop_stale_btab")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_key(self, key, minutes, **tg):
+        cfg_key = "idle_minutes" if key == "idle" else "handoff_timeout_minutes"
+        over = {cfg_key: minutes, **tg}
+        if key == "idle":
+            over["handoff_timeout_minutes"] = 25
+        cfg, _ = self.chain(**over)
+        if key == "idle":
+            self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+            self.set_status(cfg, "W1", "RUNNING")
+            t = [1000.0]
+            with mock.patch("time.time", side_effect=lambda: t[0]):
+                for i in range(3):
+                    self.pane = f"work\nmore work\nthe end {i}\n"
+                    wab.tick(cfg, wab.load_state(cfg))
+                    t[0] += 120
+        else:
+            self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+                phase="checkpoint", checkpoint_sent=True, checkpoint_at=time.time() - 3600 * 24)}})
+            self.set_status(cfg, "W1", "RUNNING")
+            wab.tick(cfg, wab.load_state(cfg))
+        return cfg
+
+    WANT = {0.5: "30 с", 1.5: "1 мин 30 с", 12: "12 мин"}
+
+    def test_tick_path_shows_the_duration_not_a_truncated_number(self):
+        for key in ("idle", "checkpoint_timeout"):
+            values = dict(self.WANT)
+            if key == "idle":
+                values[0] = "0 мин"
+            for minutes, shown in values.items():
+                with self.subTest(key=key, minutes=minutes):
+                    self.tg.clear()
+                    self.run_key(key, minutes)
+                    text = "\n".join(self.tg)
+                    self.assertTrue(self.tg, "the notification must go out")
+                    self.assertIn(shown, text)
+                    self.assertNotIn("?", text)
+                    if minutes == 0.5:
+                        self.assertNotIn("0 мин", text)
+
+    def test_notifications_without_telegram_carry_the_duration_too(self):
+        for key in ("idle", "checkpoint_timeout"):
+            with self.subTest(key=key):
+                shown = []
+                with mock.patch.object(wab, "display_all", side_effect=shown.append):
+                    cfg = self.run_key(key, 0.5, telegram=None)
+                text = "\n".join(shown) + (cfg["run_dir"] / "ATTENTION").read_text(encoding="utf-8")
+                self.assertIn("30 с", text)
+                self.assertNotIn("0 мин", text)
+
+    def test_the_formatter(self):
+        fmt = wab.NOTICE_FIELDS["minutes"][1]
+        for value, want in [(12, "12 мин"), (12.0, "12 мин"), (0, "0 мин"), (0.5, "30 с"), (1.5, "1 мин 30 с"),
+                            (True, "?"), (-1, "?"), ("5", "?"), (None, "?"), (float("nan"), "?"),
+                            (float("inf"), "?"), (10 ** 6, "?"), (10 ** 6 + 0.5, "?")]:
+            with self.subTest(value=value):
+                self.assertEqual(fmt({}, value), want)
+
+    def test_an_older_outbox_entry_renders_without_a_question_mark(self):
+        cfg, _ = self.chain(idle_minutes=15, handoff_timeout_minutes=30)
+        w = self.wave_rec()
+        for key, stored, want in [("idle", {"n": 7}, "7 мин"), ("idle", {}, "15 мин"),
+                                  ("checkpoint_timeout", {"n": 9}, "9 мин"), ("checkpoint_timeout", {}, "30 мин")]:
+            with self.subTest(key=key, stored=stored):
+                text = wab.outbox_notice(cfg, "W1", w, key, {"value": "x", "fields": dict(stored), "next_at": 0})
+                self.assertIn(want, text)
+                self.assertNotIn("?", text)
+        text = wab.outbox_notice(cfg, "W1", w, "idle", {"value": "x", "next_at": 0})  # 1.2.6: no fields at all
+        self.assertNotIn("?", text)
+
+    def test_attention_signal_has_no_question_mark(self):
+        cfg, _ = self.chain(idle_minutes=15)
+        for key in ("idle", "checkpoint_timeout"):
+            with self.subTest(key=key):
+                self.assertNotIn("?", wab.attention_signal(cfg, "W1", key))
+
+    def test_the_callers_pass_the_raw_number(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        self.assertNotIn('n=int(cfg["idle_minutes"])', src)
+        self.assertNotIn('n=int(cfg["handoff_timeout_minutes"])', src)
+
+
+class W4GateEventOnce(GateBase):
+    """#105 item 4: «merge gate passed with N open threads» is ONE event, after the state is saved."""
+
+    def test_the_open_threads_event_is_written_once(self):
+        self.start()
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False},
+                                          {"id": "PRRT_b", "isResolved": False}])
+        self.assertTrue(self.tick())
+        self.assertEqual(self.log().count("merge gate passed with 2 open threads"), 1, self.log())
+
+
+class W4OwnerTimeWithoutRich(Base):
+    """#102 item 4: without rich only the dashboard paths of W6OwnerTime are skipped, the rest runs."""
+
+    def test_a_non_dashboard_test_runs_when_dash_cannot_be_imported(self):
+        sys.modules.pop("dash", None)
+        with mock.patch.dict(sys.modules, {"dash": None}):  # `import dash` raises ImportError
+            suite = unittest.TestSuite(
+                [unittest.defaultTestLoader.loadTestsFromName("test_registry_and_drivers_are_the_same_set", W6OwnerTime),
+                 unittest.defaultTestLoader.loadTestsFromName("test_wave_session_gets_the_chain_zone", W6OwnerTime)])
+            res = unittest.TestResult()
+            suite.run(res)
+        self.assertEqual(res.skipped, [], res.skipped)
+        self.assertEqual((res.errors, res.failures), ([], []))
+        self.assertEqual(res.testsRun, 2)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
