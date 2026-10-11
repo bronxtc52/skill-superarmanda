@@ -19442,6 +19442,77 @@ class W2StateHoldsNoWaveText(Base):
         w2 = raw_state(self.cfg)["waves"]["W1"]
         self.assertEqual((w2["last_status_eid"], set(w2.get("outbox") or {})), (w["last_status_eid"], {"blocked"}))
 
+    # ----- круг 1 (R1, F1): a text lost from the store never skips the mechanics, never makes an action bolder -----
+    def lost(self, word, text=None, **rec):
+        """The record knows its last status only by word and eid, the store has no text (lost, never written)."""
+        self.fresh(**rec.pop("over", {}))
+        text = text if text is not None else f"BLOCKED: {W2_MARK} вопрос?"
+        st = wab.load_state(self.cfg)
+        st["waves"]["W1"].update(last_status_word=word, last_status_eid=wab.eid(text), **rec)
+        self.put_state(self.cfg, st)
+        self.set_status(self.cfg, "W1", "")  # the wave died mid-rewrite: the file stays empty
+        shutil.rmtree(wab.wave_dir(self.cfg, "W1") / ".texts", ignore_errors=True)
+
+    def test_a_lost_store_never_skips_the_mechanics(self):
+        def log():
+            p = self.cfg["run_dir"] / "events.log"
+            return p.read_text(encoding="utf-8") if p.exists() else ""
+
+        def dead_window():
+            self.lost("BLOCKED")
+            self.alive = False
+            self.assertFalse(self.tick())
+            self.assertEqual(raw_state(self.cfg)["waves"]["W1"]["phase"], "dead")
+            self.assertIn("dead", raw_state(self.cfg)["waves"]["W1"]["outbox"])
+
+        def awaiting_merge():
+            self.lost("BLOCKED", phase="awaiting_merge")
+            self.assertFalse(self.tick())  # the watch ends and frees the run lock
+
+        def one_word_status():  # RUNNING is its own text: the tick decides on it (here: the idle notice)
+            self.lost("RUNNING", text="RUNNING", over={"idle_minutes": 1}, pane_digest="x",
+                      pane_changed=time.time() - 3600)
+            self.pane = "a\nb\nc\nd"
+            self.tick()
+            st = wab.load_state(self.cfg)
+            st["waves"]["W1"]["pane_changed"] = time.time() - 3600
+            wab.save_state(self.cfg, st)
+            self.tick()
+            self.assertIn("idle", raw_state(self.cfg)["waves"]["W1"]["outbox"])
+
+        def blocked_without_text():  # the episode decisions that need the text are off, the refusal stays
+            refusal = {"status": wab.eid(f"BLOCKED: {W2_MARK} вопрос?"), "stamp": None, "reason": "r"}
+            self.lost("BLOCKED", over={"decision_policy": [{"class": "needs_decision", "answer": "invariant"}]},
+                      policy_refusal=refusal, tokens=10 ** 6, phase="running")
+            before = log().count("not in the store")
+            for _ in range(2):
+                self.assertTrue(self.tick())
+            w = raw_state(self.cfg)["waves"]["W1"]
+            self.assertEqual(w["policy_refusal"], refusal)
+            self.assertEqual(self.sent, [])  # nothing typed into the window: no answer, no checkpoint request
+            self.assertEqual(log().count("not in the store") - before, 1)  # one event per episode
+
+        def pending_enter_with_lost_head():  # F1: never an unverified Enter over what may be the owner's draft
+            self.lost("RUNNING", text="RUNNING", pending_enter="checkpoint request",
+                      pending_text_eid=wab.eid("[wab] WAB-CHECKPOINT"))
+            self.ansi = live("19-folded.ansi")  # something sits in the input line
+            st = wab.load_state(self.cfg)
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok = wab._deliver(self.cfg, st, "W1", "checkpoint request", wab.send_text, "")
+            self.assertFalse(ok)
+            self.assertEqual(self.enters, [])
+            self.assertTrue(self.clear_keys)  # the input is cleared instead (_abandon_input)
+            w = raw_state(self.cfg)["waves"]["W1"]
+            self.assertNotIn("pending_enter", w)
+            self.assertNotIn("unverified_enter", w.get("notified", {}))
+
+        for name, row in [("dead window in running", dead_window), ("awaiting_merge", awaiting_merge),
+                          ("one-word status", one_word_status), ("BLOCKED without text", blocked_without_text),
+                          ("pending Enter with eid", pending_enter_with_lost_head)]:
+            with self.subTest(name):
+                self.sent[:], self.enters[:], self.clear_keys[:] = [], [], []
+                row()
+
     # ----- #102 п.5: a notice queued under one zone and sent under another -----
     def test_idle_queued_before_a_zone_change_is_sent_in_one_zone(self):
         self.fresh(telegram_quote=True, idle_minutes=1, timezone="Asia/Dubai")
