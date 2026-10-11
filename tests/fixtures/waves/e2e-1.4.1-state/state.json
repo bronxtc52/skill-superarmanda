@@ -1,0 +1,208 @@
+{
+  "waves": {
+    "W1": {
+      "tmux": "wab-w1",
+      "cwd": "@ROOT@/workdir",
+      "started": "@T:-1842.275281@",
+      "restarts": 0,
+      "phase": "done",
+      "notified": {
+        "nudge": "a5bd355818fdc45bcc7666e5bf215df039c5b93c",
+        "done": "1"
+      },
+      "sessions": [
+        "@SID:W1:0@"
+      ],
+      "prompt_file": "@ROOT@/ctl/runs/e2e/2026-10-04-e2e/W1/prompt.md",
+      "prompt_source": "@ROOT@/w1-prompt.md",
+      "start_rev": "@REV:initial@",
+      "session_model": "claude-opus-5-5",
+      "outbox": {
+        "done": {
+          "value": "1",
+          "fields": {},
+          "text": "✅ e2e: волна W1 завершена\nВремя: 19:59 Дубай",
+          "next_at": "@T:+236.508940@"
+        }
+      },
+      "last_status": "DONE",
+      "pane_digest": "a5bd355818fdc45bcc7666e5bf215df039c5b93c",
+      "pane_changed": "@T:-1837.381233@",
+      "auto_off_ticks": 0,
+      "auto_alerted": false,
+      "activity_at": "@T:-1777.301116@",
+      "activity_files": {
+        "@HOME@/.claude/projects/@SLUG@/@SID:W1:0@.jsonl": "@T:-1841.802841@"
+      },
+      "activity_session": "@SID:W1:0@",
+      "tokens": 6000,
+      "peak": 6000,
+      "ctx_hist": [
+        0,
+        6000,
+        6000,
+        6000,
+        6000,
+        6000,
+        6000,
+        6000,
+        6000,
+        6000,
+        6000
+      ],
+      "ctx_watch": {
+        "bound": "@SID:W1:0@",
+        "size": 6784,
+        "ctx": 6000,
+        "ticks": 9,
+        "others": {},
+        "grew": false
+      },
+      "policy_answered_stamp": "@STAMP:W1@",
+      "auto_answers": 1,
+      "alarm_at": "@T:-1233.482516@",
+      "gate_at": "@T:-744.910914@",
+      "pr": 1,
+      "gate_fail_msg": {
+        "sent": true,
+        "text": "[wab] Гейт мерджа не пройден: проверки неуспешны: tests (macos-latest) (failure), tests (ubuntu-latest) (failure). Исправь причину, при необходимости перезапиши manifest и снова запиши DONE в $WAB_DIR/status (или BLOCKED с вопросом)."
+      },
+      "done_head": "@REV:W1: add w1.txt@",
+      "gate_sha": "@REV:W1: add w1.txt@",
+      "gate_pr": 1,
+      "merge_poll_at": "@T:-684.367343@",
+      "merge_called": "@REV:W1: add w1.txt@",
+      "merge_rc": 0,
+      "merged": {
+        "pr": 1,
+        "sha": "@REV:W1: add w1.txt@",
+        "commit": "@REV:wave/w1 (#1)@",
+        "at": "@T:-684.367343@"
+      },
+      "finished": "@T:-684.367343@",
+      "commits": 1
+    },
+    "W2": {
+      "tmux": "wab-w2",
+      "cwd": "@ROOT@/workdir",
+      "started": "@T:-683.829626@",
+      "restarts": 1,
+      "phase": "running",
+      "notified": {
+        "started": "1",
+        "policy_answer": "BLOCKED: [class=blocked_cap rec=new_run red=no] Три круга исправления T1. ВОПРОС-ЯСЕНЬ-4418. Варианты: new_run | accept_limitation",
+        "blocked": "BLOCKED: [class=blocked_cap rec=new_run red=no] Три круга исправления T1. ВОПРОС-ЯСЕНЬ-4418. Варианты: new_run | accept_limitation"
+      },
+      "sessions": [
+        "@SID:W2:0@",
+        "@SID:W2:1@"
+      ],
+      "prompt_file": "@ROOT@/ctl/runs/e2e/2026-10-04-e2e/W2/prompt.md",
+      "prompt_source": "@ROOT@/ctl/runs/e2e/2026-10-04-e2e/W1/next-prompt.md",
+      "start_rev": "@REV:wave/w1 (#1)@",
+      "session_model": "claude-opus-5-5",
+      "outbox": {
+        "started": {
+          "value": "1",
+          "fields": {},
+          "text": "🚀 e2e: стартовала волна W2\nВремя: 19:59 Дубай",
+          "next_at": "@T:+236.513786@"
+        },
+        "policy_answer": {
+          "value": "BLOCKED: [class=blocked_cap rec=new_run red=no] Три круга исправления T1. ВОПРОС-ЯСЕНЬ-4418. Варианты: new_run | accept_limitation",
+          "fields": {
+            "cls": "blocked_cap",
+            "variant": "invariant"
+          },
+          "text": "🤖 e2e: волна W2: развилка закрыта по политике\nТип вопроса: кончились попытки исправить; выбрано: исправить целиком. Ответ не нужен.\nВремя: 20:10 Дубай",
+          "next_at": "@T:+299.994049@"
+        }
+      },
+      "last_status": "BLOCKED: [class=blocked_cap rec=new_run red=no] Три круга исправления T1. ВОПРОС-ЯСЕНЬ-4418. Варианты: new_run | accept_limitation",
+      "pane_digest": "a5bd355818fdc45bcc7666e5bf215df039c5b93c",
+      "pane_changed": "@T:-620.594900@",
+      "auto_off_ticks": 0,
+      "auto_alerted": false,
+      "activity_at": "@T:-3.109517@",
+      "activity_files": {
+        "@HOME@/.claude/projects/@SLUG@/@SID:W2:1@.jsonl": "@T:-1835.681694@"
+      },
+      "activity_session": "@SID:W2:1@",
+      "tokens": 10000,
+      "peak": 62000,
+      "ctx_hist": [
+        20000,
+        62000,
+        8000,
+        8000,
+        10000
+      ],
+      "ctx_watch": {
+        "bound": "@SID:W2:1@",
+        "size": 26053,
+        "ctx": 10000,
+        "ticks": 0,
+        "others": {
+          "@SID:W2:0@": 10957
+        },
+        "grew": false
+      },
+      "alarm_at": "@T:-63.788941@",
+      "checkpoint_at": null,
+      "checkpoint_sent": true,
+      "cleared_at": "@T:-496.500713@",
+      "await_session": false,
+      "pr": 2,
+      "alarm_msg": {
+        "head": "@REV:W2: add w2.txt@",
+        "sent": true,
+        "text": "[wab] Будильник: PR #2 (HEAD @REV12:W2: add w2.txt@) — проверки завершены: 2 ok, неуспешные: нет; Codex: чисто; незакрытых тредов: 0. Разбери и продолжай по протоколу."
+      },
+      "questions": [
+        {
+          "at": "@T:-303.947405@",
+          "text": "BLOCKED: [class=question rec=A red=no] Нужен выбор. ВОПРОС-ЛИПА-5902. Варианты: A) да, B) нет"
+        }
+      ],
+      "policy_keys": [
+        [
+          "W2",
+          "2026-10-04-e2e",
+          1,
+          "T1",
+          "blocked_cap",
+          ""
+        ]
+      ],
+      "policy_answered_stamp": "@STAMP:W2@",
+      "auto_answers": 1
+    }
+  },
+  "identity": {
+    "base_branch": "main",
+    "chain": "e2e",
+    "decision_policy": [
+      {
+        "class": "needs_decision",
+        "rec": "A"
+      },
+      {
+        "answer": "invariant",
+        "class": "blocked_cap",
+        "rec": "new_run"
+      }
+    ],
+    "merge_gate": "auto",
+    "repo": "acme/waves-demo",
+    "run_dir": "@ROOT@/ctl/runs/e2e/2026-10-04-e2e",
+    "run_id": "2026-10-04-e2e",
+    "tmux_prefix": "wab-",
+    "waves": [
+      "W1",
+      "W2"
+    ],
+    "workdir": "@ROOT@/workdir"
+  },
+  "current": "W2",
+  "defaults": "1.4"
+}

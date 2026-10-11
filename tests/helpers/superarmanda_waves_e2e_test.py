@@ -38,6 +38,11 @@ Since 1.0.1-1.0.3 the same run also covers (W4, #68/#72/#57):
     another run share the wave sessions, the owner's own dashboard of this chain sits next to the owner's
     shell and a dashboard of an older run: only the run's own dashboard pane is closed.
 
+Режим `remnants` (W5 цепочки waves-remnants, класс RemnantsChain): кап автоответов 1; сразу после автоответа W2 на
+развилку капа диспетчер останавливается и перезапускается на state.json диспетчера 1.4.1, снятом в той же точке
+(tests/fixtures/waves/e2e-1.4.1-state); W2 дважды пишет ту же строку BLOCKED, владелец отвечает, цепочка доходит до
+chain-result.md. Инвариант — у oracle_no_wave_text.
+
 Mutations (same scenario, broken dispatcher, the oracle must notice): no merge gate, no session
 binding after /clear, no decision policy, an idle nudge with the process tree ignored (or no nudge at all),
 an unavailable CodeRabbit that blocks the gate, a cleanup that does not check whose a pane is.
@@ -92,6 +97,12 @@ ROLE_MODEL = {"coder": "opus", "tester": "sonnet", "internal_reviewer": "opus", 
 # unique words in the wave questions: no external text may carry them (telegram_quote is off, #83)
 QUESTION_MARKERS = {"W1": "ВОПРОС-КЕДР-7731", "W2": "ВОПРОС-ЯСЕНЬ-4418", "W2-owner": "ВОПРОС-ЛИПА-5902"}
 NUDGE_MINUTES = 5  # chain.json idle_nudge_minutes of the scenario
+# режим remnants: W2 после автоответа на развилку капа пишет ту же строку ещё CAP_REPEATS раз; первая повторная запись —
+# через CAP_REPEAT_AFTER виртуальных секунд: позже срока повтора неотправленного уведомления (NOTIFY_RETRY_SECONDS),
+# чтобы уведомление из outbox state.json 1.4.1 успело уйти, пока его эпизод жив
+CAP_REPEATS = 2
+CAP_REPEAT_AFTER = 7 * 60
+LEGACY_141 = FIXTURES / "waves" / "e2e-1.4.1-state"
 BG_SECONDS = 9 * 60  # how long W1's background shell lives: longer than the nudge threshold
 OLD_RUN = ("e2e/2026-01-01-old", "/elsewhere/runs/e2e/2026-01-01-old")  # (@wab_run, @wab_run_dir) of another run
 EXPECTED_TOOLS = ("tmux", "gh", "claude", "ps")
@@ -111,6 +122,11 @@ def review_cli_doubles():
     suite = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(suite)
     return {"claude": suite.MOCK, "codex": suite.CODEX_MOCK}
+
+
+class Restart(BaseException):
+    """Режим remnants: диспетчер остановлен в точке перезапуска (как убитый `watch`): BaseException, чтобы ни один
+    `except Exception` диспетчера его не поглотил."""
 
 
 class Stalled(BaseException):
@@ -135,6 +151,7 @@ class Clock:
         self.limit = limit
         self.real_time = time.time
         self.actor = None
+        self.hook = None  # режим remnants: точка перезапуска диспетчера (проверяется перед ходом волн)
         self.sleeps = 0
 
     def time(self):
@@ -145,6 +162,8 @@ class Clock:
         self.sleeps += 1
         if self.offset > self.limit:
             raise Stalled(f"the chain did not finish in {self.limit:.0f} virtual seconds")
+        if self.hook is not None:
+            self.hook()
         if self.actor is not None:
             self.actor.step()
 
@@ -152,7 +171,7 @@ class Clock:
 # ------------------------------------------------------------------ the world on disk
 
 class World:
-    def __init__(self, base, policy=True, quote=False):
+    def __init__(self, base, policy=True, quote=False, max_auto_answers=None):
         self.root = Path(base).resolve()
         self.home = self.root / "home"
         self.bindir = self.root / "bin"
@@ -168,6 +187,7 @@ class World:
         self.reviewbin = self.root / "review-bin"
         self.policy = policy
         self.quote = quote
+        self.max_auto_answers = max_auto_answers
         self.env = {
             "PATH": f"{self.bindir}{os.pathsep}{self.sysbin}", "HOME": str(self.home),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1",
@@ -281,6 +301,8 @@ class World:
                  "idle_nudge_minutes": NUDGE_MINUTES, "telegram": False}  # no `model`: the default
         if self.quote:  # the mutant: the wave's question is allowed into the notices
             chain["telegram_quote"] = True
+        if self.max_auto_answers is not None:  # режим remnants: кап автоответов волны — один
+            chain["max_auto_answers"] = self.max_auto_answers
         if self.policy:
             chain["decision_policy"] = [{"class": "needs_decision", "rec": "A"},
                                         {"class": "blocked_cap", "rec": "new_run", "answer": "invariant"}]
@@ -419,6 +441,8 @@ class Actor:
         self.bg_since = None
         self.worked = False
         self.statuses = []   # every status line a wave wrote
+        self.cap_line = None  # строка BLOCKED развилки капа W2 (режим remnants пишет её повторно)
+        self.cap_repeats = []  # (виртуальное время) каждой повторной записи той же строки
 
     # -- scheduling
     def after(self, delay, label, fn):
@@ -511,6 +535,8 @@ class Actor:
             s.journal.first_message(s.marker)
             return self.after(DELAY, "first prompt", lambda: getattr(self, f"start_{s.wave.lower()}")(s))
         if "РЕШЕНИЕ ПО ПОЛИТИКЕ" in text:
+            if s.wave == "W2" and self.mode.startswith("remnants"):
+                return self.after(CAP_REPEAT_AFTER, "cap line again", lambda: self.w2_cap_repeat(s))
             return self.after(DELAY, "policy answer", lambda: (self.w1_answered if s.wave == "W1" else self.w2_new_run)(s))
         if text.startswith("[wab] Толчок"):  # the idle nudge: the wave remembers its work and goes on
             return self.after(DELAY, "nudge answered", lambda: self.w1_work(s))
@@ -703,8 +729,20 @@ class Actor:
         fix("--outcome", "failed")
         fix("--decision", "invariant", "--note", "ещё круг")
         fix("--outcome", "failed")
-        self.write_status(s, f"BLOCKED: {CAP_STATUS} Три круга исправления T1. {QUESTION_MARKERS['W2']}. "
-                             "Варианты: new_run | accept_limitation")
+        self.cap_line = (f"BLOCKED: {CAP_STATUS} Три круга исправления T1. {QUESTION_MARKERS['W2']}. "
+                         "Варианты: new_run | accept_limitation")
+        self.write_status(s, self.cap_line)
+
+    def w2_cap_repeat(self, s):
+        """Режим remnants: волна не открыла новый прогон и снова записала ТУ ЖЕ строку развилки капа, без RUNNING между
+        записями (кап автоответов волны — один, он израсходован). Каждая запись — новый эпизод: владелец получает
+        уведомление. После CAP_REPEATS записей владелец отвечает в окне, и волна идёт в прогон 2."""
+        s.journal.turn(11_500)
+        self.write_status(s, self.cap_line)
+        self.cap_repeats.append(self.clock.offset)
+        if len(self.cap_repeats) < CAP_REPEATS:
+            return self.after(3 * TICK, "cap line again", lambda: self.w2_cap_repeat(s))
+        self.after(4 * TICK, "owner answers the cap fork", lambda: self.w2_new_run(s))
 
     def w2_new_run(self, s):
         s.journal.turn(12_000)
@@ -738,6 +776,51 @@ class Run:
     pass
 
 
+def put_legacy_state(run):
+    """Режим remnants: state.json прогона заменяется снятым state.json диспетчера 1.4.1 той же точки сценария
+    (tests/fixtures/waves/e2e-1.4.1-state, см. README). Руками, как названо в README: плейсхолдеры получают значения
+    ЭТОГО прогона (корень мира, его HOME, срез имени каталога журналов, id сессий, sha коммитов по их темам), моменты @T:±с@ —
+    «сейчас» виртуальных часов плюс сдвиг, [inode, mtime] файла status (@STAMP:W@) — штамп файла status этого прогона;
+    хранилище текстов `.texts/` волн удаляется: у 1.4.1 его не было, текст есть только в самом state.json."""
+    w, a = run.world, run.actor
+    raw = (LEGACY_141 / "state.json").read_text(encoding="utf-8")
+    raw = raw.replace("@SLUG@", re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(w.workdir)))
+    raw = raw.replace("@HOME@", str(w.home)).replace("@ROOT@", str(w.root))
+    for s in a.sessions.values():
+        for i, sid in enumerate(s.sids):
+            raw = raw.replace(f"@SID:{s.wave}:{i}@", sid)
+    revs = {}
+    for args in (("-C", str(w.workdir)), ("--git-dir", str(w.origin))):
+        for line in w.run("git", *args, "log", "--all", "--format=%H %s").stdout.splitlines():
+            sha, subject = line.split(" ", 1)
+            revs[subject] = sha
+    raw = re.sub(r"@REV(\d*):([^@]+)@", lambda m: revs[m.group(2)][:int(m.group(1) or 40)], raw)
+    now = time.time()
+
+    def walk(node):
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        if isinstance(node, str):
+            m = re.fullmatch(r"@T:([-+][0-9.]+)@", node)
+            if m:
+                return now + float(m.group(1))
+            m = re.fullmatch(r"@STAMP:(W\d)@", node)
+            if m:
+                st = os.stat(w.run_dir / m.group(1) / "status")
+                return [st.st_ino, st.st_mtime_ns]
+        return node
+    doc = walk(json.loads(raw))
+    left = re.findall(r"@(?:ROOT|HOME|SLUG|SID|REV|T|STAMP)[^@]*@", json.dumps(doc, ensure_ascii=False))
+    must(not left, f"placeholders of the 1.4.1 fixture left: {left}")
+    for wave in ("W1", "W2"):
+        shutil.rmtree(w.run_dir / wave / wab.TEXTS_DIR, ignore_errors=True)
+    wab.state_path({"run_dir": w.run_dir}).write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n",
+                                                      encoding="utf-8")
+    return doc
+
+
 def run_scenario(mode="normal", limit=90 * 60):
     """mode: normal | gate_off (merge gate always passes, CI red) | gate_off_codex (the same, CI green but
     Codex reviewed an older commit) | no_rebind (find_new_session finds nothing) | no_policy (chain.json
@@ -749,7 +832,9 @@ def run_scenario(mode="normal", limit=90 * 60):
     does not check whose a pane is)."""
     base = Path(tempfile.mkdtemp(prefix="wabe2e-"))
     atexit.register(shutil.rmtree, base, True)
-    world = World(base, policy=mode != "no_policy", quote=mode == "telegram_quote")
+    legacy = mode.startswith("remnants")  # remnants | remnants_no_upgrade | remnants_no_episode
+    world = World(base, policy=mode != "no_policy", quote=mode == "telegram_quote",
+                  max_auto_answers=1 if legacy else None)
     world.setup()
     clock = Clock(limit)
     actor = clock.actor = Actor(world, clock, mode)
@@ -758,6 +843,23 @@ def run_scenario(mode="normal", limit=90 * 60):
     run.urlopen_calls = []
     run.attention = []  # every text of the ATTENTION file as the dispatcher wrote it
     run.telegram = []  # what Telegram would carry: render_notice() of EVERY notice that reaches notify()
+    run.notices = []  # (виртуальное время, волна, текст) того же
+    run.restart_at = None  # режим remnants: виртуальный момент перезапуска диспетчера на state.json 1.4.1
+    run.legacy = None  # state.json 1.4.1 с подставленными значениями этого прогона
+    run.first_write = None  # state.json после первой записи перезапущенного диспетчера
+    run.outbox_sent = []  # (время, волна, ключ) записей outbox, отправленных после перезапуска
+
+    def restart_point():  # W2 получила автоответ на развилку капа, ответ дошёл (без pending_enter): перезапуск
+        if run.restart_at is not None:
+            return
+        try:
+            rec = json.loads((world.run_dir / "state.json").read_text(encoding="utf-8"))["waves"].get("W2") or {}
+        except (OSError, ValueError, KeyError):
+            return
+        if rec.get("auto_answers") == 1 and "pending_enter" not in rec:
+            raise Restart()
+    if legacy:
+        clock.hook = restart_point
 
     def no_network(*a, **kw):
         run.urlopen_calls.append(a)
@@ -774,7 +876,20 @@ def run_scenario(mode="normal", limit=90 * 60):
 
     def notify_seen(cfg, notice, wave=None):  # the one place every notice passes: record the Telegram text, then send
         run.telegram.append(wab.render_notice(notice, wab.TG_MESSAGE_LIMIT))
+        run.notices.append((clock.offset, wave, run.telegram[-1]))
         return real_notify(cfg, notice, wave)
+
+    real_save, real_outbox_notice = wab.save_state, wab.outbox_notice
+
+    def save_seen(cfg, st):  # the first state.json the restarted dispatcher writes
+        real_save(cfg, st)
+        if run.restart_at is not None and run.first_write is None:
+            run.first_write = json.loads(wab.state_path(cfg).read_text(encoding="utf-8"))
+
+    def outbox_seen(cfg, wave, w, key, item):  # an outbox entry is being sent
+        if run.restart_at is not None:
+            run.outbox_sent.append((clock.offset, wave, key))
+        return real_outbox_notice(cfg, wave, w, key, item)
 
     real_attention = wab.attention_text
 
@@ -787,6 +902,13 @@ def run_scenario(mode="normal", limit=90 * 60):
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.object(wab, "attention_text", attention_seen))
         stack.enter_context(mock.patch.object(wab, "notify", notify_seen))
+        if legacy:
+            stack.enter_context(mock.patch.object(wab, "save_state", save_seen))
+            stack.enter_context(mock.patch.object(wab, "outbox_notice", outbox_seen))
+        if mode == "remnants_no_upgrade":  # мутант: state.json 1.4.1 читается без миграции текста волны
+            stack.enter_context(mock.patch.object(wab, "upgrade_record", lambda w, legacy: None))
+        if mode == "remnants_no_episode":  # мутант: штампа записи status нет, повтор строки — не новый эпизод (1.4.3)
+            stack.enter_context(mock.patch.object(wab, "_status_stamp", lambda cfg, wave: None))
         stack.enter_context(mock.patch.dict(os.environ, world.env, clear=True))
         stack.enter_context(mock.patch.object(time, "time", clock.time))
         stack.enter_context(mock.patch.object(time, "sleep", clock.sleep))
@@ -827,6 +949,15 @@ def run_scenario(mode="normal", limit=90 * 60):
         run.resolved = {t: shutil.which(t) for t in EXPECTED_TOOLS + TOOLS_THAT_MUST_NOT_RESOLVE}
         try:
             run.codes["launch"] = call("launch", str(world.chain_file), "W1", str(world.root / "w1-prompt.md"))
+            if legacy:  # the first watch is stopped at the restart point, state.json becomes the one of 1.4.1
+                try:
+                    call("watch", str(world.chain_file))
+                    raise AssertionError("the chain never reached the restart point (W2 auto-answered on the cap fork)")
+                except Restart:
+                    pass
+                run.restart_at = clock.offset
+                run.received_at_restart = len(actor.received)
+                run.legacy = put_legacy_state(run)
             run.codes["watch"] = call("watch", str(world.chain_file))
             run.codes["done"] = call("done", str(world.chain_file))
             actor.step()  # what was typed after the last sleep (the final /exit) is read too
@@ -1068,6 +1199,108 @@ def oracle_cleanup(run):
          "the dispatcher did not report closing the run's dashboard pane")
 
 
+# ------------------------------------------------------------------ remnants: state.json без текста, эпизоды, 1.4.1
+#
+# ИНВАРИАНТ (сквозная приёмка цепочки waves-remnants, W2 + W3 + рестарт): на любом пути офлайн-цепочки, включая рестарт
+# диспетчера на state.json прошлой версии, state.json не содержит текста волны, каждый эпизод развилки без автоответа
+# даёт ровно одно уведомление владельцу, а одна развилка — не больше одного автоответа.
+
+_UNIT = {}
+
+
+def unit_suite():
+    """Набор unit-тестов waves (tests/helpers/superarmanda_waves_test.py): проверка «нет текста волны» берётся оттуда
+    (json_strings / text_holders класса W2StateHoldsNoWaveText), а не пишется заново."""
+    if "mod" not in _UNIT:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("superarmanda_waves_suite_for_e2e",
+                                                      Path(__file__).with_name("superarmanda_waves_test.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _UNIT["mod"] = mod
+    return _UNIT["mod"]
+
+
+def wave_texts(run):
+    """Тексты волн сценария: каждая строка status, которую писала волна (кроме слов STATUS_KINDS), и уникальные маркеры
+    вопросов. Ни одного из них не должно быть в state.json — ни в значении, ни в ключе."""
+    return sorted({t for t in run.actor.statuses if len(t) >= 5 and t not in wab.STATUS_KINDS}
+                  | set(QUESTION_MARKERS.values()))
+
+
+def oracle_no_wave_text(run, doc=None, where="the final state.json"):
+    """(а) Инвариант 1.4.3 на state.json этого прогона: ни текста волны, ни готового текста уведомления (время в поясе
+    владельца «Дубай») и набранного ответа («РЕШЕНИЕ ПО ПОЛИТИКЕ») — те же иглы, что у W2LegacyStateMigration."""
+    holders = unit_suite().text_holders
+    doc = run.state if doc is None else doc
+    must(isinstance(doc, dict) and doc.get("waves"), f"{where}: no state.json to check")
+    for text in [*wave_texts(run), "Дубай", "РЕШЕНИЕ ПО ПОЛИТИКЕ"]:
+        found = holders(doc, text)
+        must(not found, f"{where}: the wave's text {text[:60]!r} is in state.json at {found}")
+
+
+def blocked_notices(run, wave, since=0.0, until=float("inf")):
+    """Уведомления владельцу «волна ждёт тебя» (шаблон blocked) волны `wave` в окне виртуального времени."""
+    head = f"⏸ {CHAIN}: волна {wave} ждёт тебя"
+    return [t for at, x, t in run.notices if x == wave and since <= at < until and t.startswith(head)]
+
+
+def oracle_cap_repeat(run):
+    """(б) Эпизоды (1.4.4, #100): кап автоответов W2 (один) израсходован автоответом на развилку blocked_cap; волна
+    дважды пишет ту же строку BLOCKED без RUNNING между записями. Каждая запись — новый эпизод без автоответа и ровно
+    одно уведомление владельцу; отвеченный эпизод (до первой повторной записи) владельца не спрашивает."""
+    a = run.actor
+    must(len(a.cap_repeats) == CAP_REPEATS, f"the scenario wrote the cap line again {len(a.cap_repeats)} times")
+    must(a.statuses.count(a.cap_line) == CAP_REPEATS + 1, "the repeats are not the very same line")
+    answered = next(t for t, wave, msg in a.received if wave == "W2" and "РЕШЕНИЕ ПО ПОЛИТИКЕ" in msg)
+    must(blocked_notices(run, "W2", answered, a.cap_repeats[0]) == [],
+         "the owner was asked about the cap fork the policy had answered")
+    bounds = [*a.cap_repeats, float("inf")]
+    got = [len(blocked_notices(run, "W2", bounds[i], bounds[i + 1])) for i in range(CAP_REPEATS)]
+    must(got == [1] * CAP_REPEATS, f"notices to the owner after each repeat of the BLOCKED line at the cap: {got} "
+                                   f"(expected one per episode: {[1] * CAP_REPEATS})")
+    must(run.events_log.count("W2: policy cap reached (1/1)") == 1, "no event of the cap reached")
+
+
+def oracle_legacy_restart(run):
+    """(в) Рестарт на state.json 1.4.1 (фикстура снята настоящим диспетчером 1.4.1 в той же точке сценария: W2 получила
+    автоответ на развилку капа, уведомления не отправлены — Telegram лежал): (1) state.json фикстуры несёт текст волны,
+    после первой записи перезапущенного диспетчера его нет; (2) повторного автоответа нет — ни в окне, ни в
+    policy-decisions.log, ни в счётчике; (3) каждое неотправленное уведомление outbox фикстуры отправлено, пока жив его
+    эпизод (до первой повторной записи строки), ровно один раз; (4) текст вопроса, мигрированный из state.json
+    (хранилища `.texts/` у 1.4.1 нет), дошёл до chain-result.md."""
+    a, w = run.actor, run.world
+    must(run.restart_at is not None and run.legacy, "the dispatcher was never restarted on the 1.4.1 state.json")
+    legacy = json.dumps(run.legacy, ensure_ascii=False)
+    for marker in (QUESTION_MARKERS["W2"], QUESTION_MARKERS["W2-owner"], "Дубай"):
+        must(marker in legacy, f"the 1.4.1 fixture has no {marker!r}: the check below would be empty")
+    oracle_no_wave_text(run, run.first_write, "state.json after the first write of the restarted dispatcher")
+    oracle_no_wave_text(run)
+    # (2) one fork, one automatic answer
+    answers = [(t, msg) for t, wave, msg in a.received if wave == "W2" and "РЕШЕНИЕ ПО ПОЛИТИКЕ" in msg]
+    must(len(answers) == 1 and answers[0][0] < run.restart_at, f"W2 policy answers: {[(t, m[:50]) for t, m in answers]}")
+    log = (w.run_dir / "W2" / "policy-decisions.log").read_text(encoding="utf-8").splitlines()
+    must(len(log) == 1, f"policy-decisions.log of W2 after the restart: {log}")
+    must(run.state["waves"]["W2"]["auto_answers"] == 1, f"W2 auto answers {run.state['waves']['W2'].get('auto_answers')}")
+    must(run.events_log.count("W2: policy auto-answer") == 1, "events: W2 auto-answered more than once")
+    # (3) the unsent notices of the fixture: delivered once each, while their episode lived
+    owed = sorted((wave, key) for wave, rec in run.legacy["waves"].items() for key in (rec.get("outbox") or {}))
+    must(owed == [("W1", "done"), ("W2", "policy_answer"), ("W2", "started")], f"outbox of the 1.4.1 fixture: {owed}")
+    for wave, key in owed:
+        sent = [t for t, x, k in run.outbox_sent if (x, k) == (wave, key)]
+        must(len(sent) == 1, f"the unsent {wave}/{key} of the 1.4.1 state.json was sent {len(sent)} times after the restart")
+        must(sent[0] < a.cap_repeats[0], f"{wave}/{key} was sent after its episode could end")
+    told = [t for at, x, t in run.notices if at >= run.restart_at]
+    for wave, head in (("W1", "волна W1 завершена"), ("W2", "стартовала волна W2"),
+                       ("W2", "волна W2: развилка закрыта по политике")):
+        must(sum(head in t.splitlines()[0] for t in told) == 1, f"the notice «{head}» of the 1.4.1 outbox was lost")
+    for wave in ("W1", "W2"):
+        must(not run.state["waves"][wave].get("outbox"), f"{wave}: notices left undelivered: {run.state['waves'][wave]}")
+    # (4) the question of the 1.4.1 record reached chain-result.md from the store it was migrated into
+    result = (w.run_dir / "chain-result.md").read_text(encoding="utf-8")
+    must(QUESTION_MARKERS["W2-owner"] in result, "the question of W2 kept only in the 1.4.1 state.json is lost")
+
+
 def oracle_flow(run):
     """The scenario happened in order, as the dispatcher's own journal and the windows' inbox tell it."""
     w, a = run.world, run.actor
@@ -1185,6 +1418,43 @@ class OfflineChain(unittest.TestCase):
     def test_runs_fast(self):
         must(self.seconds < 40, f"the scenario took {self.seconds:.0f} s")
 
+    def test_state_json_holds_no_wave_text(self):
+        oracle_no_wave_text(self.chain)
+
+
+class RemnantsChain(unittest.TestCase):
+    """Сквозная приёмка цепочки waves-remnants (W5): тот же сценарий с капом автоответов 1; диспетчер остановлен сразу
+    после автоответа W2 на развилку капа и перезапущен на state.json диспетчера 1.4.1, снятом в той же точке
+    (tests/fixtures/waves/e2e-1.4.1-state); затем W2 дважды пишет ту же строку BLOCKED, владелец отвечает, цепочка
+    доходит до chain-result.md. Инвариант — над oracle_no_wave_text."""
+    chain = None
+
+    @classmethod
+    def setUpClass(cls):
+        t = time.monotonic()
+        cls.chain = run_scenario("remnants")
+        cls.seconds = time.monotonic() - t
+
+    def test_a_state_json_holds_no_wave_text_after_the_chain(self):
+        oracle_no_wave_text(self.chain)
+
+    def test_b_each_repeat_of_the_blocked_line_at_the_cap_notifies_the_owner_once(self):
+        oracle_cap_repeat(self.chain)
+
+    def test_c_restart_on_the_1_4_1_state_json_no_second_answer_no_lost_notice(self):
+        oracle_legacy_restart(self.chain)
+
+    def test_the_chain_still_runs_to_chain_result(self):
+        oracle_flow(self.chain)
+        oracle_gate(self.chain)
+        oracle_blocked_cap(self.chain)
+
+    def test_every_external_text_is_still_clean(self):
+        oracle_external(self.chain)
+
+    def test_runs_fast(self):
+        must(self.seconds < 40, f"the scenario took {self.seconds:.0f} s")
+
 
 class Mutations(unittest.TestCase):
     """The same scenario with the dispatcher broken: the oracle of the normal run must fail."""
@@ -1252,6 +1522,19 @@ class Mutations(unittest.TestCase):
         run = run_scenario("telegram_quote")
         with self.assertRaisesRegex(AssertionError, "machine token|the wave's question leaked"):
             oracle_external(run)
+
+    def test_a_1_4_1_state_json_read_without_migration_is_seen(self):
+        """Без upgrade_record текст волны из state.json 1.4.1 остаётся в state.json после первой записи."""
+        run = run_scenario("remnants_no_upgrade")
+        with self.assertRaisesRegex(AssertionError, "after the first write of the restarted dispatcher: the wave's text"):
+            oracle_legacy_restart(run)
+
+    def test_a_repeat_of_the_line_without_a_new_episode_is_seen(self):
+        """Без штампа записи status эпизод — только текст строки: повтор той же строки на капе молчит, а отвеченный эпизод
+        после рестарта читается как новый и спрашивает владельца (oracle видит первое из двух)."""
+        run = run_scenario("remnants_no_episode")
+        with self.assertRaisesRegex(AssertionError, "notices to the owner after each repeat|the owner was asked about the cap"):
+            oracle_cap_repeat(run)
 
     def test_without_the_decision_policy_the_chain_stalls(self):
         with self.assertRaises(Stalled):
