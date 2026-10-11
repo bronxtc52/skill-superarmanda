@@ -19166,6 +19166,56 @@ class MetricsScript(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["waves"][0]["fix_cycles"], 2)
 
+    def test_every_foreign_or_corrupted_source_is_no_data(self):
+        """Класс находок Codex на #118 (инвариант целиком): каждый читаемый файл — внутри каталога волны, runs.json
+        строго валиден (версия — целое 1, не bool; номера прогонов не повторяются), заявленный `run.index`
+        выбранного manifest равен номеру прогона из runs.json. Иначе — «нет данных», код 1, без traceback."""
+        def lone(mutate):
+            run, _ = self._lone_wave()
+            mutate(run / "W1")
+            return run
+
+        def runs_symlink_out(w):
+            outside = w.parent.parent / "outside-runs.json"
+            outside.write_text((w / "runs.json").read_text(encoding="utf-8"), encoding="utf-8")
+            (w / "runs.json").unlink()
+            (w / "runs.json").symlink_to(outside)
+
+        def patch_runs(**patch):
+            def mutate(w):
+                d = json.loads((w / "runs.json").read_text(encoding="utf-8"))
+                d.update(patch)
+                (w / "runs.json").write_text(json.dumps(d), encoding="utf-8")
+            return mutate
+
+        def duplicate_index(w):
+            d = json.loads((w / "runs.json").read_text(encoding="utf-8"))
+            d["runs"].append(dict(d["runs"][0]))
+            (w / "runs.json").write_text(json.dumps(d), encoding="utf-8")
+
+        def other_run_by_path(w):
+            (w / "other.json").write_text(json.dumps({"version": 1, "wave": "W1", "run": {"index": 2},
+                                                      "tasks": {"t": {"fix_cycles": 5}}}), encoding="utf-8")
+            (w / "superarmanda" / "manifest.json").unlink()
+            d = json.loads((w / "runs.json").read_text(encoding="utf-8"))
+            d["runs"][0]["manifest"] = str(w / "other.json")
+            (w / "runs.json").write_text(json.dumps(d), encoding="utf-8")
+
+        cases = {"runs.json symlinked out": runs_symlink_out, "duplicate run index": duplicate_index,
+                 "manifest by path declares another run": other_run_by_path}
+        cases.update({f"runs.json version {v!r}": patch_runs(version=v) for v in (True, 1.0, "1")})
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                r = self.cli(lone(mutate), "--json")
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertNotIn("Traceback", r.stderr)
+                w1 = json.loads(r.stdout)["waves"][0]
+                self.assertIsNone(w1["fix_cycles"], w1)
+                self.assertTrue(w1["problems"], w1)
+        r = self.cli(lone(lambda w: None), "--json")  # контроль: исправный каталог засчитывается
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["waves"][0]["fix_cycles"], 2)
+
     def test_a_broken_or_missing_file_is_named_not_skipped(self):
         def break_it(run):
             (run / "W1" / "runs.json").write_text("{", encoding="utf-8")                      # corrupt

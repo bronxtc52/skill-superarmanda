@@ -9,13 +9,13 @@
 
 <run_dir> — каталог прогона цепочки (`runs/<цепочка>/<run_id>`). Читается только он, ничего не пишется:
   * `W*/runs.json` — прогоны волны (state.py `init --from-plan`); у каждого свой manifest. runs.json проверяется
-    как в `state.read_runs`: версия 1, `wave` = имя каталога волны, `index` каждого прогона — положительное целое,
-    иначе волна «нет данных». Файл прогона ищется сначала среди `W*/superarmanda/manifest*.json` по `run.index`
+    как в `state.read_runs`: версия — целое 1, `wave` = имя каталога волны, `index` каждого прогона — положительное
+    целое, номера не повторяются, сам runs.json лежит внутри каталога волны, иначе волна «нет данных». Файл прогона ищется сначала среди `W*/superarmanda/manifest*.json` по `run.index`
     внутри (файлы переименовывают: так в живых каталогах manifest.json держит второй прогон), затем по пути из
     runs.json, затем по его имени рядом; путь принимается только внутри каталога волны (после разрешения
     симлинков), ведущий наружу заменяется именем файла в `superarmanda/`; файл, называющий себя другим
-    прогоном, не подставляется; manifest с испорченным `run` (есть, но без положительного целого `index`) —
-    «нет данных», manifest без `run` (старый формат) засчитывается;
+    прогоном, не подставляется; manifest, чей `run.index` не равен номеру прогона из runs.json
+    (или испорчен), — «нет данных», manifest без `run` (старый формат) засчитывается;
   * без `runs.json` — один прогон по `W*/superarmanda/manifest.json` (цепочки до 1.2.0 его не вели);
   * `events.log` — развилки blocked_cap.
 
@@ -76,10 +76,12 @@ def _is_index(value):
 
 def _runs_of(wave_dir, runs_file):
     """(список прогонов, None) или (None, причина): те же проверки, что у state.read_runs."""
+    if not _inside(runs_file, wave_dir):
+        return None, "runs.json ведёт вне каталога волны"
     data, why = _load(runs_file)
     if why:
         return None, why
-    if (not isinstance(data, dict) or data.get("version") != RUNS_FILE_VERSION or not isinstance(data.get("wave"), str)
+    if (not isinstance(data, dict) or not _is_index(data.get("version")) or data["version"] != RUNS_FILE_VERSION or not isinstance(data.get("wave"), str)
             or not isinstance(data.get("runs"), list) or not all(isinstance(r, dict) for r in data["runs"])):
         return None, "runs.json неподдерживаемого формата"
     if data["wave"] != wave_dir.name:
@@ -95,11 +97,14 @@ def _manifest_paths(wave_dir, problems):
     if not runs_file.exists():
         fallback = wave_dir / "superarmanda" / "manifest.json"
         if fallback.is_file() and _inside(fallback, wave_dir):
-            return [fallback]
+            return [(fallback, None)]
         return _fail(problems, "нет ни runs.json, ни superarmanda/manifest.json")
     runs, why = _runs_of(wave_dir, runs_file)
     if why:
         return _fail(problems, why)
+    indices = [r.get("index") for r in runs if _is_index(r.get("index"))]
+    if len(indices) != len(set(indices)):
+        return _fail(problems, "в runs.json повторяется номер прогона")
     by_index = _by_index(wave_dir)
     claimed = {p.resolve(): i for i, p in by_index.items()}
     found = []
@@ -107,7 +112,7 @@ def _manifest_paths(wave_dir, problems):
         index, raw = r.get("index"), r.get("manifest")
         if not _is_index(index):
             problems.append(f"в runs.json у прогона неверный номер (тип {type(index).__name__})")
-            found.append(None)
+            found.append((None, index))
             continue
         path = by_index.get(index)  # файл, который сам называет себя этим прогоном, — надёжнее имени
         if path is None and isinstance(raw, str) and raw and "\0" not in raw:
@@ -121,9 +126,9 @@ def _manifest_paths(wave_dir, problems):
                 path = None  # чужой файл или файл называет себя другим прогоном: не подставлять
         if path is None or not path.is_file():
             problems.append(f"manifest прогона {index} не найден")
-            found.append(None)
+            found.append((None, index))
             continue
-        found.append(path)
+        found.append((path, index))
     return found
 
 
@@ -147,7 +152,8 @@ def _fail(problems, why):
     return []
 
 
-def _fix_cycles(path, problems):
+def _fix_cycles(path, problems, index=None):
+    """Фикс-круги manifest прогона `index` (None — прогон без runs.json): заявленный в файле номер обязан совпасть."""
     if path is None:
         return None
     data, why = _load(path)
@@ -155,10 +161,11 @@ def _fix_cycles(path, problems):
     if why or not isinstance(tasks, dict):
         problems.append(why or f"{path.name}: нет tasks")
         return None
-    if "run" in data and not (isinstance(data["run"], dict) and _is_index(data["run"].get("index"))):
-        # без `run` — manifest старого формата; заявленный, но испорченный номер прогона — испорченный ввод
-        problems.append(f"{path.name}: неверный номер прогона в run")
-        return None
+    if "run" in data:  # без `run` — manifest старого формата; заявленный номер — испорченный или чужой ввод
+        declared = data["run"].get("index") if isinstance(data["run"], dict) else None
+        if not _is_index(declared) or (index is not None and declared != index):
+            problems.append(f"{path.name}: номер прогона в run не {index if index is not None else 'положительное целое'}")
+            return None
     total = 0
     for name, entry in tasks.items():
         cycles = entry.get("fix_cycles") if isinstance(entry, dict) else None
@@ -215,7 +222,7 @@ def measure(run_dir):
     for d in waves:
         problems = []
         manifests = _manifest_paths(d, problems)
-        cycles = [_fix_cycles(p, problems) for p in manifests]
+        cycles = [_fix_cycles(p, problems, i) for p, i in manifests]
         rows.append({
             "wave": d.name,
             "runs": len(manifests) if manifests else None,  # прогон с потерянным manifest считается: он был
