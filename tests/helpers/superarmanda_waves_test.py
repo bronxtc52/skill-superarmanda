@@ -18475,7 +18475,7 @@ class W6OwnerTime(Base):
     # ----- docs -----
     def test_release_docs_and_agent_docs(self):
         skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.[234]\.\d+"\s*$')  # the version itself is pinned by the newest release's test
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.[2-9]\.\d+"\s*$')  # the version itself is pinned by the newest release's test
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         m = re.search(r"(?ms)^## 1\.2\.6 — 2026-10-06\n(.*?)(?=^## )", log)
         self.assertTrue(m, "CHANGELOG.md: the section `## 1.2.6 — 2026-10-06`")
