@@ -299,9 +299,9 @@ manifest: `state.py init` 1.2.4 писал `review_policy.version: "1.2.4"`, с 
   отличит от прогона без внешнего ревью. И обратное: ошибочный `fix-loop --outcome failed` под
   внешним источником до результата этой роли делает `fix_sources` свидетелем пакета — задача до
   конца прогона в «новом прогоне» (повтор `internal_reviewer` его не снимает). С 1.4.2 причина
-  называет роль и вид свидетеля (`witness: marker external_review`, `fix-loop record`,
-  `fix-loop --defer record`, `fix-loop --accept record`, `session of the role`, `current result`,
-  `review history`), чтобы такую запись было видно сразу (#95, #98 п.3).
+  называет роль и вид свидетеля, чтобы такую запись было видно сразу (#95, #98 п.3); с 1.6.0 свидетель
+  назван коротко, именем поля manifest: `(<роль>, witness: <поле>)`, поле — `external_review`,
+  `session_roles`, `fix_sources`, `results`, `review_history`, `deferrals` или `acceptances`.
   Зачёт — долговечный ключ задачи `internal_review`
   (`{status, head, tree_fingerprint, epoch, result_id, model, recorded_at}`): его пишет
   `task-result --role internal_reviewer` при любом статусе, пока внешнее ревью задачи не

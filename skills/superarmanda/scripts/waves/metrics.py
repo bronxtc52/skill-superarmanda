@@ -59,6 +59,8 @@ BARE_STATUS = re.compile(r"[A-Z][A-Z_]*\Z")
 BLOCKED_CAP = re.compile(r"BLOCKED: \[class=blocked_cap\b")
 RUNS_FILE_VERSION = 1  # как state.RUNS_FILE_VERSION
 MANIFEST_VERSIONS = (1, 2)  # как state.MANIFEST_VERSIONS
+# служебные строки say пишутся видом `say-note:` (wab.SAY_NOTE) и под `say: ` не попадают; эти легаси-префиксы —
+# только для распознавания строк журналов, записанных до 1.6.0
 SAY_SERVICE = ("say: owner-answered marker not written", "say: status rewritten while the marker")
 NO_DATA = "нет данных"
 MAX_FIX_CYCLES = 1000  # кап state.py — 3 круга (+ решения владельца); больше — испорченный ввод, не печатаемое число
@@ -232,7 +234,7 @@ def blocked_cap_by_wave(events):
 
     Эпизод — непрерывный период, когда ТЕКУЩИЙ статус волны — именно эта строка blocked_cap. Статус волны меняют
     строки `<волна>: BLOCKED: …`, `<волна>: DONE|RUNNING|…`, `phase=… status=<…>`, ответ политики, успешный
-    `say: …` (но не `say FAILED` и не служебные строки say о маркере) и запуск окна;
+    `say: …` (но не `say FAILED`, не служебный `say-note: …` и не легаси-строки SAY_SERVICE) и запуск окна;
     остальные (alarm, merge gate…) его не сообщают и эпизод не рвут. Строки других волн не влияют."""
     counts, current = {}, {}
     for line in events.splitlines():

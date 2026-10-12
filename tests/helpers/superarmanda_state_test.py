@@ -7537,7 +7537,10 @@ class W4GateRoles(W4Base):
         action = self.where()["next_action"]
         self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
         self.assertIn("new run", action)
-        self.assertIn("witness: fix-loop record", action)
+        # W4 waves-tails2 п.3: свидетель — коротко, именем поля manifest, без вложенных скобок
+        self.assertIn("(cross_provider_reviewer, witness: fix_sources)", action)
+        self.assertNotIn("fix-loop record", action)
+        self.assertEqual(action.count("witness:"), 1, action)  # свидетель назван один раз
         # a repeated internal review cannot earn the credit in this run
         proc = self.state("task-result", *self.result_args("internal_reviewer", "pass", model="fable"))
         if proc.returncode == 0:
@@ -7552,7 +7555,7 @@ class W4GateRoles(W4Base):
         self.manifest.write_text(json.dumps(value), encoding="utf-8")
         action = self.where()["next_action"]
         self.assertIn("new run", action)
-        self.assertIn("witness: marker", action)
+        self.assertRegex(action, r"\((cross_provider_reviewer|second_reviewer), witness: external_review\)")
 
     def test_internal_review_before_the_packet_counts_only_as_a_current_result_of_this_tree(self):
         """Before the packet the requirement is still open: the credit of a dirty tree does not count on

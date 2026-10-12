@@ -1305,7 +1305,7 @@ def internal_review_gap(entry, results, head, models):
         # the packet went out (session history) but the marker that binds the credit to its HEAD
         # is gone or has no HEAD: nothing to count the credit against
         what = (
-            f"the first external packet of the task is known ({started}), but the marker "
+            "the first external packet of the task is known, but the marker "
             "external_review that names its HEAD is missing or has no head"
         )
     elif (
@@ -2730,7 +2730,8 @@ def record_fix_outcome(args, entry, data, location, risk, policy):
 
 def external_review_started(entry):
     """The role of the first external review recorded for the task in this run, with the witness
-    by which it is known ("cross_provider_reviewer (witness: fix-loop record, fix_sources)"), or None.
+    by which it is known, named by its manifest field ("cross_provider_reviewer, witness: fix_sources"),
+    or None.
     Callers use it as truthy and in texts; none compares it with a role name.
     The marker `external_review` is written by task-result since 1.2.3; a manifest of 1.2.2 has
     none, so every record that survives `resume` is read as a witness as well: the session
@@ -2743,30 +2744,30 @@ def external_review_started(entry):
     is left when that source had neither a fix-loop round nor a --defer/--accept."""
     marker = entry.get("external_review")
     if isinstance(marker, dict):
-        return f"{marker.get('role') or 'an external review'} (witness: marker external_review)"
+        return f"{marker.get('role') or 'an external review'}, witness: external_review"
     witnesses = []  # (role, witness) in the fixed order of the witnesses
     witnesses += [
-        (role, "session of the role")
+        (role, "session_roles")
         for role in (entry.get("session_roles") or {}).values()
         if isinstance(role, str)
     ]
-    witnesses += [(role, "fix-loop record, fix_sources") for role in (entry.get("fix_sources") or {})]
-    witnesses += [(role, "current result") for role in (entry.get("results") or {}) if isinstance(role, str)]
+    witnesses += [(role, "fix_sources") for role in (entry.get("fix_sources") or {})]
+    witnesses += [(role, "results") for role in (entry.get("results") or {}) if isinstance(role, str)]
     witnesses += [
-        (item.get("role"), "review history")
+        (item.get("role"), "review_history")
         for item in (entry.get("review_history") or ())
         if isinstance(item, dict) and isinstance(item.get("role"), str)
     ]
-    for kind, name in (("deferrals", "fix-loop --defer record"), ("acceptances", "fix-loop --accept record")):
+    for kind in ("deferrals", "acceptances"):
         witnesses += [
-            (item.get("source"), name)
+            (item.get("source"), kind)
             for item in (entry.get(kind) or ())
             if isinstance(item, dict) and isinstance(item.get("source"), str)
         ]
     roles = sorted({role for role, _ in witnesses if role in EXTERNAL_REVIEW_ROLES})
     if not roles:
         return None
-    return f"{roles[0]} (witness: {next(name for role, name in witnesses if role == roles[0])})"
+    return f"{roles[0]}, witness: {next(name for role, name in witnesses if role == roles[0])}"
 
 
 def record_internal_round(entry, data, location):

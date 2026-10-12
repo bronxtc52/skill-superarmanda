@@ -16155,6 +16155,20 @@ class DashEvents(unittest.TestCase):
         self.assertGreater(total, 200)
         self.assertEqual(raw, [], f"unrecognised event types in the live fixture: {raw[:5]}")
 
+    def test_say_note_is_not_a_message_into_the_window(self):
+        """W4 waves-tails2 п.1: служебная строка say (и её легаси-форма `say: <служебное>`) — не «написали в окно»."""
+        for msg in ("W1: say-note: owner-answered marker not written (disk full)",
+                    "W1: say-note: status rewritten while the marker was taken; the marker answers no episode",
+                    "W1: say: owner-answered marker not written (disk full)",
+                    "W1: say: status rewritten while the marker was taken; the marker answers no episode"):
+            with self.subTest(msg=msg):
+                phrase, details, colour, known = self.dash.humanize_event(msg)
+                self.assertTrue(known)
+                self.assertNotIn("написали", phrase)
+                self.assertIn("отметка ответа", phrase)
+        phrase, _, _, _ = self.dash.humanize_event("W1: say: [координатор] ответ")
+        self.assertIn("в окно волны написали", phrase)
+
     def test_blocked_says_who_is_needed(self):
         h = self.dash.humanize_event
         phrase, details, colour, known = h(
@@ -20026,10 +20040,32 @@ class MetricsScript(unittest.TestCase):
             "say service lines answer nothing": ([
                 blocked, f"{t} W1: say: owner-answered marker not written (disk full)",
                 f"{t} W1: say: status rewritten while the marker was taken; the marker answers no episode", blocked], 1),
+            "say-note lines answer nothing": ([
+                blocked, f"{t} W1: say-note: owner-answered marker not written (disk full)",
+                f"{t} W1: say-note: status rewritten while the marker was taken; the marker answers no episode",
+                blocked], 1),
+            "say-note with any text answers nothing": ([blocked, f"{t} W1: say-note: что угодно", blocked], 1),
         }
         for name, (lines, want) in cases.items():
             with self.subTest(name):
                 self.assertEqual(self.metrics.blocked_cap_by_wave("\n".join(lines)).get("W1", 0), want)
+
+    def test_service_say_lines_are_a_separate_kind(self):
+        """W4 waves-tails2 п.1: служебные строки `say` (о маркере owner-answered) пишутся видом `say-note:` через одну
+        точку записи; `say: ` в events.log — только текст, ушедший в окно волны (ответ владельца для metrics)."""
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        says = re.findall(r'event\(cfg, f"\{wave\}: say: ([^"]*)"', src)
+        self.assertEqual(says, ["{first}"], "через `say: ` идёт только отправленный текст")
+        self.assertEqual(wab.SAY_NOTE, "say-note")
+        self.assertEqual(src.count('f"{wave}: {SAY_NOTE}: '), 1, "одна точка записи служебной строки")
+        self.assertIsNone(re.search(r'event\([^)\n]*say-note:', src), "служебная строка — только через say_note()")
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {"run_dir": Path(d)}
+            with mock.patch.object(wab, "event") as ev:
+                wab.say_note(cfg, "W1", "owner-answered marker not written (disk full)")
+            ev.assert_called_once_with(cfg, "W1: say-note: owner-answered marker not written (disk full)")
+        # легаси-префиксы — только для распознавания старых строк журнала
+        self.assertTrue(all(p.startswith("say: ") for p in self.metrics.SAY_SERVICE))
 
     def make(self, mutate):
         base = Path(tempfile.mkdtemp(prefix="wab-metrics-"))
@@ -22518,6 +22554,29 @@ class W4DashReload(Base):
                 self.dash.reload_cfg(back, path)
                 self.assertEqual(len(self.told(cfg)) - base, 2)
 
+    def test_a_failed_event_is_retried_on_the_next_frame(self):
+        """W4 waves-tails2 п.2: смена идентичности помечается «сказанной» только после УСПЕШНОЙ записи события;
+        сбой записи (диск, права) — повтор на следующем кадре, а не молчание до следующей смены."""
+        cfg, path = self.chain()
+        self.edit(path, run_id="other-run")
+        calls = []
+
+        def flaky(c, text):
+            calls.append(text)
+            if len(calls) == 1:
+                raise OSError(28, "No space left on device")
+            return orig(c, text)
+
+        orig = wab.event
+        with mock.patch.object(wab, "event", side_effect=flaky):
+            got = self.dash.reload_cfg(cfg, path)  # запись упала: кадр не падает
+            self.assertEqual(self.told(cfg), [])
+            got = self.dash.reload_cfg(got, path)  # следующий кадр: повтор, теперь записано
+            self.assertEqual(len(self.told(cfg)), 1)
+            self.dash.reload_cfg(got, path)  # дальше — тишина: событие одно на смену
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(len(self.told(cfg)), 1)
+
     def test_legacy_defaults_survive_a_changed_identity(self):
         """Codex P2 on PR #116: a pre-1.4 chain.json without model/ctx_limit takes their defaults from the run
         (LEGACY for a held pre-1.4 run); a changed run_id must not switch the dashboard to the NEW run's
@@ -22616,9 +22675,15 @@ class W4NoticeMinutes(Base):
         for value, want in [(12, "12 мин"), (12.0, "12 мин"), (0, "0 мин"), (0.5, "30 с"), (1.5, "1 мин 30 с"),
                             (0.005, "<1 с"), (0.008, "<1 с"), (1e-9, "<1 с"), (0.009, "1 с"),
                             (True, "?"), (-1, "?"), ("5", "?"), (None, "?"), (float("nan"), "?"),
-                            (float("inf"), "?"), (10 ** 6, "?"), (10 ** 6 + 0.5, "?")]:
+                            (float("inf"), "?"), (10 ** 6, "?"), (10 ** 6 + 0.5, "?"),
+                            # W4 waves-tails2 п.4c: от часа — часами, как _human_dur
+                            (59.5, "59 мин 30 с"), (60, "1ч00м"), (61.5, "1ч01м"), (90, "1ч30м"), (1440, "24ч00м"),
+                            (59.999, "1ч00м")]:
             with self.subTest(value=value):
                 self.assertEqual(fmt({}, value), want)
+        for minutes in (60, 75, 125.5, 999):
+            with self.subTest(same_as_human_dur=minutes):
+                self.assertEqual(fmt({}, minutes), wab._human_dur(int(round(minutes * 60))))
 
     def test_an_older_outbox_entry_renders_without_a_question_mark(self):
         cfg, _ = self.chain(idle_minutes=15, handoff_timeout_minutes=30)
@@ -22638,6 +22703,40 @@ class W4NoticeMinutes(Base):
             with self.subTest(key=key):
                 self.assertNotIn("?", wab.attention_signal(cfg, "W1", key))
 
+    def test_an_outbox_entry_with_a_non_numeric_n_takes_the_setting_not_a_question_mark(self):
+        """W4 waves-tails2 п.4d: испорченное `n` (строка, bool, None) старой записи — как запись без числа: значение
+        настройки chain.json, а не «?» в тексте уведомления."""
+        cfg, _ = self.chain(idle_minutes=15, handoff_timeout_minutes=30)
+        w = self.wave_rec()
+        for key, want in (("idle", "15 мин"), ("checkpoint_timeout", "30 мин")):
+            for bad in ("7", True, None, [7], float("nan"), -3):
+                for field in ("n", "minutes"):
+                    with self.subTest(key=key, bad=bad, field=field):
+                        text = wab.outbox_notice(cfg, "W1", w, key, {"value": "x", "fields": {field: bad}, "next_at": 0})
+                        self.assertIn(want, text)
+                        self.assertNotIn("?", text)
+
+    def test_attention_signal_keeps_the_minutes_of_the_moment_it_was_put(self):
+        """W4 waves-tails2 п.4d: ATTENTION о молчании показывает минуты, с которыми эпизод поставлен, а не текущую
+        настройку chain.json (её могли поменять на ходу)."""
+        cfg, _ = self.chain(idle_minutes=15, telegram=None)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        st = wab.load_state(cfg)
+        w = st["waves"]["W1"]
+        wab.put_notice(cfg, w, "W1", "idle", "digest-1", minutes=15)
+        with mock.patch.object(wab, "display_all"):
+            wab.flush_notices(cfg, st, w)
+        self.assertIn("idle", w.get("attention", {}))
+        cfg = dict(cfg, idle_minutes=45)  # настройку поменяли после постановки
+        text = wab.attention_text(st, cfg)
+        self.assertIn("15 мин", text)
+        self.assertNotIn("45 мин", text)
+        # сигнал старого диспетчера (без числа) — по настройке, без «?»
+        w["attention"]["idle"].pop("minutes", None)
+        text = wab.attention_text(st, cfg)
+        self.assertIn("45 мин", text)
+        self.assertNotIn("?", text.split("attach:")[0])
+
     def test_the_callers_pass_the_raw_number(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
         self.assertNotIn('n=int(cfg["idle_minutes"])', src)
@@ -22653,13 +22752,17 @@ class W4GateEventOnce(GateBase):
                                           {"id": "PRRT_b", "isResolved": False}])
         self.assertTrue(self.tick())
         self.assertEqual(self.log().count("merge gate passed with 2 open threads"), 1, self.log())
+        self.tick()  # W4 waves-tails2 п.4a: следующий тик с теми же фактами — события не прибавляет
+        self.assertEqual(self.log().count("merge gate passed with 2 open threads"), 1, self.log())
 
 
 class W4OwnerTimeWithoutRich(Base):
     """#102 item 4: without rich only the dashboard paths of W6OwnerTime are skipped, the rest runs."""
 
     def test_a_non_dashboard_test_runs_when_dash_cannot_be_imported(self):
-        sys.modules.pop("dash", None)
+        held = sys.modules.pop("dash", None)
+        if held is not None:  # вернуть тот же модуль: следующие тесты работают с ним, а не с новым экземпляром
+            self.addCleanup(sys.modules.__setitem__, "dash", held)
         with mock.patch.dict(sys.modules, {"dash": None}):  # `import dash` raises ImportError
             suite = unittest.TestSuite(
                 [unittest.defaultTestLoader.loadTestsFromName("test_registry_and_drivers_are_the_same_set", W6OwnerTime),
@@ -22669,6 +22772,19 @@ class W4OwnerTimeWithoutRich(Base):
         self.assertEqual(res.skipped, [], res.skipped)
         self.assertEqual((res.errors, res.failures), ([], []))
         self.assertEqual(res.testsRun, 2)
+
+    def test_the_dash_module_is_back_after_the_test(self):
+        """W4 waves-tails2 п.4b: тест без rich не оставляет за собой выгруженный dash — следующие тесты видят тот же
+        модуль (иначе повторный `import dash` дал бы второй экземпляр со своим _IDENTITY_TOLD)."""
+        try:
+            import dash
+        except ImportError as exc:
+            self.skipTest(f"rich is not installed: {exc}")
+        res = unittest.TestResult()
+        unittest.defaultTestLoader.loadTestsFromName(
+            "test_a_non_dashboard_test_runs_when_dash_cannot_be_imported", W4OwnerTimeWithoutRich).run(res)
+        self.assertEqual((res.errors, res.failures), ([], []))
+        self.assertIs(sys.modules.get("dash"), dash)
 
 
 class W4MaskBoundaries(Base):
@@ -22714,6 +22830,30 @@ class W4MaskBoundaries(Base):
                 found = redact_uses_outside(d)
                 self.assertEqual([f[2] for f in found], ["out"], (src, found))
                 self.assertEqual(found[0][1], 5, found)  # the line of the call in out, not the one in safe_text
+
+    def test_item1_exception_forms_the_guards_do_not_see(self):
+        """#103 п.1, остальные формы (W4 waves-tails2 п.6): стражи `exception_formats`/`stringified_errors` узнают
+        исключение по имени и `errors` по имени выражения; эти формы они не видят — граница названа в доке."""
+        forms = {
+            "replace()": "    except KeyError as e:\n        t = e.args[0].replace('a', 'b')\n        return t\n",
+            "склейку через промежуточную переменную": "    except KeyError as e:\n        v = e\n        return f'{v}'\n",
+            "'%s' % (e,)": "    except KeyError as e:\n        return '%s' % (e,)\n",
+            "'{}'.format(e)": "    except KeyError as e:\n        return '{}'.format(e)\n",
+            "f'{e.args}'": "    except KeyError as e:\n        return f'{e.args}'\n",
+            "f'{out}'": "    except KeyError as e:\n        out = e.args\n        return f'{out}'\n",
+        }
+        para = self.boundaries_paragraph()
+        with tempfile.TemporaryDirectory() as d:
+            for name, body in forms.items():
+                with self.subTest(item=1, form=name):
+                    (Path(d) / "probe.py").write_text(f"def out_text(x):\n    try:\n        x()\n{body}", encoding="utf-8")
+                    self.assertEqual([f for f in exception_formats(d) if f[1] == "out_text"], [])
+                    self.assertEqual([f for f in stringified_errors(d) if "out_text" in str(f)], [])
+                    self.assertIn(f"`{name}`" if not name.startswith("склейку") else name, para)
+            with self.subTest(item=1, form="caught: str(e)"):  # контроль: прямая форма стражу видна
+                (Path(d) / "probe.py").write_text("def out_text(x):\n    try:\n        x()\n"
+                                                  "    except KeyError as e:\n        return str(e)\n", encoding="utf-8")
+                self.assertTrue([f for f in exception_formats(d) if f[1] == "out_text"])
 
     def test_item1_the_doc_names_what_holds_the_line(self):
         para = self.boundaries_paragraph()
