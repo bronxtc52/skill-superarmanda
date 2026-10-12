@@ -20468,6 +20468,122 @@ class MetricsScript(unittest.TestCase):
                 row = next(line for line in r.stdout.splitlines() if line.startswith("| W4 |"))
                 self.assertIn("нет данных", row)
 
+    def test_unreadable_or_oversized_file_is_no_data_not_traceback(self):
+        """Ревью W4 круг 2: любой OSError на пути к файлу (каталог без прав за симлинком events.log) и файл больше
+        лимита (runs.json, manifest, events.log — разреженный файл, лимит по st_size) — «нет данных» с причиной,
+        код 1, никогда traceback и не чтение целиком."""
+        def sparse(path, size):
+            if path.exists():
+                path.unlink()
+            with open(path, "wb") as f:
+                f.truncate(size)
+        m = self.metrics
+        cases = {
+            "events.log over the limit": (lambda run: sparse(run / "events.log", m.MAX_LOG_BYTES + 1), "events.log"),
+            "runs.json over the limit": (lambda run: sparse(run / "W1" / "runs.json", m.MAX_JSON_BYTES + 1), "runs.json"),
+            "manifest over the limit": (
+                lambda run: sparse(run / "W2" / "superarmanda" / "manifest.json", m.MAX_JSON_BYTES + 1), "manifest.json"),
+        }
+        if os.geteuid() != 0:  # root читает каталог и без прав
+            def locked_events(run):
+                locked = run / "locked"
+                locked.mkdir()
+                (run / "events.log").rename(locked / "events.log")
+                (run / "events.log").symlink_to(Path("locked") / "events.log")
+                locked.chmod(0)
+                self.addCleanup(locked.chmod, 0o755)
+            cases["events.log behind a directory without permissions"] = (locked_events, "events.log")
+        for name, (mutate, reason) in cases.items():
+            run = self.make(mutate)
+            for fmt in (("--json",), ()):
+                with self.subTest(name, fmt=fmt):
+                    r = self.cli(run, *fmt)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                    if fmt:
+                        problems = [p for w in json.loads(r.stdout)["waves"] for p in w["problems"]]
+                        self.assertTrue(any(reason in p for p in problems), (reason, problems))
+                    else:
+                        self.assertIn("нет данных", r.stdout)
+
+    def test_path_is_resolved_once_and_the_opened_file_is_checked(self):
+        """Ревью W4 круг 2: путь разрешается ОДИН раз и открывается именно результат. Подмена цели симлинка между
+        разрешением и открытием не подсовывает файл вне волны; подмена промежуточного каталога перед open (Linux:
+        сверка /proc/self/fd) — отказ, а не чтение чужого файла."""
+        manifest = {"version": 1, "wave": {"id": "W4"}, "tasks": {"t1": {"fix_cycles": 1}}}
+        outside_manifest = {**manifest, "tasks": {"t1": {"fix_cycles": 7}}}
+        real_open, real_realpath, real_resolve = os.open, os.path.realpath, Path.resolve
+
+        def build(tmp):
+            root = Path(tmp) / "run"
+            sa = root / "W4" / "superarmanda"
+            (sa / "d").mkdir(parents=True)
+            (root / "events.log").write_text("", encoding="utf-8")
+            (sa / "d" / "manifest-real.json").write_text(json.dumps(manifest), encoding="utf-8")
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (outside / "manifest-real.json").write_text(json.dumps(outside_manifest), encoding="utf-8")
+            (sa / "manifest.json").symlink_to(Path("d") / "manifest-real.json")
+            return root, sa, outside
+
+        def relink(link, target):
+            tmp_link = link.with_name(link.name + ".swap")
+            tmp_link.symlink_to(target)
+            os.replace(tmp_link, link)
+
+        with tempfile.TemporaryDirectory() as tmp:  # 1: цель симлинка меняется сразу после разрешения
+            root, sa, outside = build(tmp)
+            link, inside_target = sa / "manifest.json", Path("d") / "manifest-real.json"
+
+            def swapped_after(result, arg):
+                if os.fspath(arg) == str(link) and os.readlink(link) == str(inside_target):
+                    relink(link, outside / "manifest-real.json")
+                return result
+
+            def realpath(p, *a, **k):
+                return swapped_after(real_realpath(p, *a, **k), p)
+
+            def resolve(self_, *a, **k):
+                return swapped_after(real_resolve(self_, *a, **k), self_)
+
+            def opener(p, *a, **k):
+                try:
+                    return real_open(p, *a, **k)
+                finally:
+                    if os.path.islink(link) and os.readlink(link) != str(inside_target):
+                        relink(link, inside_target)  # окно закрыто: ссылка снова «честная»
+
+            with mock.patch("os.path.realpath", realpath), mock.patch.object(Path, "resolve", resolve), \
+                    mock.patch("os.open", opener):
+                result = self.metrics.measure(root)
+            w4 = result["waves"][0]
+            self.assertNotEqual(w4["fix_cycles"], 7, w4)
+            self.assertEqual(w4["fix_cycles"], 1, w4)
+
+        if not os.path.isdir("/proc/self/fd"):
+            return  # не-Linux: промежуточные компоненты пути не защищены (docstring _read_checked)
+        with tempfile.TemporaryDirectory() as tmp:  # 2: промежуточный каталог подменяется перед самим open
+            root, sa, outside = build(tmp)
+            inside_real = str(real_realpath(sa / "d" / "manifest-real.json"))
+
+            def opener(p, *a, **k):
+                if os.fspath(p) == inside_real and (sa / "d").is_dir() and not (sa / "d").is_symlink():
+                    (sa / "d").rename(sa / "d-old")
+                    (sa / "d").symlink_to(outside)
+                    try:
+                        return real_open(p, *a, **k)
+                    finally:
+                        (sa / "d").unlink()
+                        (sa / "d-old").rename(sa / "d")
+                return real_open(p, *a, **k)
+
+            with mock.patch("os.open", opener):
+                result = self.metrics.measure(root)
+            w4 = result["waves"][0]
+            self.assertNotEqual(w4["fix_cycles"], 7, w4)
+            self.assertIsNone(w4["fix_cycles"], w4)
+            self.assertTrue(any("manifest.json" in p for p in w4["problems"]), w4)
+
 
 class Release130(unittest.TestCase):
     """The release 1.3.0 (W8): version, CHANGELOG, the measuring table, the rows of «Что реализовано»."""
