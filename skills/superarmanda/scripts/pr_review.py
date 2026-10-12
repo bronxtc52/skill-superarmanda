@@ -48,6 +48,12 @@ RABBIT_DRAFT_SKIP = re.compile(
     r"<!-- tips_start -->\n\n---\n\n\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands\.</sub>\n\n<!-- tips_end -->\Z",
     re.DOTALL,
 )
+# The summary comment CodeRabbit keeps rewriting on a PR (walkthrough, «review in progress», «Draft PR not reviewed»,
+# the autopilot checkbox, the tips): the bot's own template, opened by its machine marker on the first line and closed
+# by the end marker of its tips block (#113 W1 п.2). Recognised by these two markers of the whole body, never by words
+# that a real finding could quote; text after the closing marker, or a body without it, is not the template.
+RABBIT_SUMMARY_OPEN = "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n"
+RABBIT_SUMMARY_CLOSE = "\n<!-- tips_end -->"
 RABBIT_DONE = re.compile(
     r"No actionable comments were generated|Actionable comments posted: \d+"
 )
@@ -81,6 +87,11 @@ def text(item):
 
 def rabbit_boilerplate(body):
     return bool(RABBIT_BOILERPLATE.fullmatch(body) or RABBIT_DRAFT_SKIP.fullmatch(body))
+
+
+def rabbit_summary(body):
+    """The PR summary comment of CodeRabbit (an issue comment only): its template from the first to the last line."""
+    return body.startswith(RABBIT_SUMMARY_OPEN) and body.endswith(RABBIT_SUMMARY_CLOSE)
 
 
 def clean_commit(body):
@@ -333,7 +344,7 @@ def evaluate(
                 )
             )
             continue
-        if rabbit_boilerplate(body):
+        if rabbit_boilerplate(body) or rabbit_summary(body):
             result["limitations"].append(
                 "CodeRabbit walkthrough/status metadata is not a finding"
             )

@@ -6,7 +6,7 @@ branch into the base of that repository, and the next wave's fetch really sees t
 
 Per PR the test sets what GitHub would show for the head: "ci" (none|in_progress|failure|success),
 "codex" (none|stale|head: the Codex review is absent / written on an older commit / on the head),
-"draft". Nothing is checked by the stand-in at merge time (GitHub without branch protection merges
+"draft", "thread" (open|resolved: the live review thread of the snapshot is unresolved / as captured). Nothing is checked by the stand-in at merge time (GitHub without branch protection merges
 a red PR too): it RECORDS in merges.jsonl what was true at that moment, and the test's oracle judges.
 Exit 2 and a log entry for any verb the dispatcher is not expected to use.
 
@@ -171,6 +171,9 @@ def api_cmd(st, args):
         out = fixture("review-threads.json", st, pr)
         if pr is None or pr["codex"] == "none":  # no Codex review, so no thread of it
             out["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"] = []
+        elif pr.get("thread") == "open":  # the live thread of the snapshot, not resolved yet (only the value changes)
+            for node in out["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+                node["isResolved"] = False
         print(json.dumps(out))
         return
     parts = path.split("/")  # repos/<owner>/<name>/...

@@ -29,3 +29,58 @@ gh api repos/bronxtc52/agent-config/issues/592/comments
 `scope=REDACTED` — это непрозрачный идентификатор области, не нужный коду. Остальной текст тел ботов
 не менялся. Секретов и личных данных, кроме публичных логинов, в телах нет (проверено глазами и
 поиском по токенам).
+
+## Сводка CodeRabbit как шаблон бота (#113 W1 п.2, 1.5.1)
+
+Снято 2026-10-12 тем же способом (только чтение, `gh api … ?per_page=100`), в той же форме и с теми же правилами
+удаления, что выше:
+
+| Файл | PR | HEAD | Что показывает |
+|---|---|---|---|
+| `pr118-rest.json` | bronxtc52/skill-superarmanda#118 | `efbf9d448d7fa487f8f7fa4976e6895e40959017` | сводка CodeRabbit в состоянии «review in progress» (блок `<!-- … review in progress by coderabbit.ai -->`), флажок `<!-- autopilot:start -->` |
+| `pr116-rest.json` | bronxtc52/skill-superarmanda#116 | `8556c3116d6b600dc0357e7af59f7d1acc8a5ede` | законченная сводка CodeRabbit (walkthrough, «Recent review info», `No actionable comments…`, autopilot) |
+| `pr75-rest.json` | bronxtc52/skill-superarmanda#75 | `54a08e59bd1aa13c73a9c8ea61ee0c78627ac7fa` | настоящая inline-находка CodeRabbit на HEAD (`discussion_r4177677540`) рядом со сводкой: находка остаётся находкой |
+
+Команды (для каждого N из 75, 116, 118):
+
+```
+gh api repos/bronxtc52/skill-superarmanda/pulls/N
+gh api "repos/bronxtc52/skill-superarmanda/pulls/N/reviews?per_page=100"
+gh api "repos/bronxtc52/skill-superarmanda/pulls/N/comments?per_page=100"
+gh api "repos/bronxtc52/skill-superarmanda/issues/N/comments?per_page=100"
+```
+
+Убрано: всё, кроме элементов ботов `coderabbitai[bot]` и `chatgpt-codex-connector[bot]` (комментарии и ревью владельца
+выпали); поля, которые код не читает (оставлены `id`, `state`, `commit_id`, `original_commit_id`,
+`pull_request_review_id`, `html_url`, `body`, `user.login`, `user.type`); из PR — только `head.sha` и `draft`.
+
+Заменено: параметр `scope=ghh_…` в ссылках CodeRabbit → `scope=REDACTED` (непрозрачный идентификатор области). Остальной
+текст тел ботов не менялся. Секретов и личных данных, кроме публичных логинов, в телах нет (проверено поиском по
+токенам и глазами; слова `password`/`SECRET` в `pr116` — цитаты предупреждений Ruff из сводки бота).
+
+## Живой черновик «Draft PR not reviewed» (#113 W1 п.2, 1.5.1, круг 4)
+
+Снято 2026-10-12 тем же способом (только чтение, `gh api … ?per_page=100`), в той же форме и с теми же правилами
+удаления, что выше:
+
+| Файл | PR | HEAD | Что показывает |
+|---|---|---|---|
+| `pr120-rest.json` | bronxtc52/skill-superarmanda#120 (draft) | `692da11ddd76b583dd97e550cca0dc03b138b48f` | живая сводка CodeRabbit черновика: блок `skip review by coderabbit.ai` с `Draft PR not reviewed`, флажок `<!-- autopilot:start -->`, `<!-- tips_end -->` (issue comment `6118957590`); рядом review и две inline-находки Codex P1 и его сводка |
+
+Команды:
+
+```
+gh api repos/bronxtc52/skill-superarmanda/pulls/120
+gh api "repos/bronxtc52/skill-superarmanda/pulls/120/reviews?per_page=100"
+gh api "repos/bronxtc52/skill-superarmanda/pulls/120/comments?per_page=100"
+gh api "repos/bronxtc52/skill-superarmanda/issues/120/comments?per_page=100"
+```
+
+Убрано: комментарий владельца (`bronxtc52`) и всё, что не от ботов `coderabbitai[bot]` и `chatgpt-codex-connector[bot]`;
+поля, которые код не читает (оставлены те же, что выше); из PR — только `head.sha` и `draft`.
+
+Заменено: ничего — тела ботов в снимке как есть (ссылок `scope=…` в них нет; секретов и личных данных, кроме публичных
+логинов, нет — проверено поиском по токенам и глазами).
+
+Тест `CodeRabbitServiceComment` (`tests/helpers/superarmanda_pr_review_test.py`) проверяет живую сводку черновика #120
+как есть: склейки синтетического блока с ответом другого PR больше нет.

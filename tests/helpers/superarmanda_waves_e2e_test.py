@@ -43,6 +43,12 @@ Since 1.0.1-1.0.3 the same run also covers (W4, #68/#72/#57):
 (tests/fixtures/waves/e2e-1.4.1-state); W2 дважды пишет ту же строку BLOCKED, владелец отвечает, цепочка доходит до
 chain-result.md. Инвариант — у oracle_no_wave_text.
 
+Режим `threads` (W1 цепочки waves-tails2, #117, класс ThreadsChain): гейт W1 проходит с открытым тредом (скрипт
+владельца); пока скрипт не запущен, владельцу приходят напоминания с интервалом chain.json `merge_remind_minutes`, а
+`wab.py status` и дашборд после `merge_attention_minutes` показывают ATTENTION; тред закрыт на том же HEAD — следующий
+такт мерджит сам. Гейт W2 тоже проходит с открытым тредом, затем волна пушит новый коммит и закрывает тред: мерджа
+старого HEAD нет, новый HEAD мерджится только своим гейтом (CI на нём сначала идёт).
+
 Mutations (same scenario, broken dispatcher, the oracle must notice): no merge gate, no session
 binding after /clear, no decision policy, an idle nudge with the process tree ignored (or no nudge at all),
 an unavailable CodeRabbit that blocks the gate, a cleanup that does not check whose a pane is.
@@ -88,6 +94,14 @@ CHAIN = "e2e"
 RUN_ID = "2026-10-04-e2e"
 CTX_LIMIT = 50_000
 TICK = 60
+FLOAT_EPS = 1e-6  # допуск сравнения виртуальных времён: они суммы float, точного равенства нет
+# Порог test_runs_fast сценария threads — по замеру, не вслепую (ревью W1, круг 4). Linux локально: 33 с на 692da11, 6b5e534
+# и круге 4 одинаково (регрессии нет, ~105 тиков по ~0,3 с реального времени). macOS-раннер CI на 6b5e534 дал 81 с, причём
+# весь его прогон был в 1,2–1,65 раза медленнее прогона на 692da11 (343 теста 907 с против 768 с, e2e 524 с против 352 с).
+# Порог ловит реальное ожидание в сценарии (сон по-настоящему, ожидание лока до INPUT_LOCK_SECONDS = 120 с), а не скорость
+# раннера: Linux — 60 с (запас ~1,8 к замеру), macOS — 150 с (запас ~1,85 к 81 с; одно реальное ожидание лока поверх
+# сценария, 120 с + 33–81 с, его всё равно превышает).
+THREADS_FAST_SECONDS = 150 if sys.platform == "darwin" else 60
 DELAY = 20  # virtual seconds between what the dispatcher typed and the session's reaction
 BOT_STATUS = "[class=needs_decision rec=A red=no]"
 CAP_STATUS = "[class=blocked_cap rec=new_run red=no]"
@@ -103,6 +117,10 @@ NUDGE_MINUTES = 5  # chain.json idle_nudge_minutes of the scenario
 CAP_REPEATS = 2
 CAP_REPEAT_AFTER = 7 * 60
 LEGACY_141 = FIXTURES / "waves" / "e2e-1.4.1-state"
+# режим threads (#117): интервал напоминания и порог ATTENTION цепочки (tunable-поля chain.json), когда закрыть тред
+REMIND_MINUTES = 20
+ATTENTION_MINUTES = 10
+THREAD_CLOSED_AFTER = 45 * 60  # виртуальных секунд после прохода гейта W1 с открытым тредом
 BG_SECONDS = 9 * 60  # how long W1's background shell lives: longer than the nudge threshold
 OLD_RUN = ("e2e/2026-01-01-old", "/elsewhere/runs/e2e/2026-01-01-old")  # (@wab_run, @wab_run_dir) of another run
 EXPECTED_TOOLS = ("tmux", "gh", "claude", "ps")
@@ -171,7 +189,7 @@ class Clock:
 # ------------------------------------------------------------------ the world on disk
 
 class World:
-    def __init__(self, base, policy=True, quote=False, max_auto_answers=None):
+    def __init__(self, base, policy=True, quote=False, max_auto_answers=None, threads=False):
         self.root = Path(base).resolve()
         self.home = self.root / "home"
         self.bindir = self.root / "bin"
@@ -188,6 +206,7 @@ class World:
         self.policy = policy
         self.quote = quote
         self.max_auto_answers = max_auto_answers
+        self.threads = threads
         self.env = {
             "PATH": f"{self.bindir}{os.pathsep}{self.sysbin}", "HOME": str(self.home),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1",
@@ -303,6 +322,9 @@ class World:
             chain["telegram_quote"] = True
         if self.max_auto_answers is not None:  # режим remnants: кап автоответов волны — один
             chain["max_auto_answers"] = self.max_auto_answers
+        if self.threads:  # режим threads: интервал напоминания и порог ATTENTION — tunable-поля chain.json
+            chain["merge_remind_minutes"] = REMIND_MINUTES
+            chain["merge_attention_minutes"] = ATTENTION_MINUTES
         if self.policy:
             chain["decision_policy"] = [{"class": "needs_decision", "rec": "A"},
                                         {"class": "blocked_cap", "rec": "new_run", "answer": "invariant"}]
@@ -443,6 +465,7 @@ class Actor:
         self.statuses = []   # every status line a wave wrote
         self.cap_line = None  # строка BLOCKED развилки капа W2 (режим remnants пишет её повторно)
         self.cap_repeats = []  # (виртуальное время) каждой повторной записи той же строки
+        self.threads = {}  # режим threads: wave -> что и когда было (гейт с тредом, снимки status/dash, закрытие, HEAD)
 
     # -- scheduling
     def after(self, delay, label, fn):
@@ -658,7 +681,11 @@ class Actor:
         number = max(int(n) for n in self.w.gh()["prs"])
         self.w.gh_set(number, ci="success", codex="stale")  # Codex has only reviewed an older commit so far
         self.write_status(s, "DONE")
-        self.after(130, "codex review", lambda: self.w.gh_set(number, codex="head"))
+        if self.mode == "threads":  # Codex reviews the head and leaves one open thread on it
+            self.after(130, "codex review", lambda: (self.w.gh_set(number, codex="head", thread="open"),
+                                                     self.wait_owner_script(s, self.w1_owner_wait)))
+        else:
+            self.after(130, "codex review", lambda: self.w.gh_set(number, codex="head"))
 
     # -- W2: context grows -> checkpoint -> handoff -> /clear -> resume -> DONE
     def start_w2(self, s):
@@ -767,7 +794,67 @@ class Actor:
         self.record_results(s)
         self.record_coderabbit_refusal(s)
         s.journal.turn(11_000)
+        if self.mode == "threads":  # the gate of W2 also passes with an open thread
+            self.w.gh_set(max(int(n) for n in self.w.gh()["prs"]), thread="open")
+            self.wait_owner_script(s, self.w2_pushes)
         self.finish(s)
+
+    # -- режим threads (#117)
+    def wait_owner_script(self, s, then):
+        """Each tick: has the gate passed with an open thread (the BLOCKED line of the owner's script)?"""
+        text = (s.wave_dir / "status").read_text(encoding="utf-8") if (s.wave_dir / "status").exists() else ""
+        if text.startswith("BLOCKED: merge gate passed; 1 unresolved review threads; owner runs "):
+            self.threads[s.wave] = {"gate_at": self.clock.offset, "head": self.w.git("rev-parse", "HEAD")}
+            self.did(s, "the owner's script is waiting")
+            return then(s)
+        self.after(TICK, "owner script?", lambda: self.wait_owner_script(s, then))
+
+    def snapshot(self, s, label):
+        """What the owner sees at the machine now: `wab.py status` and the dashboard's panel of the current wave."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            wab.status_cmd(wab.load_chain(self.w.chain_file, create=False))
+        try:
+            import dash
+            from rich.console import Console
+        except ImportError:  # no rich (a supported standalone setup): the oracle skips only the dashboard checks
+            panel = None
+        else:
+            con = Console(width=220, record=True, file=io.StringIO())
+            cfg = wab.load_chain(self.w.chain_file, create=False)
+            con.print(dash.current_panel(cfg, wab.load_state(cfg)))
+            panel = con.export_text()
+        self.threads[s.wave][label] = {"at": self.clock.offset, "status": out.getvalue(), "dash": panel}
+
+    def w1_owner_wait(self, s):
+        """Nobody runs the owner's script: the dispatcher reminds, the dashboard and `status` raise ATTENTION; then the
+        thread is closed on GitHub (the owner or the wave did it) — the head stays the same."""
+        number = max(int(n) for n in self.w.gh()["prs"])
+        self.after((ATTENTION_MINUTES - 5) * 60, "snapshot early", lambda: self.snapshot(s, "early"))
+        self.after((ATTENTION_MINUTES + 5) * 60, "snapshot late", lambda: self.snapshot(s, "late"))
+
+        def close():
+            self.w.gh_set(number, thread="resolved")
+            self.threads[s.wave]["closed_at"] = self.clock.offset
+            self.did(s, "the thread is closed on the same head")
+        self.after(THREAD_CLOSED_AFTER, "thread closed", close)
+
+    def w2_pushes(self, s):
+        """The wave pushes a fix after the gate passed with an open thread and closes the thread: the old head must
+        never be merged, the new one only by its own gate (its CI is running at first)."""
+        number = max(int(n) for n in self.w.gh()["prs"])
+        (self.w.workdir / "w2.txt").write_text("work of W2, fixed after the thread\n", encoding="utf-8")
+        self.w.git("commit", "-q", "-am", "W2: fix after the review thread")
+        self.w.git("push", "-q", "origin", "wave/w2")
+        self.w.gh_set(number, thread="resolved", ci="in_progress")
+        self.state_py("resume", "--manifest", self.manifest_path(s), "--repo", self.w.workdir,
+                      "--base", self.w.git("rev-parse", "origin/main"), "--head", self.w.git("rev-parse", "HEAD"), s=s)
+        self.record_results(s)
+        self.record_coderabbit_refusal(s)
+        self.threads[s.wave]["new_head"] = self.w.git("rev-parse", "HEAD")
+        self.threads[s.wave]["pushed_at"] = self.clock.offset
+        self.did(s, "a new commit pushed, the thread closed")
+        self.after(3 * TICK, "ci green", lambda: self.w.gh_set(number, ci="success"))
 
 
 # ------------------------------------------------------------------ one run of the scenario
@@ -834,7 +921,7 @@ def run_scenario(mode="normal", limit=90 * 60):
     atexit.register(shutil.rmtree, base, True)
     legacy = mode.startswith("remnants")  # remnants | remnants_no_upgrade | remnants_no_episode
     world = World(base, policy=mode != "no_policy", quote=mode == "telegram_quote",
-                  max_auto_answers=1 if legacy else None)
+                  max_auto_answers=1 if legacy else None, threads=mode == "threads")
     world.setup()
     clock = Clock(limit)
     actor = clock.actor = Actor(world, clock, mode)
@@ -1181,6 +1268,64 @@ def oracle_coderabbit(run):
          "the gate counted the unavailable CodeRabbit against W2")
 
 
+def check_reminder_times(at, gate_at, closed_at):
+    """The reminders of W1 on the virtual clock: none before the interval, then once per interval, none after the
+    merge. `at` — the virtual times of the reminders, `gate_at`/`closed_at` — of the gate pass and the closed thread."""
+    # Виртуальное время — сумма float-слагаемых: интервал ровно в REMIND_MINUTES выходит 1199.9999999999998, и
+    # сравнение без допуска ложно падает (CI ubuntu). Интервалы — разностями абсолютных времён, а не смещений от
+    # gate_at (лишнее вычитание — лишняя ошибка округления), и с допуском FLOAT_EPS: он на порядки меньше любого
+    # шага часов (TICK, полсекунды опроса лока), поэтому настоящий недобор интервала оракул по-прежнему видит.
+    times = [t - gate_at for t in at]
+    must(len(at) == THREAD_CLOSED_AFTER // (REMIND_MINUTES * 60), f"W1 reminders at {times}")
+    must(times[0] >= REMIND_MINUTES * 60 - TICK - FLOAT_EPS, f"an early reminder: {times}")
+    must(all(b - a_ >= REMIND_MINUTES * 60 - FLOAT_EPS for a_, b in zip(at, at[1:])),
+         f"reminders closer than the interval: {times}")
+    must(all(t <= closed_at + 3 * TICK + FLOAT_EPS for t in at), f"a reminder after the merge: {times}")
+
+
+def oracle_threads(run):
+    """#117 end to end: W1's gate passed with an open thread; reminders came once per `merge_remind_minutes` while the
+    owner's script waited; `wab.py status` and the dashboard showed ATTENTION past `merge_attention_minutes` (not before);
+    the thread closed on the same head -> the dispatcher merged that head itself, one merge event. W2's head moved after
+    its gate: the old head was never merged, the new one only after its own gate."""
+    a, w = run.actor, run.world
+    t1, t2 = a.threads.get("W1"), a.threads.get("W2")
+    must(t1 and t2 and "closed_at" in t1 and "new_head" in t2, f"the scenario of the threads did not run: {a.threads}")
+    merges = {m["pr"]: m for m in w.jsonl(w.gh_state / "merges.jsonl")}
+    must(sorted(merges) == [1, 2] and len(w.jsonl(w.gh_state / "merges.jsonl")) == 2, f"merges: {merges}")
+    # W1: the gated head merged by the dispatcher, after the thread was closed, one merge event
+    must(merges[1]["sha"] == t1["head"], "W1: not the gated head was merged")
+    log = run.events_log
+    must(log.count("W1: merge gate passed, merge of PR #1 requested") == 1, "W1: not exactly one merge event")
+    must("W1: merge gate passed with 1 open threads; owner script ~/.cache/wab/" in log, "W1: no owner script")
+    order = [l for l in log.splitlines() if l[21:].startswith("W1: ")]
+    i_owner = next(i for i, l in enumerate(order) if "merge gate passed with 1 open threads" in l)
+    i_closed = next(i for i, l in enumerate(order) if "треды закрыты" in l)
+    i_merge = next(i for i, l in enumerate(order) if "merge of PR #1 requested" in l)
+    must(i_owner < i_closed < i_merge, f"W1 events out of order: {order[i_owner:i_merge + 1]}")
+    # the reminders: the fixed template, none before the interval, then once per interval, none after the merge
+    remind = [(t, text) for t, wave, text in run.notices
+              if wave == "W1" and text.splitlines()[0].endswith("ждёт тебя: запусти скрипт мерджа")]
+    check_reminder_times([t for t, _ in remind], t1["gate_at"], t1["closed_at"])
+    for _, text in remind:
+        must("~/.cache" not in text and ".merge" not in text, "a path in the reminder")
+    # ATTENTION on the long merge: not yet at the early snapshot, then in `wab.py status` and on the dashboard
+    early, late = t1["early"], t1["late"]
+    must("ATTENTION" not in early["status"], "ATTENTION before the threshold")
+    must("ATTENTION: W1: мердж ждёт" in late["status"], f"no ATTENTION in wab.py status: {late['status']}")
+    if early["dash"] is not None and late["dash"] is not None:  # None: rich is not installed, no dashboard to check
+        must("ATTENTION" not in early["dash"], "ATTENTION on the dashboard before the threshold")
+        must("ATTENTION" in late["dash"], "no ATTENTION on the dashboard")
+    # W2: the head moved after the gate: the old head never merged, the new one only after its own gate
+    must(merges[2]["sha"] == t2["new_head"] != t2["head"], "W2: the old head was merged")
+    w2 = [l for l in log.splitlines() if l[21:].startswith("W2: ")]
+    hits = [next((i for i, l in enumerate(w2) if needle in l), None)
+            for needle in ("merge gate passed with 1 open threads", "HEAD сменился после гейта", "merge gate waits",
+                           f"merge of PR #2 requested at {t2['new_head'][:12]}")]
+    must(None not in hits and hits == sorted(hits), f"W2: no new gate between the moved head and the merge: {hits}")
+    must(f"requested at {t2['head'][:12]}" not in log, "W2: a merge of the old head was requested")
+
+
 def oracle_cleanup(run):
     """The end of the chain closes only the run's own panes (#57): the dashboard of THIS run is gone; a pane without
     a mark, a pane of another run, the owner's shell and a dashboard of an older run live, and so do their sessions."""
@@ -1454,6 +1599,59 @@ class RemnantsChain(unittest.TestCase):
 
     def test_runs_fast(self):
         must(self.seconds < 40, f"the scenario took {self.seconds:.0f} s")
+
+
+class ThreadsChain(unittest.TestCase):
+    """Сквозная приёмка W1 цепочки waves-tails2 (#117): гейт с открытым тредом, напоминание с интервалом, ATTENTION на
+    затянувшемся merging, автомердж того же HEAD после закрытия треда, новый HEAD — только своим гейтом."""
+    chain = None
+
+    @classmethod
+    def setUpClass(cls):
+        t = time.monotonic()
+        cls.chain = run_scenario("threads", limit=4 * 3600)
+        cls.seconds = time.monotonic() - t
+
+    def test_threads_closed_on_the_same_head_merge_and_a_moved_head_is_gated_again(self):
+        oracle_threads(self.chain)
+
+    def test_the_chain_still_runs_to_chain_result(self):
+        oracle_flow(self.chain)
+        oracle_gate(self.chain)
+
+    def test_every_external_text_is_still_clean(self):
+        oracle_external(self.chain)
+
+    def test_state_json_holds_no_wave_text(self):
+        oracle_no_wave_text(self.chain)
+
+    def test_runs_fast(self):
+        must(self.seconds < THREADS_FAST_SECONDS, f"the scenario took {self.seconds:.0f} s")
+
+
+class ReminderOracle(unittest.TestCase):
+    """The oracle of the reminders on substituted times, without a chain. The virtual times are float sums: a CI run on
+    ubuntu got reminders exactly one interval apart, and the subtraction of `gate_at` made the gap 1199.9999999999998."""
+
+    GATE = 2460.0000000000005  # with it, (gate + 2340) - gate - ((gate + 1140) - gate) == 1199.9999999999995
+
+    def check(self, *after_gate):
+        check_reminder_times([self.GATE + t for t in after_gate], self.GATE, self.GATE + THREAD_CLOSED_AFTER)
+
+    def test_reminders_exactly_one_interval_apart_pass_despite_the_float_error(self):
+        check_reminder_times([3600.0000000000005, 4800.0], self.GATE, self.GATE + THREAD_CLOSED_AFTER)
+
+    def test_reminders_closer_than_the_interval_fail(self):
+        with self.assertRaisesRegex(AssertionError, "reminders closer than the interval"):
+            self.check(REMIND_MINUTES * 60, 2 * REMIND_MINUTES * 60 - 1)
+        with self.assertRaisesRegex(AssertionError, "reminders closer than the interval"):
+            self.check(REMIND_MINUTES * 60, 2 * REMIND_MINUTES * 60 - 0.001)
+
+    def test_an_early_reminder_and_one_after_the_merge_fail(self):
+        with self.assertRaisesRegex(AssertionError, "an early reminder"):
+            self.check(REMIND_MINUTES * 60 - TICK - 1, 2 * REMIND_MINUTES * 60)
+        with self.assertRaisesRegex(AssertionError, "a reminder after the merge"):
+            self.check(REMIND_MINUTES * 60, THREAD_CLOSED_AFTER + 3 * TICK + 1)
 
 
 class Mutations(unittest.TestCase):

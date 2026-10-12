@@ -64,7 +64,17 @@ actual CodeRabbit finding remains a finding.
 `task-result --role coderabbit --status unavailable` с причиной timeout. Запись роли `coderabbit` по полю:
 `pass` → `pass`, `findings` → `findings`, `unavailable` → `unavailable`. `unavailable` гейт мерджа не
 блокирует; `findings` разбираются (исправление, `fix-loop --defer` или `--accept`).
-Фикстуры — `tests/fixtures/pr-review/coderabbit/` (PR #70, #71, #592).
+Фикстуры — `tests/fixtures/pr-review/coderabbit/` (PR #70, #71, #75, #116, #118, #592).
+
+**Сводка CodeRabbit — не находка (1.5.1, #113 W1 п.2).** Issue comment, который CodeRabbit держит на PR и
+переписывает (walkthrough, «review in progress», «Draft PR not reviewed», флажок autopilot, подсказки), — шаблон бота,
+а не находка: в `findings` он не попадает, в `limitations` — строка `CodeRabbit walkthrough/status metadata is not a
+finding`. Распознаётся по машинным маркерам шаблона на всём теле: первая строка — `<!-- This is an auto-generated
+comment: summarize by coderabbit.ai -->`, последняя — `<!-- tips_end -->` (`pr_review.rabbit_summary`), только у
+доверенного `coderabbitai[bot]` с типом `Bot`. Слова шаблона внутри другого текста, маркер в середине, тело без
+закрывающего маркера или с текстом после него, ответ бота на команду (`<!-- This is an auto-generated reply by
+CodeRabbit -->`) остаются находкой. Inline-находки и review CodeRabbit на HEAD — находки, как и раньше. Канал
+доказательства `coderabbit` (сводка с `No actionable comments…` и диапазоном до HEAD) это не меняет.
 
 Two clean-comment formats are accepted, each a structure, not a wording list. The legacy format
 (unchanged by #442) is:
