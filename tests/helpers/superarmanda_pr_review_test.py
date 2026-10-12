@@ -1293,8 +1293,9 @@ class LivePr71Fixture(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         # Codex оставил чистый комментарий на 98b72fc (он распознан и резолвится в HEAD),
         # но inline-тред с 9306e85 перенесён GitHub на текущий HEAD (commit.oid == HEAD,
-        # originalCommit.oid == 9306e85), а три комментария CodeRabbit — не шаблон
-        # пропуска. Поэтому честный статус — findings, а не pass.
+        # originalCommit.oid == 9306e85), а два ответа CodeRabbit на команды — не шаблон
+        # (сводка CodeRabbit с 1.5.1 — шаблон бота, не находка, #113). Поэтому честный
+        # статус — findings, а не pass.
         self.assertEqual(result["status"], "findings")
         self.assertEqual(result["current_head"], self.LIVE_HEAD)
         self.assertIn(result["coderabbit"]["status"], ("pass", "findings"))
@@ -1304,8 +1305,9 @@ class LivePr71Fixture(unittest.TestCase):
         self.assertEqual(threads[0]["original_commit_id"], self.OLD_HEAD)
         self.assertEqual(
             [f["author"] for f in result["findings"] if f["source"] == "issue_comment"],
-            ["coderabbitai[bot]"] * 3,
+            ["coderabbitai[bot]"] * 2,
         )
+        self.assertIn("CodeRabbit walkthrough/status metadata is not a finding", result["limitations"])
         self.assertNotIn(
             "https://github.com/bronxtc52/skill-superarmanda/pull/71#issuecomment-5977422763",
             [f["url"] for f in result["findings"]],
@@ -1696,7 +1698,12 @@ class CodeRabbitFact(unittest.TestCase):
     def test_pr70_empty_review_on_head_is_pass_and_not_incomplete(self):
         result = self.run_eval(self.load(70))
         self.assertEqual(result["coderabbit"]["status"], "pass", result["coderabbit"])
-        self.assertNotEqual(result["status"], "incomplete")
+        # the empty CodeRabbit review is not what keeps the result open: only the Codex evidence of this fixture
+        # (its clean comment names a short SHA that the stub resolver does not resolve) does, since 1.5.1 the
+        # summary comment of CodeRabbit is no finding to hide it (#113)
+        self.assertIn("empty CodeRabbit COMMENTED review on HEAD proves completion", result["limitations"])
+        self.assertIn("no completed, clean GitHub Codex review bound to current HEAD", result["limitations"])
+        self.assertEqual(result["findings"], [])
         self.assertNotIn(
             "empty CodeRabbit COMMENTED review is incomplete", result["limitations"]
         )
@@ -1896,6 +1903,82 @@ class CodeRabbitFact(unittest.TestCase):
         result = self.run_eval(self.load(71))
         self.assertEqual(result["status"], "findings")
         self.assertTrue([f for f in result["findings"] if f["source"] == "issue_comment"])
+
+
+class CodeRabbitServiceComment(unittest.TestCase):
+    """#113 W1 п.2 (1.5.1): the summary comment CodeRabbit keeps rewriting on a PR (walkthrough, «review in progress»,
+    the autopilot checkbox, the draft skip) is the bot's template, not a finding. Recognised by the machine markers of the
+    template (the first line `<!-- This is an auto-generated comment: summarize by coderabbit.ai -->` and the closing
+    `<!-- tips_end -->`), never by words that a real finding may contain. Live samples: tests/fixtures/pr-review/
+    coderabbit/pr{75,116,118}-rest.json (README there)."""
+
+    RABBIT = "coderabbitai[bot]"
+
+    def load(self, n):
+        return json.loads((FIXTURES / "coderabbit" / f"pr{n}-rest.json").read_text("utf-8"))
+
+    def run_eval(self, data):
+        head = data["head"]["sha"]
+        return MODULE.evaluate({"head": {"sha": head}, "draft": False}, data["reviews"], data["review_comments"],
+                               data["issue_comments"], head, lambda ref: None)
+
+    def rabbit_issue_findings(self, result):
+        return [f for f in result["findings"] if f["source"] == "issue_comment" and f["author"] == self.RABBIT]
+
+    def test_live_service_comments_are_not_findings(self):
+        for n, what in ((118, "review in progress"), (116, "Recent review info"), (75, "summarize by coderabbit.ai")):
+            with self.subTest(pr=n):
+                data = self.load(n)
+                bodies = [c["body"] for c in data["issue_comments"] if c["user"]["login"] == self.RABBIT]
+                self.assertTrue(bodies and all(what in b for b in bodies), "the live sample is what it claims")
+                self.assertTrue(all("<!-- autopilot:start -->" in b for b in bodies))
+                result = self.run_eval(data)
+                self.assertEqual(self.rabbit_issue_findings(result), [], result["findings"])
+                self.assertIn("CodeRabbit walkthrough/status metadata is not a finding", result["limitations"])
+
+    def test_draft_not_reviewed_in_the_live_template_is_not_a_finding(self):
+        data = self.load(118)
+        item = next(c for c in data["issue_comments"] if c["user"]["login"] == self.RABBIT)
+        # the draft skip block of the live draft template, in place of the «review in progress» block of the same comment
+        start = item["body"].index("<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->")
+        end = item["body"].index("<!-- end of auto-generated comment: review in progress by coderabbit.ai -->")
+        end += len("<!-- end of auto-generated comment: review in progress by coderabbit.ai -->")
+        skip = CODERABBIT_DRAFT_SKIP.split("\n", 1)[1].split("<!-- tips_start -->")[0].strip()
+        item["body"] = item["body"][:start] + skip + item["body"][end:]
+        self.assertIn("Draft PR not reviewed", item["body"])
+        self.assertEqual(self.rabbit_issue_findings(self.run_eval(data)), [])
+
+    def test_a_real_coderabbit_finding_is_still_a_finding(self):
+        data = self.load(75)
+        result = self.run_eval(data)
+        inline = [f for f in result["findings"] if f["author"] == self.RABBIT and f["source"] == "review_comment"]
+        self.assertTrue(inline, "the live inline finding of CodeRabbit on PR #75 stays a finding")
+        self.assertEqual(result["status"], "findings")
+
+    def test_template_words_outside_the_template_markers_stay_a_finding(self):
+        data = self.load(118)
+        live = next(c for c in data["issue_comments"] if c["user"]["login"] == self.RABBIT)["body"]
+        variants = {
+            "words only": "Draft PR not reviewed; review in progress; autopilot — but the null check in gate.py:12 is wrong.",
+            "marker quoted inside a finding": "Please fix gate.py:12.\n\n" + live,
+            "no closing marker": live.rsplit("<!-- tips_start -->", 1)[0] + "\nAlso: gate.py:12 drops the error.",
+            "text after the template": live + "\n\nAlso: gate.py:12 drops the error.",
+            "a reply of the bot": "<!-- This is an auto-generated reply by CodeRabbit -->\nThe null check in gate.py:12 is wrong.",
+        }
+        for name, body in variants.items():
+            with self.subTest(case=name):
+                d = self.load(118)
+                d["issue_comments"] = [{"id": 1, "user": {"login": self.RABBIT, "type": "Bot"}, "body": body,
+                                        "html_url": "https://x/1"}]
+                self.assertEqual(len(self.rabbit_issue_findings(self.run_eval(d))), 1)
+
+    def test_the_template_of_another_author_is_not_trusted(self):
+        data = self.load(116)
+        for c in data["issue_comments"]:
+            if c["user"]["login"] == self.RABBIT:
+                c["user"] = {"login": self.RABBIT, "type": "User"}  # a person named like the bot: not the bot
+        result = self.run_eval(data)
+        self.assertEqual(self.rabbit_issue_findings(result), [])  # untrusted: not evidence at all, as before
 
 
 if __name__ == "__main__":
