@@ -178,6 +178,11 @@ class Base(unittest.TestCase):
         os.environ.pop("TMUX", None)
         os.environ.pop("TMUX_PANE", None)
         os.environ.pop("SUPERARMANDA_TZ", None)  # the owner's zone of the machine must not leak into tests (#88)
+        # the module-global registry of the owner's script names (redact(owner_paths=True)) starts empty in every test:
+        # a name one test derived never keeps another test's path whole (W3 round 4, F1)
+        names = mock.patch.object(wab, "_OWNER_SCRIPT_NAMES", set())
+        names.start()
+        self.addCleanup(names.stop)
         self.tmux_calls = []
         self.sent = []  # (kind, name, text)
         self.alive = True
@@ -8410,6 +8415,13 @@ class MergeGate(GateBase):
         token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2"
         line = f"BLOCKED: merge gate passed; token {token} phone 89161234567; owner runs ~/.cache/wab/{self.PHONE_SHAPED}"
         forged = "~/.cache/wab/W1.aaaaaaaaaaaa.78297023340d0000.merge"  # the shape, but no such file: masked as before
+        self.assertEqual(wab._OWNER_SCRIPT_NAMES, set(), "every test starts with an empty registry (Base.setUp)")
+        with self.subTest("the name is not derived by the dispatcher: the path is masked though its file exists"):
+            self.assertNotIn("~/.cache/wab/" + self.PHONE_SHAPED,
+                             wab.safe_text(line, 10 ** 9, owner_paths=True))
+        with mock.patch.object(wab, "owner_script_name", return_value=self.PHONE_SHAPED):
+            wab._owner_script(cfg, "W1", "a" * 40)  # the dispatcher derives the name: the exemption takes it
+        self.assertEqual(wab._OWNER_SCRIPT_NAMES, {self.PHONE_SHAPED})
         wab.owner_event(cfg, line + " " + forged)
         w = {"notified": {}}
         wab.note_question(cfg, "W1", w, wab.safe_text(line + " " + forged, 10 ** 9, owner_paths=True), time.time())
@@ -21960,7 +21972,7 @@ class W3PolicyMarksAndNotices(Base):
     rest only on a fresh NON-EMPTY read of status: an empty/unreadable read never opens an episode nor mutes a notice,
     a non-empty OTHER read mutes it. Every episode without an auto-answer (the cap, a refusal, a corrupt mark, the rule
     gone) notifies the owner exactly once. A key in flight whose text was not typed never outlives its delivery."""
-    HEAD_B, ND = FixedAnswerPolicy.HEAD_B, FixedAnswerPolicy.ND
+    HEAD_B, ND, BC = FixedAnswerPolicy.HEAD_B, FixedAnswerPolicy.ND, FixedAnswerPolicy.BC
     mandate, tick, answers = DecisionPolicy.mandate, DecisionPolicy.tick, DecisionPolicy.answers
     log, owner_asked = DecisionPolicy.log, DecisionPolicy.owner_asked
     forge = FixedAnswerPolicy.__dict__["forge"]
@@ -21968,6 +21980,11 @@ class W3PolicyMarksAndNotices(Base):
     CORRUPT = W3PolicyEpisodes.CORRUPT
     WITH, WITHOUT = W3PolicyEpisodes.WITH, W3PolicyEpisodes.WITHOUT
     DAMAGE = {"garbage": "garbage", "short eid": "sha256:abc", "not a str": 5}
+    JUNK_PREFIXED = "[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ мусор"
+    # a fixed text of 1.4.x as _fork_decision typed it when the wave recommended another variant (the frozen form)
+    WITH_REC = ("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант invariant. Доделай как следует: ещё один круг, чини класс "
+                "находки целиком, не латай; находки low/P3 — fix-loop --defer в остаток. Решение запиши: fix-loop "
+                "--decision invariant. (рекомендация волны: cut_surface) Затем запиши RUNNING в status.")
 
     @classmethod
     def setUpClass(cls):
@@ -22073,7 +22090,19 @@ class W3PolicyMarksAndNotices(Base):
                 ("a line in flight with a junk label stays", {"policy_key_pending": {"key": list(self.other),
                                                                                      "status": "BLOCKED: [junk] x",
                                                                                      "text": text}},
-                 ("policy_key_pending", "status", "BLOCKED: [junk] x"))):
+                 ("policy_key_pending", "status", "BLOCKED: [junk] x")),
+                # the prefix of a fixed answer, not its 1.4.x form (F2, W3 round 4): garbage after the prefix, and the
+                # answer of a rule without `answer` (POLICY_ANSWER shares the prefix) — never a fixed text in flight
+                ("the right prefix, not the form, stays", {"policy_key_pending": {"key": list(self.other),
+                                                                                  "status": self.line,
+                                                                                  "text": self.JUNK_PREFIXED}},
+                 ("policy_key_pending", "text", self.JUNK_PREFIXED)),
+                ("a policy answer of a rule without `answer` stays", {"policy_key_pending": {
+                    "key": list(self.other), "status": self.line, "text": wab.POLICY_ANSWER.format(rec="invariant")}},
+                 ("policy_key_pending", "text", wab.POLICY_ANSWER.format(rec="invariant"))),
+                ("a fixed text with the recommendation of the wave", {"policy_key_pending": {
+                    "key": list(self.other), "status": self.line, "text": self.WITH_REC}},
+                 ("policy_key_pending", "text", wab.text_eid(self.WITH_REC)))):
             with self.subTest(name):
                 cfg = self.fresh()
                 st = wab.load_state(cfg)
@@ -22082,7 +22111,8 @@ class W3PolicyMarksAndNotices(Base):
                 holder, field, value = want
                 rec = wab.load_state(cfg)["waves"]["W1"]
                 self.assertEqual(rec[holder][field], value)
-                if value == "BLOCKED: [junk] x":  # left as it is, the schema reads it as corrupt (never a valid mark)
+                if value in ("BLOCKED: [junk] x", self.JUNK_PREFIXED, wab.POLICY_ANSWER.format(rec="invariant")):
+                    # left as it is, the schema reads it as corrupt (never a valid mark)
                     if holder == "policy_refusal":
                         self.assertFalse(wab._refusal_ok(rec[holder]))
                     else:
@@ -22170,6 +22200,125 @@ class W3PolicyMarksAndNotices(Base):
                     self.tick(cfg)
                     self.tick(cfg)
                     self.assertEqual(self.count(), (0, want), "(answers, owner notices)")
+
+    # ----- A1 (W3 round 4): the episode is accounted on EVERY exit without an auto-answer, the mark created there too -----
+    def corrupt_from_the_start(self, rule, line=None, episode=None):
+        """A chain whose policy_refusal is corrupt BEFORE the first episode (no policy_episode yet: no earlier episode
+        of the line ever ran through the rule path); cap 0, so a rule path after the refusal goes is a refusal too."""
+        cfg = self.fresh(getattr(self, rule), cap=0)
+        self.set_status(cfg, "W1", line or self.line)
+        st = wab.load_state(cfg)
+        st["waves"]["W1"]["policy_refusal"] = "x"
+        if episode is not None:
+            st["waves"]["W1"]["policy_episode"] = episode
+        wab.save_state(cfg, st)
+        self.tick(cfg)
+        self.assertEqual(self.count(), (0, 1), "the first episode: told once")
+        return cfg
+
+    def test_iw3_a_corrupt_refusal_without_an_episode_mark_tells_every_episode_once(self):
+        path = lambda cfg: cfg["run_dir"] / "W1" / "status"  # noqa: E731
+
+        def running_then_the_line(cfg):
+            self.rewrite(cfg, "RUNNING")
+            self.tick(cfg)  # the BLOCKED episode is over: _tick drops the corrupt refusal with it
+            self.rewrite(cfg, self.line)
+        events = (("the same line rewritten", lambda cfg: self.rewrite(cfg, self.line), 2),
+                  ("RUNNING, then the same line", running_then_the_line, 2),
+                  ("empty", lambda cfg: self.rewrite(cfg, ""), 1),
+                  ("missing", lambda cfg: (self.rewrite(cfg, ""), path(cfg).unlink()), 1))
+        for rule in ("WITH", "WITHOUT"):
+            for name, event, want in events:
+                with self.subTest(rule=rule, event=name):
+                    cfg = self.corrupt_from_the_start(rule)
+                    w = wab.load_state(cfg)["waves"]["W1"]
+                    self.assertTrue(wab._episode_ok(w.get("policy_episode")), "the exit without an answer accounts "
+                                                                              "the episode: its mark is created")
+                    self.assertEqual(w["policy_refusal"], "x", "a corrupt refusal is never rewritten (fail closed)")
+                    event(cfg)
+                    self.tick(cfg)
+                    self.tick(cfg)
+                    self.assertEqual(self.count(), (0, want), "(answers, owner notices)")
+
+    def test_iw3_a_line_no_rule_fits_keeps_the_dedup_by_text(self):
+        line = self.BC.format(rec="new_run")  # the rules here are of needs_decision: none fits a blocked_cap line
+        for rule in ("WITH", "WITHOUT"):
+            for corrupt in (True, False):
+                with self.subTest(rule=rule, corrupt_refusal=corrupt):
+                    if corrupt:
+                        cfg = self.corrupt_from_the_start(rule, line)
+                    else:
+                        cfg = self.fresh(getattr(self, rule), cap=0)
+                        self.tick(cfg, line)
+                        self.assertEqual(self.count(), (0, 1))
+                    self.assertNotIn("policy_episode", wab.load_state(cfg)["waves"]["W1"])
+                    self.rewrite(cfg, line)
+                    self.tick(cfg)
+                    self.tick(cfg)
+                    self.assertEqual(self.count(), (0, 1), "1.2.0: a line no rule fits is told once per text")
+
+    def test_iw3_a_corrupt_episode_mark_is_never_rewritten_by_an_exit_without_an_answer(self):
+        # both marks corrupt: the known limit (waves.md, I-W3) — the first episode is told, the repeats of the line stay
+        # silent until the owner answers or the wave moves on; the corrupt episode mark is kept as it is (fail closed)
+        for rule in ("WITH", "WITHOUT"):
+            with self.subTest(rule=rule):
+                cfg = self.corrupt_from_the_start(rule, episode="garbage")
+                self.assertEqual(wab.load_state(cfg)["waves"]["W1"]["policy_episode"], "garbage")
+                self.rewrite(cfg, self.line)
+                self.tick(cfg)
+                self.assertEqual(wab.load_state(cfg)["waves"]["W1"]["policy_episode"], "garbage")
+                self.assertEqual(self.count(), (0, 1))
+
+    def test_iw3_an_empty_read_records_no_episode_mark(self):
+        # A3 kept on the exit without an answer: the line is decided on last_status (the file empty mid-rewrite) — no
+        # mark is recorded under the stamp of the empty file, nothing is reset; the line written right after is the
+        # same episode (one notice), its mark recorded by that first stable read
+        for rule in ("WITH", "WITHOUT"):
+            with self.subTest(rule=rule):
+                cfg = self.fresh(getattr(self, rule), cap=0)
+                self.set_status(cfg, "W1", "")
+                st = wab.load_state(cfg)
+                w = st["waves"]["W1"]
+                wab.set_last_status(cfg, "W1", w, self.line)
+                w["policy_refusal"] = "x"
+                wab.save_state(cfg, st)
+                self.tick(cfg)
+                self.assertEqual(self.count(), (0, 1), "decided on last_status: told once")
+                self.assertNotIn("policy_episode", wab.load_state(cfg)["waves"]["W1"])
+                self.rewrite(cfg, self.line)
+                self.tick(cfg)
+                self.assertTrue(wab._episode_ok(wab.load_state(cfg)["waves"]["W1"].get("policy_episode")))
+                self.tick(cfg)
+                self.assertEqual(self.count(), (0, 1), "the write that was in progress is no new episode")
+
+    def test_iw3_a_rewrite_between_the_stamp_and_the_read_is_one_episode(self):
+        """The stamp of the status file is taken mid-rewrite (the file empty), the wave writes the line right after: one
+        rewrite is ONE new episode — the mark takes the stamp of the very write it read (stamp -> read -> stamp), never
+        the stamp of the empty file (that would make the next tick see a «new» episode of the same write)."""
+        for rule in ("WITH", "WITHOUT"):
+            for start in ("a corrupt refusal", "the cap"):
+                with self.subTest(rule=rule, start=start):
+                    if start == "the cap":
+                        cfg = self.fresh(getattr(self, rule), cap=0)
+                        self.tick(cfg, self.line)
+                        self.assertEqual(self.count(), (0, 1))
+                    else:
+                        cfg = self.corrupt_from_the_start(rule)
+                    self.rewrite(cfg, "")  # the wave truncates the file to write the same line again
+                    real, raced = wab._status_stamp, []
+
+                    def stamp(cfg_, wave, cfg=cfg, real=real, raced=raced):
+                        got = real(cfg_, wave)
+                        if not raced and (cfg["run_dir"] / "W1" / "status").read_text(encoding="utf-8") == "":
+                            raced.append(1)
+                            self.rewrite(cfg, self.line)  # ...and writes it right after the stamp was taken
+                        return got
+                    with mock.patch.object(wab, "_status_stamp", side_effect=stamp):
+                        self.tick(cfg)
+                    self.assertTrue(raced)
+                    self.tick(cfg)
+                    self.tick(cfg)
+                    self.assertEqual(self.count(), (0, 2), "one rewrite, one new episode, one notice")
 
     def test_iw3_a_failed_delivery_notifies_only_on_a_fresh_read(self):
         for rule in ("WITH", "WITHOUT"):

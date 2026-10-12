@@ -627,6 +627,14 @@ def _same(mark, e):
     return isinstance(mark, str) and mark_eid(mark) == e
 
 
+# THE form of a fixed answer as 1.4.x typed it (_fork_decision): FIXED_HEAD with an answer of the closed vocabulary,
+# its wording, the wave's recommendation when it differed, FIXED_TAIL — one line. FROZEN on purpose: it describes
+# what 1.4.x wrote into state.json, not what this release types (a later change of FIXED_HEAD must not move it). A
+# string that only shares the prefix (garbage after it, POLICY_ANSWER of a rule without `answer`) is not this form.
+_LEGACY_FIXED_TEXT = re.compile(r"\[wab\] РЕШЕНИЕ ПО ПОЛИТИКЕ \(chain\.json\): вариант "
+                                r"(?:invariant|cut_surface|accept_limitation|new_run)\. [^\n]+ Затем запиши RUNNING в status\.")
+
+
 def _keep_legacy(legacy, text):
     if isinstance(text, str) and text and not EID.fullmatch(text):
         legacy[mark_eid(text)] = text
@@ -694,7 +702,7 @@ def upgrade_record(w, legacy):
             holder["status"] = text_eid(holder["status"])
     pend = w.get("policy_key_pending")
     if (isinstance(pend, dict) and isinstance(pend.get("text"), str)
-            and pend["text"].startswith("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ")):  # the text of a fixed answer (FIXED_HEAD) of 1.4.x
+            and _LEGACY_FIXED_TEXT.fullmatch(pend["text"])):  # the whole text of a fixed answer of 1.4.x, nothing else
         pend["text"] = text_eid(pend["text"])
     handed = w.get("fable_blocked_episode")
     # an empty status is never written: it stays as it is and never matches an episode (no schema check here: the mark
@@ -3381,10 +3389,12 @@ def _refuse(reason):
 # The 1.4.x migration (upgrade_record) turns into an eid only a legacy string of its own form (a labelled BLOCKED
 # line; the text of a fixed answer). Any deviation is a corrupt mark: a refusal to the owner (FORK_MARKS_CORRUPT, a
 # corrupt policy_refusal / policy_episode), never an automatic answer. A new BLOCKED episode, the owner's notice and
-# its silence rest only on a fresh NON-EMPTY read of status (_fresh_status): an empty or unreadable read never opens
-# an episode and never mutes a notice, a non-empty OTHER read mutes it (the episode is over; the next tick decides).
-# Every episode without an automatic answer (the cap, a refusal, a corrupt mark, the rule gone) notifies the owner
-# exactly once. A key in flight whose text was not typed into the window never outlives its delivery.
+# its silence rest only on a fresh NON-EMPTY read of status (_episode_read: one stable stamp -> text -> stamp read in
+# _policy_answer; _fresh_status in _tick): an empty or unreadable read never opens an episode and never mutes a notice,
+# a non-empty OTHER read mutes it (the episode is over; the next tick decides). Every episode without an automatic
+# answer (the cap, a refusal, a corrupt mark, the rule gone) notifies the owner exactly once: the episode is accounted
+# at ONE point (_episode_step) on the rule path and on every exit without an answer. Known limit: a corrupt
+# policy_refusal AND a corrupt policy_episode at once — the repeats of the same line stay silent (fail closed). A key in flight whose text was not typed into the window never outlives its delivery.
 
 def _fork_keys(rec, wave, run_id=None):
     """(answered keys, the key in flight or None) of one wave record of state.json of `wave`. A mark that is there
@@ -7136,6 +7146,54 @@ def _fresh_status(cfg, wave):
     return read(wave_dir(cfg, wave) / "status", on_error=None) or None
 
 
+def _episode_read(cfg, wave, status):
+    """I-W3: THE read every episode decision of _policy_answer rests on, taken once per call: (reads, stamp). `reads`:
+    the status file reads as `status` NOW by one stable snapshot (stamp -> text -> stamp, _status_snapshot), and
+    `stamp` is the stamp of that very write — never the stamp of an empty file the line was written over right after
+    the stamp was taken (that would make the next tick see a «new» episode of the same write). Otherwise (empty,
+    unreadable, another line, rewritten during the read) `reads` is False — such a read opens no new episode and
+    records no mark — and `stamp` is the file's current stamp (the same-stamp check of a mark still holds)."""
+    snap = _status_snapshot(cfg, wave)
+    if snap is not None and snap[0] == status:
+        return True, snap[1]
+    return False, _status_stamp(cfg, wave)
+
+
+def _policy_rule(cfg, status):
+    """(label, rule): the rule of decision_policy that fits a BLOCKED line, or rule None when no rule may answer it
+    (no or bad label, red=yes, merge_gate, a class/rec the policy does not name)."""
+    label = parse_blocked_label(status)
+    if label is None or label["red"] or label["class"] == "merge_gate":
+        return label, None
+    rule = next((r for r in decision_policy(cfg)
+                 if r["class"] == label["class"] and r["rec"] in (None, label["rec"])), None)
+    return label, rule
+
+
+def _episode_step(w, es, stamp, reads, create=True):
+    """I-W3: THE accounting of a BLOCKED episode in `policy_episode` — the eid of the line AND the stamp of the status
+    write that reads as it — for the rule path and for every exit without an answer of _policy_answer alike.
+    None: the mark is corrupt; it is kept as it is (fail closed: the rule path refuses on it, an exit without an
+    answer leaves it — it is never read as «a new episode» and never overwritten). True: a NEW episode of the line the
+    mark already holds (the same text under another stamp while the file reads as it), or the first episode of
+    another line after a mark (the caller drops the `blocked` mark of the owner's notice: one notice per episode).
+    False: the same episode (the same stamp, or a read that is not this line now: empty, unreadable, mid-rewrite),
+    or the first mark ever written (a state.json of 1.4.3, or the first episode: its notice is the first one).
+    Nothing is written on a read that is not the line now; `create` False only moves a mark of this very line on."""
+    episode = w.get("policy_episode")
+    if episode is not None and not _episode_ok(episode):
+        return None
+    if isinstance(episode, dict) and _same(episode["status"], es):
+        if episode.get("stamp") == stamp or not reads:
+            return False
+        w["policy_episode"] = {"status": es, "stamp": stamp}
+        return True
+    if not (create and reads):
+        return False
+    w["policy_episode"] = {"status": es, "stamp": stamp}
+    return episode is not None
+
+
 def _policy_answer(cfg, st, wave, w, status, now, attach):
     """Answer a BLOCKED episode by the decision_policy of chain.json. True when it is answered (now
     or earlier in this episode): the owner is then informed (`policy_answer`), not asked. False sends
@@ -7162,16 +7220,19 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     MOVES to `policy_keys` and counts as answered; it is dropped unanswered only by its own decision and
     only when nothing reached the window — the status changed before the typing, the delivery failed, or the
     window died before the paste (_WindowGone with nothing typed: re-raised after the key is dropped, #100 p.17).
-    I-W3: the episode decisions here rest on a fresh non-empty read of status (_fresh_status): the answered episode
-    and a refused one end only when the file reads as the line again under another stamp; an exit without an
-    answer before the episode is accounted (a corrupt refusal, no rule any more) still raises BLOCKED to the owner
-    once for a new episode of a line answered or decided before (_no_answer). The path of a rule without `answer`
+    I-W3: the episode decisions here rest on ONE stable non-empty read of status (_episode_read: stamp -> text ->
+    stamp): the answered episode and a refused one end only when the file reads as the line again under another
+    stamp. The episode is accounted at ONE point (_episode_step) on the rule path and on every exit without an answer
+    (no_answer): a corrupt refusal of a line a rule fits records the episode mark too (the first record opens no
+    second notice), so every later episode of that line — rewritten with or without RUNNING in between — is told
+    to the owner exactly once; a line no rule fits keeps the 1.2.0 dedup by text (only a mark of it already there
+    moves on). A corrupt `policy_episode` is never overwritten. The path of a rule without `answer`
     in this function neither reads nor writes `policy_key_pending` / `policy_keys`."""
-    stamp = _status_stamp(cfg, wave)
+    reads, stamp = _episode_read(cfg, wave, status)
     es = text_eid(status)  # every mark of an episode in state.json is the eid of its line (1.4.3)
     anew = False  # the very line of the last decision under another stamp: a new episode of the same text
     if _answered(w) == es:
-        if w.get("policy_answered_stamp") in (None, stamp) or _fresh_status(cfg, wave) != status:
+        if w.get("policy_answered_stamp") in (None, stamp) or not reads:
             # the answered episode: the same stamp, or a file that does not read as this line now (empty or
             # unreadable mid-rewrite, another line: the next tick decides) — another stamp alone is no episode (I-W3)
             return True
@@ -7181,16 +7242,14 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         w.pop("policy_answered_stamp", None)
         anew = True
 
-    def no_answer():
-        # I-W3: an exit without an automatic answer BEFORE the episode is accounted below (a corrupt refusal, a line no
-        # rule fits any more). A new episode of a line answered or decided before (the answer above, or the episode
-        # mark of this very line under another stamp while the file reads as it) is still one notice to the owner:
-        # the `blocked` mark the earlier episode left is dropped, the episode mark moves on (no second notice)
+    def no_answer(create=False):
+        # I-W3: an exit without an automatic answer, accounted by the same _episode_step as the rule path below. A new
+        # episode of a line answered or decided before (the answer above, or the episode mark of this very line under
+        # another stamp while the file reads as it) is still one notice to the owner: the `blocked` mark the earlier
+        # episode left is dropped, the episode mark moves on (no second notice). `create`: the mark is recorded here
+        # too (a corrupt refusal of a line a rule fits) — otherwise only a mark already there moves on
         nonlocal anew
-        episode = w.get("policy_episode")
-        if (_episode_ok(episode) and _same(episode["status"], es) and episode.get("stamp") != stamp
-                and _fresh_status(cfg, wave) == status):
-            w["policy_episode"] = {"status": es, "stamp": stamp}
+        if _episode_step(w, es, stamp, reads, create):
             anew = True
         if anew:
             drop_notice(w, "blocked")
@@ -7199,20 +7258,21 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     refusal = w.get("policy_refusal")
     if refusal is not None:
         if not _refusal_ok(refusal):
-            return no_answer()  # a corrupt refusal reads as a refusal (fail closed) — of every episode, each told once
-        if _same(refusal["status"], es) and (refusal.get("stamp") == stamp or _fresh_status(cfg, wave) != status):
+            # a corrupt refusal reads as a refusal (fail closed) — of every episode, each told once: the episode of a
+            # line a rule fits is accounted here as on the rule path (its mark created), a line no rule fits keeps
+            # the dedup by text
+            return no_answer(create=_policy_rule(cfg, status)[1] is not None)
+        if _same(refusal["status"], es) and (refusal.get("stamp") == stamp or not reads):
             # one decision per episode: this one was refused and stays with the owner. Another stamp alone
             # is not a new episode: the file must read as this very line again (not empty or unreadable)
             return False
         w.pop("policy_refusal")  # the same line written anew: another episode, decided anew
         anew = True
-    label = parse_blocked_label(status)
-    if label is None or label["red"] or label["class"] == "merge_gate":
-        return no_answer()
-    rules = decision_policy(cfg)
-    rule = next((r for r in rules if r["class"] == label["class"] and r["rec"] in (None, label["rec"])), None)
+    label, rule = _policy_rule(cfg, status)
     if rule is None:
-        return no_answer()  # the policy changed between episodes: the new one goes to the owner, never silently
+        # no or bad label, red, merge_gate — or the policy changed between episodes: the new one goes to the owner,
+        # never silently
+        return no_answer()
     fixed = None  # a rule with `answer` (#89); without it every line below is the 1.2.0 path
     # THE episode of a line a rule fits (with `answer` or without): the eid of the line AND the stamp of the status
     # write that reads as it. The `blocked` mark of the owner's notice belongs to the EPISODE, not to the text:
@@ -7221,15 +7281,12 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     # The same stamp, or a status that does not read as the line now (empty/unreadable mid-rewrite, decided on
     # last_status), is the same episode. No mark at all is a state.json of 1.4.3 (the chain upgraded between waves):
     # the current episode is adopted as it is, its `blocked` mark (if any) was set by that episode — no second notice.
-    episode = w.get("policy_episode")
-    if episode is not None and not _episode_ok(episode):
+    step = _episode_step(w, es, stamp, reads)
+    if step is None:
         # a corrupt mark of the episode is never read as «a new episode» (that would answer automatically after
         # the corruption): the machine refusal of this episode, to the owner with its reason (fail closed)
         return _policy_refuse(cfg, st, wave, w, es, stamp, EPISODE_CORRUPT, status)
-    if not (isinstance(episode, dict) and _same(episode.get("status"), es) and (
-            episode.get("stamp") == stamp or _fresh_status(cfg, wave) != status)):
-        w["policy_episode"] = {"status": es, "stamp": stamp}
-        anew = anew or episode is not None
+    anew = anew or step
     if anew:
         drop_notice(w, "blocked")
     if owner_answered(cfg, wave, status):  # the owner answered this very episode with `say`
