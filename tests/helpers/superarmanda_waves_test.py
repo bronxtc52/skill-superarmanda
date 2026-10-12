@@ -8389,6 +8389,38 @@ class MergeGate(GateBase):
         self.assertEqual(self.rec()["phase"], "done")
         self.assertEqual(self.merges(), [])
 
+    PHONE_SHAPED = "W1.aaaaaaaaaaaa.78297023340d065a.merge"  # id16 after the dot reads as a RU phone to redact()
+
+    def test_an_owner_script_name_shaped_like_a_phone_stays_whole_where_the_owner_reads_it(self):
+        # W3 (#113, A5): the flake of test_an_interrupted_merge_is_handed_to_the_owner_once made deterministic — the
+        # random id16 of the temp chain file once looked like a phone number, and the path became «[скрыто]» in
+        # events.log and questions[] (only the status line took the owner-script exemption)
+        self.assertNotEqual(wab.safe_text("~/.cache/wab/" + self.PHONE_SHAPED, 10 ** 9),
+                            "~/.cache/wab/" + self.PHONE_SHAPED, "the guard needs a name the heuristic masks")
+        with mock.patch.object(wab, "owner_script_name", return_value=self.PHONE_SHAPED):
+            self.test_an_interrupted_merge_is_handed_to_the_owner_once()
+        path = wab.write_chain_result(self.cfg, wab.load_state(self.cfg))[0]
+        self.assertIn("~/.cache/wab/" + self.PHONE_SHAPED, path.read_text(encoding="utf-8"))
+
+    def test_the_owner_path_exemption_keeps_every_other_mask_of_the_line(self):
+        folder = self.home / ".cache" / "wab"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / self.PHONE_SHAPED).write_text("x", encoding="utf-8")
+        cfg, _ = self.chain()
+        token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2"
+        line = f"BLOCKED: merge gate passed; token {token} phone 89161234567; owner runs ~/.cache/wab/{self.PHONE_SHAPED}"
+        forged = "~/.cache/wab/W1.aaaaaaaaaaaa.78297023340d0000.merge"  # the shape, but no such file: masked as before
+        wab.event(cfg, line + " " + forged, owner_paths=True)
+        w = {"notified": {}}
+        wab.note_question(cfg, "W1", w, wab.safe_text(line + " " + forged, 10 ** 9, owner_paths=True), time.time())
+        for name, text in (("events.log", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")),
+                           ("questions[]", q_texts(cfg, "W1", w)[0])):
+            with self.subTest(name):
+                self.assertIn("~/.cache/wab/" + self.PHONE_SHAPED, text)
+                self.assertNotIn(token, text)
+                self.assertNotIn("89161234567", text)
+                self.assertNotIn(forged, text)
+
     def test_failed_check_blocks_with_the_reason_and_tells_the_window(self):  # acceptance 2
         self.start()
         self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
@@ -12508,12 +12540,13 @@ class FixedAnswerPolicy(Base):
         first = self.decide(cfg, status=status)
         key = first["key"]
         self.assertEqual(key, ["W1", cfg["run_id"], 2, "T1", "needs_decision", "tester"])
-        pend = {"key": key, "status": status, "text": first["text"]}  # what the decision typed
+        # what the decision typed — as state.json holds it since 1.4.3 (eids; I-W3 takes no other value, 1.5.3)
+        pend = {"key": key, "status": wab.text_eid(status), "text": wab.text_eid(first["text"])}
         for name, w, ok in [
                 ("acc07 the key is answered", {"policy_keys": [key]}, False),
                 ("acc09 answered in an archived attempt (the wave restarted)", {"attempts": [{"policy_keys": [key]}]}, False),
                 ("another run index is another fork", {"policy_keys": [key[:2] + [1] + key[3:]]}, True),
-                ("in flight, a new episode", {"policy_key_pending": dict(pend, status="BLOCKED: other")}, False),
+                ("in flight, a new episode", {"policy_key_pending": dict(pend, status=wab.text_eid("BLOCKED: other"))}, False),
                 ("in flight, watch died before Enter was recorded", {"policy_key_pending": pend, "policy_pending": status}, False),
                 ("in flight in an archived attempt", {"attempts": [{"policy_key_pending": pend}]}, False),
                 ("the Enter-only retry of the same episode", {"policy_key_pending": pend, "policy_pending": status, "pending_enter": "policy answer"}, True)]:
@@ -12548,7 +12581,7 @@ class FixedAnswerPolicy(Base):
                 ("the manifest is gone", {"index": 2, "manifest": "missing"}, {}, "несуществующий файл"),
                 ("another run was opened: another key", {"index": 3}, {}, "не совпадает с напечатанным"),
                 ("fix-loop 3/3 on the last run", {"index": 2, "edit": capped}, {"max_runs": 2}, "потолок прогонов исчерпан (2/2)"),
-                ("the typed text is not the decision's", {"index": 2}, {"text": "t"}, "не совпадает с напечатанным"),
+                ("the typed text is not the decision's", {"index": 2}, {"text": wab.text_eid("t")}, "не совпадает с напечатанным"),
                 ]:
             with self.subTest(name):
                 shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)
@@ -13127,7 +13160,7 @@ class FixedAnswerPolicy(Base):
                     self.assertNotIn("policy_key_pending", rec)
 
     def test_n1_a_rule_without_answer_leaves_a_foreign_fork_key_alone(self):
-        flight = {"key": self.KEY, "status": self.ND.format(rec="invariant"), "text": "t"}
+        flight = {"key": self.KEY, "status": self.ND.format(rec="invariant"), "text": wab.text_eid("t")}
         for name, failed in [("none", None), ("false", False), ("sent", "sent")]:
             for mark in (flight, "x"):  # a corrupt mark too: this path neither reads nor writes the fields
                 with self.subTest(name, mark=mark):
@@ -13142,8 +13175,9 @@ class FixedAnswerPolicy(Base):
                     else:
                         with mock.patch.object(wab, "_deliver", return_value=failed):
                             w = self.tick(cfg, self.QN)["waves"]["W1"]
-                    # 1.4.3: the mark is kept with the eids of its line and text (load_state migrates a 1.4.x one)
-                    kept = dict(mark, status=wab.mark_eid(mark["status"]), text=wab.mark_eid("t")) if isinstance(mark, dict) else mark
+                    # 1.4.3: the mark is kept with the eids of its line and text (load_state migrates a 1.4.x line;
+                    # 1.5.3, I-W3: a text that is not a fixed answer of 1.4.x is not migrated, the fixture holds an eid)
+                    kept = dict(mark, status=wab.mark_eid(mark["status"])) if isinstance(mark, dict) else mark
                     self.assertEqual(w["policy_key_pending"], kept)
                     self.assertNotIn("policy_keys", w)
 
@@ -21710,6 +21744,256 @@ class W3PolicyEpisodes(Base):
                             self.assertIn(flag, cmd, f"state.py refuses --accept without {flag}")
 
 
+class W3PolicyMarksAndNotices(Base):
+    """W3 of waves-tails2 (#113, the remainder of #100): ONE invariant (I-W3), ONE brute force over its surface.
+    I-W3: a mark of an automatic answer in state.json (policy_key_pending, policy_refusal, policy_episode, policy_keys)
+    is taken only by its full schema: status/text are eids (EID.fullmatch), the key in flight of the current record is
+    of its wave and run_id, an archived one of its wave (its run_id may be another); the 1.4.x migration turns into an
+    eid only a legacy string of its own form (a labelled BLOCKED line; the text of a fixed answer). Any deviation is a
+    corrupt mark: a refusal to the owner, never an automatic answer. A new BLOCKED episode, its notice and its silence
+    rest only on a fresh NON-EMPTY read of status: an empty/unreadable read never opens an episode nor mutes a notice,
+    a non-empty OTHER read mutes it. Every episode without an auto-answer (the cap, a refusal, a corrupt mark, the rule
+    gone) notifies the owner exactly once. A key in flight whose text was not typed never outlives its delivery."""
+    HEAD_B, ND = FixedAnswerPolicy.HEAD_B, FixedAnswerPolicy.ND
+    mandate, tick, answers = DecisionPolicy.mandate, DecisionPolicy.tick, DecisionPolicy.answers
+    log, owner_asked = DecisionPolicy.log, DecisionPolicy.owner_asked
+    forge = FixedAnswerPolicy.__dict__["forge"]
+    fork, decide, rewrite = FixedAnswerPolicy.fork, FixedAnswerPolicy.decide, FixedAnswerPolicy.rewrite
+    CORRUPT = W3PolicyEpisodes.CORRUPT
+    WITH, WITHOUT = W3PolicyEpisodes.WITH, W3PolicyEpisodes.WITHOUT
+    DAMAGE = {"garbage": "garbage", "short eid": "sha256:abc", "not a str": 5}
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with mock.patch.dict(os.environ):
+            cls.bases = cls.forge()
+
+    def setUp(self):
+        super().setUp()
+        self.line = self.ND.format(rec="invariant")
+        self.other = ["W1", RUN_ID, 2, "T1", "needs_decision", "tester"]  # a valid key of ANOTHER fork (run 2)
+
+    def fresh(self, rule=None, cap=3):
+        self.tg.clear()
+        self.sent.clear()
+        self.enters.clear()
+        self.alive = True
+        cfg, _ = self.mandate(policy=[self.WITH if rule is None else rule], max_runs=5)
+        cfg["max_auto_answers"] = cap
+        self.fork(cfg)
+        self.addCleanup(shutil.rmtree, cfg["run_dir"], True)
+        return cfg
+
+    def count(self):
+        return len(self.answers()), len(self.owner_asked())
+
+    # ----- the marks (A1, A2): every holder × every damage, in memory and through load_state of a raw state.json -----
+    def mark(self, holder, damage):
+        """The fields of the wave record with `holder` damaged by `damage` («<field> <kind>» or «key foreign …»)."""
+        if holder == "policy_refusal":
+            mark = {"status": wab.text_eid(self.line), "stamp": None, "reason": "r"}
+        else:
+            mark = {"key": list(self.other), "status": wab.text_eid(self.line), "text": wab.text_eid("t")}
+        if damage == "key foreign wave":
+            mark["key"] = ["W2", *self.other[1:]]
+        elif damage == "key foreign run_id":
+            mark["key"] = ["W1", "1999-01-01", *self.other[2:]]
+        elif damage != "none":
+            field, kind = damage.split(" ", 1)
+            mark[field] = self.DAMAGE[kind]
+        return {"attempts": [{"policy_key_pending": mark}]} if holder == "attempts" else {holder: mark}
+
+    def mark_rows(self):
+        rows = []
+        for holder in ("policy_key_pending", "attempts", "policy_refusal"):
+            damages = [f"status {k}" for k in self.DAMAGE]
+            if holder != "policy_refusal":
+                damages += [f"text {k}" for k in self.DAMAGE] + ["key foreign wave"]
+            if holder == "policy_key_pending":
+                damages.append("key foreign run_id")  # an archived attempt may hold another run: a guard below
+            rows += [(holder, d, load, False) for d in damages for load in ("memory", "disk")]
+        # guards: the valid shapes are taken (the archive of another run included)
+        rows += [(h, "none", load, True) for h in ("policy_key_pending", "attempts", "policy_refusal")
+                 for load in ("memory", "disk")]
+        rows += [("attempts", "key foreign run_id", load, True) for load in ("memory", "disk")]
+        return rows
+
+    def test_iw3_marks_by_the_full_schema(self):
+        for holder, damage, load, valid in self.mark_rows():
+            with self.subTest(holder=holder, damage=damage, load=load):
+                cfg = self.fresh()
+                self.set_status(cfg, "W1", self.line)
+                fields = self.mark(holder, damage)
+                if load == "disk":
+                    st = wab.load_state(cfg)
+                    st["waves"]["W1"].update(fields)
+                    self.put_state(cfg, st)  # raw json on disk: a 1.4.x or hand-edited file, read by load_state
+                    fields = wab.load_state(cfg)["waves"]["W1"]
+                if holder == "policy_refusal":
+                    self.assertEqual(bool(wab._refusal_ok(fields["policy_refusal"])), valid, fields["policy_refusal"])
+                else:
+                    got = self.decide(cfg, w=fields, status=self.line)
+                    self.assertEqual(got["ok"], valid, got)
+                    if not valid:
+                        self.assertTrue(got["reason"].startswith(self.CORRUPT), got["reason"])
+                if load == "memory" or (holder == "policy_refusal" and valid):
+                    continue  # a valid refusal of THIS line holds the episode: no tick-level row for it here
+                self.tick(cfg)
+                self.tick(cfg)
+                self.assertEqual(self.count(), (1, 0) if valid else (0, 1), "(answers, owner notices)")
+
+    def test_iw3_the_migration_takes_only_a_legacy_string_of_its_own_form(self):
+        text = wab.FIXED_HEAD.format(answer="invariant") + " Доделай как следует." + wab.FIXED_TAIL
+        for name, fields, want in (
+                ("1.4.2 refusal: the labelled line", {"policy_refusal": {"status": self.line, "stamp": None, "reason": "r"}},
+                 ("policy_refusal", "status", wab.text_eid(self.line))),
+                ("1.4.x key in flight: the line", {"policy_key_pending": {"key": list(self.other), "status": self.line,
+                                                                          "text": text}},
+                 ("policy_key_pending", "status", wab.text_eid(self.line))),
+                ("1.4.x key in flight: the fixed text", {"policy_key_pending": {"key": list(self.other), "status": self.line,
+                                                                                "text": text}},
+                 ("policy_key_pending", "text", wab.text_eid(text))),
+                ("an unlabelled refusal line stays", {"policy_refusal": {"status": "BLOCKED: no label", "stamp": None,
+                                                                         "reason": "r"}},
+                 ("policy_refusal", "status", "BLOCKED: no label")),
+                ("a free text in flight stays", {"policy_key_pending": {"key": list(self.other), "status": self.line,
+                                                                        "text": "чужой текст"}},
+                 ("policy_key_pending", "text", "чужой текст"))):
+            with self.subTest(name):
+                cfg = self.fresh()
+                st = wab.load_state(cfg)
+                st["waves"]["W1"].update(fields)
+                self.put_state(cfg, st)
+                holder, field, value = want
+                self.assertEqual(wab.load_state(cfg)["waves"]["W1"][holder][field], value)
+        with self.subTest("the migrated 1.4.2 refusal still holds its episode"):
+            cfg = self.fresh()
+            self.set_status(cfg, "W1", self.line)
+            st = wab.load_state(cfg)
+            st["waves"]["W1"]["policy_refusal"] = {"status": self.line, "stamp": wab._status_stamp(cfg, "W1"), "reason": "r"}
+            st["waves"]["W1"]["notified"]["blocked"] = self.line  # the owner was told by 1.4.2
+            self.put_state(cfg, st)
+            self.tick(cfg)
+            self.tick(cfg)
+            self.assertEqual(self.count(), (0, 0))
+
+    # ----- the notices (A3, A4, #100 p.11a/p.11b): the event after an auto-answer × the rule × the cap -----
+    def after_answer(self, rule, cap):
+        cfg = self.fresh(getattr(self, rule), cap)
+        self.tick(cfg, self.line)
+        self.assertEqual(self.count(), (1, 0), "the first episode is auto-answered")
+        return cfg
+
+    def test_iw3_notices_by_the_fresh_non_empty_read(self):
+        path = lambda cfg: cfg["run_dir"] / "W1" / "status"  # noqa: E731
+        events = {
+            "empty": lambda cfg: self.rewrite(cfg, ""),
+            "missing": lambda cfg: (self.rewrite(cfg, ""), path(cfg).unlink()),
+            "RUNNING": lambda cfg: self.rewrite(cfg, "RUNNING"),
+            "the same line rewritten": lambda cfg: self.rewrite(cfg, self.line),
+        }
+        rows = []
+        for rule in ("WITH", "WITHOUT"):
+            for cap in (1, 3):  # spent by the first answer / left
+                for ev in events:
+                    want = (1, 0)  # an empty/unreadable read or another line: nothing to tell
+                    if ev == "the same line rewritten":
+                        # a new episode: at the cap or refused (the fork is answered) -> one notice; below the cap a
+                        # rule without `answer` answers it again
+                        want = (2, 0) if (rule, cap) == ("WITHOUT", 3) else (1, 1)
+                    rows.append((f"{rule} cap={cap} after the answer: {ev}", rule, cap, events[ev], want))
+        for rule in ("WITH", "WITHOUT"):
+            for name, newpol in (("removed", []), ("other class only", [{"class": "blocked_cap", "rec": "new_run"}]),
+                                 ("another rec only", [{"class": "needs_decision", "rec": "cut_surface"}])):
+                def drop_policy(cfg, newpol=newpol):
+                    cfg["decision_policy"] = newpol
+                    self.rewrite(cfg, self.line)
+                rows.append((f"{rule}: the policy changed between episodes ({name})", rule, 3, drop_policy, (1, 1)))
+
+            def corrupt_refusal(cfg):
+                st = wab.load_state(cfg)
+                st["waves"]["W1"]["policy_refusal"] = "x"
+                wab.save_state(cfg, st)
+                self.rewrite(cfg, self.line)
+            rows.append((f"{rule}: a corrupt refusal and the same line rewritten", rule, 3, corrupt_refusal, (1, 1)))
+        for name, rule, cap, event, want in rows:
+            with self.subTest(name):
+                cfg = self.after_answer(rule, cap)
+                event(cfg)
+                self.tick(cfg)
+                self.tick(cfg)
+                self.assertEqual(self.count(), want, "(answers, owner notices)")
+
+    def test_iw3_a_failed_delivery_notifies_only_on_a_fresh_read(self):
+        for rule in ("WITH", "WITHOUT"):
+            for after, want in (("RUNNING", 0), ("", 1), (None, 1)):  # only a non-empty OTHER read mutes it
+                with self.subTest(rule=rule, after=after):
+                    cfg = self.fresh(getattr(self, rule))
+                    self.set_status(cfg, "W1", self.line)
+
+                    def fail(n, t, **kw):  # the paste fails (the window is alive); meanwhile the wave writes `after`
+                        if after is not None:
+                            self.rewrite(cfg, after)
+                        raise subprocess.CalledProcessError(1, "tmux")
+                    with mock.patch.object(wab, "send_text", side_effect=fail):
+                        self.tick(cfg)
+                    self.assertEqual(self.count(), (0, want), "(answers, owner notices)")
+                    w = wab.load_state(cfg)["waves"]["W1"]
+                    self.assertNotIn("policy_key_pending", w)  # nothing reached the window: the key left the flight
+
+    # ----- #100 p.17: the window dies while the answer is delivered -----
+    def test_iw3_a_key_in_flight_never_outlives_a_delivery_that_typed_nothing(self):
+        cfg = self.fresh()
+        self.set_status(cfg, "W1", self.line)
+
+        def die(n, t, **kw):  # the window dies before anything is pasted (on_typed is never called)
+            self.alive = False
+            raise subprocess.CalledProcessError(1, "tmux")
+        with mock.patch.object(wab, "send_text", side_effect=die):
+            try:
+                self.tick(cfg)
+            except wab._WindowGone:
+                pass
+        w = wab.load_state(cfg)["waves"]["W1"]
+        self.assertNotIn("policy_key_pending", w)
+        self.assertNotIn("policy_pending", w)
+        self.assertFalse(w.get("policy_keys"))
+        archived = {k: v for k, v in w.items() if k not in ("attempts", "outbox")}  # a relaunch archives it (launch)
+        st = wab.load_state(cfg)
+        st["waves"]["W1"] = dict(self.wave_rec("W1"), attempts=[archived])
+        wab.save_state(cfg, st)
+        self.alive = True
+        got = self.decide(cfg, w=wab.load_state(cfg)["waves"]["W1"], status=self.line)
+        self.assertTrue(got["ok"], got)
+        self.tick(cfg)
+        self.assertEqual(self.count(), (1, 0), "the fork is answered once the window is back")
+
+    def test_iw3_a_collect_error_in_the_recheck_before_the_enter_postpones_it(self):
+        # coverage of _deliver: a CollectError of the precheck between the typing and the Enter (no product change)
+        cfg = self.fresh()
+        st = wab.load_state(cfg)
+        calls = []
+
+        def precheck():
+            calls.append(1)
+            if len(calls) > 1:
+                raise wab.gate.CollectError("gh: down")
+            return True
+
+        def send(n, t, on_typed=None, before_enter=None):
+            on_typed()
+            before_enter()
+            self.enters.append(n)
+        with mock.patch.object(wab, "send_text", side_effect=send):
+            got = wab._deliver(cfg, st, "W1", "policy answer", wab.send_text, "hello", precheck=precheck,
+                               recheck_enter=True)
+        self.assertIs(got, False)
+        self.assertEqual(self.enters, [])
+        self.assertEqual(st["waves"]["W1"].get("pending_enter"), "policy answer")
+        self.assertIn("postponed: facts not collected before the Enter", self.log(cfg))
+
+
 # ---------------------------------------------------------------- W4 dash-texts: live reload, minutes in notices, one gate event
 class W4DashReload(Base):
     """#102 item 6: the dashboard holds the identity of the run from its start, like `watch`; a live edit of
@@ -22088,13 +22372,12 @@ class Release152(unittest.TestCase):
     """The release 1.5.2 (#113 W2; wave W2 of waves-tails2): version, the CHANGELOG section on top, the paragraph of
     the store of texts in the doc (I1-I3)."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.2"\s*$')
+    # the version of SKILL.md moved on to 1.5.3 (#113 W3): Release153 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.2 — 2026-10-12$", "1.5.2 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.5\.2 — 2026-10-12$", "CHANGELOG.md: the section of 1.5.2")
+        self.assertTrue(log.index("## 1.5.2") < log.index("## 1.5.1"), "1.5.2 is above 1.5.1")
         body = re.search(r"(?ms)^## 1\.5\.2 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
         for needle in ("issues/113", "`waves-tails2`", "`text_eid`", "`mark_eid`", "`stashed_text`", "`text_lost`",
                        "текст недоступен", "`TextStoreEpisodes`", "`W2MarksStableAcrossVersions`", "w2-state-1.5.1"):
@@ -22104,6 +22387,34 @@ class Release152(unittest.TestCase):
         waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
         for needle in ("`text_eid`", "`mark_eid`", "`notified.text_store`", "`text_lost`", "текст недоступен"):
             self.assertIn(needle, waves)
+
+
+
+class Release153(unittest.TestCase):
+    """The release 1.5.3 (#113 W3; wave W3 of waves-tails2): version, the CHANGELOG section on top, the invariant I-W3 in
+    wab.py and in the doc, the row of what is implemented."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.3"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.3 — 2026-10-12$", "1.5.3 is the first section")
+        body = re.search(r"(?ms)^## 1\.5\.3 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
+        for needle in ("issues/113", "issues/100", "`waves-tails2`", "I-W3", "`W3PolicyMarksAndNotices`", "`_fork_keys`",
+                       "`upgrade_record`", "`owner_paths=True`", "п.17", "п.15", "п.11"):
+            self.assertIn(needle, body)
+        self.assertIn("Уточнение 1.5.3: для `policy_refusal`", log)  # the wording of 1.4.4 corrected
+
+    def test_the_invariant_is_written_once_in_wab_and_in_the_doc(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        self.assertEqual(src.count("# I-W3 (#113 W3, 1.5.3): THE invariant"), 1)
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        self.assertIn("Инвариант I-W3 (1.5.3", waves)
+        table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
+        self.assertRegex(table, r"(?m)^\| Отметки автоответов по полной схеме[^\n]*реализовано \(1\.5\.3; "
+                                r"[^\n]*`W3PolicyMarksAndNotices`, `MergeGate` \|$")
 
 
 if __name__ == "__main__":
