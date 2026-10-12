@@ -9009,12 +9009,18 @@ class MergeAfterThreads(GateBase):  # #117 п.1–3 (1.5.1): the merge decision 
                     else:  # the owner's script, the status names it, one notice of the refusal / the unknown result
                         self.assertTrue(self.status().startswith("BLOCKED: merge gate passed; "), self.status())
                         self.assertIn("owner runs ~/.cache/wab/", self.status())
+                    # an interrupted call (the dispatcher died in it) is handed to the owner by the next tick, once,
+                    # restart or not; a refused or a requested one is not «unknown»
+                    unknown = 1 if outcome == "interrupt" else 0  # «error» is an OSError of gh: a refusal
+                    self.assertEqual(log.count("merge result unknown; handed to the owner"), unknown, log)
                 else:  # threads still open, or the gate on the same head is not ready: the owner's script only
                     self.assertEqual(self.merges(), [])
                     self.assertEqual(self.rec()["phase"], "merging")
                     self.assertNotIn("merge_called", self.rec())
                 self.assertEqual(self.reminders(), [], "no reminder inside the interval")
-                self.assertNotIn("result of the merge call is unknown", log if outcome == "ok" else "")
+                # F6 of round 2: the wait for MERGED never calls a merge «unknown» whatever the outcome (an unknown one
+                # is handed to the owner by its own event above); before, the check was empty for every outcome but ok
+                self.assertNotIn("result of the merge call is unknown", log)
         # the axes of the review of round 1 (P2-1..P2-3): who calls `gh pr merge` first — the owner's script or the
         # dispatcher (while the script collects the gate again after closing the threads); who took the draft off and
         # how (none / the dispatcher's ready went through / was refused / the PR stayed draft); what the wave's status
@@ -9321,6 +9327,149 @@ class MergeAfterThreads(GateBase):  # #117 п.1–3 (1.5.1): the merge decision 
         self.path.write_text(json.dumps(doc), encoding="utf-8")
         self.at(6)
         self.assertIn("ATTENTION: W1: мердж ждёт", self.status_out())
+
+    # ----- round 2, class K: the texts and the hand-off know that the merge was already called -----
+    def owner_closes_and_merges(self):
+        """The owner's script: it closes the open threads on GitHub, gates again and calls `gh pr merge` itself."""
+        def resolve(query, variables):
+            self.facts["threads"] = [{**t, "isResolved": True} if t["id"] == variables["id"] else t
+                                     for t in self.facts["threads"]]
+            return {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}
+        with mock.patch.object(wab, "gh_graphql", side_effect=resolve):
+            return self.run_owner_script()
+
+    def refused(self):
+        return [t for t in self.tg if "мердж не выполнен" in t]
+
+    def test_no_reminder_after_the_owners_script_called_the_merge(self):  # F1
+        self.threads_gate()
+        said = self.owner_closes_and_merges()
+        self.assertEqual(len(self.merges()), 1, said)
+        for minute in (1, 121, 122, 250, 400):  # GitHub keeps showing OPEN past two intervals
+            self.at(minute)
+            self.tick()
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.reminders(), [])
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_no_reminder_after_the_owner_takes_over_a_refused_merge(self):  # F1, the second variant
+        self.start()
+        self.merge_mode = "refuse"
+        self.tick()
+        self.assertEqual(self.rec()["merge_rc"], 1)
+        self.at(121)
+        self.tick()
+        self.assertEqual(len(self.reminders()), 1, "before the owner's mark the interval still reminds")
+        self.merge_mode = "ok"
+        said = self.run_owner_script()
+        self.assertEqual(len(self.merges()), 2, said)  # the refused call and the owner's one
+        self.assertTrue(wab.owner_merge_mark(self.cfg, "W1", HEAD))
+        for minute in (250, 400, 600):
+            self.at(minute)
+            self.tick()
+        self.assertEqual(len(self.reminders()), 1)
+        self.assertEqual(len(self.merges()), 2)
+
+    def test_an_owner_mark_seen_by_the_gate_of_a_1_5_0_record_is_not_a_refusal(self):  # F2
+        self.threads_gate()
+        st = self.get_state(self.cfg)
+        for key in ("owner_wait", "merging_since", "owner_remind"):  # what 1.5.0 did not write
+            st["waves"]["W1"].pop(key, None)
+        self.put_state(self.cfg, st)
+        self.tg.clear()
+        self.facts = green_facts(threads=list(self.CLOSED))
+        real = wab.gate_check
+
+        def check(cfg, wave, w):  # the owner's script marks the sha while the dispatcher collects the gate
+            v = real(cfg, wave, w)
+            wab._write_owner_merge_mark(cfg, wave, {"sha": HEAD, "pr": 7, "pid": 1, "at": self.now})
+            return v
+        with mock.patch.object(wab, "gate_check", side_effect=check):
+            self.at(1)
+            self.tick()
+        for minute in (2, 3):
+            self.at(minute)
+            self.tick()
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.refused(), [])
+        self.assertEqual(self.log().count("скрипт владельца вызвал мердж"), 1, self.log())
+        self.assertEqual(self.rec()["merge_attempt"]["by"], "owner")
+        self.assertEqual(self.rec()["phase"], "merging")
+
+    def hold_merge_lock(self):
+        fh = open(wab.wave_dir(self.cfg, "W1") / wab._MergeLock.NAME, "a+", encoding="utf-8")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(fh.close)
+        return fh
+
+    def test_a_busy_merge_lock_is_retried_not_handed_to_the_owner(self):  # F3, the recheck after closed threads
+        self.threads_gate()
+        self.tg.clear()
+        self.facts = green_facts(threads=list(self.CLOSED))
+        fh = self.hold_merge_lock()
+        with mock.patch.object(wab, "INPUT_LOCK_SECONDS", 0):
+            for minute in (1, 2):
+                self.at(minute)
+                self.tick()
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.refused(), [])
+        self.assertEqual(self.rec()["owner_wait"], {"sha": HEAD, "reason": "threads"})
+        self.assertEqual(self.log().count("держит другой процесс"), 1, self.log())
+        self.at(3)
+        self.tick()
+        self.at(4)
+        self.tick()
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+
+    def test_a_busy_merge_lock_on_the_first_pass_of_a_readied_draft_gates_again(self):  # F3, no owner_wait at all
+        self.start()
+        self.pr = {**self.pr, "isDraft": True}
+        self.facts = green_facts()
+        self.facts["pr"]["draft"] = True
+        self.tick()  # the dispatcher asks `gh pr ready` (ready_called)
+        self.pr = {**self.pr, "isDraft": False}
+        self.facts = green_facts()
+        fh = self.hold_merge_lock()
+        with mock.patch.object(wab, "INPUT_LOCK_SECONDS", 0):
+            self.at(1)
+            self.tick()
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.refused(), [])
+        self.assertNotIn("owner_wait", self.rec())
+        for minute in (2, 3):
+            self.at(minute)
+            self.tick()
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+
+    def test_the_attention_line_says_the_merge_was_requested(self):  # F5
+        for who in ("dispatcher", "owner"):
+            with self.subTest(who=who):
+                self.gh_calls.clear()
+                self.tg.clear()
+                self.at(0)
+                self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+                self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "main"}
+                self.merge_mode = "ok"
+                if who == "dispatcher":
+                    self.start()
+                    self.facts = green_facts()
+                    self.tick()
+                    self.assertEqual(self.rec()["merge_rc"], 0)
+                else:
+                    self.threads_gate()
+                    self.owner_closes_and_merges()
+                    self.assertNotIn("merge_called", self.rec())
+                self.assertEqual(len(self.merges()), 1)
+                self.at(31)
+                self.tick()
+                out = self.status_out()
+                self.assertIn("ATTENTION: W1: мердж ждёт", out)
+                self.assertIn("мердж запрошен, GitHub ещё не показал MERGED", out)
+                self.assertNotIn("не запущен", out)
+                self.assertIn("мердж запрошен", self.dash_text())
+                (wab.wave_dir(self.cfg, "W1") / wab.OWNER_MERGE_MARK).unlink(missing_ok=True)
 
 
 class OwnerMerge(GateBase):  # D3

@@ -2184,8 +2184,8 @@ REASON_WORDS = {
     "merge_refused": "мердж отклонён",
     "ready_refused": "перевод PR в ready отклонён",
     "still_draft": "PR остался draft после перевода в ready",
-    "owner_merge": "скрипт владельца уже вызывал мердж этого коммита",
-    "merge_busy": "отметку попытки мерджа держит другой процесс",
+    "owner_merge": "скрипт владельца уже вызывал мердж этого коммита",  # 1.5.1 до круга 2: только старый outbox
+    "merge_busy": "отметку попытки мерджа держит другой процесс",  # 1.5.1 до круга 2: только старый outbox
     "no_gate_record": "в записи волны нет номера PR или коммита гейта",
     "wrong_base": "PR смержен не в ту ветку",
     "other_head": "PR смержен с другим коммитом, чем проверял гейт",
@@ -5659,7 +5659,9 @@ def _enter_merging(w):
 # Codex on the head without P0/P1, manifest pass, 0 open threads; gate_check) passes AND the wave's status, read again
 # after the gate, is still the dispatcher's line or DONE (a wave that took the work back is not merged under it).
 # Everything else in `merging` is the owner's script, and the owner is reminded no more often than once per
-# merge_remind_minutes (_owner_reminder, the mark `owner_remind` in state.json) until the phase leaves `merging`.
+# merge_remind_minutes (_owner_reminder, the mark `owner_remind` in state.json) until the phase leaves `merging` or the
+# owner's script calls the merge itself (merge_requested). A merge that was called is never handed to the owner again:
+# the owner's mark seen by the gate is one event, a busy merge.lock (only the owner's script holds it) is retried.
 
 OWNER_MERGE_MARK = "owner-merge.json"  # <run_dir>/<wave>/: the owner's script called `gh pr merge` of this sha
 OWNER_LINE = "BLOCKED: merge gate passed; "  # the start of every status line the dispatcher writes for the owner
@@ -5735,6 +5737,20 @@ def _owner_waits(w, sha):
     return True  # open threads, or a draft PR that could not be made ready (ready_called)
 
 
+def merge_requested(cfg, wave, w, sha):
+    """Was `gh pr merge` of `sha` already called and not refused (round 2 of #117, class K)? The dispatcher's call went
+    through (`merge_rc` 0), or the owner's script marked it (owner-merge.json, or `merge_attempt` by the owner). Then the
+    texts say «the merge is requested, GitHub has not shown MERGED yet», never «the script is not run»."""
+    if not isinstance(sha, str):
+        return False
+    if w.get("merge_called") == sha and w.get("merge_rc") == 0:
+        return True
+    att = w.get("merge_attempt")
+    if isinstance(att, dict) and att.get("sha") == sha and att.get("by") == "owner":
+        return True
+    return owner_merge_mark(cfg, wave, sha)
+
+
 def _owner_wait_started(w, sha, reason):
     """The first notice of the owner's script went into the outbox: the clock of the reminder starts now; `owner_wait`
     keeps WHY the owner is awaited (only «threads» lets the dispatcher merge itself once they are closed)."""
@@ -5745,8 +5761,10 @@ def _owner_wait_started(w, sha, reason):
 def _owner_reminder(cfg, st, wave, w, number, sha, now):
     """#117 п.2: while the owner's script waits, a notice of the fixed template `merge_remind` on the first tick after
     `merge_remind_minutes` since the last one, never more often. The mark is in state.json (a restarted watch keeps the
-    clock); a record of 1.5.0 without it starts the clock now. After the merge or another phase: nothing."""
-    if not _owner_waits(w, sha):
+    clock); a record of 1.5.0 without it starts the clock now. After the merge or another phase: nothing. After the
+    owner's script called the merge (its mark, also after a refused call of the dispatcher): nothing either — the wait for
+    MERGED is watched by ATTENTION (round 2, F1)."""
+    if not _owner_waits(w, sha) or merge_requested(cfg, wave, w, sha):
         return
     mark = w.get("owner_remind")
     at = num(mark.get("at")) if isinstance(mark, dict) and mark.get("sha") == sha else None
@@ -5927,16 +5945,21 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
                 w["merge_called"] = sha  # saved BEFORE the call: a crash in it must not merge again
                 w["merge_attempt"] = {"sha": sha, "by": "dispatcher", "at": time.time()}
                 save_state(cfg, st)
-    except NotSubmitted as e:
-        return _hand_to_owner(cfg, st, wave, w, wdir, number, sha, "merge_busy", f"merge not called: {_exc_text(e)}")
-    if owner:
+    except NotSubmitted:
+        # merge.lock is held only by the owner's script marking its own call: the owner already acts. Not a hand-off
+        # (no notice, owner_wait untouched): the next poll sees the owner's mark, or gates again and merges (round 2, F3)
+        if once_per(w, "merge_busy", sha):
+            event(cfg, f"{wave}: отметку попытки мерджа {sha[:12]} держит другой процесс: мердж не вызван, "
+                       f"повтор на следующем опросе")
+        if not _threads_wait(cfg, w, sha):  # nothing in `merging` would gate it again: back to the gate
+            w["phase"], w["gate_at"] = "gate", 0
+        save_state(cfg, st)
+        return True
+    w.get("notified", {}).pop("merge_busy", None)
+    if owner:  # the owner's script called the merge of this sha: never a second call, never a «refused» notice (F2)
         _note_owner_merge(cfg, wave, w, sha)
-        wait = w.get("owner_wait")
-        if isinstance(wait, dict) and wait.get("sha") == sha:  # the owner already has the script: no false alarm
-            save_state(cfg, st)
-            return True
-        return _hand_to_owner(cfg, st, wave, w, wdir, number, sha, "owner_merge",
-                              "the owner's script already called the merge of this sha")
+        save_state(cfg, st)
+        return True
     refused = _run_gh_step(gate.merge_argv(repo, number, sha))
     w["merge_rc"] = 0 if refused is None else 1
     if refused is None:
@@ -6018,7 +6041,7 @@ def _regate(cfg, st, wave, w, wdir, old, new):
     for key in ("gate_sha", "gate_pr", "merge_called", "ready_called", "merge_rc", "merge_poll_at", "gate_at",
                 "merging_since", "owner_remind", "owner_wait", "merge_attempt"):
         w.pop(key, None)
-    for key in ("merge_unknown", "gate_wait", "threads_recheck", "owner_merge"):
+    for key in ("merge_unknown", "gate_wait", "threads_recheck", "owner_merge", "merge_busy"):
         w.get("notified", {}).pop(key, None)
     w["phase"] = "gate"  # the save drops the merge_owner / merge_refused notices
     set_last_status(cfg, wave, w, _write_status(wdir, "DONE"))  # the gate runs on DONE; the BLOCKED line was ours
@@ -8191,9 +8214,14 @@ def merge_overdue_line(cfg, st, wave, now=None):
     waited = merge_overdue(cfg, st, wave, now)
     if waited is None:
         return None
-    phase = st["waves"][wave]["phase"]
-    what = ("скрипт мерджа владельца не запущен или мердж не прошёл (путь — в status волны и events.log)"
-            if phase == "merging" else "координатор не смержил PR")
+    w = st["waves"][wave]
+    phase = w["phase"]
+    if phase != "merging":
+        what = "координатор не смержил PR"
+    elif merge_requested(cfg, wave, w, w.get("gate_sha")):  # round 2, F5: the call went through, MERGED is late
+        what = "мердж запрошен, GitHub ещё не показал MERGED"
+    else:
+        what = "скрипт мерджа владельца не запущен или мердж не прошёл (путь — в status волны и events.log)"
     return (f"ATTENTION: {wave}: мердж ждёт {_human_dur(waited)} (фаза {phase}, порог "
             f"{cfg.get('merge_attention_minutes', MERGE_ATTENTION_MINUTES):g} мин): PR не смержен — {what}")
 

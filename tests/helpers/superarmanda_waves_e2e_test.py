@@ -1596,6 +1596,9 @@ class ThreadsChain(unittest.TestCase):
     def test_every_external_text_is_still_clean(self):
         oracle_external(self.chain)
 
+    def test_state_json_holds_no_wave_text(self):
+        oracle_no_wave_text(self.chain)
+
     def test_runs_fast(self):
         must(self.seconds < 60, f"the scenario took {self.seconds:.0f} s")
 
