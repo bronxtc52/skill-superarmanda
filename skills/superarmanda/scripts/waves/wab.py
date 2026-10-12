@@ -2343,13 +2343,19 @@ def _minutes_value(value):
     return None if _minutes_field({}, value) == "?" else value
 
 
-def _outbox_minutes(key, item):
-    """Минуты эпизода, сохранённые в записи outbox (`minutes`, у 1.4.3 и старше — `n`), или None (и для шаблона
-    без поля `minutes`: там `n` — счётчик, а не минуты)."""
-    if "minutes" not in NOTICE_TEMPLATES.get(key, {}).get("fields", ()):
+def _outbox_minutes(cfg, key, item):
+    """Минуты, которые показывает текст записи outbox сейчас (`_outbox_fields` — тот же источник, что у
+    outbox_notice): сохранённые `minutes` (у 1.4.3 и старше — `n`), а при битом или отсутствующем числе — настройка
+    chain.json на момент доставки. None — для шаблона без поля `minutes` (там `n` — счётчик, а не минуты)."""
+    if key not in NOTICE_TEMPLATES or "minutes" not in NOTICE_TEMPLATES[key]["fields"]:
         return None
-    stored = item.get("fields") if isinstance(item.get("fields"), dict) else {}
-    return _minutes_value(stored.get("minutes", stored.get("n")))
+    return _minutes_value(_outbox_fields(cfg, key, item).get("minutes"))
+
+
+def _minutes_default(cfg, key):
+    """Настройка chain.json, которую показывает шаблон `key` без числа минут (NOTICE_MINUTES_DEFAULT), или None."""
+    default = NOTICE_MINUTES_DEFAULT.get(key)
+    return cfg.get(default) if default else None
 
 
 def _status_field(cfg, value):
@@ -2515,9 +2521,8 @@ def external_attach(name):
 
 def _notice_values(cfg, wave, tpl, fields, key=None):
     given = dict(fields, chain=cfg.get("chain"), wave=wave)
-    default = NOTICE_MINUTES_DEFAULT.get(key)
-    if "minutes" in tpl["fields"] and given.get("minutes") is None and default:
-        given["minutes"] = cfg.get(default)  # an entry without the number: the chain.json setting
+    if "minutes" in tpl["fields"] and given.get("minutes") is None:
+        given["minutes"] = _minutes_default(cfg, key)  # an entry without the number: the chain.json setting
     if "tmux" in tpl["fields"] and given.get("tmux") is None:
         given["tmux"] = f"{cfg.get('tmux_prefix') or 'wab-'}{str(wave).lower()}"
     return {n: NOTICE_FIELDS[n][1](cfg, given.get(n)) for n in tpl["fields"]}, given
@@ -2639,10 +2644,10 @@ def put_notice(cfg, w, wave, key, value, value_is_mark=False, **fields):
         box[key] = item
 
 
-def outbox_notice(cfg, wave, w, key, item):
-    """The notice of an outbox entry as it is sent now: its template + its stored fields. An entry of an older
-    dispatcher (no `fields`; its text has the wave's quote) is made again by the template of its key from the fields
-    of the registry that are still known (chain, wave, session): its free text is dropped."""
+def _outbox_fields(cfg, key, item):
+    """The stored fields of an outbox entry that its template takes, as outbox_notice shows them: `n` of 1.4.3 and
+    older is the minutes; a broken or missing number of minutes is the chain.json setting NOW (the one source of the
+    number both the delivered text and its ATTENTION signal keep, _outbox_minutes)."""
     stored = item.get("fields") if isinstance(item.get("fields"), dict) else {}
     tpl = NOTICE_TEMPLATES[key]
     stored = dict(stored)
@@ -2650,7 +2655,17 @@ def outbox_notice(cfg, wave, w, key, item):
         stored["minutes"] = stored["n"]  # an entry of 1.4.3 and older kept the minutes as `n`
     if "minutes" in stored and _minutes_value(stored["minutes"]) is None:
         stored.pop("minutes")  # испорченное число (строка, bool, nan): как запись без числа — настройка, не «?»
-    fields = {k: v for k, v in stored.items() if k in tpl["fields"] and k in NOTICE_FIELDS}
+    if "minutes" in tpl["fields"] and "minutes" not in stored and _minutes_value(_minutes_default(cfg, key)) is not None:
+        stored["minutes"] = _minutes_default(cfg, key)
+    return {k: v for k, v in stored.items() if k in tpl["fields"] and k in NOTICE_FIELDS}
+
+
+def outbox_notice(cfg, wave, w, key, item):
+    """The notice of an outbox entry as it is sent now: its template + its stored fields. An entry of an older
+    dispatcher (no `fields`; its text has the wave's quote) is made again by the template of its key from the fields
+    of the registry that are still known (chain, wave, session): its free text is dropped."""
+    tpl = NOTICE_TEMPLATES[key]
+    fields = _outbox_fields(cfg, key, item)
     if "tmux" in tpl["fields"] and isinstance(w.get("tmux"), str):
         fields["tmux"] = w["tmux"]
     fields.pop("question", None)  # a 1.4.x entry: its text is not taken from the record
@@ -3062,7 +3077,7 @@ def flush_notices(cfg, st, w, force=False):
         if notify(cfg, notice, wave):
             box.pop(key, None)
             if local and key not in INFO_NOTICES:
-                note_attention(w, key, notice, now, _outbox_minutes(key, item))
+                note_attention(w, key, notice, now, _outbox_minutes(cfg, key, item))
         else:
             item["next_at"] = now + NOTIFY_RETRY_SECONDS
     if not box:

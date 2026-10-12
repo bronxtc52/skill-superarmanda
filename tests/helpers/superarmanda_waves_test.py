@@ -3,8 +3,8 @@
 
 Nothing here talks to a user's tmux server: every tmux/claude/Telegram interaction goes
 through module functions that are patched, TMUX is removed from the environment and
-TMUX_TMPDIR points into a throw-away directory. The only real tmux use is A8, on a private
-`-L wabtest-<pid>` socket that is killed afterwards.
+TMUX_TMPDIR points into a throw-away directory. Real tmux runs only on private sockets
+`-L wabtest-<pid>-<kind><n>`, a new one per test (fresh_tmux_socket), killed afterwards.
 
 The module enforces this itself (TMUX_GUARD below, active before any test runs):
   * TMUX_TMPDIR is a fresh temporary directory, TMUX/TMUX_PANE/WAB_TMUX_SOCKET are unset;
@@ -1878,6 +1878,17 @@ class Episodes(Base):
         self.assertEqual(len(self.tg), 2)
 
 
+_SOCKETS = iter(range(1, 1 << 30))
+
+
+def fresh_tmux_socket(kind):
+    """A tmux socket name never used before in this process. `kill-server` returns before the server has exited and
+    unlinked its socket: a client that reuses the name in that window connects to the dying server and fails with
+    «server exited unexpectedly» (seen under the parallel run-tests.sh). One server per test (and per subtest) —
+    never a reused one."""
+    return f"wabtest-{os.getpid()}-{kind}{next(_SOCKETS)}"
+
+
 class ExactTargets(Base):
     def setUp(self):
         super().setUp()
@@ -1889,10 +1900,10 @@ class ExactTargets(Base):
         if ver is None or ver < (3, 2):
             self.skipTest(f"tmux {out.strip()!r} is older than 3.2")
         self.exe = exe
-        self.sock = f"wabtest-{os.getpid()}"
+        self.sock = fresh_tmux_socket("t")
         self.env = {k: v for k, v in os.environ.items() if k != "TMUX"}
-        self.addCleanup(lambda: subprocess.run([exe, "-L", self.sock, "kill-server"],
-                                               capture_output=True, env=self.env))
+        self.addCleanup(lambda sock=self.sock: subprocess.run([exe, "-L", sock, "kill-server"],
+                                                              capture_output=True, env=self.env))
         self.w = load_orig("wab_targets")  # unpatched copy: real tmux functions
         self.w.TMUX_SOCKET = self.sock
 
@@ -15603,7 +15614,7 @@ class IdleNudge(BgBase):
 
 class ChainCleanup(Base):
     """W3 (#57): closing the tmux sessions and panes of a finished chain, only the chain's own.
-    Real tmux on the private socket `-L wabtest-<pid>-cc` (the module under test is the unpatched copy)."""
+    Real tmux on the private socket `-L wabtest-<pid>-cc<n>` (fresh_tmux_socket) (the module under test is the unpatched copy)."""
 
     def setUp(self):
         super().setUp()
@@ -15615,10 +15626,10 @@ class ChainCleanup(Base):
         if ver is None or ver < (3, 2):
             self.skipTest(f"tmux {out.strip()!r} is older than 3.2")
         self.exe = exe
-        self.sock = f"wabtest-{os.getpid()}-cc"
+        self.sock = fresh_tmux_socket("cc")
         self.env = {k: v for k, v in os.environ.items() if k != "TMUX"}
-        self.addCleanup(lambda: subprocess.run([exe, "-L", self.sock, "kill-server"],
-                                               capture_output=True, env=self.env))
+        self.addCleanup(lambda sock=self.sock: subprocess.run([exe, "-L", sock, "kill-server"],
+                                                              capture_output=True, env=self.env))
         self.w = load_orig("wab_cleanup")
         self.w.TMUX_SOCKET = self.sock
         self.w._send_telegram = lambda cfg, text: None  # nothing leaves the machine
@@ -15627,6 +15638,12 @@ class ChainCleanup(Base):
     def tm(self, *args):
         return subprocess.run([self.exe, "-L", self.sock, "-f", "/dev/null", *args], capture_output=True,
                               text=True, encoding="utf-8", env=self.env)
+
+    def use_fresh_server(self):
+        """Switch to a new, empty server (instead of `kill-server` and reusing the name: see fresh_tmux_socket)."""
+        self.sock = self.w.TMUX_SOCKET = fresh_tmux_socket("cc")
+        self.addCleanup(lambda sock=self.sock: subprocess.run([self.exe, "-L", sock, "kill-server"],
+                                                              capture_output=True, env=self.env))
 
     def session(self, name, tag=None, run_dir=None, cmd="sleep 600", env=None):
         envs = [a for k, v in (env or {}).items() for a in ("-e", f"{k}={v}")]
@@ -16039,7 +16056,7 @@ class ChainCleanup(Base):
     def test_recover_launch_does_not_mark_a_lone_pane_whose_environment_is_not_this_waves(self):
         for env in (None, {"WAB_DIR": "/elsewhere/W1", "WAB_WAVE": "W1"}, "wrong-wave"):
             with self.subTest(env=env):
-                self.tm("kill-server")
+                self.use_fresh_server()
                 cfg, path = self.cfg()
                 if env == "wrong-wave":
                     env = {"WAB_DIR": str(self.w.wave_dir(cfg, "W1")), "WAB_WAVE": "W9"}
@@ -20724,6 +20741,118 @@ class MetricsScript(unittest.TestCase):
             # без подмены тот же каталог читается: отказ — из-за подмены, а не из-за симлинков в пути
             self.assertEqual(self.metrics.measure(root)["waves"][0]["fix_cycles"], 1)
 
+    def _assert_no_data(self, root, wave, reason):
+        r = self.cli(root, "--json")
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        row = {w["wave"]: w for w in json.loads(r.stdout)["waves"]}[wave]
+        self.assertIsNone(row["fix_cycles"], row)
+        self.assertTrue(any(reason in p for p in row["problems"]), (reason, row["problems"]))
+        return json.loads(r.stdout)
+
+    def test_one_physical_file_is_never_two_runs(self):
+        """W4 #113 ревью P2: runs.json перечисляет два прогона, а manifest у них — один физический файл (тот же путь,
+        другая запись того же пути, симлинк, hardlink; с `run` и без) → фикс-круги не удваиваются: «нет данных», код 1."""
+        def manifest(with_run):
+            data = {"version": 2, "tasks": {"t": {"fix_cycles": 2}}}
+            if with_run:
+                data["run"] = {"index": 1}
+            return json.dumps(data)
+
+        def build(root, names, extra, with_run):
+            sa = root / "W1" / "superarmanda"
+            sa.mkdir(parents=True)
+            (root / "events.log").write_text("", encoding="utf-8")
+            (sa / "manifest.json").write_text(manifest(with_run), encoding="utf-8")
+            extra(root / "W1")
+            (root / "W1" / "runs.json").write_text(json.dumps({"version": 1, "wave": "W1", "runs": [
+                {"index": i, "manifest": n} for i, n in enumerate(names, 1)]}), encoding="utf-8")
+
+        nothing = lambda w: None  # noqa: E731
+        cases = {
+            "the same path": (["superarmanda/manifest.json", "superarmanda/manifest.json"], nothing),
+            "a second spelling of the path": (["superarmanda/manifest.json", "./superarmanda/../superarmanda/manifest.json"],
+                                              nothing),
+            "an absolute path to the same file": (["superarmanda/manifest.json", None], nothing),
+            "a symlink to the same file": (["superarmanda/manifest.json", "superarmanda/manifest-b.json"],
+                                           lambda w: (w / "superarmanda" / "manifest-b.json").symlink_to("manifest.json")),
+            "a symlink outside superarmanda/": (["superarmanda/manifest.json", "manifest-b.json"],
+                                                lambda w: (w / "manifest-b.json").symlink_to("superarmanda/manifest.json")),
+            "a hardlink to the same file": (["superarmanda/manifest.json", "superarmanda/manifest-b.json"],
+                                            lambda w: os.link(w / "superarmanda" / "manifest.json",
+                                                              w / "superarmanda" / "manifest-b.json")),
+            "a hardlink not matched by manifest*.json": (["superarmanda/manifest.json", "superarmanda/copy.json"],
+                                                         lambda w: os.link(w / "superarmanda" / "manifest.json",
+                                                                           w / "superarmanda" / "copy.json")),
+        }
+        for name, (names, extra) in cases.items():
+            for with_run in (False, True):
+                with self.subTest(name, with_run=with_run), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    names_ = [n if n is not None else str(root / "W1" / "superarmanda" / "manifest.json") for n in names]
+                    build(root, names_, extra, with_run)
+                    data = self._assert_no_data(root, "W1", "")
+                    self.assertNotEqual(data["total"]["fix_cycles"], 4, data)
+        # контроль: два РАЗНЫХ файла — два прогона, код 0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build(root, ["superarmanda/manifest.json", "superarmanda/manifest-b.json"],
+                  lambda w: (w / "superarmanda" / "manifest-b.json").write_text(manifest(False), encoding="utf-8"), False)
+            r = self.cli(root)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("| W1 | 2 | 4 | 0 |", r.stdout)
+
+    def test_one_physical_file_is_never_runs_of_two_waves(self):
+        """Тот же класс поперёк волн: W2 — симлинк внутри прогона на W1 (допустим), но manifest старого формата
+        (без `wave`) у них один файл — второй раз он не засчитывается."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "W1" / "superarmanda").mkdir(parents=True)
+            (root / "events.log").write_text("", encoding="utf-8")
+            (root / "W1" / "superarmanda" / "manifest.json").write_text(
+                json.dumps({"version": 1, "tasks": {"t": {"fix_cycles": 3}}}), encoding="utf-8")
+            (root / "W2").symlink_to("W1")
+            data = self._assert_no_data(root, "W2", "W1")
+            self.assertEqual(data["total"]["fix_cycles"], 3, data)
+
+    def test_a_wave_dir_leading_out_of_the_run_dir_is_not_counted(self):
+        """W4 #113 ревью P3: `<run_dir>/W1 -> ../other-chain/W1` — волна чужой цепочки не засчитывается («нет данных»,
+        код 1); симлинк волны ВНУТРИ каталога прогона допустим. Граница одна — каталог прогона — для волн и
+        events.log."""
+        def chain(root, cycles):
+            (root / "W1" / "superarmanda").mkdir(parents=True)
+            (root / "W1" / "superarmanda" / "manifest.json").write_text(json.dumps(
+                {"version": 2, "wave": {"id": "W1"}, "tasks": {"t": {"fix_cycles": cycles}}}), encoding="utf-8")
+            (root / "events.log").write_text("", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            other, run = Path(tmp) / "other-chain", Path(tmp) / "run"
+            chain(other, 9)
+            run.mkdir()
+            (run / "events.log").write_text("", encoding="utf-8")
+            (run / "W1").symlink_to("../other-chain/W1")
+            data = self._assert_no_data(run, "W1", "вне каталога прогона")
+            self.assertEqual(data["total"]["fix_cycles"], 0, data)
+            # absolute symlink out — the same
+            (run / "W1").unlink()
+            (run / "W1").symlink_to(other / "W1")
+            self._assert_no_data(run, "W1", "вне каталога прогона")
+            # symlink inside the run dir — counted
+            (run / "W1").unlink()
+            shutil.copytree(other / "W1", run / "archive" / "W1")
+            (run / "W1").symlink_to("archive/W1")
+            r = self.cli(run)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("| W1 | 1 | 9 | 0 |", r.stdout)
+            # events.log leading out — not read
+            (run / "events.log").unlink()
+            (run / "events.log").symlink_to(other / "events.log")
+            r = self.cli(run, "--json")
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            w1 = json.loads(r.stdout)["waves"][0]
+            self.assertIsNone(w1["blocked_cap"], w1)
+            self.assertTrue(any("events.log" in p for p in w1["problems"]), w1)
+
 
 class Release130(unittest.TestCase):
     """The release 1.3.0 (W8): version, CHANGELOG, the measuring table, the rows of «Что реализовано»."""
@@ -23051,6 +23180,48 @@ class W4NoticeMinutes(Base):
         text = wab.attention_text(st, cfg)
         self.assertIn("45 мин", text)
         self.assertNotIn("?", text.split("attach:")[0])
+
+    def test_attention_keeps_the_minutes_the_delivered_notice_showed(self):
+        """W4 #113 Codex P2 (wab.py `_outbox_minutes`): у легаси-записи outbox с битым или отсутствующим числом
+        доставленный текст показывает настройку chain.json на момент доставки — её же хранит ATTENTION; смена
+        настройки после доставки сигнал не переписывает. Один источник с outbox_notice."""
+        cases = [  # (key, stored fields, minutes the delivered text shows)
+            ("idle", {"minutes": 7}, "7 мин"), ("idle", {"n": 9}, "9 мин"),
+            ("idle", {"n": "7"}, "15 мин"), ("idle", {"minutes": True}, "15 мин"), ("idle", {"n": None}, "15 мин"),
+            ("idle", {}, "15 мин"), ("idle", None, "15 мин"),
+            ("checkpoint_timeout", {"n": "x"}, "30 мин"), ("checkpoint_timeout", {}, "30 мин"),
+            ("checkpoint_timeout", {"n": 9}, "9 мин"),
+        ]
+        for key, stored, want in cases:
+            with self.subTest(key=key, stored=stored):
+                cfg, _ = self.chain(idle_minutes=15, handoff_timeout_minutes=30, telegram=None)
+                rec = self.wave_rec(phase="checkpoint") if key == "checkpoint_timeout" else self.wave_rec()
+                self.put_state(cfg, {"current": "W1", "waves": {"W1": rec}})
+                st = wab.load_state(cfg)
+                w = st["waves"]["W1"]
+                item = {"value": "x", "next_at": 0}
+                if stored is not None:
+                    item["fields"] = dict(stored)
+                w["outbox"] = {key: item}
+                shown = []
+                with mock.patch.object(wab, "display_all", side_effect=shown.append):
+                    wab.flush_notices(cfg, st, w)
+                self.assertIn(want, "\n".join(map(str, shown)))
+                self.assertIn(key, w.get("attention", {}))
+                cfg = dict(cfg, idle_minutes=45, handoff_timeout_minutes=50)  # настройку поменяли после доставки
+                text = wab.attention_text(st, cfg)
+                self.assertIn(want, text)
+                self.assertNotIn("45 мин", text)
+                self.assertNotIn("50 мин", text)
+        # шаблон без поля minutes: `n` — не минуты, сигнал их не хранит
+        cfg, _ = self.chain(idle_minutes=15, telegram=None)
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
+        st = wab.load_state(cfg)
+        w = st["waves"]["W1"]
+        w["outbox"] = {"permission": {"value": "x", "fields": {"n": 3}, "next_at": 0}}
+        with mock.patch.object(wab, "display_all"):
+            wab.flush_notices(cfg, st, w)
+        self.assertNotIn("minutes", w["attention"]["permission"])
 
     def test_the_callers_pass_the_raw_number(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")

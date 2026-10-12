@@ -42,7 +42,15 @@
 - `wab.py` (остаток W4 [PR #116](https://github.com/bronxtc52/skill-superarmanda/pull/116)): минуты уведомлений от
   60 выводятся как `1ч30м`; испорченные `n`/`minutes` записи outbox (строка, `bool`, `None`, `nan`, отрицательное) —
   запись без числа, берётся настройка `chain.json`, а не «?»; сигнал `ATTENTION` хранит минуты эпизода на момент
-  постановки.
+  постановки. У такой записи `ATTENTION` хранит ту же настройку, что показал доставленный текст (один источник —
+  `_outbox_fields`), и смена таймаута в `chain.json` после доставки сигнал не переписывает (тест
+  `test_attention_keeps_the_minutes_the_delivered_notice_showed`).
+- `metrics.py` (#113 W4, ревью): один физический файл (`st_dev`, `st_ino` открытого дескриптора) — один прогон во
+  всём каталоге прогона: тот же путь дважды в `runs.json`, другая запись пути, симлинк, hardlink, волна-симлинк на
+  другую волну — «нет данных», код 1, а не удвоенные фикс-круги (с `run` и без; тесты
+  `test_one_physical_file_is_never_two_runs`, `test_one_physical_file_is_never_runs_of_two_waves`). Граница чтения
+  одна — каталог прогона: волна-симлинк наружу (`W1 -> ../other-chain/W1`) не засчитывается, симлинк волны внутри
+  прогона допустим (тест `test_a_wave_dir_leading_out_of_the_run_dir_is_not_counted`).
 - `scripts/run-tests.sh`: наборы идут параллельно, по числу CPU (`RUN_TESTS_JOBS` переопределяет, `1` — прежний
   последовательный цикл, неверное значение или больше 999999 — код 2); долгие наборы стартуют первыми, вывод каждого
   печатается целым блоком в исходном порядке. Совместим с bash 3.2. Порядок наборов — байтовый на любой машине (glob
@@ -63,6 +71,10 @@
   Порог `test_runs_fast` у `OfflineChain`, `RemnantsChain` и `Remnants150Chain` — по платформе (`CHAIN_FAST_SECONDS`):
   Linux 40 с, как раньше, macOS 90 с (при параллельном `run-tests.sh` раннер CI дал 44 с на `Remnants150Chain`).
   Порог `ThreadsChain` (с 1.5.1, Linux 60 с, macOS 150 с) — константа `THREADS_FAST_SECONDS` того же модуля.
+- Тесты на настоящем tmux (`ExactTargets`, `ChainCleanup`) берут новый сокет на каждый тест и подтест
+  (`fresh_tmux_socket`), а не `kill-server` с повтором имени: `kill-server` возвращается раньше, чем сервер вышел и
+  убрал сокет, и клиент в этом окне получал «server exited unexpectedly» (под параллельным `run-tests.sh` — 24 из 80
+  прогонов `test_recover_launch_does_not_mark_a_lone_pane_whose_environment_is_not_this_waves`, после — 0 из 80).
 - `Release160.test_every_developer_threshold_and_setting_is_in_the_changelog`: каждый порог `*_FAST_SECONDS`
   сквозного модуля и каждая переменная окружения, которую читает `scripts/run-tests.sh`, названы в CHANGELOG по
   имени, а переменные — ещё и в шапке скрипта.
