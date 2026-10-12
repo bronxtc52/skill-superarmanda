@@ -3,7 +3,8 @@
 Срез живого каталога прогона `runs/waves-tails/2026-10-04-wt` (цепочка waves-tails, волны W1–W3), снят 2026-10-06
 для теста `MetricsScript` в `tests/helpers/superarmanda_waves_test.py`.
 
-Что оставлено: форма `runs.json` (индексы прогонов и их порядок), у каждого manifest — поля `version`, `wave`, `run`,
+Что оставлено: форма `runs.json` (индексы прогонов и их порядок), у каждого manifest — поля `version`, `wave` (объект, от
+него оставлен только `id`, как пишет state.py), `run`,
 `tasks.<задача>.{status, fix_cycles}`, строки `events.log` вида `<волна>: BLOCKED: [class=… rec=… red=…]`, в том числе
 повтор той же записи с префиксом `phase=running … status=` (его замер не считает второй раз).
 

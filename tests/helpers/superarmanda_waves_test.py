@@ -20087,7 +20087,7 @@ class MetricsScript(unittest.TestCase):
         (оригинал, fix_cycles=outside_cycles); в копии рядом manifest без run.index (по индексу его не найти)."""
         base = Path(tempfile.mkdtemp(prefix="wab-metrics-"))
         self.addCleanup(shutil.rmtree, base, True)
-        manifest = lambda n: json.dumps({"version": 1, "wave": "W1", "tasks": {"t": {"fix_cycles": n}}})  # noqa: E731
+        manifest = lambda n: json.dumps({"version": 1, "wave": {"id": "W1"}, "tasks": {"t": {"fix_cycles": n}}})  # noqa: E731
         outside = base / "original" / "manifest.json"
         outside.parent.mkdir()
         outside.write_text(manifest(outside_cycles), encoding="utf-8")
@@ -20115,7 +20115,7 @@ class MetricsScript(unittest.TestCase):
 
     def test_symlink_manifest_pointing_out_is_never_read(self):
         run, outside = self._lone_wave(in_copy=False)
-        outside.write_text(json.dumps({"version": 1, "wave": "W1", "run": {"index": 1},
+        outside.write_text(json.dumps({"version": 1, "wave": {"id": "W1"}, "run": {"index": 1},
                                        "tasks": {"t": {"fix_cycles": 7}}}), encoding="utf-8")
         (run / "W1" / "superarmanda" / "manifest-run1.json").symlink_to(outside)
         (run / "W1" / "superarmanda" / "manifest.json").symlink_to(outside)
@@ -20129,7 +20129,7 @@ class MetricsScript(unittest.TestCase):
     def test_manifest_of_another_run_is_not_substituted(self):
         run, _ = self._lone_wave()
         (run / "W1" / "superarmanda" / "manifest.json").write_text(json.dumps(
-            {"version": 1, "wave": "W1", "run": {"index": 2}, "tasks": {"t": {"fix_cycles": 2}}}), encoding="utf-8")
+            {"version": 1, "wave": {"id": "W1"}, "run": {"index": 2}, "tasks": {"t": {"fix_cycles": 2}}}), encoding="utf-8")
         r = self.cli(run, "--json")
         self.assertEqual(r.returncode, 1, r.stderr)
         w1 = json.loads(r.stdout)["waves"][0]
@@ -20188,7 +20188,7 @@ class MetricsScript(unittest.TestCase):
             (w / "runs.json").write_text(json.dumps(d), encoding="utf-8")
 
         def other_run_by_path(w):
-            (w / "other.json").write_text(json.dumps({"version": 1, "wave": "W1", "run": {"index": 2},
+            (w / "other.json").write_text(json.dumps({"version": 1, "wave": {"id": "W1"}, "run": {"index": 2},
                                                       "tasks": {"t": {"fix_cycles": 5}}}), encoding="utf-8")
             (w / "superarmanda" / "manifest.json").unlink()
             d = json.loads((w / "runs.json").read_text(encoding="utf-8"))
@@ -20230,7 +20230,7 @@ class MetricsScript(unittest.TestCase):
         """Tester на 4cf014e: каждое значение fix_cycles проходит, а сумма не печатается (больше 4300 цифр), и
         каталог волны без права чтения — тоже «нет данных», код 1, без traceback (инвариант «никогда traceback»)."""
         def huge_cycles(w):
-            (w / "superarmanda" / "manifest.json").write_text(json.dumps({"version": 1, "wave": "W1", "tasks": {
+            (w / "superarmanda" / "manifest.json").write_text(json.dumps({"version": 1, "wave": {"id": "W1"}, "tasks": {
                 f"t{i}": {"fix_cycles": int("9" * 4299)} for i in range(12)}}), encoding="utf-8")
         run, _ = self._lone_wave()
         huge_cycles(run / "W1")
@@ -20295,6 +20295,83 @@ class MetricsScript(unittest.TestCase):
         text = " ".join(p.read_text(encoding="utf-8") for p in self.FIXTURE.rglob("*") if p.is_file())
         for needle in ("/home/", "/Users/", "azureuser", "mh-central", "bronxtc52"):
             self.assertNotIn(needle, text)
+
+    def test_every_counted_file_passes_one_identity_check(self):
+        """Инвариант идентичности (W4 waves-tails2): каждый runs.json и manifest, из которых берётся число,
+        проверяется до использования; нарушение — «нет данных» с причиной, код 1, без traceback."""
+        def manifest(**over):
+            data = {"version": 2, "wave": {"id": "W4"}, "run": {"index": 1}, "tasks": {"t1": {"fix_cycles": 1}}}
+            for k, v in over.items():
+                if v is self:  # «ключа нет»
+                    data.pop(k, None)
+                else:
+                    data[k] = v
+            return data
+
+        def runs(*indices):
+            return {"version": 1, "wave": "W4",
+                    "runs": [{"index": i, "manifest": f"superarmanda/manifest-run{i}.json"} for i in indices]}
+
+        def put(root, rel, value):
+            p = root / "W4" / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(value), encoding="utf-8")
+
+        MISSING = self
+        bad_version = {f"version {v!r}": {"superarmanda/manifest.json": manifest(version=v)}
+                       for v in (MISSING, 0, 3, "2", True, 1.0, None, -1)}
+        bad_version["version absent"] = bad_version.pop(f"version {MISSING!r}")
+        # имя случая: (файлы волны, симлинки {имя: цель}, ожидаемый код, подстрока причины)
+        cases = {
+            "valid runs.json + manifest": ({"runs.json": runs(1), "superarmanda/manifest.json": manifest()}, {}, 0, None),
+            "valid without runs.json": ({"superarmanda/manifest.json": manifest()}, {}, 0, None),
+            "old manifest, no wave and no run": ({"superarmanda/manifest.json": {"version": 1, "tasks": {"t1": {"fix_cycles": 1}}}},
+                                                 {}, 0, None),
+            "runs.json symlink to a valid file inside the wave": (
+                {"runs-real.json": runs(1), "superarmanda/manifest.json": manifest()}, {"runs.json": "runs-real.json"}, 0, None),
+            **{name: (files, {}, 1, "version") for name, files in bad_version.items()},
+            **{name: ({"runs.json": runs(1), **files}, {}, 1, "version") for name, files in
+               (("with runs.json: " + n, f) for n, f in list(bad_version.items())[:3])},
+            "wave of another wave": ({"superarmanda/manifest.json": manifest(wave={"id": "W5"})}, {}, 1, "W5"),
+            "wave is a string": ({"superarmanda/manifest.json": manifest(wave="W4")}, {}, 1, "wave"),
+            "wave is a list": ({"superarmanda/manifest.json": manifest(wave=["W4"])}, {}, 1, "wave"),
+            "wave without id": ({"superarmanda/manifest.json": manifest(wave={})}, {}, 1, "wave"),
+            "wave id is not a string": ({"superarmanda/manifest.json": manifest(wave={"id": 4})}, {}, 1, "wave"),
+            "foreign wave with runs.json": ({"runs.json": runs(1), "superarmanda/manifest.json": manifest(wave={"id": "W1"})},
+                                            {}, 1, "W1"),
+            "duplicate run.index with runs.json": (
+                {"runs.json": runs(1), "superarmanda/manifest.json": manifest(),
+                 "superarmanda/manifest-copy.json": manifest()}, {}, 1, "run.index"),
+            "duplicate run.index without runs.json": (
+                {"superarmanda/manifest.json": manifest(), "superarmanda/manifest-old.json": manifest()}, {}, 1, "run.index"),
+            "broken runs.json symlink, valid manifest.json beside": (
+                {"superarmanda/manifest.json": manifest()}, {"runs.json": "gone.json"}, 1, "runs.json"),
+            "broken runs.json symlink alone": ({}, {"runs.json": "gone.json"}, 1, "runs.json"),
+            "runs.json is a directory, valid manifest.json beside": (
+                {"runs.json/x": {}, "superarmanda/manifest.json": manifest()}, {}, 1, "runs.json"),
+        }
+        for name, (files, links, code, reason) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "W4").mkdir()
+                (root / "events.log").write_text("", encoding="utf-8")
+                for rel, value in files.items():
+                    put(root, rel, value)
+                for rel, target in links.items():
+                    (root / "W4" / rel).symlink_to(target)
+                r = self.cli(root)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+                if code == 0:
+                    self.assertIn("| W4 | 1 | 1 | 0 |", r.stdout)
+                    continue
+                problems = [line for line in r.stdout.splitlines() if line.startswith("W4: нет данных — ")]
+                self.assertTrue(problems, r.stdout)
+                self.assertTrue(any(reason in p for p in problems), (reason, problems))
+                self.assertNotIn("нет ни runs.json", r.stdout)  # битый симлинк — не «нет файла»
+                self.assertIn("| W4 | ", r.stdout)
+                row = next(line for line in r.stdout.splitlines() if line.startswith("| W4 |"))
+                self.assertIn("нет данных", row)
 
 
 class Release130(unittest.TestCase):
