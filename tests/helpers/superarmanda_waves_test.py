@@ -19212,6 +19212,22 @@ class MetricsScript(unittest.TestCase):
                 w1 = json.loads(r.stdout)["waves"][0]
                 self.assertIsNone(w1["fix_cycles"], w1)
                 self.assertTrue(w1["problems"], w1)
+        # Astra на 3f1b376: текст из чужого файла (одиночный суррогат) не роняет вывод ни в одном формате
+        for fmt in (("--json",), ()):
+            with self.subTest("lone surrogate in wave", fmt=fmt):
+                run = lone(lambda w: (w / "runs.json").write_text(
+                    (w / "runs.json").read_text(encoding="utf-8").replace('"wave": "W1"', '"wave": "\\ud800"'),
+                    encoding="utf-8"))
+                self.assertIn("\\ud800", (run / "W1" / "runs.json").read_text(encoding="utf-8"))
+                r = self.cli(run, *fmt)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                if fmt:
+                    w1 = json.loads(r.stdout)["waves"][0]
+                    self.assertIsNone(w1["fix_cycles"], w1)
+                    self.assertTrue(w1["problems"], w1)
+                else:
+                    self.assertIn("нет данных", r.stdout)
         r = self.cli(lone(lambda w: None), "--json")  # контроль: исправный каталог засчитывается
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["waves"][0]["fix_cycles"], 2)

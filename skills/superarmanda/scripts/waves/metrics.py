@@ -255,7 +255,10 @@ def main(argv=None):
     if not result["waves"]:
         print(f"metrics.py: в {args.run_dir} нет каталога прогона с волнами W*", file=sys.stderr)
         return 2
-    print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else table(result))
+    text = json.dumps(result, ensure_ascii=False, indent=2) if args.json else table(result)
+    # в problems попадает текст из чужих файлов (одиночный суррогат и т. п.): вывод не роняет ни один символ
+    enc = sys.stdout.encoding or "utf-8"
+    print(text.encode(enc, "backslashreplace").decode(enc, "replace"))
     if not result["ok"]:
         print("metrics.py: часть данных не прочитана (см. «нет данных»), код выхода 1", file=sys.stderr)
         return 1
