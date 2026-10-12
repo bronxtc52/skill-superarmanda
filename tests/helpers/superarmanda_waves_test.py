@@ -20409,6 +20409,65 @@ class MetricsScript(unittest.TestCase):
                 row = next(line for line in r.stdout.splitlines() if line.startswith("| W4 |"))
                 self.assertIn("нет данных", row)
 
+    def test_every_read_file_is_read_from_one_checked_descriptor(self):
+        """Ревью W4 waves-tails2: каждый читаемый файл (runs.json, manifest*.json в поиске по run.index, events.log)
+        открывается одним путём — проверка и чтение из одного дескриптора, только обычный файл. FIFO — «нет данных»,
+        код 1, без зависания; чужая волна рядом с настоящей — причина про волну, а не «дубль»; два симлинка внутри
+        волны на один файл — один прогон, не дубль."""
+        manifest = {"version": 2, "wave": {"id": "W4"}, "run": {"index": 1}, "tasks": {"t1": {"fix_cycles": 1}}}
+        runs = {"version": 1, "wave": "W4", "runs": [{"index": 1, "manifest": "superarmanda/manifest-run1.json"}]}
+        # имя случая: (файлы {путь от каталога прогона: JSON}, симлинки {путь: цель}, FIFO [путь], код, причина, не в выводе)
+        cases = {
+            "FIFO manifest-x.json beside a valid manifest": (
+                {"W4/runs.json": runs, "W4/superarmanda/manifest.json": manifest}, {},
+                ["W4/superarmanda/manifest-x.json"], 1, "manifest-x.json", None),
+            "FIFO manifest.json without runs.json": ({}, {}, ["W4/superarmanda/manifest.json"], 1, "manifest.json", None),
+            "FIFO manifest.json with runs.json": ({"W4/runs.json": runs}, {}, ["W4/superarmanda/manifest.json"], 1,
+                                                  "manifest.json", None),
+            "FIFO runs.json, valid manifest beside": ({"W4/superarmanda/manifest.json": manifest}, {}, ["W4/runs.json"], 1,
+                                                      "runs.json", "нет ни runs.json"),
+            "FIFO events.log": ({"W4/superarmanda/manifest.json": manifest}, {}, ["events.log"], 1, "events.log", None),
+            "foreign wave beside the real one with the same index": (
+                {"W4/runs.json": runs, "W4/superarmanda/manifest.json": manifest,
+                 "W4/superarmanda/manifest-x.json": {**manifest, "wave": {"id": "W5"}}}, {}, [], 1, "W5", "заявлен двумя"),
+            "two symlinks inside the wave on one manifest": (
+                {"W4/runs.json": runs, "W4/superarmanda/manifest-real.json": manifest},
+                {"W4/superarmanda/manifest.json": "manifest-real.json",
+                 "W4/superarmanda/manifest-run1.json": "manifest-real.json"}, [], 0, None, None),
+            "a symlink beside its own target, no runs.json": (
+                {"W4/superarmanda/manifest.json": manifest}, {"W4/superarmanda/manifest-link.json": "manifest.json"},
+                [], 0, None, None),
+        }
+        env = {k: v for k, v in os.environ.items() if not k.startswith("WAB_")}
+        for name, (files, links, fifos, code, reason, absent) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "W4" / "superarmanda").mkdir(parents=True)
+                if "events.log" not in fifos:
+                    (root / "events.log").write_text("", encoding="utf-8")
+                for rel, value in files.items():
+                    (root / rel).write_text(json.dumps(value), encoding="utf-8")
+                for rel, target in links.items():
+                    (root / rel).symlink_to(target)
+                for rel in fifos:
+                    os.mkfifo(root / rel)
+                try:
+                    r = subprocess.run([sys.executable, str(self.SCRIPT), str(root)], capture_output=True, text=True,
+                                       encoding="utf-8", env=env, timeout=20)
+                except subprocess.TimeoutExpired:
+                    self.fail(f"{name}: metrics.py завис на чтении")
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+                if absent:
+                    self.assertNotIn(absent, r.stdout)
+                if code == 0:
+                    self.assertIn("| W4 | 1 | 1 | 0 |", r.stdout)
+                    continue
+                problems = [line for line in r.stdout.splitlines() if line.startswith("W4: нет данных — ")]
+                self.assertTrue(any(reason in p for p in problems), (reason, problems))
+                row = next(line for line in r.stdout.splitlines() if line.startswith("| W4 |"))
+                self.assertIn("нет данных", row)
+
 
 class Release130(unittest.TestCase):
     """The release 1.3.0 (W8): version, CHANGELOG, the measuring table, the rows of «Что реализовано»."""

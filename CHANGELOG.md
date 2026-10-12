@@ -30,6 +30,7 @@
   запасной путь через `manifest.json` при нём не срабатывает. Тест `MetricsScript`
   `test_every_counted_file_passes_one_identity_check`; фикстура `tests/fixtures/waves/metrics-run/` получила
   `version` и `wave.id` в manifest.
+- `metrics.py` (#113 W4, ревью): каждый читаемый файл (`runs.json`, все `manifest*.json` поиска по `run.index`, `events.log`) открывается одним путём с `O_NOFOLLOW|O_NONBLOCK`, только обычный файл и чтение из проверенного дескриптора — FIFO не вешает замер; чужая волна при поиске по номеру — причина про волну, а не «дубль»; два симлинка на один файл — не дубль (тест `test_every_read_file_is_read_from_one_checked_descriptor`).
 - `wab.py`, `metrics.py`, `dash.py` (#113 W4): служебные строки ответа владельца («marker not written», «status
   rewritten») пишутся отдельным видом события `<волна>: say-note: …` (одна функция `say_note`); `say: ` — только текст,
   ушедший в окно. `metrics.py` узнаёт старые служебные `say:` только в журналах прошлых версий, дашборд показывает

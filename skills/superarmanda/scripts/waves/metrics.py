@@ -7,16 +7,21 @@
 волны не читается; любой испорченный ввод (в том числе JSON глубокой вложенности) → problems, код 1,
 никогда traceback.
 
-Инвариант идентичности: каждый файл, из которого берётся число (`runs.json` волны, manifest прогона), проходит
-ОДНУ проверку до использования (`_read_entry` → `_runs_of` / `_manifest_identity`):
+Инвариант идентичности: каждый файл, который читается (`runs.json` волны, каждый `superarmanda/manifest*.json` —
+и засчитанный, и просмотренный при поиске по `run.index`, — `events.log`), открывается ОДНИМ путём (`_read_checked`
+→ `_read_entry` → `_runs_of` / `_manifest_identity`) и читается из того же дескриптора, который проверен:
   * запись каталога есть (`lexists`: битый симлинк — присутствующий, но нечитаемый файл, а не «нет файла», и
-    fallback на manifest.json при нём не срабатывает), после разрешения симлинков лежит в каталоге волны и
-    это файл;
+    fallback на manifest.json при нём не срабатывает), после разрешения симлинков лежит в каталоге волны;
+    разрешённый путь открывается с O_NOFOLLOW|O_NONBLOCK, fstat того же дескриптора — только обычный файл (FIFO,
+    каталог, устройство — отказ без зависания), и читается тот же дескриптор (подмена записи после проверки
+    не подсовывает другой файл);
   * формат и идентичность: runs.json — `version` 1, `wave` = имя каталога волны, `runs` — список; manifest —
     `version` целое 1 или 2 (не bool, не 1.0, не строка; как state.check_schema), а если есть ключ `wave` —
     это объект с `id`, равным имени каталога волны (`W4`). Manifest без `wave` и без `run` (цепочки до 1.2.0)
     читается как раньше;
-  * `run.index` однозначен: два `superarmanda/manifest*.json` волны с одним номером — отказ, а не первый по имени.
+  * `run.index` однозначен: два РАЗНЫХ файла (`st_dev`, `st_ino`) волны с одним номером — отказ, а не первый по
+    имени; два пути (симлинки внутри волны) на один файл — один прогон. Файл, не прошедший проверку при поиске по
+    номеру (чужая волна, испорченный, FIFO), — отказ с его причиной, а не пропуск и не «дубль».
 Нарушение — строка в `problems` с причиной, волна «нет данных», код 1, без traceback.
 
 <run_dir> — каталог прогона цепочки (`runs/<цепочка>/<run_id>`). Читается только он, ничего не пишется:
@@ -49,6 +54,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -66,16 +72,38 @@ NO_DATA = "нет данных"
 MAX_FIX_CYCLES = 1000  # кап state.py — 3 круга (+ решения владельца); больше — испорченный ввод, не печатаемое число
 
 
-def _load(path):
-    """(объект JSON, None) или (None, причина) — никогда не бросает."""
+def _read_checked(path, root):
+    """Единая проверка записи каталога и чтение из того же дескриптора: (байты, (st_dev, st_ino), None) или
+    (None, None, причина) — никогда не бросает и не зависает. Запись есть (битый симлинк — файл есть, но не
+    читается, а не «нет файла»), после разрешения симлинков лежит внутри `root`; разрешённый путь открывается с
+    O_NOFOLLOW|O_NONBLOCK (FIFO не блокирует открытие), fstat того же дескриптора — только обычный файл, и
+    читается этот же дескриптор: подмена записи между проверкой и чтением не подсовывает другой файл."""
+    if not os.path.lexists(path):
+        return None, None, f"нет файла {path.name}"
+    if not _inside(path, root):
+        return None, None, f"{path.name} ведёт вне каталога волны"
+    if path.is_symlink() and not path.exists():
+        return None, None, f"{path.name} не читается (битый симлинк)"
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     try:
-        return json.loads(path.read_text(encoding="utf-8")), None
-    except FileNotFoundError:
-        return None, f"нет файла {path.name}"
-    except RecursionError:
-        return None, f"{path.name} не читается (слишком глубокая вложенность)"
-    except (OSError, ValueError) as e:
-        return None, f"{path.name} не читается ({type(e).__name__})"
+        fd = os.open(path.resolve(), flags)
+    except (OSError, RuntimeError, ValueError) as e:
+        return None, None, f"{path.name} не читается ({type(e).__name__})"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, None, f"{path.name} не читается (не файл)"
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks), (st.st_dev, st.st_ino), None
+    except OSError as e:
+        return None, None, f"{path.name} не читается ({type(e).__name__})"
+    finally:
+        os.close(fd)
 
 
 def _inside(path, wave_dir):
@@ -86,25 +114,43 @@ def _inside(path, wave_dir):
         return False
 
 
+def _read_json(path, wave_dir):
+    """(объект JSON, ключ файла, None) или (None, None, причина): `_read_checked` и разбор того же содержимого."""
+    raw, key, why = _read_checked(path, wave_dir)
+    if why:
+        return None, None, why
+    try:
+        return json.loads(raw.decode("utf-8")), key, None
+    except RecursionError:
+        return None, None, f"{path.name} не читается (слишком глубокая вложенность)"
+    except ValueError as e:
+        return None, None, f"{path.name} не читается ({type(e).__name__})"
+
+
 def _read_entry(path, wave_dir):
     """Единая проверка записи каталога до чтения: (объект JSON, None) или (None, причина) — никогда не бросает.
     Битый симлинк — файл есть, но не читается (а не «нет файла»)."""
-    if not os.path.lexists(path):
-        return None, f"нет файла {path.name}"
-    if not _inside(path, wave_dir):
-        return None, f"{path.name} ведёт вне каталога волны"
-    if path.is_symlink() and not path.exists():
-        return None, f"{path.name} не читается (битый симлинк)"
-    if not path.is_file():
-        return None, f"{path.name} не читается (не файл)"
-    return _load(path)
+    data, _, why = _read_json(path, wave_dir)
+    return data, why
 
 
 def _manifest_identity(path, wave_dir):
     """(manifest, None) или (None, причина): версия 1/2 и, если есть `wave`, — эта волна."""
-    data, why = _read_entry(path, wave_dir)
+    data, _, why = _manifest_checked(path, wave_dir)
+    return data, why
+
+
+def _manifest_checked(path, wave_dir):
+    """(manifest, ключ файла, None) или (None, None, причина) — проверки `_manifest_identity`."""
+    data, key, why = _read_json(path, wave_dir)
     if why:
-        return None, why
+        return None, None, why
+    data, why = _manifest_fields(path, wave_dir, data)
+    return (None, None, why) if why else (data, key, None)
+
+
+def _manifest_fields(path, wave_dir, data):
+    """(manifest, None) или (None, причина) по уже прочитанному объекту: версия 1/2 и, если есть `wave`, — эта волна."""
     if not isinstance(data, dict):
         return None, f"{path.name}: не объект manifest"
     version = data.get("version")
@@ -185,18 +231,22 @@ def _manifest_paths(wave_dir, problems):
 
 def _by_index(wave_dir):
     """({номер прогона: файл}, None) по `run.index` внутри `superarmanda/manifest*.json` (файлы переименовывают)
-    или (None, причина), если номер заявлен двумя файлами. Файлы, ведущие вне каталога волны, не читаются."""
-    out = {}
+    или (None, причина). Каждый файл проходит ту же проверку идентичности (`_manifest_checked`), что и засчитанный:
+    файл вне каталога волны, не обычный файл (FIFO), испорченный или чужой волны — отказ с его причиной, а не
+    пропуск и не «дубль». Номер, заявленный двумя РАЗНЫМИ файлами, — отказ; два пути (симлинки внутри волны) на
+    один файл (`st_dev`, `st_ino`) — один прогон."""
+    out, keys = {}, {}
     for path in sorted((wave_dir / "superarmanda").glob("manifest*.json")):
-        if not _inside(path, wave_dir):
-            continue
-        data, why = _load(path)
-        run = data.get("run") if isinstance(data, dict) else None
+        data, key, why = _manifest_checked(path, wave_dir)
+        if why:
+            return None, why
+        run = data.get("run")
         index = run.get("index") if isinstance(run, dict) else None
-        if not why and _is_index(index):
-            if index in out:
+        if _is_index(index):
+            if index in out and keys[index] != key:
                 return None, f"run.index {index} заявлен двумя файлами: {out[index].name} и {path.name}"
-            out[index] = path
+            out.setdefault(index, path)
+            keys[index] = key
     return out, None
 
 
@@ -268,12 +318,13 @@ def measure(run_dir):
                        key=lambda d: int(WAVE_DIR.match(d.name).group(1))) if run_dir.is_dir() else []
     except OSError:
         waves = []  # каталог прогона не читается — как каталог без волн, код 2
-    events_file = run_dir / "events.log"
-    try:
-        forks = blocked_cap_by_wave(events_file.read_text(encoding="utf-8"))
-        forks_problem = None
-    except (OSError, UnicodeDecodeError) as e:
-        forks, forks_problem = None, f"events.log не читается ({type(e).__name__})"
+    raw, _, forks_problem = _read_checked(run_dir / "events.log", run_dir)  # та же проверка: FIFO не вешает замер
+    forks = None
+    if not forks_problem:
+        try:
+            forks = blocked_cap_by_wave(raw.decode("utf-8"))
+        except UnicodeDecodeError as e:
+            forks_problem = f"events.log не читается ({type(e).__name__})"
     rows = []
     for d in waves:
         problems = []
