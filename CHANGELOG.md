@@ -3,6 +3,46 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 1.5.1 — 2026-10-12
+
+Цепочка `waves-tails2`, волна W1: гейт мерджа больше не ждёт скрипт владельца вечно после того, как треды ревью закрыли
+([#117](https://github.com/bronxtc52/skill-superarmanda/issues/117)); служебная сводка CodeRabbit — не находка
+([#113](https://github.com/bronxtc52/skill-superarmanda/issues/113), раздел W1, п. 2).
+
+### Исправлено
+
+- `wab.py` (#117 п.1): решение о мердже в фазе `merging` — один инвариант. `gh pr merge` одного sha волны
+  вызывается не больше одного раза (отметка `merge_called` сохраняется в `state.json` до вызова и снимается только
+  сменой HEAD). Пока волна ждёт скрипт владельца только из-за открытых тредов этого sha (`_threads_wait`), диспетчер на
+  каждом опросе заново прогоняет полный гейт на том же HEAD (CI, Codex на HEAD без P0/P1, manifest `pass`, 0 открытых
+  тредов) и при `merge_gate: auto` мерджит сам: одно событие мерджа. HEAD сменился — гейт заново; гейт на том же HEAD
+  не готов — мерджа нет; отказ, ошибка, прерывание или неизвестный результат уже вызванного мерджа — путь скрипта
+  владельца без автоповтора, и это переживает перезапуск `watch`. При `merge_gate`, отличном от `auto`, поведение
+  прежнее. Запись 1.4.x/1.5.0 идущей цепочки читается по тем же полям.
+- `wab.py`: событие «the result of the merge call is unknown» больше не пишется, когда мерджа не вызывали (ожидание
+  тредов).
+- `pr_review.py` (#113 W1 п.2): сводка CodeRabbit (walkthrough, «review in progress», «Draft PR not reviewed», флажок
+  autopilot) распознаётся по машинным маркерам всего тела (`<!-- This is an auto-generated comment: summarize by
+  coderabbit.ai -->` … `<!-- tips_end -->`) и в `findings` не попадает; настоящая находка CodeRabbit (inline, review,
+  ответ бота, слова шаблона внутри другого текста) остаётся находкой. Живые фикстуры — PR #75, #116, #118.
+
+### Добавлено
+
+- Напоминание владельцу (#117 п.2): шаблон `merge_remind` («⏸ <цепочка>: волна <id> ждёт тебя: запусти скрипт
+  мерджа»), повтор на первом опросе после `merge_remind_minutes` (tunable-поле `chain.json`, 120 по умолчанию), не
+  чаще раза за интервал; отметка `owner_remind` в `state.json` переживает перезапуск `watch`; после мерджа или смены
+  фазы повторов нет. Первые строки `merge_owner`, `merge_refused`, `merge_unknown` теперь тоже «⏸ … ждёт тебя: …
+  запусти скрипт мерджа»; путь к скрипту — по-прежнему только в `events.log` и `wab.py status`.
+- ATTENTION на затянувшемся мердже (#117 п.3): текущая волна в `merging` (с `merging_since`) или `awaiting_merge` (с
+  `finished`) без `MERGED` дольше `merge_attention_minutes` (tunable, 30) — строка `ATTENTION: <волна>: мердж ждёт …` в
+  `wab.py status` и в панели текущей волны дашборда при любом тексте `status`.
+- Поля `chain.json` `merge_remind_minutes` и `merge_attention_minutes`: в `wab.TUNABLE`, не меняют идентичность
+  прогона; старый `chain.json` без них читается с дефолтами; не число, `true`, `0`, `nan` или больше 10080 — отказ
+  `load_chain` (в `watch` живая правка с ошибкой оставляет прежние настройки).
+- Сквозной офлайн-тест `ThreadsChain` (режим `threads` в `tests/helpers/superarmanda_waves_e2e_test.py`): гейт с
+  открытым тредом, напоминания с интервалом, ATTENTION, автомердж того же HEAD после закрытия треда, новый HEAD —
+  только своим гейтом. Подставной `gh` понимает `thread: open`.
+
 ## 1.5.0 — 2026-10-11
 
 Итог цепочки `waves-remnants` (пять волн): остаток прошлых цепочек закрыт, замер `metrics.py` устойчив к

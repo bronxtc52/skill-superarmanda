@@ -8882,6 +8882,310 @@ class Regate(GateBase):  # D2: the head moved while the wave sat in `merging`
         self.assertIn(self.NEW, self.merges()[1])
 
 
+class MergeAfterThreads(GateBase):  # #117 п.1–3 (1.5.1): the merge decision of phase `merging`, one invariant
+    """THE invariant (wab._threads_wait / _owner_waits): `gh pr merge` of a (wave, sha) is called at most once (the mark
+    `merge_called` saved BEFORE the call, in state.json, kept until the head moves); an automatic call in `merging`
+    happens only with merge_gate auto, when the wave waits ONLY for open threads of that sha (no merge or ready call
+    for it yet) and a fresh full gate on that same sha passes with no open thread. Every other state of `merging` is
+    the owner's script, with a reminder no more than once per `merge_remind_minutes`."""
+    NEW = "e" * 40
+    OPEN = [{"id": "PRRT_a", "isResolved": False}]
+    CLOSED = [{"id": "PRRT_a", "isResolved": True}]
+
+    def setUp(self):
+        super().setUp()
+        self.now = 1_800_000_000.0
+        p = mock.patch("time.time", side_effect=lambda: self.now)
+        p.start()
+        self.addCleanup(p.stop)
+        self.merge_mode = "ok"
+        real = self.handle
+
+        def handle(args):
+            if args[:3] == ("gh", "pr", "merge"):
+                if self.merge_mode == "error":
+                    raise OSError("gh: broken pipe")
+                if self.merge_mode == "interrupt":
+                    raise KeyboardInterrupt
+                self.merge_rc, self.merge_err = (1, "not mergeable") if self.merge_mode == "refuse" else (0, "")
+            return real(args)
+        self.gh_handler = handle
+
+    def at(self, minutes):
+        self.now = 1_800_000_000.0 + minutes * 60
+
+    def moved(self, ready=True):
+        self.pr = {**self.pr, "headRefOid": self.NEW}
+        self.facts = green_facts(pr={"state": "open", "merged": False, "draft": False, "head": self.NEW, "base": "main"},
+                                 reviews=[{"user": BOT, "commit_id": self.NEW, "state": "COMMENTED"}])
+        if not ready:
+            self.facts["check_runs"] = [{"name": "ci", "status": "in_progress", "conclusion": None}]
+        self.manifest = green_manifest()
+        self.manifest["head"] = self.NEW
+        for entry in self.manifest["tasks"].values():
+            for r in entry["results"].values():
+                r["head"] = self.NEW
+        self.work = {**WORK, "head": self.NEW}
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": self.NEW, "baseRefName": "main"}
+
+    def reminders(self):
+        return [t for t in self.tg if t.splitlines()[0].endswith("ждёт тебя: запусти скрипт мерджа")]
+
+    def threads_gate(self, gate_mode="auto"):
+        """The gate passed with one open thread: the owner's script, no merge (the state before #117 п.1)."""
+        self.start(merge_gate=gate_mode)
+        self.facts = green_facts(threads=list(self.OPEN))
+        self.tick()
+        self.assertEqual(self.merges(), [])
+
+    def safe_tick(self):
+        try:
+            return self.tick()
+        except KeyboardInterrupt:
+            return None
+
+    def restart_watch(self):
+        try:
+            wab.watch(wab.load_chain(self.path), self.path, max_ticks=1)
+        except KeyboardInterrupt:
+            pass
+
+    # ----- the one enumeration of every path (the coordinator's brief) -----
+    def test_every_path_of_the_merge_decision_in_merging(self):
+        import itertools
+        combos = itertools.product(("auto", "external"), ("open", "closed"), ("same", "moved"), (True, False),
+                                   ("ok", "refuse", "error", "interrupt"), (False, True))
+        for gate_mode, threads, head, ready, outcome, restart in combos:
+            with self.subTest(gate=gate_mode, threads=threads, head=head, ready=ready, outcome=outcome, restart=restart):
+                self.gh_calls.clear()
+                self.tg.clear()
+                self.at(0)
+                self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+                self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "main"}
+                self.manifest, self.work = green_manifest(), dict(WORK)
+                self.merge_mode = "ok"
+                self.threads_gate(gate_mode)
+                if (self.cfg["run_dir"] / "events.log").exists():
+                    (self.cfg["run_dir"] / "events.log").write_text("", encoding="utf-8")
+                # what changes on GitHub while the owner's script waits
+                if head == "moved":
+                    self.moved(ready)
+                elif not ready:  # the same head, but a new CI run or a Codex review of an older commit
+                    self.facts = green_facts(check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+                else:
+                    self.facts = green_facts()
+                self.facts["threads"] = list(self.CLOSED if threads == "closed" else self.OPEN)
+                self.merge_mode = outcome
+                for minute in (1, 2):
+                    self.at(minute)
+                    self.safe_tick()
+                if restart:
+                    self.at(3)
+                    self.restart_watch()
+                for minute in (4, 5, 6):
+                    self.at(minute)
+                    self.safe_tick()
+                at_old = [m for m in self.merges() if HEAD in m]
+                at_new = [m for m in self.merges() if self.NEW in m]
+                log = self.log()
+                if gate_mode != "auto":  # no merging phase at all: the coordinator / the owner's script only
+                    self.assertEqual(self.merges(), [])
+                    self.assertEqual(self.rec()["phase"], "awaiting_merge")
+                elif head == "moved":  # the old sha is never merged; the new head only by its own gate
+                    self.assertEqual(at_old, [])
+                    self.assertIn(f"HEAD сменился после гейта: {HEAD[:12]}→{self.NEW[:12]}, гейт заново", log)
+                    expect = 1 if ready and threads == "closed" else 0
+                    self.assertEqual(len(at_new), expect)
+                    if not ready:
+                        self.assertNotEqual(self.rec()["phase"], "merging")
+                elif threads == "closed" and ready:  # the one automatic merge, never a second for this sha
+                    self.assertEqual(at_old, [tuple(gate.merge_argv("o/r", 7, HEAD))])
+                    self.assertEqual(self.rec()["merge_called"], HEAD)
+                    self.assertEqual(log.count(f"merge of PR #7 requested at {HEAD[:12]}"), 1 if outcome == "ok" else 0)
+                    if outcome == "ok":
+                        self.assertEqual(self.rec()["merge_rc"], 0)
+                    else:  # the owner's script, the status names it, one notice of the refusal / the unknown result
+                        self.assertTrue(self.status().startswith("BLOCKED: merge gate passed; "), self.status())
+                        self.assertIn("owner runs ~/.cache/wab/", self.status())
+                else:  # threads still open, or the gate on the same head is not ready: the owner's script only
+                    self.assertEqual(self.merges(), [])
+                    self.assertEqual(self.rec()["phase"], "merging")
+                    self.assertNotIn("merge_called", self.rec())
+                self.assertEqual(self.reminders(), [], "no reminder inside the interval")
+                self.assertNotIn("result of the merge call is unknown", log if outcome == "ok" else "")
+
+    # ----- acceptance 1: the thread is closed on the same head -> the next tick merges, one merge event -----
+    def test_a_thread_closed_on_the_same_head_is_merged_by_the_next_tick(self):
+        self.threads_gate()
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate passed; 1 unresolved review threads; owner runs "))
+        self.facts = green_facts(threads=list(self.CLOSED))
+        self.at(1)
+        self.assertTrue(self.tick())
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+        self.assertEqual(self.log().count("merge of PR #7 requested"), 1)
+        self.assertIn("треды закрыты", self.log())
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
+        self.at(2)
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "done")
+        self.assertEqual(len(self.merges()), 1)
+        self.launch.assert_called_once()
+
+    def test_the_wave_writing_done_after_closing_the_thread_changes_nothing(self):  # the incident of #117
+        self.threads_gate()
+        self.set_status(self.cfg, "W1", "DONE")
+        self.facts = green_facts(threads=list(self.CLOSED))
+        self.at(1)
+        self.tick()
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_a_1_5_0_record_waiting_for_threads_is_merged_after_the_upgrade(self):
+        self.threads_gate()
+        st = self.get_state(self.cfg)
+        for key in ("merging_since", "owner_remind"):  # what 1.5.0 did not write
+            st["waves"]["W1"].pop(key, None)
+        self.put_state(self.cfg, st)
+        self.facts = green_facts(threads=list(self.CLOSED))
+        self.at(1)
+        self.restart_watch()
+        self.assertEqual(len(self.merges()), 1)
+
+    # ----- acceptance 3: the reminder on a fake clock -----
+    def test_the_owner_is_reminded_once_per_interval_until_the_merge(self):
+        self.threads_gate()
+        first = [t for t in self.tg if "незакрытые треды" in t]
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0].splitlines()[0], f"⏸ {CHAIN}: волна W1 ждёт тебя: запусти скрипт мерджа (есть незакрытые треды)")
+        self.assertNotIn("~/.cache", first[0])
+        for minute in (1, 60, 119):
+            self.at(minute)
+            self.tick()
+        self.assertEqual(self.reminders(), [], "no early repeat")
+        self.at(121)
+        self.tick()
+        self.assertEqual(len(self.reminders()), 1, "a repeat after the interval")
+        said = self.reminders()[0]
+        self.assertNotIn("~/.cache", said)
+        self.assertNotIn(".merge", said)
+        self.assertIn("Нужно: ", said)
+        self.at(122)
+        self.tick()
+        self.at(200)
+        self.restart_watch()  # the mark is in state.json: a new watch does not repeat early
+        self.assertEqual(len(self.reminders()), 1)
+        self.at(242)
+        self.tick()
+        self.assertEqual(len(self.reminders()), 2)
+        self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD, "baseRefName": "main"}
+        self.at(250)
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "done")
+        for minute in (400, 600):
+            self.at(minute)
+            self.tick()
+        self.assertEqual(len(self.reminders()), 2, "no repeat after the merge")
+
+    def test_the_reminder_stops_when_the_phase_changes(self):
+        self.threads_gate()
+        self.moved(ready=False)  # the head moved: back to the gate, the owner is no longer awaited
+        self.facts["threads"] = list(self.OPEN)
+        for minute in (1, 130, 300):
+            self.at(minute)
+            self.tick()
+        self.assertNotEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.reminders(), [])
+
+    def test_a_refused_merge_reminds_the_owner_too(self):
+        self.start()
+        self.merge_mode = "refuse"
+        self.tick()
+        self.assertEqual(len(self.merges()), 1)
+        head = [t for t in self.tg if "мердж не выполнен" in t]
+        self.assertEqual(len(head), 1)
+        self.assertIn("ждёт тебя", head[0].splitlines()[0])
+        for minute in (60, 121, 122):
+            self.at(minute)
+            self.tick()
+        self.assertEqual(len(self.reminders()), 1)
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_the_interval_is_tunable_live_and_not_part_of_the_identity(self):
+        self.threads_gate()
+        doc = json.loads(self.path.read_text(encoding="utf-8"))
+        doc["merge_remind_minutes"] = 30
+        self.path.write_text(json.dumps(doc), encoding="utf-8")
+        cfg = wab.load_chain(self.path)
+        self.assertEqual(wab._identity(cfg), wab._identity(self.cfg))
+        self.at(31)
+        wab.tick(cfg, wab.load_state(cfg))
+        self.assertEqual(len(self.reminders()), 1)
+
+    # ----- acceptance 4: ATTENTION on a merge that takes too long -----
+    def status_out(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            wab.status_cmd(wab.load_chain(self.path, create=False))
+        return out.getvalue()
+
+    def dash_text(self):
+        import dash
+        from rich.console import Console
+        con = Console(width=200, record=True, file=io.StringIO())
+        with mock.patch.object(dash.wab, "pane_text", return_value=""), \
+                mock.patch.object(dash.wab, "tmux_alive", return_value=True):
+            con.print(dash.current_panel(self.cfg, wab.load_state(self.cfg)))
+        return con.export_text()
+
+    def test_merging_without_merged_past_the_threshold_is_an_attention_signal(self):
+        for status in (None, "DONE"):  # the BLOCKED line of the owner's script, or the wave's own DONE
+            with self.subTest(status=status):
+                self.at(0)
+                self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "main"}
+                self.threads_gate()
+                if status:
+                    self.set_status(self.cfg, "W1", status)
+                self.at(29)
+                self.tick()
+                self.assertNotIn("ATTENTION", self.status_out())
+                self.assertNotIn("ATTENTION", self.dash_text())
+                self.at(31)
+                self.tick()
+                out = self.status_out()
+                self.assertIn("ATTENTION: W1: мердж ждёт", out)
+                self.assertIn("ATTENTION", self.dash_text())
+                self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD,
+                             "baseRefName": "main"}
+                self.at(32)
+                self.tick()
+                self.assertNotIn("ATTENTION", self.status_out())
+
+    def test_awaiting_merge_past_the_threshold_is_an_attention_signal(self):
+        self.threads_gate(gate_mode="external")
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+        self.at(20)
+        self.assertNotIn("ATTENTION", self.status_out())
+        self.at(31)
+        self.assertIn("ATTENTION: W1: мердж ждёт", self.status_out())
+        self.assertIn("ATTENTION", self.dash_text())
+
+    def test_the_threshold_is_tunable_and_defaults_for_an_old_chain_json(self):
+        cfg, _ = self.chain()
+        self.assertEqual((cfg["merge_attention_minutes"], cfg["merge_remind_minutes"]), (30, 120))
+        for key in ("merge_attention_minutes", "merge_remind_minutes"):
+            self.assertIn(key, wab.TUNABLE)
+            other, _ = self.chain(**{key: 5})
+            self.assertEqual(wab._identity(other), wab._identity(cfg))
+            for bad in (0, -1, "30", True, float("nan"), 10 ** 9):
+                with self.subTest(key=key, value=bad), self.assertRaises(SystemExit):
+                    self.chain(**{key: bad})
+        self.threads_gate()
+        doc = json.loads(self.path.read_text(encoding="utf-8"))
+        doc["merge_attention_minutes"] = 5
+        self.path.write_text(json.dumps(doc), encoding="utf-8")
+        self.at(6)
+        self.assertIn("ATTENTION: W1: мердж ждёт", self.status_out())
+
+
 class OwnerMerge(GateBase):  # D3
     def setUp(self):
         super().setUp()
@@ -16041,6 +16345,7 @@ _allow("wab.py", "owner_merge", _LIST, "merge[:3]")
 _allow("wab.py", "owner_handover", _SHA, "str(pr_head)[:12]", "str(head)[:12]", "merge[:12]", "head[:12]")
 _allow("wab.py", "_merging_tick", _DEDUP, "_exc_text(e)[:150]")
 _allow("wab.py", "_merging_tick", _SHA, "str(head)[:12]", "sha[:12]")
+_allow("wab.py", "_threads_recheck", _SHA, "sha[:12]")  # 1.5.1, #117
 _allow("wab.py", "_alarm_tick", _DEDUP, "_exc_text(e)[:150]", "str(facts['error'])[:150]")
 _allow("wab.py", "_alarm_tick", _SHA, "head[:12]")
 _allow("wab.py", "_pending_alarm_enter", _DEDUP, "_exc_text(e)[:150]")
@@ -18628,7 +18933,7 @@ class W7NoticeTemplates(Base):
     # ----- the loop: every key of the episode table x flag x path x (a fresh entry, an entry of 1.2.6) -----
     def test_every_key_every_flag_every_path_is_a_template(self):
         self.assertEqual(set(wab.NOTICE_TEMPLATES), set(wab.NOTICE_EPISODE_ENDS))
-        self.assertEqual(len(wab.NOTICE_TEMPLATES), 23)
+        self.assertEqual(len(wab.NOTICE_TEMPLATES), 24)  # +merge_remind (1.5.1, #117)
         for quote in (False, True):
             tcfg, lcfg = self.fx_cfg(quote or None), self.fx_cfg(quote or None, telegram=False)
             for key in sorted(wab.NOTICE_TEMPLATES):
@@ -18930,7 +19235,7 @@ class W7NoticeTemplates(Base):
         # the 25 call sites of 1.2.6; chain_done is put by one helper now (23 keys); +1 not_ready of the Fable switch (#108);
         # +1 updating of an unconfirmed Fable switch delivery (Codex P2 / CodeRabbit on #109);
         # +1 blocked of a BLOCKED episode whose line is lost from the store and was never told (1.4.3, круг 2 W2)
-        self.assertEqual(len(calls), 27)
+        self.assertEqual(len(calls), 28)  # +merge_remind of the owner reminder (1.5.1, #117)
         self.assertEqual({c.args[3].value for c in calls if len(c.args) == 5}, set(wab.NOTICE_TEMPLATES))
         for node in calls:
             self.assertEqual(len(node.args), 5, f"put_notice(cfg, w, wave, key, value, **fields), line {node.lineno}")
@@ -20910,13 +21215,12 @@ class Release150(unittest.TestCase):
     """The release 1.5.0 (#107, the summary of the chain waves-remnants; wave W5): version, the CHANGELOG section on top
     with the PRs of the waves and the remnant issue, the rows of what is implemented."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.0"\s*$')
+    # the version of SKILL.md moved on to 1.5.1 (#117): Release151 pins it
 
-    def test_changelog_section_on_top(self):
+    def test_changelog_section(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.0 — 2026-10-11$", "1.5.0 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.5\.0 — 2026-10-11$", "CHANGELOG.md: the section of 1.5.0")
+        self.assertTrue(log.index("## 1.5.0") < log.index("## 1.4.5"), "1.5.0 is above 1.4.5")
         body = re.search(r"(?ms)^## 1\.5\.0 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
         for needle in ("#107", "`waves-remnants`", "pull/112", "pull/114", "pull/115", "pull/116", "issues/113",
                        "`RemnantsChain`", "e2e-1.4.1-state", "`RecursionError`", "`say:`"):
@@ -20927,6 +21231,33 @@ class Release150(unittest.TestCase):
         table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
         self.assertRegex(table, r"(?m)^\| Замер `metrics\.py` устойчив[^\n]*реализовано \(1\.5\.0; \[#107\]")
         self.assertRegex(table, r"(?m)^\| Сквозная приёмка цепочки `waves-remnants`[^\n]*`RemnantsChain` \|$")
+
+
+
+class Release151(unittest.TestCase):
+    """The release 1.5.1 (#117, #113 W1 п.2; wave W1 of waves-tails2): version, the CHANGELOG section on top, the row of
+    what is implemented, the fields of chain.json in the doc."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.1"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.1 — 2026-10-12$", "1.5.1 is the first section")
+        body = re.search(r"(?ms)^## 1\.5\.1 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
+        for needle in ("issues/117", "issues/113", "`waves-tails2`", "`merge_remind_minutes`", "`merge_attention_minutes`",
+                       "`ThreadsChain`", "`merge_remind`", "`pr_review.py`"):
+            self.assertIn(needle, body)
+
+    def test_waves_doc_has_the_row_and_the_fields(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
+        self.assertRegex(table, r"(?m)^\| Гейт мерджа после закрытых тредов \(#117\)[^\n]*реализовано \(1\.5\.1; "
+                                r"\[#117\][^\n]*`ThreadsChain` \|$")
+        for field in ("merge_remind_minutes", "merge_attention_minutes"):
+            self.assertRegex(waves, rf"(?m)^\| `{field}` \| число \|")
+        self.assertIn("**Решение о мердже в фазе `merging`", waves)
 
 
 if __name__ == "__main__":

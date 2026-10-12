@@ -463,6 +463,9 @@ def current_panel(cfg, st):
         head.append(f"   статус: {_safe(status)}", style="yellow" if key == "BLOCKED" else "green")
     if w.get("model_override"):  # the wave was switched from Fable on its limit (#108)
         head.append(f"   модель: {_safe(w['model_override'])} (лимит Fable)", style="bright_yellow")
+    overdue = wab.merge_overdue_line(cfg, st, wave)  # #117 п.3: merging / awaiting_merge without MERGED for too long
+    if overdue:
+        head.append(f"\n⚠ {_safe(overdue)}", style="bold red")
     ctx = Group(Text("Контекст ", style="bold").append_text(ctx_cell(w, cfg["ctx_limit"], 40)),
                 Text("История  ", style="bold").append(spark(w.get("ctx_hist", []), cfg["ctx_limit"])))
     # the screen of the wave is shown too: masked as a whole BEFORE it is cut into lines and into 150 characters
