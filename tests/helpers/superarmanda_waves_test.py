@@ -23379,6 +23379,33 @@ class Release160(unittest.TestCase):
         self.assertIn("`fix_cycles` задачи вне 0..1000", v150)
         self.assertIn("каталог прогона, который не\n  читается, — как каталог без волн, код 2", v150)
 
+    def test_every_developer_threshold_and_setting_is_in_the_changelog(self):
+        # tester W4: порог или настройка, видимые разработчику, обязаны быть названы в CHANGELOG по имени (класс находки
+        # про `CHAIN_FAST_SECONDS`): пороги времени сквозных сценариев (`*_FAST_SECONDS` модуля e2e) и переменные
+        # окружения, которые читает run-tests.sh (их же называет шапка-комментарий скрипта)
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        e2e = (ROOT / "tests" / "helpers" / "superarmanda_waves_e2e_test.py").read_text(encoding="utf-8")
+        fast = set(re.findall(r"(?m)^([A-Z][A-Z0-9_]*_FAST_SECONDS)\s*=", e2e))
+        self.assertTrue({"THREADS_FAST_SECONDS", "CHAIN_FAST_SECONDS"} <= fast, fast)
+        script = (ROOT / "scripts" / "run-tests.sh").read_text(encoding="utf-8")
+        header = re.match(r"(?:#[^\n]*\n)*", script).group(0)  # шапка: комментарии с первой строки
+        code = "\n".join(l for l in script.splitlines() if not l.lstrip().startswith("#"))
+        used = set(re.findall(r"\$\{?([A-Z][A-Z0-9_]*)", code))
+        assigned = set(re.findall(r"(?m)^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)=", code))
+        # из окружения: проверка `${X+set}` / подстановка по умолчанию `${X:-…}`, либо имя читается, но не присваивается
+        defaulted = set(re.findall(r"\$\{([A-Z][A-Z0-9_]*):?[-+=]", code))
+        standard = {"PATH", "HOME", "TMPDIR", "LC_ALL", "LC_COLLATE", "LANG", "BASH_SOURCE", "BASH_VERSION"}
+        env = {n for n in (used - assigned) | defaulted if n not in standard and not n.startswith("PYTHON")}
+        self.assertTrue({"RUN_TESTS_JOBS", "TESTS_DIR"} <= env, env)
+        for name in sorted(fast):
+            with self.subTest(changelog=name):
+                self.assertTrue(f"`{name}`" in log, f"CHANGELOG.md does not name `{name}`")
+        for name in sorted(env):
+            with self.subTest(changelog=name):
+                self.assertTrue(f"`{name}`" in log, f"CHANGELOG.md does not name `{name}`")
+            with self.subTest(header=name):
+                self.assertTrue(re.search(rf"\b{name}\b", header), f"the header of run-tests.sh does not name {name}")
+
     def test_waves_doc_has_the_rows(self):
         waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
         table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]

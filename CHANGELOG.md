@@ -48,6 +48,8 @@
   печатается целым блоком в исходном порядке. Совместим с bash 3.2. Порядок наборов — байтовый на любой машине (glob
   под `LC_ALL=C`, локаль наборов не меняется); наборы идут с `PYTHONDONTWRITEBYTECODE=1` — байткод не попадает в
   `tests/fixtures`, загрузка замороженного гейта 1.0.0 сама не пишет `__pycache__`. Набор `tests/run-tests.test.sh`.
+  Каталог наборов по-прежнему задаёт `TESTS_DIR` (по умолчанию `tests/` репозитория); теперь он назван в шапке
+  скрипта рядом с `RUN_TESTS_JOBS`.
 
 ### Тесты
 
@@ -60,6 +62,10 @@
   доказывает, что оракул эпизодов видит фикстуру.
   Порог `test_runs_fast` у `OfflineChain`, `RemnantsChain` и `Remnants150Chain` — по платформе (`CHAIN_FAST_SECONDS`):
   Linux 40 с, как раньше, macOS 90 с (при параллельном `run-tests.sh` раннер CI дал 44 с на `Remnants150Chain`).
+  Порог `ThreadsChain` (с 1.5.1, Linux 60 с, macOS 150 с) — константа `THREADS_FAST_SECONDS` того же модуля.
+- `Release160.test_every_developer_threshold_and_setting_is_in_the_changelog`: каждый порог `*_FAST_SECONDS`
+  сквозного модуля и каждая переменная окружения, которую читает `scripts/run-tests.sh`, названы в CHANGELOG по
+  имени, а переменные — ещё и в шапке скрипта.
 - `MetricsScript`, `DashEvents`, `W4DashReload`, `W4GateRoles`, `W4GateEventOnce`, `W4OwnerTimeWithoutRich`,
   `W4NoticeMinutes`, `W4MaskBoundaries`, `Release160`.
 
