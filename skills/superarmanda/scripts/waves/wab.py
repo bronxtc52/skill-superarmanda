@@ -5811,6 +5811,39 @@ def _owner_reminder(cfg, st, wave, w, number, sha, now):
     flush_notices(cfg, st, w)
 
 
+def _wave_took_back(cfg, st, wave, w, why):
+    """Class S: the wave wrote its own line (RUNNING, a question) while the owner was awaited for open threads — the
+    work is the wave's again. The wait for the owner and the gate's marks go, phase `running` (its questions, the idle
+    nudge and the window are handled by the usual tick again; its next DONE is gated afresh), the wave's line is not
+    touched; one event (the phase leaves `merging`). A merge already called is not undone: the recheck runs only before
+    any mark of an attempt (_threads_wait)."""
+    _leave_owner_wait(w)
+    for key in ("gate_sha", "gate_pr", "merging_since", "merge_poll_at"):
+        w.pop(key, None)
+    w["phase"] = "running"
+    w.pop("done_head", None)
+    save_state(cfg, st)
+    event(cfg, why)
+    return True
+
+
+def _recheck_status(cfg, st, wave, w, wdir, sha, who):
+    """Class S on the recheck after closed threads: the merge is the dispatcher's only while the status file holds its
+    own line or the wave's DONE (`who` from status_writer): then «go». A line of the wave — _wave_took_back (True). An
+    empty file (the wave is mid-rewrite) — None: nothing is written, the wave keeps waiting, the next poll gates again
+    and decides (one event per status)."""
+    if who in ("ours", "done"):
+        return "go"
+    again = read(wdir / "status", on_error=None)
+    if who == "wave":
+        return _wave_took_back(cfg, st, wave, w, f"{wave}: гейт на {sha[:12]} перепроверен, мерджа нет: статус волны "
+                                                 f"«{safe_text(again or '', 80)}», волна работает")
+    if once_per(w, "threads_recheck", f"status:{again}"):
+        event(cfg, f"{wave}: гейт на {sha[:12]} пройден заново, но мерджа нет: статус волны "
+                   f"«{safe_text(again or '', 80)}», жду")
+    return None
+
+
 def _threads_recheck(cfg, st, wave, w, wdir, number, sha):
     """#117 п.1: the wave waits for the owner's script only because of open threads (_threads_wait): the FULL gate is
     run again on every poll. A pass on the same sha and PR with no open thread merges it (the usual _gate_passed: the
@@ -5823,30 +5856,25 @@ def _threads_recheck(cfg, st, wave, w, wdir, number, sha):
     if v["verdict"] == "pass" and head == sha and v.get("number") == number and not v["unresolved"]:
         # collecting took a while: the wave may have taken the work back (RUNNING, a question) and be about to push a
         # fix; the merge is the dispatcher's only while the status is still its own line or the wave's DONE
-        if status_writer(wdir) not in ("ours", "done"):
-            again = read(wdir / "status", on_error=None)
-            if once_per(w, "threads_recheck", f"status:{again}"):
-                event(cfg, f"{wave}: гейт на {sha[:12]} пройден заново, но мерджа нет: статус волны "
-                           f"«{safe_text(again or '', 80)}», жду")
-            return None
+        held = _recheck_status(cfg, st, wave, w, wdir, sha, status_writer(wdir))
+        if held != "go":
+            return held
         w.get("notified", {}).pop("threads_recheck", None)
         event(cfg, f"{wave}: треды закрыты на {sha[:12]}, полный гейт пройден заново: мерджу сам")
-        return _gate_passed(cfg, st, wave, w, wdir, v)
-    who = status_writer(wdir) if v["verdict"] == "fail" and head == sha else None
-    if who in ("ours", "done", "wave"):
+        return _gate_passed(cfg, st, wave, w, wdir, v, recheck=True)
+    who = status_writer(wdir)
+    if v["verdict"] == "fail" and head == sha and who in ("ours", "done"):
         # round 3, F2: the gate on the same head fails — the owner's script would refuse too: back to the wave
         _leave_owner_wait(w)
         for key in ("gate_sha", "gate_pr", "merging_since", "merge_poll_at"):
             w.pop(key, None)
-        reasons = "; ".join(v["reasons"])
-        if who in ("ours", "done"):
-            return _gate_failed(cfg, st, wave, w, wdir, reasons)
-        w["phase"] = "running"  # the wave's own line stays: it works; its next DONE is gated again
-        w.pop("done_head", None)
-        save_state(cfg, st)
-        event(cfg, f"{wave}: гейт на {sha[:12]} не пройден в ожидании тредов ({safe_text(reasons, 300)}); статус волны "
-                   f"не трогаю, волна работает")
-        return True
+        return _gate_failed(cfg, st, wave, w, wdir, "; ".join(v["reasons"]))
+    if who == "wave":  # any outcome under the wave's own line (round 4, Codex P1): the wave works, `running`
+        if v["verdict"] == "fail" and head == sha:
+            return _wave_took_back(cfg, st, wave, w, f"{wave}: гейт на {sha[:12]} не пройден в ожидании тредов "
+                                                     f"({safe_text('; '.join(v['reasons']), 300)}); статус волны "
+                                                     f"не трогаю, волна работает")
+        return _recheck_status(cfg, st, wave, w, wdir, sha, who)
     why = "; ".join(v["reasons"]) if v["verdict"] != "pass" else f"незакрытых тредов: {len(v['unresolved'])}"
     if once_per(w, "threads_recheck", why):  # once_per keeps only the eid of the reason
         event(cfg, f"{wave}: гейт на {sha[:12]} перепроверен, мерджа нет ({v['verdict']}): {safe_text(why, 300)}")
@@ -5952,7 +5980,11 @@ def _send_gate_failure(cfg, st, wave, w):
     save_state(cfg, st)
 
 
-def _gate_passed(cfg, st, wave, w, wdir, v):
+def _gate_passed(cfg, st, wave, w, wdir, v, recheck=False):
+    """`recheck`: called by _threads_recheck (the wave waited only for open threads). The status read there is read
+    again under merge.lock, right before the mark of the attempt: waiting for the lock may take up to
+    INPUT_LOCK_SECONDS, and a RUNNING or a question written meanwhile stops the merge (class S, Astra-4 of round 4).
+    The window left is the unavoidable one between this read and `gh pr merge` (the wave's status is under no lock)."""
     repo, number, sha = cfg["repo"], v["number"], v["head"]
     try:
         gate.merge_argv(repo, number, sha)  # validates repo/PR/sha
@@ -5985,7 +6017,8 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
     try:
         with _MergeLock(cfg, wave):  # the owner's script marks under the same lock: one caller per sha
             owner = owner_merge_mark(cfg, wave, sha)
-            if not owner:
+            who = status_writer(wdir) if recheck and not owner else "ours"
+            if not owner and who in ("ours", "done"):
                 w["merge_called"] = sha  # saved BEFORE the call: a crash in it must not merge again
                 w["merge_attempt"] = {"sha": sha, "by": "dispatcher", "at": time.time()}
                 save_state(cfg, st)
@@ -6000,6 +6033,10 @@ def _gate_passed(cfg, st, wave, w, wdir, v):
         save_state(cfg, st)
         return True
     w.get("notified", {}).pop("merge_busy", None)
+    if not owner and who not in ("ours", "done"):  # no mark, no call (round 4, Astra-4)
+        held = _recheck_status(cfg, st, wave, w, wdir, sha, who)
+        save_state(cfg, st)
+        return held
     if owner:  # the owner's script called the merge of this sha: never a second call, never a «refused» notice (F2)
         _note_owner_merge(cfg, wave, w, sha)
         save_state(cfg, st)

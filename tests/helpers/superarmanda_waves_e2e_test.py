@@ -94,6 +94,14 @@ CHAIN = "e2e"
 RUN_ID = "2026-10-04-e2e"
 CTX_LIMIT = 50_000
 TICK = 60
+FLOAT_EPS = 1e-6  # допуск сравнения виртуальных времён: они суммы float, точного равенства нет
+# Порог test_runs_fast сценария threads — по замеру, не вслепую (ревью W1, круг 4). Linux локально: 33 с на 692da11, 6b5e534
+# и круге 4 одинаково (регрессии нет, ~105 тиков по ~0,3 с реального времени). macOS-раннер CI на 6b5e534 дал 81 с, причём
+# весь его прогон был в 1,2–1,65 раза медленнее прогона на 692da11 (343 теста 907 с против 768 с, e2e 524 с против 352 с).
+# Порог ловит реальное ожидание в сценарии (сон по-настоящему, ожидание лока до INPUT_LOCK_SECONDS = 120 с), а не скорость
+# раннера: Linux — 60 с (запас ~1,8 к замеру), macOS — 150 с (запас ~1,85 к 81 с; одно реальное ожидание лока поверх
+# сценария, 120 с + 33–81 с, его всё равно превышает).
+THREADS_FAST_SECONDS = 150 if sys.platform == "darwin" else 60
 DELAY = 20  # virtual seconds between what the dispatcher typed and the session's reaction
 BOT_STATUS = "[class=needs_decision rec=A red=no]"
 CAP_STATUS = "[class=blocked_cap rec=new_run red=no]"
@@ -1260,6 +1268,21 @@ def oracle_coderabbit(run):
          "the gate counted the unavailable CodeRabbit against W2")
 
 
+def check_reminder_times(at, gate_at, closed_at):
+    """The reminders of W1 on the virtual clock: none before the interval, then once per interval, none after the
+    merge. `at` — the virtual times of the reminders, `gate_at`/`closed_at` — of the gate pass and the closed thread."""
+    # Виртуальное время — сумма float-слагаемых: интервал ровно в REMIND_MINUTES выходит 1199.9999999999998, и
+    # сравнение без допуска ложно падает (CI ubuntu). Интервалы — разностями абсолютных времён, а не смещений от
+    # gate_at (лишнее вычитание — лишняя ошибка округления), и с допуском FLOAT_EPS: он на порядки меньше любого
+    # шага часов (TICK, полсекунды опроса лока), поэтому настоящий недобор интервала оракул по-прежнему видит.
+    times = [t - gate_at for t in at]
+    must(len(at) == THREAD_CLOSED_AFTER // (REMIND_MINUTES * 60), f"W1 reminders at {times}")
+    must(times[0] >= REMIND_MINUTES * 60 - TICK - FLOAT_EPS, f"an early reminder: {times}")
+    must(all(b - a_ >= REMIND_MINUTES * 60 - FLOAT_EPS for a_, b in zip(at, at[1:])),
+         f"reminders closer than the interval: {times}")
+    must(all(t <= closed_at + 3 * TICK + FLOAT_EPS for t in at), f"a reminder after the merge: {times}")
+
+
 def oracle_threads(run):
     """#117 end to end: W1's gate passed with an open thread; reminders came once per `merge_remind_minutes` while the
     owner's script waited; `wab.py status` and the dashboard showed ATTENTION past `merge_attention_minutes` (not before);
@@ -1283,11 +1306,7 @@ def oracle_threads(run):
     # the reminders: the fixed template, none before the interval, then once per interval, none after the merge
     remind = [(t, text) for t, wave, text in run.notices
               if wave == "W1" and text.splitlines()[0].endswith("ждёт тебя: запусти скрипт мерджа")]
-    times = [t - t1["gate_at"] for t, _ in remind]
-    must(len(remind) == THREAD_CLOSED_AFTER // (REMIND_MINUTES * 60), f"W1 reminders at {times}")
-    must(times[0] >= REMIND_MINUTES * 60 - TICK, f"an early reminder: {times}")
-    must(all(b - a_ >= REMIND_MINUTES * 60 for a_, b in zip(times, times[1:])), f"reminders closer than the interval: {times}")
-    must(all(t <= t1["closed_at"] - t1["gate_at"] + 3 * TICK for t in times), f"a reminder after the merge: {times}")
+    check_reminder_times([t for t, _ in remind], t1["gate_at"], t1["closed_at"])
     for _, text in remind:
         must("~/.cache" not in text and ".merge" not in text, "a path in the reminder")
     # ATTENTION on the long merge: not yet at the early snapshot, then in `wab.py status` and on the dashboard
@@ -1607,7 +1626,32 @@ class ThreadsChain(unittest.TestCase):
         oracle_no_wave_text(self.chain)
 
     def test_runs_fast(self):
-        must(self.seconds < 60, f"the scenario took {self.seconds:.0f} s")
+        must(self.seconds < THREADS_FAST_SECONDS, f"the scenario took {self.seconds:.0f} s")
+
+
+class ReminderOracle(unittest.TestCase):
+    """The oracle of the reminders on substituted times, without a chain. The virtual times are float sums: a CI run on
+    ubuntu got reminders exactly one interval apart, and the subtraction of `gate_at` made the gap 1199.9999999999998."""
+
+    GATE = 2460.0000000000005  # with it, (gate + 2340) - gate - ((gate + 1140) - gate) == 1199.9999999999995
+
+    def check(self, *after_gate):
+        check_reminder_times([self.GATE + t for t in after_gate], self.GATE, self.GATE + THREAD_CLOSED_AFTER)
+
+    def test_reminders_exactly_one_interval_apart_pass_despite_the_float_error(self):
+        check_reminder_times([3600.0000000000005, 4800.0], self.GATE, self.GATE + THREAD_CLOSED_AFTER)
+
+    def test_reminders_closer_than_the_interval_fail(self):
+        with self.assertRaisesRegex(AssertionError, "reminders closer than the interval"):
+            self.check(REMIND_MINUTES * 60, 2 * REMIND_MINUTES * 60 - 1)
+        with self.assertRaisesRegex(AssertionError, "reminders closer than the interval"):
+            self.check(REMIND_MINUTES * 60, 2 * REMIND_MINUTES * 60 - 0.001)
+
+    def test_an_early_reminder_and_one_after_the_merge_fail(self):
+        with self.assertRaisesRegex(AssertionError, "an early reminder"):
+            self.check(REMIND_MINUTES * 60 - TICK - 1, 2 * REMIND_MINUTES * 60)
+        with self.assertRaisesRegex(AssertionError, "a reminder after the merge"):
+            self.check(REMIND_MINUTES * 60, THREAD_CLOSED_AFTER + 3 * TICK + 1)
 
 
 class Mutations(unittest.TestCase):
