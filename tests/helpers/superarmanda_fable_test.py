@@ -1246,6 +1246,33 @@ class TextStoreEpisodes(FableLimitBase):
         self.assert_one_store_event(how)
         self.assert_nothing_forged_out(how, delivered)
 
+    def stash_on_tick(self, text):
+        """One more keeping of `text` on a tick, with the wave's record as it is saved (the mark persists)."""
+        st = wab.load_state(self.cfg)
+        wab.stash_text(self.cfg, "W1", text, st["waves"]["W1"])
+        wab.save_state(self.cfg, st)
+
+    def test_partial_failure_of_the_store_is_one_event_per_episode(self):
+        # L-1: the status line is kept idly every tick (its file is there), another text fails every tick (a
+        # directory sits where its file goes). The idle «success» never ends the episode: one event in three ticks.
+        self.fresh()
+        self.set_status(self.cfg, "W1", self.TEXT)
+        self.tick()  # the status line written for real once
+        bad = "начало набранного ответа"
+        store = wab.wave_dir(self.cfg, "W1") / ".texts"
+        (store / wab.text_eid(bad).split(":", 1)[1]).mkdir()
+        for _ in range(3):
+            self.stash_on_tick(bad)
+            self.tick()  # the status unchanged: its keeping takes the idle path
+        self.assertEqual(self.store_events(), 1, self.events())
+        self.assertEqual(self.w()["notified"].get("text_store"), wab.text_eid("1"))
+        # a real write (os.replace done) ends the episode: the next failure is a new episode, a new event
+        self.stash_on_tick("новый текст волны")
+        self.assertNotIn("text_store", self.w()["notified"])
+        self.stash_on_tick(bad)
+        self.tick()
+        self.assertEqual(self.store_events(), 2, self.events())
+
     def test_every_path_with_every_state_of_the_store(self):
         paths = [self.path_status_steady, self.path_status_rewrite, self.path_quote, self.path_typed_answer,
                  self.path_fable_switch]

@@ -524,9 +524,11 @@ def stash_text(cfg, wave, text, w=None):
     """Keep `text` of the wave in its store (atomically, 0600) and return its text_eid; any text is kept, one shaped
     like an eid too. A failure to write is an event, never a stop: the eid is still the episode's identity, only the
     text cannot be told later. I3: with the record `w` the event is written once per episode of the failure (the mark
-    `notified.text_store`, ended by the next successful write); every caller in wab.py passes its record."""
+    `notified.text_store`, ended only by a real write, os.replace done: an idle keeping of a text whose file is
+    already there is no proof the store takes writes and never ends it); every caller in wab.py passes its record."""
     text = "" if text is None else str(text)
     e = text_eid(text)
+    wrote = False
     try:
         d = wave_dir(cfg, wave) / TEXTS_DIR
         d.mkdir(mode=0o700, exist_ok=True)
@@ -541,6 +543,7 @@ def stash_text(cfg, wave, text, w=None):
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, target)
+                wrote = True
             except BaseException:
                 pathlib.Path(tmp).unlink(missing_ok=True)
                 raise
@@ -548,8 +551,8 @@ def stash_text(cfg, wave, text, w=None):
         if w is None or once_per(w, "text_store", "1"):
             event(cfg, f"{wave}: the wave's text store not written: {_exc_text(err)}")
     else:
-        if isinstance(w, dict) and isinstance(w.get("notified"), dict):
-            w["notified"].pop("text_store", None)  # written: the episode of the failure is over
+        if wrote and isinstance(w, dict) and isinstance(w.get("notified"), dict):
+            w["notified"].pop("text_store", None)  # really written: the episode of the failure is over
     return e
 
 
