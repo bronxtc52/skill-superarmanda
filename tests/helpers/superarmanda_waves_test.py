@@ -18475,7 +18475,7 @@ class W6OwnerTime(Base):
     # ----- docs -----
     def test_release_docs_and_agent_docs(self):
         skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.[234]\.\d+"\s*$')  # the version itself is pinned by the newest release's test
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.[2-9]\.\d+"\s*$')  # the version itself is pinned by the newest release's test
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         m = re.search(r"(?ms)^## 1\.2\.6 — 2026-10-06\n(.*?)(?=^## )", log)
         self.assertTrue(m, "CHANGELOG.md: the section `## 1.2.6 — 2026-10-06`")
@@ -19026,6 +19026,12 @@ class MetricsScript(unittest.TestCase):
             "other wave interleaved does not reset": ([blocked, other, blocked, other], 1),
             "phase status is a truncated prefix": ([blocked, f"{t} W1: phase=running ctx=1k restarts=0 status=BLOCKED: [class=blocked_cap rec=new_run red"], 1),
             "bare RUNNING between": ([blocked, f"{t} W1: RUNNING", blocked], 2),
+            "successful say answers the fork": ([blocked, f"{t} W1: say: [координатор] ответ", blocked], 2),
+            "say of another wave does not": ([blocked, f"{t} W2: say: ответ", blocked], 1),
+            "say FAILED does not answer": ([blocked, f"{t} W1: say FAILED (no window x): ответ", blocked], 1),
+            "say service lines answer nothing": ([
+                blocked, f"{t} W1: say: owner-answered marker not written (disk full)",
+                f"{t} W1: say: status rewritten while the marker was taken; the marker answers no episode", blocked], 1),
         }
         for name, (lines, want) in cases.items():
             with self.subTest(name):
@@ -19038,6 +19044,220 @@ class MetricsScript(unittest.TestCase):
         shutil.copytree(self.FIXTURE, run)
         mutate(run)
         return run
+
+    def test_bad_input_is_no_data_not_traceback(self):
+        """#107: испорченный и чужой ввод — «нет данных», код 1, никогда traceback."""
+        def runs(run, **patch):
+            f = run / "W1" / "runs.json"
+            d = json.loads(f.read_text(encoding="utf-8"))
+            d.update(patch)
+            f.write_text(json.dumps(d), encoding="utf-8")
+
+        def bad_index(value):
+            def mutate(run):
+                f = run / "W1" / "runs.json"
+                d = json.loads(f.read_text(encoding="utf-8"))
+                d["runs"][0]["index"] = value
+                f.write_text(json.dumps(d), encoding="utf-8")
+            return mutate
+
+        deep = "[" * 100000
+
+        def deep_runs(run):
+            (run / "W1" / "runs.json").write_text(deep, encoding="utf-8")
+
+        def deep_manifest(run):
+            for m in (run / "W1" / "superarmanda").glob("manifest*.json"):
+                m.write_text(deep, encoding="utf-8")
+
+        cases = {f"index {v!r}": bad_index(v) for v in ([], {}, True, 0, -1, "1", 1.5)}
+        cases.update({
+            "deep runs.json": deep_runs,
+            "deep manifest": deep_manifest,
+            "runs.json of another wave": lambda run: runs(run, wave="W2"),
+            "runs.json of a wrong version": lambda run: runs(run, version=2),
+            "runs.json without a version": lambda run: runs(run, version=None),
+        })
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                run = self.make(mutate)
+                r = self.cli(run, "--json")
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                w1 = {w["wave"]: w for w in json.loads(r.stdout)["waves"]}["W1"]
+                self.assertTrue(w1["problems"], w1)
+                self.assertIsNone(w1["fix_cycles"], w1)
+
+    def _lone_wave(self, copy_cycles=2, outside_cycles=7, in_copy=True):
+        """Каталог прогона с одной волной W1: runs.json называет manifest по абсолютному пути ВНЕ каталога волны
+        (оригинал, fix_cycles=outside_cycles); в копии рядом manifest без run.index (по индексу его не найти)."""
+        base = Path(tempfile.mkdtemp(prefix="wab-metrics-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        manifest = lambda n: json.dumps({"version": 1, "wave": "W1", "tasks": {"t": {"fix_cycles": n}}})  # noqa: E731
+        outside = base / "original" / "manifest.json"
+        outside.parent.mkdir()
+        outside.write_text(manifest(outside_cycles), encoding="utf-8")
+        run = base / "run"
+        (run / "W1" / "superarmanda").mkdir(parents=True)
+        (run / "events.log").write_text("", encoding="utf-8")
+        (run / "W1" / "runs.json").write_text(json.dumps({"version": 1, "wave": "W1", "runs": [
+            {"index": 1, "manifest": str(outside)}]}), encoding="utf-8")
+        if in_copy:
+            (run / "W1" / "superarmanda" / "manifest.json").write_text(manifest(copy_cycles), encoding="utf-8")
+        return run, outside
+
+    def test_manifest_outside_the_wave_dir_is_never_read(self):
+        run, _ = self._lone_wave()
+        r = self.cli(run, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        w1 = json.loads(r.stdout)["waves"][0]
+        self.assertEqual((w1["runs"], w1["fix_cycles"]), (1, 2))  # числа копии, а не оригинала
+        run, _ = self._lone_wave(in_copy=False)
+        r = self.cli(run, "--json")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        w1 = json.loads(r.stdout)["waves"][0]
+        self.assertIsNone(w1["fix_cycles"])
+        self.assertTrue(w1["problems"])
+
+    def test_symlink_manifest_pointing_out_is_never_read(self):
+        run, outside = self._lone_wave(in_copy=False)
+        outside.write_text(json.dumps({"version": 1, "wave": "W1", "run": {"index": 1},
+                                       "tasks": {"t": {"fix_cycles": 7}}}), encoding="utf-8")
+        (run / "W1" / "superarmanda" / "manifest-run1.json").symlink_to(outside)
+        (run / "W1" / "superarmanda" / "manifest.json").symlink_to(outside)
+        r = self.cli(run, "--json")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        w1 = json.loads(r.stdout)["waves"][0]
+        self.assertIsNone(w1["fix_cycles"])
+        self.assertTrue(w1["problems"])
+
+    def test_manifest_of_another_run_is_not_substituted(self):
+        run, _ = self._lone_wave()
+        (run / "W1" / "superarmanda" / "manifest.json").write_text(json.dumps(
+            {"version": 1, "wave": "W1", "run": {"index": 2}, "tasks": {"t": {"fix_cycles": 2}}}), encoding="utf-8")
+        r = self.cli(run, "--json")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        w1 = json.loads(r.stdout)["waves"][0]
+        self.assertIsNone(w1["fix_cycles"])
+        self.assertTrue(w1["problems"])
+
+    def test_manifest_with_a_broken_run_identity_is_not_counted(self):
+        """Codex P2 на #118: manifest без `run` — старый формат и засчитывается; manifest, который заявляет
+        прогон, но с испорченным `run`/`run.index`, — испорченный ввод, а не «свой» прогон."""
+        def with_run(run_value):
+            run, _ = self._lone_wave()
+            m = run / "W1" / "superarmanda" / "manifest.json"
+            d = json.loads(m.read_text(encoding="utf-8"))
+            d["run"] = run_value
+            m.write_text(json.dumps(d), encoding="utf-8")
+            return run
+
+        broken = [{"index": v} for v in (False, True, [], {}, 0, -1, "1", 1.5, None)] + [{}, [], "1", 1, None]
+        for value in broken:
+            with self.subTest(run=value):
+                r = self.cli(with_run(value), "--json")
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                w1 = json.loads(r.stdout)["waves"][0]
+                self.assertIsNone(w1["fix_cycles"], w1)
+                self.assertTrue(w1["problems"], w1)
+        r = self.cli(with_run({"index": 1}), "--json")  # исправное заявление — засчитывается
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["waves"][0]["fix_cycles"], 2)
+
+    def test_every_foreign_or_corrupted_source_is_no_data(self):
+        """Класс находок Codex на #118 (инвариант целиком): каждый читаемый файл — внутри каталога волны, runs.json
+        строго валиден (версия — целое 1, не bool; номера прогонов не повторяются), заявленный `run.index`
+        выбранного manifest равен номеру прогона из runs.json. Иначе — «нет данных», код 1, без traceback."""
+        def lone(mutate):
+            run, _ = self._lone_wave()
+            mutate(run / "W1")
+            return run
+
+        def runs_symlink_out(w):
+            outside = w.parent.parent / "outside-runs.json"
+            outside.write_text((w / "runs.json").read_text(encoding="utf-8"), encoding="utf-8")
+            (w / "runs.json").unlink()
+            (w / "runs.json").symlink_to(outside)
+
+        def patch_runs(**patch):
+            def mutate(w):
+                d = json.loads((w / "runs.json").read_text(encoding="utf-8"))
+                d.update(patch)
+                (w / "runs.json").write_text(json.dumps(d), encoding="utf-8")
+            return mutate
+
+        def duplicate_index(w):
+            d = json.loads((w / "runs.json").read_text(encoding="utf-8"))
+            d["runs"].append(dict(d["runs"][0]))
+            (w / "runs.json").write_text(json.dumps(d), encoding="utf-8")
+
+        def other_run_by_path(w):
+            (w / "other.json").write_text(json.dumps({"version": 1, "wave": "W1", "run": {"index": 2},
+                                                      "tasks": {"t": {"fix_cycles": 5}}}), encoding="utf-8")
+            (w / "superarmanda" / "manifest.json").unlink()
+            d = json.loads((w / "runs.json").read_text(encoding="utf-8"))
+            d["runs"][0]["manifest"] = str(w / "other.json")
+            (w / "runs.json").write_text(json.dumps(d), encoding="utf-8")
+
+        cases = {"runs.json symlinked out": runs_symlink_out, "duplicate run index": duplicate_index,
+                 "manifest by path declares another run": other_run_by_path}
+        cases.update({f"runs.json version {v!r}": patch_runs(version=v) for v in (True, 1.0, "1")})
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                r = self.cli(lone(mutate), "--json")
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertNotIn("Traceback", r.stderr)
+                w1 = json.loads(r.stdout)["waves"][0]
+                self.assertIsNone(w1["fix_cycles"], w1)
+                self.assertTrue(w1["problems"], w1)
+        # Astra на 3f1b376: текст из чужого файла (одиночный суррогат) не роняет вывод ни в одном формате
+        for fmt in (("--json",), ()):
+            with self.subTest("lone surrogate in wave", fmt=fmt):
+                run = lone(lambda w: (w / "runs.json").write_text(
+                    (w / "runs.json").read_text(encoding="utf-8").replace('"wave": "W1"', '"wave": "\\ud800"'),
+                    encoding="utf-8"))
+                self.assertIn("\\ud800", (run / "W1" / "runs.json").read_text(encoding="utf-8"))
+                r = self.cli(run, *fmt)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                if fmt:
+                    w1 = json.loads(r.stdout)["waves"][0]
+                    self.assertIsNone(w1["fix_cycles"], w1)
+                    self.assertTrue(w1["problems"], w1)
+                else:
+                    self.assertIn("нет данных", r.stdout)
+        r = self.cli(lone(lambda w: None), "--json")  # контроль: исправный каталог засчитывается
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["waves"][0]["fix_cycles"], 2)
+
+    def test_absurd_counts_and_unreadable_wave_dir_are_no_data(self):
+        """Tester на 4cf014e: каждое значение fix_cycles проходит, а сумма не печатается (больше 4300 цифр), и
+        каталог волны без права чтения — тоже «нет данных», код 1, без traceback (инвариант «никогда traceback»)."""
+        def huge_cycles(w):
+            (w / "superarmanda" / "manifest.json").write_text(json.dumps({"version": 1, "wave": "W1", "tasks": {
+                f"t{i}": {"fix_cycles": int("9" * 4299)} for i in range(12)}}), encoding="utf-8")
+        run, _ = self._lone_wave()
+        huge_cycles(run / "W1")
+        cases = {"huge fix_cycles": run}
+        if os.geteuid() != 0:  # root читает каталог и без прав
+            locked, _ = self._lone_wave()
+            (locked / "W1").chmod(0)
+            self.addCleanup((locked / "W1").chmod, 0o755)
+            cases["unreadable wave dir"] = locked
+        for name, run in cases.items():
+            for fmt in (("--json",), ()):
+                with self.subTest(name, fmt=fmt):
+                    r = self.cli(run, *fmt)
+                    self.assertEqual(r.returncode, 1, r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    if fmt:
+                        w1 = json.loads(r.stdout)["waves"][0]
+                        self.assertIsNone(w1["fix_cycles"], w1)
+                        self.assertTrue(w1["problems"], w1)
+                    else:
+                        self.assertIn("нет данных", r.stdout)
 
     def test_a_broken_or_missing_file_is_named_not_skipped(self):
         def break_it(run):
@@ -20675,16 +20895,39 @@ class Release145(unittest.TestCase):
     """The release 1.4.5 (#102 пп.4,6, #105 пп.2-4, #103; wave W4 of waves-remnants): version, the CHANGELOG section
     on top."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.4\.5"\s*$')
+    # the version of SKILL.md moved on to 1.5.0 (#107): Release150 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.4\.5 — 2026-10-11$", "1.4.5 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.4\.5 — 2026-10-11$", "CHANGELOG.md: the section of 1.4.5")
+        self.assertTrue(log.index("## 1.4.5") < log.index("## 1.4.4"), "1.4.5 is above 1.4.4")
         body = re.search(r"(?ms)^## 1\.4\.5 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
         for needle in ("#102", "#105", "#103", "`waves-remnants`", "`wab.TUNABLE`", "`minutes`", "`W4MaskBoundaries`"):
             self.assertIn(needle, body)
+
+
+class Release150(unittest.TestCase):
+    """The release 1.5.0 (#107, the summary of the chain waves-remnants; wave W5): version, the CHANGELOG section on top
+    with the PRs of the waves and the remnant issue, the rows of what is implemented."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.0"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.0 — 2026-10-11$", "1.5.0 is the first section")
+        body = re.search(r"(?ms)^## 1\.5\.0 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
+        for needle in ("#107", "`waves-remnants`", "pull/112", "pull/114", "pull/115", "pull/116", "issues/113",
+                       "`RemnantsChain`", "e2e-1.4.1-state", "`RecursionError`", "`say:`"):
+            self.assertIn(needle, body)
+
+    def test_waves_doc_has_the_rows_of_what_is_implemented(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
+        self.assertRegex(table, r"(?m)^\| Замер `metrics\.py` устойчив[^\n]*реализовано \(1\.5\.0; \[#107\]")
+        self.assertRegex(table, r"(?m)^\| Сквозная приёмка цепочки `waves-remnants`[^\n]*`RemnantsChain` \|$")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
