@@ -8883,11 +8883,13 @@ class Regate(GateBase):  # D2: the head moved while the wave sat in `merging`
 
 
 class MergeAfterThreads(GateBase):  # #117 п.1–3 (1.5.1): the merge decision of phase `merging`, one invariant
-    """THE invariant (wab._threads_wait / _owner_waits): `gh pr merge` of a (wave, sha) is called at most once (the mark
-    `merge_called` saved BEFORE the call, in state.json, kept until the head moves); an automatic call in `merging`
-    happens only with merge_gate auto, when the wave waits ONLY for open threads of that sha (no merge or ready call
-    for it yet) and a fresh full gate on that same sha passes with no open thread. Every other state of `merging` is
-    the owner's script, with a reminder no more than once per `merge_remind_minutes`."""
+    """THE invariant (wab._threads_wait / _owner_waits / _MergeLock): `gh pr merge` is called once, and only on the sha
+    the wave handed in, by whichever caller marks the attempt first under merge.lock — the dispatcher (`merge_called`,
+    `merge_attempt` in state.json, kept until the head moves) or the owner's script (owner-merge.json); the owner's call
+    after a refused or unknown call of the dispatcher is the hand-off. An automatic call in `merging` happens only with
+    merge_gate auto, when the wave waits ONLY for open threads of that sha (`owner_wait` «threads»), a fresh full gate on
+    that same sha passes with no open thread and the wave's status is still the dispatcher's line or DONE. Every other
+    state of `merging` is the owner's script, with a reminder no more than once per `merge_remind_minutes`."""
     NEW = "e" * 40
     OPEN = [{"id": "PRRT_a", "isResolved": False}]
     CLOSED = [{"id": "PRRT_a", "isResolved": True}]
@@ -9013,6 +9015,141 @@ class MergeAfterThreads(GateBase):  # #117 п.1–3 (1.5.1): the merge decision 
                     self.assertNotIn("merge_called", self.rec())
                 self.assertEqual(self.reminders(), [], "no reminder inside the interval")
                 self.assertNotIn("result of the merge call is unknown", log if outcome == "ok" else "")
+        # the axes of the review of round 1 (P2-1..P2-3): who calls `gh pr merge` first — the owner's script or the
+        # dispatcher (while the script collects the gate again after closing the threads); who took the draft off and
+        # how (none / the dispatcher's ready went through / was refused / the PR stayed draft); what the wave's status
+        # says when the thread is closed. ONE call per sha the wave handed in, except the owner's own call after the
+        # dispatcher's refused one (the hand-off of a refusal, as since 1.3).
+        combos = itertools.product(("owner", "dispatcher"), ("none", "ready_ok", "ready_refused", "still_draft"),
+                                   ("ours", "DONE", "RUNNING", "BLOCKED: вопрос координатору", ""), ("ok", "refuse"))
+        for first, ready, status, outcome in combos:
+            with self.subTest(first=first, ready=ready, status=status, outcome=outcome):
+                self.who_merges_first(first, ready, status, outcome)
+
+    def merging_after_ready(self, ready):
+        """The state before the thread is closed: the gate passed with one open thread (merging, the owner's script);
+        `ready` says who took the draft off before that and with what result."""
+        self.ready_rc = 0
+        if ready == "none":
+            return self.threads_gate()
+        self.start()
+        self.pr = {**self.pr, "isDraft": True}
+        self.facts = green_facts()
+        self.facts["pr"]["draft"] = True
+        if ready == "ready_refused":
+            self.ready_rc = 1
+        self.tick()  # a draft without threads: the dispatcher asks `gh pr ready`
+        if ready == "still_draft":
+            self.at(0.5)
+            self.tick()  # GitHub still shows a draft: handed to the owner
+        if ready == "ready_ok":  # ready went through; CodeRabbit now reviews the non-draft PR and opens a thread
+            self.pr = {**self.pr, "isDraft": False}
+            self.facts = green_facts(threads=list(self.OPEN))
+            self.at(0.5)
+            self.tick()
+        else:  # the PR was made ready by hand meanwhile, a thread is open: the owner's script is the way
+            self.pr = {**self.pr, "isDraft": False}
+            self.facts = green_facts(threads=list(self.OPEN))
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.merges(), [])
+
+    def run_owner_script(self):
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                wab.owner_merge(wab.load_chain(self.path), "W1", RUN_ID, HEAD)
+        except SystemExit as e:
+            return f"{out.getvalue()}{e}"
+        return out.getvalue()
+
+    def who_merges_first(self, first, ready, status, outcome):
+        self.gh_calls.clear()
+        self.tg.clear()
+        self.at(0)
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "main"}
+        self.manifest, self.work = green_manifest(), dict(WORK)
+        self.merge_mode = "ok"
+        if hasattr(self, "cfg"):  # the owner's mark of the previous case (the same run, the same sha) is not this one's
+            (wab.wave_dir(self.cfg, "W1") / wab.OWNER_MERGE_MARK).unlink(missing_ok=True)
+        self.merging_after_ready(ready)
+        self.tg.clear()  # the notices of the hand-off itself are not what is checked here
+        (self.cfg["run_dir"] / "events.log").write_text("", encoding="utf-8")
+        if status != "ours":
+            self.set_status(self.cfg, "W1", status) if status else \
+                (wab.wave_dir(self.cfg, "W1") / "status").write_text("", encoding="utf-8")
+        self.merge_mode = outcome
+        ticks = []
+
+        def resolve(query, variables):  # the owner's script closes the thread on GitHub
+            self.facts["threads"] = [{**t, "isResolved": True} if t["id"] == variables["id"] else t
+                                     for t in self.facts["threads"]]  # never the shared OPEN dicts
+            if first == "dispatcher":  # the dispatcher's poll falls between the closing and the script's merge
+                self.at(1)
+                ticks.append(self.safe_tick())
+            return {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}
+        with mock.patch.object(wab, "gh_graphql", side_effect=resolve):
+            said = self.run_owner_script()
+        for minute in (2, 3):  # the dispatcher's next polls; GitHub has not shown MERGED yet
+            self.at(minute)
+            self.safe_tick()
+        auto = ready in ("none", "ready_ok") and status in ("ours", "DONE")  # the wave waits ONLY for threads
+        calls = self.merges()
+        self.assertTrue(all(c == tuple(gate.merge_argv("o/r", 7, HEAD)) for c in calls), calls)
+        refused_notices = [t for t in self.tg if "мердж не выполнен" in t]
+        if first == "dispatcher" and auto:
+            want = 2 if outcome == "refuse" else 1  # refused: handed to the owner, whose script calls once
+            self.assertEqual(len(calls), want, said)
+            self.assertEqual(self.rec()["merge_called"], HEAD)
+            self.assertEqual(len(refused_notices), 1 if outcome == "refuse" else 0)
+            if outcome == "ok":
+                self.assertIn("мердж уже запрошен диспетчером", said)
+        else:  # the owner's script makes the one call; the dispatcher never calls after it, never a false refusal
+            self.assertEqual(len(calls), 1, said)
+            self.assertNotIn("merge_called", self.rec())
+            self.assertEqual(refused_notices, [])
+        if first == "dispatcher" and ready in ("none", "ready_ok") and status not in ("ours", "DONE"):
+            self.assertIn("мерджа нет", self.log())
+
+    def test_a_draft_made_ready_by_the_dispatcher_is_merged_once_its_thread_is_closed(self):  # P2-2 of round 1
+        self.merging_after_ready("ready_ok")
+        self.assertEqual(len([c for c in self.gh_calls if c[:3] == ("gh", "pr", "ready")]), 1)
+        self.facts = green_facts(threads=list(self.CLOSED))
+        self.at(1)
+        self.tick()
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+        self.at(2)
+        self.tick()
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(self.log().count("merge of PR #7 requested"), 1)
+
+    def test_a_wave_that_took_the_work_back_is_not_merged_when_the_thread_closes(self):  # P2-3 of round 1
+        self.threads_gate()
+        self.set_status(self.cfg, "W1", "RUNNING")  # the wave works on the threads, its fix is not pushed yet
+        self.facts = green_facts(threads=list(self.CLOSED))
+        for minute in (1, 2, 3):
+            self.at(minute)
+            self.tick()
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.log().count("мерджа нет: статус волны"), 1, self.log())
+        self.set_status(self.cfg, "W1", "DONE")  # the wave hands it in again on the same head
+        self.at(4)
+        self.tick()
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_merging_since_starts_afresh_after_the_phase_was_left(self):  # P3-1 of round 1
+        self.threads_gate()
+        since = self.rec()["merging_since"]
+        st = self.get_state(self.cfg)
+        st["waves"]["W1"]["phase"] = "gate"  # left `merging` without a re-gate (the coordinator took it back)
+        self.put_state(self.cfg, st)
+        self.set_status(self.cfg, "W1", "DONE")
+        self.at(90)
+        self.tick()
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertEqual(self.rec()["merging_since"], self.now)
+        self.assertNotEqual(self.rec()["merging_since"], since)
 
     # ----- acceptance 1: the thread is closed on the same head -> the next tick merges, one merge event -----
     def test_a_thread_closed_on_the_same_head_is_merged_by_the_next_tick(self):
@@ -16346,6 +16483,8 @@ _allow("wab.py", "owner_handover", _SHA, "str(pr_head)[:12]", "str(head)[:12]", 
 _allow("wab.py", "_merging_tick", _DEDUP, "_exc_text(e)[:150]")
 _allow("wab.py", "_merging_tick", _SHA, "str(head)[:12]", "sha[:12]")
 _allow("wab.py", "_threads_recheck", _SHA, "sha[:12]")  # 1.5.1, #117
+_allow("wab.py", "_note_owner_merge", _SHA, "sha[:12]")  # 1.5.1, review of W1 round 1 (P2-1)
+_allow("wab.py", "_owner_merge_take", _SHA, "sha[:12]")  # 1.5.1, review of W1 round 1 (P2-1)
 _allow("wab.py", "_alarm_tick", _DEDUP, "_exc_text(e)[:150]", "str(facts['error'])[:150]")
 _allow("wab.py", "_alarm_tick", _SHA, "head[:12]")
 _allow("wab.py", "_pending_alarm_enter", _DEDUP, "_exc_text(e)[:150]")
