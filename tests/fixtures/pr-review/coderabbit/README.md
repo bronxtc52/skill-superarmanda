@@ -58,6 +58,29 @@ gh api "repos/bronxtc52/skill-superarmanda/issues/N/comments?per_page=100"
 текст тел ботов не менялся. Секретов и личных данных, кроме публичных логинов, в телах нет (проверено поиском по
 токенам и глазами; слова `password`/`SECRET` в `pr116` — цитаты предупреждений Ruff из сводки бота).
 
-Тест `CodeRabbitServiceComment` (`tests/helpers/superarmanda_pr_review_test.py`) вставляет в живую сводку #118 блок
-пропуска черновика из живого шаблона «Draft PR not reviewed» (`CODERABBIT_DRAFT_SKIP` того же файла) вместо блока
-«review in progress» — живой сводки черновика нового формата в этом репозитории нет.
+## Живой черновик «Draft PR not reviewed» (#113 W1 п.2, 1.5.1, круг 4)
+
+Снято 2026-10-12 тем же способом (только чтение, `gh api … ?per_page=100`), в той же форме и с теми же правилами
+удаления, что выше:
+
+| Файл | PR | HEAD | Что показывает |
+|---|---|---|---|
+| `pr120-rest.json` | bronxtc52/skill-superarmanda#120 (draft) | `692da11ddd76b583dd97e550cca0dc03b138b48f` | живая сводка CodeRabbit черновика: блок `skip review by coderabbit.ai` с `Draft PR not reviewed`, флажок `<!-- autopilot:start -->`, `<!-- tips_end -->` (issue comment `6118957590`); рядом review и две inline-находки Codex P1 и его сводка |
+
+Команды:
+
+```
+gh api repos/bronxtc52/skill-superarmanda/pulls/120
+gh api "repos/bronxtc52/skill-superarmanda/pulls/120/reviews?per_page=100"
+gh api "repos/bronxtc52/skill-superarmanda/pulls/120/comments?per_page=100"
+gh api "repos/bronxtc52/skill-superarmanda/issues/120/comments?per_page=100"
+```
+
+Убрано: комментарий владельца (`bronxtc52`) и всё, что не от ботов `coderabbitai[bot]` и `chatgpt-codex-connector[bot]`;
+поля, которые код не читает (оставлены те же, что выше); из PR — только `head.sha` и `draft`.
+
+Заменено: ничего — тела ботов в снимке как есть (ссылок `scope=…` в них нет; секретов и личных данных, кроме публичных
+логинов, нет — проверено поиском по токенам и глазами).
+
+Тест `CodeRabbitServiceComment` (`tests/helpers/superarmanda_pr_review_test.py`) проверяет живую сводку черновика #120
+как есть: склейки синтетического блока с ответом другого PR больше нет.

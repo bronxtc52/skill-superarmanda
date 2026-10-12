@@ -9271,13 +9271,24 @@ class MergeAfterThreads(GateBase):  # #117 п.1–3 (1.5.1): the merge decision 
         return out.getvalue()
 
     def dash_text(self):
-        import dash
-        from rich.console import Console
+        """The dashboard's panel of the current wave, or None without rich (a supported standalone setup): only the
+        dashboard checks are skipped then (dash_has), the rest of the test runs."""
+        try:
+            import dash
+            from rich.console import Console
+        except ImportError:
+            return None
         con = Console(width=200, record=True, file=io.StringIO())
         with mock.patch.object(dash.wab, "pane_text", return_value=""), \
                 mock.patch.object(dash.wab, "tmux_alive", return_value=True):
             con.print(dash.current_panel(self.cfg, wab.load_state(self.cfg)))
         return con.export_text()
+
+    def dash_has(self, needle, present=True):
+        text = self.dash_text()
+        if text is None:  # no rich: the dashboard is not checked
+            return
+        (self.assertIn if present else self.assertNotIn)(needle, text)
 
     def test_merging_without_merged_past_the_threshold_is_an_attention_signal(self):
         for status in (None, "DONE"):  # the BLOCKED line of the owner's script, or the wave's own DONE
@@ -9290,12 +9301,12 @@ class MergeAfterThreads(GateBase):  # #117 п.1–3 (1.5.1): the merge decision 
                 self.at(29)
                 self.tick()
                 self.assertNotIn("ATTENTION", self.status_out())
-                self.assertNotIn("ATTENTION", self.dash_text())
+                self.dash_has("ATTENTION", present=False)
                 self.at(31)
                 self.tick()
                 out = self.status_out()
                 self.assertIn("ATTENTION: W1: мердж ждёт", out)
-                self.assertIn("ATTENTION", self.dash_text())
+                self.dash_has("ATTENTION")
                 self.view = {"state": "MERGED", "mergeCommit": {"oid": "d" * 40}, "headRefOid": HEAD,
                              "baseRefName": "main"}
                 self.at(32)
@@ -9309,7 +9320,7 @@ class MergeAfterThreads(GateBase):  # #117 п.1–3 (1.5.1): the merge decision 
         self.assertNotIn("ATTENTION", self.status_out())
         self.at(31)
         self.assertIn("ATTENTION: W1: мердж ждёт", self.status_out())
-        self.assertIn("ATTENTION", self.dash_text())
+        self.dash_has("ATTENTION")
 
     def test_the_threshold_is_tunable_and_defaults_for_an_old_chain_json(self):
         cfg, _ = self.chain()
@@ -9468,9 +9479,286 @@ class MergeAfterThreads(GateBase):  # #117 п.1–3 (1.5.1): the merge decision 
                 self.assertIn("ATTENTION: W1: мердж ждёт", out)
                 self.assertIn("мердж запрошен, GitHub ещё не показал MERGED", out)
                 self.assertNotIn("не запущен", out)
-                self.assertIn("мердж запрошен", self.dash_text())
+                self.dash_has("мердж запрошен")
                 (wab.wave_dir(self.cfg, "W1") / wab.OWNER_MERGE_MARK).unlink(missing_ok=True)
 
+    # ----- round 3, class S: who wrote the status decides (triage-3: A1, F1, F2 and paths 1–11) -----
+    P1_ON_HEAD = [{"user": BOT, "commit_id": HEAD, "original_commit_id": HEAD, "body": "![P1 Badge](x) bad",
+                   "html_url": "u"}]
+    STATUSES = ("ours", "DONE", "RUNNING", "BLOCKED: вопрос координатору", "")
+
+    def put_status(self, status):
+        """`ours` keeps the dispatcher's own line; anything else is written as the wave would (the empty file too)."""
+        if status != "ours":
+            (wab.wave_dir(self.cfg, "W1") / "status").write_text(f"{status}\n" if status else "", encoding="utf-8")
+
+    def readies(self):
+        return [c for c in self.gh_calls if c[:3] == ("gh", "pr", "ready")]
+
+    def window_failures(self):
+        return [s for s in self.sent if "Гейт мерджа не пройден" in s[2]]
+
+    def unknown_notices(self):
+        return [t for t in self.tg if "результат мерджа неизвестен" in t.splitlines()[0]]
+
+    def step(self, minute, restart):
+        self.at(minute)
+        return self.restart_watch() if restart else self.safe_tick()
+
+    def s_reset(self):
+        self.gh_calls.clear()
+        self.tg.clear()
+        self.sent.clear()
+        self.at(0)
+        self.pr = {"number": 7, "headRefOid": HEAD, "isDraft": False, "state": "OPEN"}
+        self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "main"}
+        self.manifest, self.work = green_manifest(), dict(WORK)
+        self.merge_mode, self.ready_rc, self.mid_status = "ok", 0, None
+        if hasattr(self, "cfg"):
+            (wab.wave_dir(self.cfg, "W1") / wab.OWNER_MERGE_MARK).unlink(missing_ok=True)
+
+    def s_owner_wait(self, draft, legacy):
+        """The gate passed with one open thread (a draft PR too): `merging`, the dispatcher's line, the owner awaited."""
+        if draft:
+            self.start()
+            self.pr = {**self.pr, "isDraft": True}
+            self.facts = green_facts(threads=list(self.OPEN))
+            self.facts["pr"]["draft"] = True
+            self.tick()
+        else:
+            self.threads_gate()
+        self.assertEqual(self.rec()["phase"], "merging")
+        self.assertTrue(self.status().startswith(wab.OWNER_LINE), self.status())
+        self.assertEqual(self.readies(), [])
+        if legacy:  # a record of 1.5.0: none of what 1.5.1 adds
+            st = self.get_state(self.cfg)
+            for key in ("owner_wait", "owner_remind", "merging_since"):
+                st["waves"]["W1"].pop(key, None)
+            self.put_state(self.cfg, st)
+        self.tg.clear()
+        self.sent.clear()
+        (self.cfg["run_dir"] / "events.log").write_text("", encoding="utf-8")
+
+    def s_case(self, path, status, restart, legacy):
+        """One path of the invariant of class S with the status `status` written when the event happens. Returns the
+        observations after the event tick (`first`) and at the end (`last`), with the exact counters."""
+        self.s_reset()
+        if path == "still_done":  # path 10: the gate waits on DONE, then the status changes before the next poll
+            self.start()
+            self.facts = green_facts(check_runs=[{"name": "ci", "status": "in_progress", "conclusion": None}])
+            self.tick()
+            self.assertEqual(self.rec()["phase"], "gate")
+        else:
+            self.s_owner_wait(path.startswith("draft"), legacy)
+        real = self.gh_handler
+
+        def handle(args):  # path 9: the wave writes its status while `gh pr merge` runs
+            if args[:3] == ("gh", "pr", "merge") and self.mid_status is not None:
+                self.put_status(self.mid_status)
+            return real(args)
+        self.gh_handler = handle
+        mid = path in ("refused_mid", "unknown_mid")
+        if not mid:
+            self.put_status(status)
+        if path in ("pass", "refused_mid", "unknown_mid"):
+            self.facts = green_facts(threads=list(self.CLOSED))
+            if mid:
+                self.mid_status = status
+                self.merge_mode = "refuse" if path == "refused_mid" else "interrupt"
+        elif path.startswith("draft"):
+            self.facts = green_facts(threads=list(self.CLOSED))
+            self.facts["pr"]["draft"] = True
+            self.ready_rc = 1 if path == "draft_refused" else 0
+        elif path == "fail":
+            self.facts = green_facts(threads=list(self.OPEN), review_comments=self.P1_ON_HEAD)
+        elif path == "wait":
+            self.facts = green_facts(threads=list(self.OPEN))
+        elif path in ("moved_view", "moved_facts"):
+            self.moved(ready=True)
+            self.facts["threads"] = list(self.CLOSED)
+            if path == "moved_facts":  # `gh pr view` still shows the old head: the recheck's gate sees the new one
+                self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": HEAD, "baseRefName": "main"}
+        elif path == "base":
+            self.facts = green_facts(threads=list(self.CLOSED))
+            self.view = {**self.view, "baseRefName": "dev"}
+        self.step(1, restart)
+        first = {"phase": self.rec()["phase"], "status": self.status(), "readies": len(self.readies()),
+                 "merges": len(self.merges()), "window": len(self.window_failures()),
+                 "refused": len(self.refused()), "unknown": len(self.unknown_notices())}
+        # what follows on GitHub / in the wave
+        self.mid_status = None
+        if path == "draft_ready":
+            self.pr = {**self.pr, "isDraft": False}
+            self.facts["pr"]["draft"] = False
+        if path == "moved_facts":
+            self.view = {"state": "OPEN", "mergeCommit": None, "headRefOid": self.NEW, "baseRefName": "main"}
+        if path == "base":
+            self.view = {**self.view, "baseRefName": "main"}
+        if path in ("moved_view", "moved_facts", "base") and status not in ("ours", "DONE"):
+            self.put_status("DONE")  # the wave hands it in again: its DONE starts the gate
+        for minute in (2, 3, 4):
+            self.step(minute, restart)
+        for minute in (125, 250):  # two intervals of the reminder
+            self.step(minute, restart)
+        last = {"phase": self.rec()["phase"], "status": self.status(), "readies": len(self.readies()),
+                "at_old": len([m for m in self.merges() if HEAD in m]),
+                "at_new": len([m for m in self.merges() if self.NEW in m]), "window": len(self.window_failures()),
+                "refused": len(self.refused()), "unknown": len(self.unknown_notices()),
+                "reminders": len(self.reminders())}
+        self.gh_handler = real
+        return first, last
+
+    def test_every_path_of_the_class_s_invariant(self):
+        """triage-3: status at the event ∈ {the dispatcher's line, DONE, RUNNING, a question, empty} × the 11 paths ×
+        a restart of watch (every tick after the event by a new `watch`), plus a record of 1.5.0 on paths 2, 4, 6."""
+        import itertools
+        paths = ("pass", "draft_ready", "draft_refused", "draft_still", "fail", "wait", "moved_view", "moved_facts",
+                 "base", "refused_mid", "unknown_mid", "still_done")
+        combos = [(p, s, r, False) for p, s, r in itertools.product(paths, self.STATUSES, (False, True))]
+        combos += [(p, s, r, True) for p, s, r in itertools.product(("draft_ready", "fail", "moved_view", "moved_facts"),
+                                                                     self.STATUSES, (False, True))]
+        for path, status, restart, legacy in combos:
+            if path == "still_done" and status == "ours":
+                continue  # the dispatcher never writes its line in phase gate
+            with self.subTest(path=path, status=status, restart=restart, legacy=legacy):
+                first, last = self.s_case(path, status, restart, legacy)
+                self.check_s(path, status, first, last)
+
+    def check_s(self, path, status, first, last):
+        disp = status in ("ours", "DONE")  # the dispatcher's line, or the wave's DONE: the dispatcher may write
+        wave_line = status in ("RUNNING", "BLOCKED: вопрос координатору")
+        line = status if status != "ours" else None  # the expected untouched status
+        eq = self.assertEqual
+        eq(last["at_old"] + last["at_new"] <= 2, True)
+        if path == "pass":  # 1
+            eq(first["merges"], 1 if disp else 0)
+            eq(last["at_old"], 1 if disp else 0)
+            eq(last["phase"], "merging")
+            if line is not None:
+                eq(last["status"], line)
+            eq(last["reminders"], 0)
+        elif path == "draft_ready":  # 2 (A1)
+            eq(first["readies"], 1 if disp else 0)
+            if disp:
+                eq((first["phase"], first["status"]), ("gate", "DONE"))
+                eq(last["at_old"], 1)
+            else:
+                eq((first["phase"], first["status"], last["at_old"]), ("merging", line, 0))
+            eq(last["readies"], first["readies"])
+            eq(last["reminders"], 0)
+        elif path in ("draft_refused", "draft_still"):  # 3
+            eq(last["readies"], 1 if disp else 0)
+            eq(last["at_old"], 0)
+            eq(last["phase"], "merging")
+            if disp:
+                self.assertTrue(last["status"].startswith(wab.OWNER_LINE), last["status"])
+                self.assertIn("ready refused" if path == "draft_refused" else "PR still draft after ready",
+                              last["status"])
+                eq(last["refused"], 1)
+                eq(last["reminders"], 2)
+            else:
+                eq((last["status"], last["refused"], last["reminders"]), (line, 0, 0))
+        elif path == "fail":  # 4 (F2)
+            eq(last["at_old"], 0)
+            eq(last["reminders"], 0)
+            if disp:
+                self.assertTrue(first["status"].startswith("BLOCKED: merge gate: "), first["status"])
+                eq((first["phase"], last["window"]), ("running", 1))
+            elif wave_line:
+                eq((first["phase"], first["status"], last["window"]), ("running", line, 0))
+            else:  # empty: mid-rewrite, the next poll decides; nothing is written over it
+                eq((first["phase"], first["status"], last["window"]), ("merging", "", 0))
+        elif path == "wait":  # 5, 8
+            eq((last["at_old"], last["phase"]), (0, "merging"))
+            if line is not None:
+                eq(last["status"], line)
+            eq(last["reminders"], 2 if status == "ours" else 0)  # only while the dispatcher's line is there
+        elif path in ("moved_view", "moved_facts", "base"):  # 6, 7 (F1)
+            if disp:
+                eq((first["phase"], first["status"]), ("gate", "DONE"))
+            elif wave_line:
+                eq((first["phase"], first["status"]), ("running", line))
+            else:
+                eq((first["phase"], first["status"]), ("merging", ""))
+            eq(first["merges"], 0)
+            eq(last["window"], 0)
+            if path == "base":
+                eq((last["at_old"], last["at_new"]), (1, 0))
+            else:
+                eq((last["at_old"], last["at_new"]), (0, 1))
+            eq(last["reminders"], 0)
+        elif path in ("refused_mid", "unknown_mid"):  # 9
+            eq((last["at_old"], last["at_new"]), (1, 0))
+            eq(last["phase"], "merging")
+            eq(last["refused" if path == "refused_mid" else "unknown"], 1)
+            if disp:
+                self.assertTrue(last["status"].startswith(wab.OWNER_LINE), last["status"])
+                self.assertIn("merge refused" if path == "refused_mid" else "merge result unknown", last["status"])
+                eq(last["reminders"], 2)
+            else:
+                eq((last["status"], last["reminders"]), (line, 0))
+        elif path == "still_done":  # 10
+            eq(first["phase"], "gate" if status in ("DONE", "") else "running")
+            eq(last["at_old"], 0)
+
+    def test_a_draft_with_an_open_thread_is_merged_once_the_thread_closes(self):  # A1 of round 3
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                self.s_reset()
+                self.s_owner_wait(draft=True, legacy=False)
+                self.facts = green_facts(threads=list(self.CLOSED))
+                self.facts["pr"]["draft"] = True  # the head and the status file are not touched
+                self.step(1, restart)
+                self.assertEqual(len(self.readies()), 1)
+                self.assertEqual((self.rec()["phase"], self.status()), ("gate", "DONE"))
+                self.assertNotIn("owner_wait", self.rec())
+                self.pr = {**self.pr, "isDraft": False}
+                self.facts["pr"]["draft"] = False
+                for minute in (2, 3, 4, 125, 250):
+                    self.step(minute, restart)
+                self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
+                self.assertEqual(self.log().count("merge of PR #7 requested"), 1)
+                self.assertEqual(len(self.readies()), 1)
+                self.assertEqual(self.reminders(), [])
+
+    def test_a_running_wave_keeps_its_status_when_it_pushes_in_merging(self):  # F1 of round 3
+        self.s_reset()
+        self.s_owner_wait(draft=False, legacy=False)
+        self.set_status(self.cfg, "W1", "RUNNING")  # PROTOCOL: RUNNING first, then push, then DONE
+        self.moved(ready=True)
+        self.facts["threads"] = list(self.CLOSED)
+        for minute in (1, 2, 3):
+            self.at(minute)
+            self.tick()
+        self.assertEqual((self.status(), self.rec()["phase"]), ("RUNNING", "running"))
+        self.assertEqual((self.merges(), self.window_failures()), ([], []))
+        self.assertNotIn("merge gate", self.log())
+        self.set_status(self.cfg, "W1", "DONE")
+        self.at(4)
+        self.tick()
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, self.NEW))])
+
+    def test_a_failed_gate_while_waiting_for_threads_goes_back_to_the_wave(self):  # F2 of round 3
+        self.s_reset()
+        self.s_owner_wait(draft=False, legacy=False)
+        self.facts = green_facts(threads=list(self.OPEN), review_comments=self.P1_ON_HEAD)
+        self.at(1)
+        self.tick()
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: "), self.status())
+        self.assertEqual(self.rec()["phase"], "running")
+        self.assertEqual(len(self.window_failures()), 1)
+        for key in ("owner_wait", "owner_remind", "gate_sha", "merging_since"):
+            self.assertNotIn(key, self.rec())
+        for minute in (125, 250):
+            self.at(minute)
+            self.tick()
+        self.assertEqual((self.reminders(), self.merges()), ([], []))
+        self.assertNotIn("ATTENTION", self.status_out())
+        self.facts = green_facts()  # the wave fixed it on the same head and hands it in again
+        self.set_status(self.cfg, "W1", "DONE")
+        self.at(251)
+        self.tick()
+        self.assertEqual(self.merges(), [tuple(gate.merge_argv("o/r", 7, HEAD))])
 
 class OwnerMerge(GateBase):  # D3
     def setUp(self):

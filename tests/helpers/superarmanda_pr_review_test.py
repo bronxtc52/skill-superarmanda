@@ -1910,7 +1910,7 @@ class CodeRabbitServiceComment(unittest.TestCase):
     the autopilot checkbox, the draft skip) is the bot's template, not a finding. Recognised by the machine markers of the
     template (the first line `<!-- This is an auto-generated comment: summarize by coderabbit.ai -->` and the closing
     `<!-- tips_end -->`), never by words that a real finding may contain. Live samples: tests/fixtures/pr-review/
-    coderabbit/pr{75,116,118}-rest.json (README there)."""
+    coderabbit/pr{75,116,118,120}-rest.json (README there)."""
 
     RABBIT = "coderabbitai[bot]"
 
@@ -1926,7 +1926,8 @@ class CodeRabbitServiceComment(unittest.TestCase):
         return [f for f in result["findings"] if f["source"] == "issue_comment" and f["author"] == self.RABBIT]
 
     def test_live_service_comments_are_not_findings(self):
-        for n, what in ((118, "review in progress"), (116, "Recent review info"), (75, "summarize by coderabbit.ai")):
+        for n, what in ((118, "review in progress"), (116, "Recent review info"), (75, "summarize by coderabbit.ai"),
+                        (120, "Draft PR not reviewed")):
             with self.subTest(pr=n):
                 data = self.load(n)
                 bodies = [c["body"] for c in data["issue_comments"] if c["user"]["login"] == self.RABBIT]
@@ -1937,16 +1938,16 @@ class CodeRabbitServiceComment(unittest.TestCase):
                 self.assertIn("CodeRabbit walkthrough/status metadata is not a finding", result["limitations"])
 
     def test_draft_not_reviewed_in_the_live_template_is_not_a_finding(self):
-        data = self.load(118)
+        # the live comment «Draft PR not reviewed» of PR #120 (issue comment 6118957590), as GitHub returned it
+        data = self.load(120)
+        self.assertTrue(data["draft"])
         item = next(c for c in data["issue_comments"] if c["user"]["login"] == self.RABBIT)
-        # the draft skip block of the live draft template, in place of the «review in progress» block of the same comment
-        start = item["body"].index("<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->")
-        end = item["body"].index("<!-- end of auto-generated comment: review in progress by coderabbit.ai -->")
-        end += len("<!-- end of auto-generated comment: review in progress by coderabbit.ai -->")
-        skip = CODERABBIT_DRAFT_SKIP.split("\n", 1)[1].split("<!-- tips_start -->")[0].strip()
-        item["body"] = item["body"][:start] + skip + item["body"][end:]
-        self.assertIn("Draft PR not reviewed", item["body"])
-        self.assertEqual(self.rabbit_issue_findings(self.run_eval(data)), [])
+        self.assertEqual(item["id"], 6118957590)
+        self.assertIn("> ## Draft PR not reviewed", item["body"])
+        self.assertIn("<!-- autopilot:start -->", item["body"])
+        result = self.run_eval(data)
+        self.assertEqual(self.rabbit_issue_findings(result), [], result["findings"])
+        self.assertIn("CodeRabbit walkthrough/status metadata is not a finding", result["limitations"])
 
     def test_a_real_coderabbit_finding_is_still_a_finding(self):
         data = self.load(75)

@@ -806,12 +806,17 @@ class Actor:
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             wab.status_cmd(wab.load_chain(self.w.chain_file, create=False))
-        import dash
-        from rich.console import Console
-        con = Console(width=220, record=True, file=io.StringIO())
-        cfg = wab.load_chain(self.w.chain_file, create=False)
-        con.print(dash.current_panel(cfg, wab.load_state(cfg)))
-        self.threads[s.wave][label] = {"at": self.clock.offset, "status": out.getvalue(), "dash": con.export_text()}
+        try:
+            import dash
+            from rich.console import Console
+        except ImportError:  # no rich (a supported standalone setup): the oracle skips only the dashboard checks
+            panel = None
+        else:
+            con = Console(width=220, record=True, file=io.StringIO())
+            cfg = wab.load_chain(self.w.chain_file, create=False)
+            con.print(dash.current_panel(cfg, wab.load_state(cfg)))
+            panel = con.export_text()
+        self.threads[s.wave][label] = {"at": self.clock.offset, "status": out.getvalue(), "dash": panel}
 
     def w1_owner_wait(self, s):
         """Nobody runs the owner's script: the dispatcher reminds, the dashboard and `status` raise ATTENTION; then the
@@ -1287,9 +1292,11 @@ def oracle_threads(run):
         must("~/.cache" not in text and ".merge" not in text, "a path in the reminder")
     # ATTENTION on the long merge: not yet at the early snapshot, then in `wab.py status` and on the dashboard
     early, late = t1["early"], t1["late"]
-    must("ATTENTION" not in early["status"] and "ATTENTION" not in early["dash"], "ATTENTION before the threshold")
+    must("ATTENTION" not in early["status"], "ATTENTION before the threshold")
     must("ATTENTION: W1: мердж ждёт" in late["status"], f"no ATTENTION in wab.py status: {late['status']}")
-    must("ATTENTION" in late["dash"], "no ATTENTION on the dashboard")
+    if early["dash"] is not None and late["dash"] is not None:  # None: rich is not installed, no dashboard to check
+        must("ATTENTION" not in early["dash"], "ATTENTION on the dashboard before the threshold")
+        must("ATTENTION" in late["dash"], "no ATTENTION on the dashboard")
     # W2: the head moved after the gate: the old head never merged, the new one only after its own gate
     must(merges[2]["sha"] == t2["new_head"] != t2["head"], "W2: the old head was merged")
     w2 = [l for l in log.splitlines() if l[21:].startswith("W2: ")]

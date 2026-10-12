@@ -5662,9 +5662,36 @@ def _enter_merging(w):
 # merge_remind_minutes (_owner_reminder, the mark `owner_remind` in state.json) until the phase leaves `merging` or the
 # owner's script calls the merge itself (merge_requested). A merge that was called is never handed to the owner again:
 # the owner's mark seen by the gate is one event, a busy merge.lock (only the owner's script holds it) is retried.
+# Round 3 (class S): in `merging` the status file and the choice «the owner / the wave / the merge» follow WHO wrote the
+# current status (status_writer). The dispatcher writes over its own line (OWNER_LINE) or the wave's DONE only; over a
+# line of the wave (RUNNING, a question) it only moves the phase to `running` and stops waiting for the owner; an empty
+# file is left to the next poll. The owner is reminded only while the dispatcher's line is there. A `fail` of the gate on
+# the same head goes back to the wave (`BLOCKED: merge gate`, or just `running` under its own line); a `ready` of a draft
+# that waited for threads puts DONE in place of the dispatcher's line, so the next gate merges it. All of it is decided
+# from the status file and state.json, so a restarted watch decides the same.
 
 OWNER_MERGE_MARK = "owner-merge.json"  # <run_dir>/<wave>/: the owner's script called `gh pr merge` of this sha
 OWNER_LINE = "BLOCKED: merge gate passed; "  # the start of every status line the dispatcher writes for the owner
+
+
+def status_writer(wdir):
+    """Who wrote the wave's status file now (round 3 of #117, class S)? «ours» — the dispatcher's line for the owner
+    (OWNER_LINE), «done» — the wave's DONE, «wave» — any other line of the wave (RUNNING, a question), «empty» — empty or
+    unreadable (the wave is mid-rewrite: the next poll decides). In `merging` the dispatcher writes the status only over
+    «ours» or «done»; over a line of the wave it only moves the phase to `running` and stops waiting for the owner."""
+    text = read(wdir / "status", on_error=None)
+    if not text:
+        return "empty"
+    if text == "DONE":
+        return "done"
+    return "ours" if text.startswith(OWNER_LINE) else "wave"
+
+
+def _leave_owner_wait(w):
+    """The owner is not awaited any more (the wave or the gate takes over): the marks of the wait go."""
+    for key in ("owner_wait", "owner_remind"):
+        w.pop(key, None)
+    w.get("notified", {}).pop("threads_recheck", None)
 
 
 class _MergeLock(_InputLock):
@@ -5766,6 +5793,8 @@ def _owner_reminder(cfg, st, wave, w, number, sha, now):
     MERGED is watched by ATTENTION (round 2, F1)."""
     if not _owner_waits(w, sha) or merge_requested(cfg, wave, w, sha):
         return
+    if status_writer(wave_dir(cfg, wave)) != "ours":  # class S: the wave took the work back (or is mid-rewrite)
+        return
     mark = w.get("owner_remind")
     at = num(mark.get("at")) if isinstance(mark, dict) and mark.get("sha") == sha else None
     if at is None:
@@ -5794,8 +5823,8 @@ def _threads_recheck(cfg, st, wave, w, wdir, number, sha):
     if v["verdict"] == "pass" and head == sha and v.get("number") == number and not v["unresolved"]:
         # collecting took a while: the wave may have taken the work back (RUNNING, a question) and be about to push a
         # fix; the merge is the dispatcher's only while the status is still its own line or the wave's DONE
-        again = read(wdir / "status", on_error=None)
-        if not (again == "DONE" or (isinstance(again, str) and again.startswith(OWNER_LINE))):
+        if status_writer(wdir) not in ("ours", "done"):
+            again = read(wdir / "status", on_error=None)
             if once_per(w, "threads_recheck", f"status:{again}"):
                 event(cfg, f"{wave}: гейт на {sha[:12]} пройден заново, но мерджа нет: статус волны "
                            f"«{safe_text(again or '', 80)}», жду")
@@ -5803,6 +5832,21 @@ def _threads_recheck(cfg, st, wave, w, wdir, number, sha):
         w.get("notified", {}).pop("threads_recheck", None)
         event(cfg, f"{wave}: треды закрыты на {sha[:12]}, полный гейт пройден заново: мерджу сам")
         return _gate_passed(cfg, st, wave, w, wdir, v)
+    who = status_writer(wdir) if v["verdict"] == "fail" and head == sha else None
+    if who in ("ours", "done", "wave"):
+        # round 3, F2: the gate on the same head fails — the owner's script would refuse too: back to the wave
+        _leave_owner_wait(w)
+        for key in ("gate_sha", "gate_pr", "merging_since", "merge_poll_at"):
+            w.pop(key, None)
+        reasons = "; ".join(v["reasons"])
+        if who in ("ours", "done"):
+            return _gate_failed(cfg, st, wave, w, wdir, reasons)
+        w["phase"] = "running"  # the wave's own line stays: it works; its next DONE is gated again
+        w.pop("done_head", None)
+        save_state(cfg, st)
+        event(cfg, f"{wave}: гейт на {sha[:12]} не пройден в ожидании тредов ({safe_text(reasons, 300)}); статус волны "
+                   f"не трогаю, волна работает")
+        return True
     why = "; ".join(v["reasons"]) if v["verdict"] != "pass" else f"незакрытых тредов: {len(v['unresolved'])}"
     if once_per(w, "threads_recheck", why):  # once_per keeps only the eid of the reason
         event(cfg, f"{wave}: гейт на {sha[:12]} перепроверен, мерджа нет ({v['verdict']}): {safe_text(why, 300)}")
@@ -5995,6 +6039,9 @@ def _gate_ready(cfg, st, wave, w, wdir, number, sha):
         _enter_merging(w)
         return _hand_to_owner(cfg, st, wave, w, wdir, number, sha, "ready_refused", f"ready refused: {refused}",
                               question=refused)
+    if status_writer(wdir) == "ours":  # round 3, A1: from the wait for threads — the gate runs on DONE, our line goes
+        set_last_status(cfg, wave, w, _write_status(wdir, "DONE"))  # written BEFORE the phase: a crash keeps merging
+    _leave_owner_wait(w)  # the owner is not awaited: the next gate on the non-draft PR decides
     w["phase"] = "gate"  # the new checks must register before the next collection
     w["gate_at"] = time.time()
     save_state(cfg, st)
@@ -6007,8 +6054,9 @@ def _hand_to_owner(cfg, st, wave, w, wdir, number, sha, reason, log_text, questi
         command = home_form(write_owner_script(cfg, wave, sha))
     except (OSError, ValueError) as e:
         command = f"(скрипт владельца не записан: {_masked_line(e, 100)}; проверь PR #{number} вручную)"
-    line = set_last_status(cfg, wave, w, _write_status(wdir, f"{OWNER_LINE}{log_text}; owner runs {command}"))
-    note_question(cfg, wave, w, line, time.time())
+    if status_writer(wdir) in ("ours", "done"):  # class S: a line of the wave is never written over
+        line = set_last_status(cfg, wave, w, _write_status(wdir, f"{OWNER_LINE}{log_text}; owner runs {command}"))
+        note_question(cfg, wave, w, line, time.time())
     _owner_wait_started(w, sha, reason)
     put_notice(cfg, w, wave, "merge_refused", sha, pr=number, reason=reason, question=question)
     save_state(cfg, st)
@@ -6037,14 +6085,30 @@ def _merge_stopped(cfg, st, wave, w, wdir, why, now, reason="other"):
 def _regate(cfg, st, wave, w, wdir, old, new):
     """The PR is still open but its head moved after the gate passed (a push after a refused merge,
     or while the owner's script waits): the verdict was about another commit, so the wave goes back
-    to the gate with everything the pass left behind forgotten."""
+    to the gate with everything the pass left behind forgotten. Round 3 (class S, F1): only over the dispatcher's line or
+    DONE is the status rewritten to DONE (the gate runs on it); a line of the wave (RUNNING before its push, a question)
+    stays, the phase goes to `running` and the wave's next DONE gates the new head; an empty file waits for the next
+    poll (the head still differs then)."""
+    who = status_writer(wdir)
+    if who == "empty":
+        if once_per(w, "regate_empty", str(new)):
+            event(cfg, f"{wave}: HEAD сменился после гейта: {str(old)[:12]}→{str(new)[:12]}, статус пуст: жду")
+        save_state(cfg, st)
+        return True
     for key in ("gate_sha", "gate_pr", "merge_called", "ready_called", "merge_rc", "merge_poll_at", "gate_at",
                 "merging_since", "owner_remind", "owner_wait", "merge_attempt"):
         w.pop(key, None)
-    for key in ("merge_unknown", "gate_wait", "threads_recheck", "owner_merge", "merge_busy"):
+    for key in ("merge_unknown", "gate_wait", "threads_recheck", "owner_merge", "merge_busy", "regate_empty"):
         w.get("notified", {}).pop(key, None)
+    if who == "wave":  # the wave works (it pushed under RUNNING): its line stays, its DONE gates the new head
+        w["phase"] = "running"  # the save drops the merge_owner / merge_refused notices
+        w.pop("done_head", None)
+        save_state(cfg, st)
+        event(cfg, f"{wave}: HEAD сменился после гейта: {str(old)[:12]}→{str(new)[:12]}, статус волны не трогаю: "
+                   f"гейт после её DONE")
+        return True
     w["phase"] = "gate"  # the save drops the merge_owner / merge_refused notices
-    set_last_status(cfg, wave, w, _write_status(wdir, "DONE"))  # the gate runs on DONE; the BLOCKED line was ours
+    set_last_status(cfg, wave, w, _write_status(wdir, "DONE"))  # the gate runs on DONE: the line was ours or DONE
     _note_done_head(cfg, wave, w, new if new != old else None)
     save_state(cfg, st)
     event(cfg, f"{wave}: HEAD сменился после гейта: {str(old)[:12]}→{str(new)[:12]}, гейт заново")
@@ -6324,10 +6388,11 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
             command = home_form(write_owner_script(cfg, wave, sha))
         except (OSError, ValueError) as e:
             command = f"(скрипт владельца не записан: {_masked_line(e, 100)}; проверь PR #{number} вручную)"
-        w["merge_rc"] = None  # marker: handed to the owner
-        line = set_last_status(cfg, wave, w, _write_status(
-            wdir, f"{OWNER_LINE}merge result unknown; owner runs {command}"))
-        note_question(cfg, wave, w, line, now)
+        w["merge_rc"] = None  # marker: handed to the owner (never a second call: merge_rc, not the status, guards it)
+        if status_writer(wdir) in ("ours", "done"):  # class S: a line of the wave is never written over
+            line = set_last_status(cfg, wave, w, _write_status(
+                wdir, f"{OWNER_LINE}merge result unknown; owner runs {command}"))
+            note_question(cfg, wave, w, line, now)
         _owner_wait_started(w, sha, "merge_unknown")
         put_notice(cfg, w, wave, "merge_unknown", sha, pr=number)
         save_state(cfg, st)
