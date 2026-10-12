@@ -178,6 +178,11 @@ class Base(unittest.TestCase):
         os.environ.pop("TMUX", None)
         os.environ.pop("TMUX_PANE", None)
         os.environ.pop("SUPERARMANDA_TZ", None)  # the owner's zone of the machine must not leak into tests (#88)
+        # the module-global registry of the owner's script names (redact(owner_paths=True)) starts empty in every test:
+        # a name one test derived never keeps another test's path whole (W3 round 4, F1)
+        names = mock.patch.object(wab, "_OWNER_SCRIPT_NAMES", set())
+        names.start()
+        self.addCleanup(names.stop)
         self.tmux_calls = []
         self.sent = []  # (kind, name, text)
         self.alive = True
@@ -8389,6 +8394,45 @@ class MergeGate(GateBase):
         self.assertEqual(self.rec()["phase"], "done")
         self.assertEqual(self.merges(), [])
 
+    PHONE_SHAPED = "W1.aaaaaaaaaaaa.78297023340d065a.merge"  # id16 after the dot reads as a RU phone to redact()
+
+    def test_an_owner_script_name_shaped_like_a_phone_stays_whole_where_the_owner_reads_it(self):
+        # W3 (#113, A5): the flake of test_an_interrupted_merge_is_handed_to_the_owner_once made deterministic — the
+        # random id16 of the temp chain file once looked like a phone number, and the path became «[скрыто]» in
+        # events.log and questions[] (only the status line took the owner-script exemption)
+        self.assertNotEqual(wab.safe_text("~/.cache/wab/" + self.PHONE_SHAPED, 10 ** 9),
+                            "~/.cache/wab/" + self.PHONE_SHAPED, "the guard needs a name the heuristic masks")
+        with mock.patch.object(wab, "owner_script_name", return_value=self.PHONE_SHAPED):
+            self.test_an_interrupted_merge_is_handed_to_the_owner_once()
+        path = wab.write_chain_result(self.cfg, wab.load_state(self.cfg))[0]
+        self.assertIn("~/.cache/wab/" + self.PHONE_SHAPED, path.read_text(encoding="utf-8"))
+
+    def test_the_owner_path_exemption_keeps_every_other_mask_of_the_line(self):
+        folder = self.home / ".cache" / "wab"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / self.PHONE_SHAPED).write_text("x", encoding="utf-8")
+        cfg, _ = self.chain()
+        token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2"
+        line = f"BLOCKED: merge gate passed; token {token} phone 89161234567; owner runs ~/.cache/wab/{self.PHONE_SHAPED}"
+        forged = "~/.cache/wab/W1.aaaaaaaaaaaa.78297023340d0000.merge"  # the shape, but no such file: masked as before
+        self.assertEqual(wab._OWNER_SCRIPT_NAMES, set(), "every test starts with an empty registry (Base.setUp)")
+        with self.subTest("the name is not derived by the dispatcher: the path is masked though its file exists"):
+            self.assertNotIn("~/.cache/wab/" + self.PHONE_SHAPED,
+                             wab.safe_text(line, 10 ** 9, owner_paths=True))
+        with mock.patch.object(wab, "owner_script_name", return_value=self.PHONE_SHAPED):
+            wab._owner_script(cfg, "W1", "a" * 40)  # the dispatcher derives the name: the exemption takes it
+        self.assertEqual(wab._OWNER_SCRIPT_NAMES, {self.PHONE_SHAPED})
+        wab.owner_event(cfg, line + " " + forged)
+        w = {"notified": {}}
+        wab.note_question(cfg, "W1", w, wab.safe_text(line + " " + forged, 10 ** 9, owner_paths=True), time.time())
+        for name, text in (("events.log", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")),
+                           ("questions[]", q_texts(cfg, "W1", w)[0])):
+            with self.subTest(name):
+                self.assertIn("~/.cache/wab/" + self.PHONE_SHAPED, text)
+                self.assertNotIn(token, text)
+                self.assertNotIn("89161234567", text)
+                self.assertNotIn(forged, text)
+
     def test_failed_check_blocks_with_the_reason_and_tells_the_window(self):  # acceptance 2
         self.start()
         self.facts = green_facts(check_runs=[{"name": "ci", "status": "completed", "conclusion": "failure"}])
@@ -12508,12 +12552,13 @@ class FixedAnswerPolicy(Base):
         first = self.decide(cfg, status=status)
         key = first["key"]
         self.assertEqual(key, ["W1", cfg["run_id"], 2, "T1", "needs_decision", "tester"])
-        pend = {"key": key, "status": status, "text": first["text"]}  # what the decision typed
+        # what the decision typed — as state.json holds it since 1.4.3 (eids; I-W3 takes no other value, 1.5.3)
+        pend = {"key": key, "status": wab.text_eid(status), "text": wab.text_eid(first["text"])}
         for name, w, ok in [
                 ("acc07 the key is answered", {"policy_keys": [key]}, False),
                 ("acc09 answered in an archived attempt (the wave restarted)", {"attempts": [{"policy_keys": [key]}]}, False),
                 ("another run index is another fork", {"policy_keys": [key[:2] + [1] + key[3:]]}, True),
-                ("in flight, a new episode", {"policy_key_pending": dict(pend, status="BLOCKED: other")}, False),
+                ("in flight, a new episode", {"policy_key_pending": dict(pend, status=wab.text_eid("BLOCKED: other"))}, False),
                 ("in flight, watch died before Enter was recorded", {"policy_key_pending": pend, "policy_pending": status}, False),
                 ("in flight in an archived attempt", {"attempts": [{"policy_key_pending": pend}]}, False),
                 ("the Enter-only retry of the same episode", {"policy_key_pending": pend, "policy_pending": status, "pending_enter": "policy answer"}, True)]:
@@ -12548,7 +12593,7 @@ class FixedAnswerPolicy(Base):
                 ("the manifest is gone", {"index": 2, "manifest": "missing"}, {}, "несуществующий файл"),
                 ("another run was opened: another key", {"index": 3}, {}, "не совпадает с напечатанным"),
                 ("fix-loop 3/3 on the last run", {"index": 2, "edit": capped}, {"max_runs": 2}, "потолок прогонов исчерпан (2/2)"),
-                ("the typed text is not the decision's", {"index": 2}, {"text": "t"}, "не совпадает с напечатанным"),
+                ("the typed text is not the decision's", {"index": 2}, {"text": wab.text_eid("t")}, "не совпадает с напечатанным"),
                 ]:
             with self.subTest(name):
                 shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)
@@ -13127,7 +13172,7 @@ class FixedAnswerPolicy(Base):
                     self.assertNotIn("policy_key_pending", rec)
 
     def test_n1_a_rule_without_answer_leaves_a_foreign_fork_key_alone(self):
-        flight = {"key": self.KEY, "status": self.ND.format(rec="invariant"), "text": "t"}
+        flight = {"key": self.KEY, "status": self.ND.format(rec="invariant"), "text": wab.text_eid("t")}
         for name, failed in [("none", None), ("false", False), ("sent", "sent")]:
             for mark in (flight, "x"):  # a corrupt mark too: this path neither reads nor writes the fields
                 with self.subTest(name, mark=mark):
@@ -13142,8 +13187,9 @@ class FixedAnswerPolicy(Base):
                     else:
                         with mock.patch.object(wab, "_deliver", return_value=failed):
                             w = self.tick(cfg, self.QN)["waves"]["W1"]
-                    # 1.4.3: the mark is kept with the eids of its line and text (load_state migrates a 1.4.x one)
-                    kept = dict(mark, status=wab.mark_eid(mark["status"]), text=wab.mark_eid("t")) if isinstance(mark, dict) else mark
+                    # 1.4.3: the mark is kept with the eids of its line and text (load_state migrates a 1.4.x line;
+                    # 1.5.3, I-W3: a text that is not a fixed answer of 1.4.x is not migrated, the fixture holds an eid)
+                    kept = dict(mark, status=wab.mark_eid(mark["status"])) if isinstance(mark, dict) else mark
                     self.assertEqual(w["policy_key_pending"], kept)
                     self.assertNotIn("policy_keys", w)
 
@@ -21710,6 +21756,639 @@ class W3PolicyEpisodes(Base):
                             self.assertIn(flag, cmd, f"state.py refuses --accept without {flag}")
 
 
+OWNER_SCRIPT_VALUES = {"write_owner_script", "owner_script_name", "_owner_script", "handoff_gate_line"}
+
+
+def owner_script_events_outside_owner_event(src):
+    """Every event() call of wab.py whose text is built from the owner's script path — a call of write_owner_script /
+    owner_script_name / _owner_script / handoff_gate_line in its arguments, or a name assigned from one in the same function (to a
+    fixpoint, tuple targets included) — that is not owner_event(): [(function, line)]. Also any event() with
+    owner_paths passed by hand outside owner_event (the policy has ONE point)."""
+    found = []
+    for fn in ast.walk(ast.parse(src)):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        tainted = set()
+
+        def dirty(node):
+            return any((isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in OWNER_SCRIPT_VALUES)
+                       or (isinstance(n, ast.Name) and n.id in tainted) for n in ast.walk(node))
+        while True:
+            before = len(tainted)
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Assign) and dirty(n.value):
+                    for t in n.targets:
+                        tainted |= {x.id for x in ast.walk(t) if isinstance(x, ast.Name)}
+            if len(tainted) == before:
+                break
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "event":
+                by_hand = any(k.arg == "owner_paths" for k in n.keywords) or len(n.args) > 2
+                if (any(dirty(a) for a in n.args) or by_hand) and fn.name != "owner_event":
+                    found.append((fn.name, n.lineno))
+    return found
+
+
+class W3OwnerScriptPathEverywhere(GateBase):
+    """W3 round 2 (#113): ONE table over EVERY place the dispatcher names the owner's merge script — the events of the
+    hand-over (merge result unknown, a refused merge, the reminder, open threads, the hand-off gate of merge_gate
+    external), the status line, questions[], chain-result.md and `wab.py status` — with a name whose id16 reads as a
+    phone number to redact(): the path stays whole everywhere, a secret in the same line is still masked. The static
+    check keeps a new place from forgetting the policy: an event built from the script's path goes through owner_event."""
+    PHONE = "W1.aaaaaaaaaaaa.78297023340d065a.merge"
+    TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2"
+
+    def setUp(self):
+        super().setUp()
+        self.now = 1_800_000_000.0
+        for target, kw in (("time.time", dict(side_effect=lambda: self.now)),):
+            p = mock.patch(target, **kw)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "owner_script_name", return_value=self.PHONE)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "_OWNER_SCRIPT_NAMES", set())  # every test starts with no derived name (no leak)
+        p.start()
+        self.addCleanup(p.stop)
+        self.merge_mode = "ok"
+        real = self.handle
+
+        def handle(args):
+            if args[:3] == ("gh", "pr", "merge"):
+                if self.merge_mode == "interrupt":
+                    raise KeyboardInterrupt
+                self.merge_rc, self.merge_err = ((1, f"not mergeable: token {self.TOKEN}") if self.merge_mode == "refuse"
+                                                 else (0, ""))
+            return real(args)
+        self.gh_handler = handle
+        self.shown = "~/.cache/wab/" + self.PHONE
+
+    def status_out(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            wab.status_cmd(wab.load_chain(self.path, create=False))
+        return out.getvalue()
+
+    # the places: each brings the wave to it and returns the needle of its event line and whether the status, the
+    # questions and the chain result name the script too
+    def merge_unknown(self):
+        self.start()
+        self.merge_mode = "interrupt"
+        try:
+            self.tick()
+        except KeyboardInterrupt:
+            pass
+        self.tick()
+        return "merge result unknown; handed to the owner: ", True
+
+    def merge_refused(self):
+        self.start()
+        self.merge_mode = "refuse"
+        self.tick()
+        return "merge gate passed, merge refused: ", True
+
+    def reminder(self):
+        self.merge_refused()
+        self.now += 121 * 60
+        self.tick()
+        return "напоминание владельцу #1: PR #7 не смержен; owner runs ", True
+
+    def open_threads(self):
+        self.start()
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
+        self.tick()
+        return "open threads; owner script ", True
+
+    def external_pass(self):
+        self.start(merge_gate="external")
+        self.tick()
+        return "hand-off gate: Гейт мерджа пройден. Выполни: ", False
+
+    def external_threads(self):
+        self.start(merge_gate="external")
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
+        self.tick()
+        return "hand-off gate: Гейт мерджа пройден, но есть незакрытые треды", False
+
+    def test_the_owner_script_path_is_whole_in_every_place_and_the_rest_stays_masked(self):
+        self.assertNotEqual(wab.safe_text(self.shown, 10 ** 9), self.shown, "the name must be one the heuristic masks")
+        for place in ("merge_unknown", "merge_refused", "reminder", "open_threads", "external_pass", "external_threads"):
+            with self.subTest(place):
+                self.tg.clear()
+                if hasattr(self, "cfg"):  # every place on a clean run directory and without an earlier script file
+                    shutil.rmtree(self.cfg["run_dir"], ignore_errors=True)
+                shutil.rmtree(self.home / ".cache" / "wab", ignore_errors=True)
+                self.facts, self.merge_mode, self.now = green_facts(), "ok", 1_800_000_000.0
+                needle, in_status = getattr(self, place)()
+                self.assertTrue((self.home / ".cache" / "wab" / self.PHONE).is_file())
+                lines = [l for l in self.log().splitlines() if needle in l]
+                self.assertTrue(lines, f"no event of {place}: {self.log()}")
+                self.assertIn(self.shown, lines[-1], "events.log")
+                self.assertNotIn("[скрыто]d065a", self.log())
+                self.assertNotIn(self.TOKEN, self.log())  # the refused merge carries gh's stderr: still masked
+                if place in ("merge_refused", "reminder"):
+                    self.assertIn("not mergeable: token", self.log())
+                if in_status:
+                    self.assertIn(self.shown, self.status(), "status")
+                    self.assertIn(self.shown, self.status_out(), "wab.py status")
+                    self.assertTrue(any(self.shown in (t or "") for t in q_texts(self.cfg, "W1", self.rec())), "questions[]")
+                    chain = wab.write_chain_result(self.cfg, wab.load_state(self.cfg))[0].read_text(encoding="utf-8")
+                    self.assertIn(self.shown, chain, "chain-result.md")
+                for said in self.tg:  # #83: never in an outside text
+                    self.assertNotIn("~/.cache", said)
+
+    def test_every_event_built_from_the_script_path_goes_through_owner_event(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        self.assertEqual(owner_script_events_outside_owner_event(src), [])
+        # the check itself sees a site that forgets the policy (one per kind: a direct call, a tainted name)
+        for old, new in (('owner_event(cfg, f"{wave}: hand-off gate: {gate_text}")', 'event(cfg, f"{wave}: hand-off gate: {gate_text}")'),
+                         ('owner_event(cfg, f"{wave}: merge gate passed, {log_text}; owner runs {command}")',
+                          'event(cfg, f"{wave}: merge gate passed, {log_text}; owner runs {command}")')):
+            with self.subTest(mutant=new):
+                self.assertEqual(src.count(old), 1)
+                self.assertTrue(owner_script_events_outside_owner_event(src.replace(old, new)))
+
+    def test_a_forged_script_of_the_wave_is_masked_even_when_its_file_exists(self):
+        """Codex P2 on f5e2c7a: the wave (the same user) may create ~/.cache/wab/<a name of the right form> and write it
+        into status or a question — an existing file is no proof the dispatcher named it. The exemption covers only a
+        name the dispatcher itself derived (owner_script_name of a wave and sha of this run, from state.json in a fresh
+        process): the forged path is masked in `wab.py status`, questions[] and chain-result.md, the dispatcher's own
+        path stays whole — in this process and in a fresh one (the registry empty, the names re-derived from state)."""
+        forged = "W1.bbbbbbbbbbbb.78297023340d0000.merge"
+        shown_forged = "~/.cache/wab/" + forged
+        self.assertNotEqual(wab.safe_text(shown_forged, 10 ** 9), shown_forged, "the forged name must be maskable")
+        self.merge_refused()
+        own_line = self.status()
+        self.assertIn(self.shown, own_line)
+        (self.home / ".cache" / "wab" / forged).write_text("x", encoding="utf-8")  # the wave plants the file
+        forged_line = f"BLOCKED: run {shown_forged}"
+        cfg = wab.load_chain(self.path, create=False)
+        st = wab.load_state(cfg)
+        w = st["waves"]["W1"]
+        wab._record_question(w, wab.stash_text(cfg, "W1", forged_line, w), self.now)
+        wab._record_question(w, wab.stash_text(cfg, "W1", own_line, w), self.now + 1)
+        wab.save_state(cfg, st)
+        for fresh in (False, True):
+            with self.subTest(fresh_process=fresh):
+                if fresh:
+                    wab._OWNER_SCRIPT_NAMES.clear()
+                self.set_status(self.cfg, "W1", forged_line)
+                out = self.status_out()
+                self.assertNotIn(shown_forged, out, "wab.py status: the wave's forged path")
+                self.set_status(self.cfg, "W1", own_line)
+                self.assertIn(self.shown, self.status_out(), "wab.py status: the dispatcher's own path")
+                if fresh:
+                    wab._OWNER_SCRIPT_NAMES.clear()
+                chain = wab.write_chain_result(self.cfg, wab.load_state(self.cfg))[0].read_text(encoding="utf-8")
+                self.assertNotIn(shown_forged, chain, "chain-result.md: the forged path")
+                self.assertIn(self.shown, chain, "chain-result.md: the dispatcher's own path")
+        # a name the dispatcher never derived is masked even by owner_event / _write_status (the file exists)
+        wab._OWNER_SCRIPT_NAMES.clear()
+        wab.owner_event(self.cfg, f"owner runs {shown_forged}")
+        self.assertNotIn(shown_forged, self.log())
+
+    def test_owner_event_keeps_every_other_mask_of_the_line(self):
+        folder = self.home / ".cache" / "wab"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / self.PHONE).write_text("x", encoding="utf-8")
+        cfg, _ = self.chain()
+        wab._owner_script(cfg, "W1", "a" * 40)  # the dispatcher derived this name (the mock gives PHONE)
+        forged = "~/.cache/wab/W1.aaaaaaaaaaaa.78297023340d0000.merge"  # the shape, but no such file: masked as before
+        wab.owner_event(cfg, f"token {self.TOKEN} phone 89161234567; owner runs {self.shown} {forged}")
+        text = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn(self.shown, text)
+        for gone in (self.TOKEN, "89161234567", forged):
+            self.assertNotIn(gone, text)
+
+
+class W3PolicyMarksAndNotices(Base):
+    """W3 of waves-tails2 (#113, the remainder of #100): ONE invariant (I-W3), ONE brute force over its surface.
+    I-W3: a mark of an automatic answer in state.json (policy_key_pending, policy_refusal, policy_episode, policy_keys)
+    is taken only by its full schema: status/text are eids (EID.fullmatch), the key in flight of the current record is
+    of its wave and run_id, an archived one of its wave (its run_id may be another); the 1.4.x migration turns into an
+    eid only a legacy string of its own form (a labelled BLOCKED line; the text of a fixed answer). Any deviation is a
+    corrupt mark: a refusal to the owner, never an automatic answer. A new BLOCKED episode, its notice and its silence
+    rest only on a fresh NON-EMPTY read of status: an empty/unreadable read never opens an episode nor mutes a notice,
+    a non-empty OTHER read mutes it. Every episode without an auto-answer (the cap, a refusal, a corrupt mark, the rule
+    gone) notifies the owner exactly once. A key in flight whose text was not typed never outlives its delivery."""
+    HEAD_B, ND, BC = FixedAnswerPolicy.HEAD_B, FixedAnswerPolicy.ND, FixedAnswerPolicy.BC
+    mandate, tick, answers = DecisionPolicy.mandate, DecisionPolicy.tick, DecisionPolicy.answers
+    log, owner_asked = DecisionPolicy.log, DecisionPolicy.owner_asked
+    forge = FixedAnswerPolicy.__dict__["forge"]
+    fork, decide, rewrite = FixedAnswerPolicy.fork, FixedAnswerPolicy.decide, FixedAnswerPolicy.rewrite
+    CORRUPT = W3PolicyEpisodes.CORRUPT
+    WITH, WITHOUT = W3PolicyEpisodes.WITH, W3PolicyEpisodes.WITHOUT
+    DAMAGE = {"garbage": "garbage", "short eid": "sha256:abc", "not a str": 5}
+    JUNK_PREFIXED = "[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ мусор"
+    # a fixed text of 1.4.x as _fork_decision typed it when the wave recommended another variant (the frozen form)
+    WITH_REC = ("[wab] РЕШЕНИЕ ПО ПОЛИТИКЕ (chain.json): вариант invariant. Доделай как следует: ещё один круг, чини класс "
+                "находки целиком, не латай; находки low/P3 — fix-loop --defer в остаток. Решение запиши: fix-loop "
+                "--decision invariant. (рекомендация волны: cut_surface) Затем запиши RUNNING в status.")
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with mock.patch.dict(os.environ):
+            cls.bases = cls.forge()
+
+    def setUp(self):
+        super().setUp()
+        self.line = self.ND.format(rec="invariant")
+        self.other = ["W1", RUN_ID, 2, "T1", "needs_decision", "tester"]  # a valid key of ANOTHER fork (run 2)
+
+    def fresh(self, rule=None, cap=3):
+        self.tg.clear()
+        self.sent.clear()
+        self.enters.clear()
+        self.alive = True
+        cfg, _ = self.mandate(policy=[self.WITH if rule is None else rule], max_runs=5)
+        cfg["max_auto_answers"] = cap
+        self.fork(cfg)
+        self.addCleanup(shutil.rmtree, cfg["run_dir"], True)
+        return cfg
+
+    def count(self):
+        return len(self.answers()), len(self.owner_asked())
+
+    # ----- the marks (A1, A2): every holder × every damage, in memory and through load_state of a raw state.json -----
+    def mark(self, holder, damage):
+        """The fields of the wave record with `holder` damaged by `damage` («<field> <kind>» or «key foreign …»)."""
+        if holder == "policy_refusal":
+            mark = {"status": wab.text_eid(self.line), "stamp": None, "reason": "r"}
+        else:
+            mark = {"key": list(self.other), "status": wab.text_eid(self.line), "text": wab.text_eid("t")}
+        if damage == "key foreign wave":
+            mark["key"] = ["W2", *self.other[1:]]
+        elif damage == "key foreign run_id":
+            mark["key"] = ["W1", "1999-01-01", *self.other[2:]]
+        elif damage != "none":
+            field, kind = damage.split(" ", 1)
+            mark[field] = self.DAMAGE[kind]
+        return {"attempts": [{"policy_key_pending": mark}]} if holder == "attempts" else {holder: mark}
+
+    def mark_rows(self):
+        rows = []
+        for holder in ("policy_key_pending", "attempts", "policy_refusal"):
+            damages = [f"status {k}" for k in self.DAMAGE]
+            if holder != "policy_refusal":
+                damages += [f"text {k}" for k in self.DAMAGE] + ["key foreign wave"]
+            if holder == "policy_key_pending":
+                damages.append("key foreign run_id")  # an archived attempt may hold another run: a guard below
+            rows += [(holder, d, load, False) for d in damages for load in ("memory", "disk")]
+        # guards: the valid shapes are taken (the archive of another run included)
+        rows += [(h, "none", load, True) for h in ("policy_key_pending", "attempts", "policy_refusal")
+                 for load in ("memory", "disk")]
+        rows += [("attempts", "key foreign run_id", load, True) for load in ("memory", "disk")]
+        return rows
+
+    def test_iw3_marks_by_the_full_schema(self):
+        for holder, damage, load, valid in self.mark_rows():
+            with self.subTest(holder=holder, damage=damage, load=load):
+                cfg = self.fresh()
+                self.set_status(cfg, "W1", self.line)
+                fields = self.mark(holder, damage)
+                if load == "disk":
+                    st = wab.load_state(cfg)
+                    st["waves"]["W1"].update(fields)
+                    self.put_state(cfg, st)  # raw json on disk: a 1.4.x or hand-edited file, read by load_state
+                    fields = wab.load_state(cfg)["waves"]["W1"]
+                if holder == "policy_refusal":
+                    self.assertEqual(bool(wab._refusal_ok(fields["policy_refusal"])), valid, fields["policy_refusal"])
+                else:
+                    got = self.decide(cfg, w=fields, status=self.line)
+                    self.assertEqual(got["ok"], valid, got)
+                    if not valid:
+                        self.assertTrue(got["reason"].startswith(self.CORRUPT), got["reason"])
+                if load == "memory" or (holder == "policy_refusal" and valid):
+                    continue  # a valid refusal of THIS line holds the episode: no tick-level row for it here
+                self.tick(cfg)
+                self.tick(cfg)
+                self.assertEqual(self.count(), (1, 0) if valid else (0, 1), "(answers, owner notices)")
+
+    def test_iw3_the_migration_takes_only_a_legacy_string_of_its_own_form(self):
+        text = wab.FIXED_HEAD.format(answer="invariant") + " Доделай как следует." + wab.FIXED_TAIL
+        for name, fields, want in (
+                ("1.4.2 refusal: the labelled line", {"policy_refusal": {"status": self.line, "stamp": None, "reason": "r"}},
+                 ("policy_refusal", "status", wab.text_eid(self.line))),
+                ("1.4.x key in flight: the line", {"policy_key_pending": {"key": list(self.other), "status": self.line,
+                                                                          "text": text}},
+                 ("policy_key_pending", "status", wab.text_eid(self.line))),
+                ("1.4.x key in flight: the fixed text", {"policy_key_pending": {"key": list(self.other), "status": self.line,
+                                                                                "text": text}},
+                 ("policy_key_pending", "text", wab.text_eid(text))),
+                ("an unlabelled refusal line stays", {"policy_refusal": {"status": "BLOCKED: no label", "stamp": None,
+                                                                         "reason": "r"}},
+                 ("policy_refusal", "status", "BLOCKED: no label")),
+                ("a free text in flight stays", {"policy_key_pending": {"key": list(self.other), "status": self.line,
+                                                                        "text": "чужой текст"}},
+                 ("policy_key_pending", "text", "чужой текст")),
+                # the BLOCKED prefix without a valid label (parse_blocked_label is None): 1.4.x never wrote such a mark
+                ("a refusal line with a junk label stays", {"policy_refusal": {"status": "BLOCKED: [junk] x", "stamp": None,
+                                                                               "reason": "r"}},
+                 ("policy_refusal", "status", "BLOCKED: [junk] x")),
+                ("a line in flight with a junk label stays", {"policy_key_pending": {"key": list(self.other),
+                                                                                     "status": "BLOCKED: [junk] x",
+                                                                                     "text": text}},
+                 ("policy_key_pending", "status", "BLOCKED: [junk] x")),
+                # the prefix of a fixed answer, not its 1.4.x form (F2, W3 round 4): garbage after the prefix, and the
+                # answer of a rule without `answer` (POLICY_ANSWER shares the prefix) — never a fixed text in flight
+                ("the right prefix, not the form, stays", {"policy_key_pending": {"key": list(self.other),
+                                                                                  "status": self.line,
+                                                                                  "text": self.JUNK_PREFIXED}},
+                 ("policy_key_pending", "text", self.JUNK_PREFIXED)),
+                ("a policy answer of a rule without `answer` stays", {"policy_key_pending": {
+                    "key": list(self.other), "status": self.line, "text": wab.POLICY_ANSWER.format(rec="invariant")}},
+                 ("policy_key_pending", "text", wab.POLICY_ANSWER.format(rec="invariant"))),
+                ("a fixed text with the recommendation of the wave", {"policy_key_pending": {
+                    "key": list(self.other), "status": self.line, "text": self.WITH_REC}},
+                 ("policy_key_pending", "text", wab.text_eid(self.WITH_REC)))):
+            with self.subTest(name):
+                cfg = self.fresh()
+                st = wab.load_state(cfg)
+                st["waves"]["W1"].update(fields)
+                self.put_state(cfg, st)
+                holder, field, value = want
+                rec = wab.load_state(cfg)["waves"]["W1"]
+                self.assertEqual(rec[holder][field], value)
+                if value in ("BLOCKED: [junk] x", self.JUNK_PREFIXED, wab.POLICY_ANSWER.format(rec="invariant")):
+                    # left as it is, the schema reads it as corrupt (never a valid mark)
+                    if holder == "policy_refusal":
+                        self.assertFalse(wab._refusal_ok(rec[holder]))
+                    else:
+                        with self.assertRaises(ValueError):
+                            wab._fork_keys(rec, "W1", cfg["run_id"])
+        with self.subTest("the migrated 1.4.2 refusal still holds its episode"):
+            cfg = self.fresh()
+            self.set_status(cfg, "W1", self.line)
+            st = wab.load_state(cfg)
+            st["waves"]["W1"]["policy_refusal"] = {"status": self.line, "stamp": wab._status_stamp(cfg, "W1"), "reason": "r"}
+            st["waves"]["W1"]["notified"]["blocked"] = self.line  # the owner was told by 1.4.2
+            self.put_state(cfg, st)
+            self.tick(cfg)
+            self.tick(cfg)
+            self.assertEqual(self.count(), (0, 0))
+
+    # ----- the notices (A3, A4, #100 p.11a/p.11b): the event after an auto-answer × the rule × the cap -----
+    def after_answer(self, rule, cap):
+        cfg = self.fresh(getattr(self, rule), cap)
+        self.tick(cfg, self.line)
+        self.assertEqual(self.count(), (1, 0), "the first episode is auto-answered")
+        return cfg
+
+    def test_iw3_notices_by_the_fresh_non_empty_read(self):
+        path = lambda cfg: cfg["run_dir"] / "W1" / "status"  # noqa: E731
+        events = {
+            "empty": lambda cfg: self.rewrite(cfg, ""),
+            "missing": lambda cfg: (self.rewrite(cfg, ""), path(cfg).unlink()),
+            "RUNNING": lambda cfg: self.rewrite(cfg, "RUNNING"),
+            "the same line rewritten": lambda cfg: self.rewrite(cfg, self.line),
+        }
+        rows = []
+        for rule in ("WITH", "WITHOUT"):
+            for cap in (1, 3):  # spent by the first answer / left
+                for ev in events:
+                    want = (1, 0)  # an empty/unreadable read or another line: nothing to tell
+                    if ev == "the same line rewritten":
+                        # a new episode: at the cap or refused (the fork is answered) -> one notice; below the cap a
+                        # rule without `answer` answers it again
+                        want = (2, 0) if (rule, cap) == ("WITHOUT", 3) else (1, 1)
+                    rows.append((f"{rule} cap={cap} after the answer: {ev}", rule, cap, events[ev], want))
+        for rule in ("WITH", "WITHOUT"):
+            for name, newpol in (("removed", []), ("other class only", [{"class": "blocked_cap", "rec": "new_run"}]),
+                                 ("another rec only", [{"class": "needs_decision", "rec": "cut_surface"}])):
+                def drop_policy(cfg, newpol=newpol):
+                    cfg["decision_policy"] = newpol
+                    self.rewrite(cfg, self.line)
+                rows.append((f"{rule}: the policy changed between episodes ({name})", rule, 3, drop_policy, (1, 1)))
+
+            def corrupt_refusal(cfg):
+                st = wab.load_state(cfg)
+                st["waves"]["W1"]["policy_refusal"] = "x"
+                wab.save_state(cfg, st)
+                self.rewrite(cfg, self.line)
+            rows.append((f"{rule}: a corrupt refusal and the same line rewritten", rule, 3, corrupt_refusal, (1, 1)))
+        for name, rule, cap, event, want in rows:
+            with self.subTest(name):
+                cfg = self.after_answer(rule, cap)
+                event(cfg)
+                self.tick(cfg)
+                self.tick(cfg)
+                self.assertEqual(self.count(), want, "(answers, owner notices)")
+
+    def test_iw3_a_new_episode_without_an_earlier_answer_is_told_once(self):
+        """no_answer() on its own (tester-2 P3): the earlier episode of the line had NO auto-answer (refused at the cap),
+        so only its episode mark tells a new episode; the exit without an answer (a corrupt refusal) must still raise
+        BLOCKED once per episode — and an empty or unreadable read of status is no new episode."""
+        path = lambda cfg: cfg["run_dir"] / "W1" / "status"  # noqa: E731
+        for rule in ("WITH", "WITHOUT"):
+            for name, after, want in (("the same line rewritten", self.line, 2), ("empty", "", 1),
+                                      ("missing", None, 1), ("RUNNING", "RUNNING", 1)):
+                with self.subTest(rule=rule, event=name):
+                    cfg = self.fresh(getattr(self, rule), cap=0)
+                    self.tick(cfg, self.line)
+                    self.assertEqual(self.count(), (0, 1), "the first episode: refused at the cap, told once")
+                    st = wab.load_state(cfg)
+                    w = st["waves"]["W1"]
+                    self.assertIsNone(wab._answered(w), "no auto-answer before: only the episode mark tells a new episode")
+                    self.assertTrue(wab._episode_ok(w.get("policy_episode")), w.get("policy_episode"))
+                    w["policy_refusal"] = "x"  # the refusal mark is damaged between the episodes
+                    wab.save_state(cfg, st)
+                    self.rewrite(cfg, after if after is not None else "")
+                    if after is None:
+                        path(cfg).unlink()
+                    self.tick(cfg)
+                    self.tick(cfg)
+                    self.assertEqual(self.count(), (0, want), "(answers, owner notices)")
+
+    # ----- A1 (W3 round 4): the episode is accounted on EVERY exit without an auto-answer, the mark created there too -----
+    def corrupt_from_the_start(self, rule, line=None, episode=None):
+        """A chain whose policy_refusal is corrupt BEFORE the first episode (no policy_episode yet: no earlier episode
+        of the line ever ran through the rule path); cap 0, so a rule path after the refusal goes is a refusal too."""
+        cfg = self.fresh(getattr(self, rule), cap=0)
+        self.set_status(cfg, "W1", line or self.line)
+        st = wab.load_state(cfg)
+        st["waves"]["W1"]["policy_refusal"] = "x"
+        if episode is not None:
+            st["waves"]["W1"]["policy_episode"] = episode
+        wab.save_state(cfg, st)
+        self.tick(cfg)
+        self.assertEqual(self.count(), (0, 1), "the first episode: told once")
+        return cfg
+
+    def test_iw3_a_corrupt_refusal_without_an_episode_mark_tells_every_episode_once(self):
+        path = lambda cfg: cfg["run_dir"] / "W1" / "status"  # noqa: E731
+
+        def running_then_the_line(cfg):
+            self.rewrite(cfg, "RUNNING")
+            self.tick(cfg)  # the BLOCKED episode is over: _tick drops the corrupt refusal with it
+            self.rewrite(cfg, self.line)
+        events = (("the same line rewritten", lambda cfg: self.rewrite(cfg, self.line), 2),
+                  ("RUNNING, then the same line", running_then_the_line, 2),
+                  ("empty", lambda cfg: self.rewrite(cfg, ""), 1),
+                  ("missing", lambda cfg: (self.rewrite(cfg, ""), path(cfg).unlink()), 1))
+        for rule in ("WITH", "WITHOUT"):
+            for name, event, want in events:
+                with self.subTest(rule=rule, event=name):
+                    cfg = self.corrupt_from_the_start(rule)
+                    w = wab.load_state(cfg)["waves"]["W1"]
+                    self.assertTrue(wab._episode_ok(w.get("policy_episode")), "the exit without an answer accounts "
+                                                                              "the episode: its mark is created")
+                    self.assertEqual(w["policy_refusal"], "x", "a corrupt refusal is never rewritten (fail closed)")
+                    event(cfg)
+                    self.tick(cfg)
+                    self.tick(cfg)
+                    self.assertEqual(self.count(), (0, want), "(answers, owner notices)")
+
+    def test_iw3_a_line_no_rule_fits_keeps_the_dedup_by_text(self):
+        line = self.BC.format(rec="new_run")  # the rules here are of needs_decision: none fits a blocked_cap line
+        for rule in ("WITH", "WITHOUT"):
+            for corrupt in (True, False):
+                with self.subTest(rule=rule, corrupt_refusal=corrupt):
+                    if corrupt:
+                        cfg = self.corrupt_from_the_start(rule, line)
+                    else:
+                        cfg = self.fresh(getattr(self, rule), cap=0)
+                        self.tick(cfg, line)
+                        self.assertEqual(self.count(), (0, 1))
+                    self.assertNotIn("policy_episode", wab.load_state(cfg)["waves"]["W1"])
+                    self.rewrite(cfg, line)
+                    self.tick(cfg)
+                    self.tick(cfg)
+                    self.assertEqual(self.count(), (0, 1), "1.2.0: a line no rule fits is told once per text")
+
+    def test_iw3_a_corrupt_episode_mark_is_never_rewritten_by_an_exit_without_an_answer(self):
+        # both marks corrupt: the known limit (waves.md, I-W3) — the first episode is told, the repeats of the line stay
+        # silent until the owner answers or the wave moves on; the corrupt episode mark is kept as it is (fail closed)
+        for rule in ("WITH", "WITHOUT"):
+            with self.subTest(rule=rule):
+                cfg = self.corrupt_from_the_start(rule, episode="garbage")
+                self.assertEqual(wab.load_state(cfg)["waves"]["W1"]["policy_episode"], "garbage")
+                self.rewrite(cfg, self.line)
+                self.tick(cfg)
+                self.assertEqual(wab.load_state(cfg)["waves"]["W1"]["policy_episode"], "garbage")
+                self.assertEqual(self.count(), (0, 1))
+
+    def test_iw3_an_empty_read_records_no_episode_mark(self):
+        # A3 kept on the exit without an answer: the line is decided on last_status (the file empty mid-rewrite) — no
+        # mark is recorded under the stamp of the empty file, nothing is reset; the line written right after is the
+        # same episode (one notice), its mark recorded by that first stable read
+        for rule in ("WITH", "WITHOUT"):
+            with self.subTest(rule=rule):
+                cfg = self.fresh(getattr(self, rule), cap=0)
+                self.set_status(cfg, "W1", "")
+                st = wab.load_state(cfg)
+                w = st["waves"]["W1"]
+                wab.set_last_status(cfg, "W1", w, self.line)
+                w["policy_refusal"] = "x"
+                wab.save_state(cfg, st)
+                self.tick(cfg)
+                self.assertEqual(self.count(), (0, 1), "decided on last_status: told once")
+                self.assertNotIn("policy_episode", wab.load_state(cfg)["waves"]["W1"])
+                self.rewrite(cfg, self.line)
+                self.tick(cfg)
+                self.assertTrue(wab._episode_ok(wab.load_state(cfg)["waves"]["W1"].get("policy_episode")))
+                self.tick(cfg)
+                self.assertEqual(self.count(), (0, 1), "the write that was in progress is no new episode")
+
+    def test_iw3_a_rewrite_between_the_stamp_and_the_read_is_one_episode(self):
+        """The stamp of the status file is taken mid-rewrite (the file empty), the wave writes the line right after: one
+        rewrite is ONE new episode — the mark takes the stamp of the very write it read (stamp -> read -> stamp), never
+        the stamp of the empty file (that would make the next tick see a «new» episode of the same write)."""
+        for rule in ("WITH", "WITHOUT"):
+            for start in ("a corrupt refusal", "the cap"):
+                with self.subTest(rule=rule, start=start):
+                    if start == "the cap":
+                        cfg = self.fresh(getattr(self, rule), cap=0)
+                        self.tick(cfg, self.line)
+                        self.assertEqual(self.count(), (0, 1))
+                    else:
+                        cfg = self.corrupt_from_the_start(rule)
+                    self.rewrite(cfg, "")  # the wave truncates the file to write the same line again
+                    real, raced = wab._status_stamp, []
+
+                    def stamp(cfg_, wave, cfg=cfg, real=real, raced=raced):
+                        got = real(cfg_, wave)
+                        if not raced and (cfg["run_dir"] / "W1" / "status").read_text(encoding="utf-8") == "":
+                            raced.append(1)
+                            self.rewrite(cfg, self.line)  # ...and writes it right after the stamp was taken
+                        return got
+                    with mock.patch.object(wab, "_status_stamp", side_effect=stamp):
+                        self.tick(cfg)
+                    self.assertTrue(raced)
+                    self.tick(cfg)
+                    self.tick(cfg)
+                    self.assertEqual(self.count(), (0, 2), "one rewrite, one new episode, one notice")
+
+    def test_iw3_a_failed_delivery_notifies_only_on_a_fresh_read(self):
+        for rule in ("WITH", "WITHOUT"):
+            for after, want in (("RUNNING", 0), ("", 1), (None, 1)):  # only a non-empty OTHER read mutes it
+                with self.subTest(rule=rule, after=after):
+                    cfg = self.fresh(getattr(self, rule))
+                    self.set_status(cfg, "W1", self.line)
+
+                    def fail(n, t, **kw):  # the paste fails (the window is alive); meanwhile the wave writes `after`
+                        if after is not None:
+                            self.rewrite(cfg, after)
+                        raise subprocess.CalledProcessError(1, "tmux")
+                    with mock.patch.object(wab, "send_text", side_effect=fail):
+                        self.tick(cfg)
+                    self.assertEqual(self.count(), (0, want), "(answers, owner notices)")
+                    w = wab.load_state(cfg)["waves"]["W1"]
+                    self.assertNotIn("policy_key_pending", w)  # nothing reached the window: the key left the flight
+
+    # ----- #100 p.17: the window dies while the answer is delivered -----
+    def test_iw3_a_key_in_flight_never_outlives_a_delivery_that_typed_nothing(self):
+        cfg = self.fresh()
+        self.set_status(cfg, "W1", self.line)
+
+        def die(n, t, **kw):  # the window dies before anything is pasted (on_typed is never called)
+            self.alive = False
+            raise subprocess.CalledProcessError(1, "tmux")
+        with mock.patch.object(wab, "send_text", side_effect=die):
+            try:
+                self.tick(cfg)
+            except wab._WindowGone:
+                pass
+        w = wab.load_state(cfg)["waves"]["W1"]
+        self.assertNotIn("policy_key_pending", w)
+        self.assertNotIn("policy_pending", w)
+        self.assertFalse(w.get("policy_keys"))
+        archived = {k: v for k, v in w.items() if k not in ("attempts", "outbox")}  # a relaunch archives it (launch)
+        st = wab.load_state(cfg)
+        st["waves"]["W1"] = dict(self.wave_rec("W1"), attempts=[archived])
+        wab.save_state(cfg, st)
+        self.alive = True
+        got = self.decide(cfg, w=wab.load_state(cfg)["waves"]["W1"], status=self.line)
+        self.assertTrue(got["ok"], got)
+        self.tick(cfg)
+        self.assertEqual(self.count(), (1, 0), "the fork is answered once the window is back")
+
+    def test_iw3_a_collect_error_in_the_recheck_before_the_enter_postpones_it(self):
+        # coverage of _deliver: a CollectError of the precheck between the typing and the Enter (no product change)
+        cfg = self.fresh()
+        st = wab.load_state(cfg)
+        calls = []
+
+        def precheck():
+            calls.append(1)
+            if len(calls) > 1:
+                raise wab.gate.CollectError("gh: down")
+            return True
+
+        def send(n, t, on_typed=None, before_enter=None):
+            on_typed()
+            before_enter()
+            self.enters.append(n)
+        with mock.patch.object(wab, "send_text", side_effect=send):
+            got = wab._deliver(cfg, st, "W1", "policy answer", wab.send_text, "hello", precheck=precheck,
+                               recheck_enter=True)
+        self.assertIs(got, False)
+        self.assertEqual(self.enters, [])
+        self.assertEqual(st["waves"]["W1"].get("pending_enter"), "policy answer")
+        self.assertIn("postponed: facts not collected before the Enter", self.log(cfg))
+
+
 # ---------------------------------------------------------------- W4 dash-texts: live reload, minutes in notices, one gate event
 class W4DashReload(Base):
     """#102 item 6: the dashboard holds the identity of the run from its start, like `watch`; a live edit of
@@ -22088,13 +22767,12 @@ class Release152(unittest.TestCase):
     """The release 1.5.2 (#113 W2; wave W2 of waves-tails2): version, the CHANGELOG section on top, the paragraph of
     the store of texts in the doc (I1-I3)."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.2"\s*$')
+    # the version of SKILL.md moved on to 1.5.3 (#113 W3): Release153 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.2 — 2026-10-12$", "1.5.2 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.5\.2 — 2026-10-12$", "CHANGELOG.md: the section of 1.5.2")
+        self.assertTrue(log.index("## 1.5.2") < log.index("## 1.5.1"), "1.5.2 is above 1.5.1")
         body = re.search(r"(?ms)^## 1\.5\.2 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
         for needle in ("issues/113", "`waves-tails2`", "`text_eid`", "`mark_eid`", "`stashed_text`", "`text_lost`",
                        "текст недоступен", "`TextStoreEpisodes`", "`W2MarksStableAcrossVersions`", "w2-state-1.5.1"):
@@ -22104,6 +22782,36 @@ class Release152(unittest.TestCase):
         waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
         for needle in ("`text_eid`", "`mark_eid`", "`notified.text_store`", "`text_lost`", "текст недоступен"):
             self.assertIn(needle, waves)
+
+
+
+class Release153(unittest.TestCase):
+    """The release 1.5.3 (#113 W3; wave W3 of waves-tails2): version, the CHANGELOG section on top, the invariant I-W3 in
+    wab.py and in the doc, the row of what is implemented."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.3"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.3 — 2026-10-12$", "1.5.3 is the first section")
+        body = re.search(r"(?ms)^## 1\.5\.3 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
+        for needle in ("issues/113", "issues/100", "`waves-tails2`", "I-W3", "`W3PolicyMarksAndNotices`", "`_fork_keys`",
+                       "`upgrade_record`", "`owner_paths=True`", "`owner_event`", "`W3OwnerScriptPathEverywhere`",
+                       "п.17", "п.15", "п.11"):
+            self.assertIn(needle, body)
+        self.assertIn("Уточнение 1.5.3: для `policy_refusal`", log)  # the wording of 1.4.4 corrected
+
+    def test_the_invariant_is_written_once_in_wab_and_in_the_doc(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        self.assertEqual(src.count("# I-W3 (#113 W3, 1.5.3): THE invariant"), 1)
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        self.assertIn("Инвариант I-W3 (1.5.3", waves)
+        self.assertIn("Известное ограничение (следствие I-W3)", waves)
+        table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
+        self.assertRegex(table, r"(?m)^\| Отметки автоответов по полной схеме[^\n]*реализовано \(1\.5\.3; "
+                                r"[^\n]*`W3PolicyMarksAndNotices`, `W3OwnerScriptPathEverywhere`, `MergeGate` \|$")
 
 
 if __name__ == "__main__":

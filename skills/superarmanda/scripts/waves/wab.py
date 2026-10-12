@@ -457,16 +457,29 @@ def notice_stamp(cfg, ts):
     return f"Время: {hum(cfg, ts)}"
 
 
-def event(cfg, text):
+def event(cfg, text, owner_paths=False):
     # the WHOLE text of the event passes safe_text BEFORE it is cut into lines: events.log is read by a
     # human (the watch window tails it, the dashboard shows it), and a line break (a lone CR, U+2028, NEL)
-    # inside a secret would otherwise cut it into two pieces that redact() does not recognise (#81)
-    text = " ⏎ ".join(l for l in safe_text(text, 10 ** 9).splitlines() if l.strip())
+    # inside a secret would otherwise cut it into two pieces that redact() does not recognise (#81).
+    # `owner_paths` (#113 W3): an event of a hand-over to the owner names the owner's merge script, and its
+    # path is exempt from the heuristics only for a name the dispatcher derived whose file exists (_owner_script_spans)
+    # — every other mask stays
+    text = " ⏎ ".join(l for l in safe_text(text, 10 ** 9, owner_paths).splitlines() if l.strip())
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}Z {text}"
     cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     with open(cfg["run_dir"] / "events.log", "a", encoding="utf-8") as f:
         f.write(line + "\n")
     print(line, flush=True)
+
+
+def owner_event(cfg, text):
+    """THE event of a hand-over to the owner: a text that names the owner's merge script (~/.cache/wab/<owner_script_name>,
+    a value of write_owner_script / _owner_script / owner_script_name / handoff_gate_line). Masked with owner_paths=True:
+    the path is exempt from the heuristics (its sha12/id16 may read as a phone number) only for a name the dispatcher
+    derived (_OWNER_SCRIPT_NAMES) while that very file exists
+    (_owner_script_spans), every other mask of the line stays. The one way to log such a text (#113 W3): a static test
+    finds every event() whose text is built from those values."""
+    event(cfg, text, owner_paths=True)
 
 
 def wave_dir(cfg, wave):
@@ -614,6 +627,14 @@ def _same(mark, e):
     return isinstance(mark, str) and mark_eid(mark) == e
 
 
+# THE form of a fixed answer as 1.4.x typed it (_fork_decision): FIXED_HEAD with an answer of the closed vocabulary,
+# its wording, the wave's recommendation when it differed, FIXED_TAIL — one line. FROZEN on purpose: it describes
+# what 1.4.x wrote into state.json, not what this release types (a later change of FIXED_HEAD must not move it). A
+# string that only shares the prefix (garbage after it, POLICY_ANSWER of a rule without `answer`) is not this form.
+_LEGACY_FIXED_TEXT = re.compile(r"\[wab\] РЕШЕНИЕ ПО ПОЛИТИКЕ \(chain\.json\): вариант "
+                                r"(?:invariant|cut_surface|accept_limitation|new_run)\. [^\n]+ Затем запиши RUNNING в status\.")
+
+
 def _keep_legacy(legacy, text):
     if isinstance(text, str) and text and not EID.fullmatch(text):
         legacy[mark_eid(text)] = text
@@ -670,16 +691,24 @@ def upgrade_record(w, legacy):
                 q["eid"] = _keep_legacy(legacy, text if isinstance(text, str) else "")
     if isinstance(w.get("policy_pending"), str):
         w["policy_pending"] = mark_eid(w["policy_pending"])
-    for holder in (w.get("policy_key_pending"), w.get("policy_refusal"), w.get("fable_blocked_episode")):
-        # an empty status is never written (a mark holds the line of its episode): it stays as it is, never the eid
-        # of an empty line. policy_refusal reads it as corrupt (C4); in policy_key_pending and fable_blocked_episode
-        # it only never matches an episode (no Enter-only retry; the key is kept as answered) — the schema there
-        # checks types, not values (accepted limitation, PR #115)
-        if isinstance(holder, dict) and isinstance(holder.get("status"), str) and holder["status"]:
-            holder["status"] = mark_eid(holder["status"])
+    for holder in (w.get("policy_key_pending"), w.get("policy_refusal")):
+        # I-W3 (#113 W3, 1.5.3): only a legacy line of ITS OWN form becomes an eid — 1.4.x wrote these marks for a
+        # labelled BLOCKED line only (the refusal and the key in flight come after parse_blocked_label, so the line
+        # parses as a label). Anything else (an empty string, garbage, a short `sha256:abc`, `BLOCKED: [junk] x`)
+        # stays as it is, and the schema reads it as corrupt (_refusal_ok, _fork_keys): a migration never turns a
+        # damaged mark into a valid one
+        if (isinstance(holder, dict) and isinstance(holder.get("status"), str)
+                and parse_blocked_label(holder["status"]) is not None and not EID.fullmatch(holder["status"])):
+            holder["status"] = text_eid(holder["status"])
     pend = w.get("policy_key_pending")
-    if isinstance(pend, dict) and isinstance(pend.get("text"), str):
-        pend["text"] = mark_eid(pend["text"])
+    if (isinstance(pend, dict) and isinstance(pend.get("text"), str)
+            and _LEGACY_FIXED_TEXT.fullmatch(pend["text"])):  # the whole text of a fixed answer of 1.4.x, nothing else
+        pend["text"] = text_eid(pend["text"])
+    handed = w.get("fable_blocked_episode")
+    # an empty status is never written: it stays as it is and never matches an episode (no schema check here: the mark
+    # only keeps the policy and the owner's notice off a line handed to an Opus session)
+    if isinstance(handed, dict) and isinstance(handed.get("status"), str) and handed["status"]:
+        handed["status"] = mark_eid(handed["status"])
     sw = w.get("fable_switch")
     if isinstance(sw, dict):
         blocked = sw.get("blocked")
@@ -1575,8 +1604,8 @@ TG_MESSAGE_LIMIT = 1200  # whole message; quoted text is capped at TG_LIMIT firs
 #     /commits/ or /tree/. The query and fragment of the URL are not exempt.
 #  3. Explicit exceptions only: a bare 40-64 hex after a SHA label (`commit`, `sha`, `head`, ...),
 #     the github SHA above, an _OPAQUE run made only of word-like parts (_readable_dashed), and the
-#     owner's merge script path `.cache/wab/<wave>.<sha12>.<id16>.merge` when that file exists
-#     (_OWNER_SCRIPT, _owner_script_spans).
+#     owner's merge script path `.cache/wab/<wave>.<sha12>.<id16>.merge` when the dispatcher derived that
+#     name and the file exists (_OWNER_SCRIPT, _OWNER_SCRIPT_NAMES, _owner_script_spans).
 # A long run of base64/base64url characters. Without a dash any 40+ run is a blob; with a dash
 # it stays readable only when every part between -, /, _ and + looks like a word (see
 # _readable_dashed): `kebab-case-words`, paths, dates stay, base64url and UUID-like keys go.
@@ -1678,15 +1707,20 @@ _GITHUB_PATH = re.compile(r"(?i)(?<![^\s\"'`(\[<,])(?:https?://[^/" + _TOKEN_END
 _GITHUB_HOSTS = ("github.com", "www.github.com")
 # The owner's merge script (owner_script_name) in a notice: its sha12 and id16 may look like a phone
 # number (`.71234567890a.`) or a blob to the heuristics, and a masked path is a useless command. Only
-# a path of that shape whose file EXISTS in ~/.cache/wab (written by write_owner_script) is exempt
-# from HEURISTIC: a secret dressed up as such a path in the wave's own text names no file and is
-# masked as before. The check survives a restart of the dispatcher (no in-memory registry).
+# a path of that shape is exempt from HEURISTIC only when the DISPATCHER derived its name (_owner_script: a wave and a
+# sha of this run, in this process or re-derived from state.json by _note_owner_scripts) AND its file exists in
+# ~/.cache/wab. An existing file alone is no proof (Codex P2 on 1.5.3): the wave runs as the same user and may create
+# ~/.cache/wab/<any name of that shape> and write it into status or a question — such a path is masked as before, and
+# so is a secret dressed up as such a path that names no file.
 _OWNER_SCRIPT = re.compile(r"\.cache/wab/([A-Za-z0-9_-]+\.[0-9a-f]{12}\.[0-9a-f]{16}\.merge)(?![\w.])")
+_OWNER_SCRIPT_NAMES = set()  # the names _owner_script derived in this process: the only ones the exemption takes
 
 
 def _owner_script_spans(text):
     spans = []
     for m in _OWNER_SCRIPT.finditer(text):  # the home folder is looked up only for a path of that shape (#85)
+        if m.group(1) not in _OWNER_SCRIPT_NAMES:
+            continue
         try:
             if (pathlib.Path.home() / ".cache" / "wab" / m.group(1)).is_file():
                 spans.append(m.span())
@@ -1768,8 +1802,13 @@ def _mask_structured(m):
 def redact(text, limit=TG_LIMIT, owner_paths=True):
     """Mask secrets and personal data in text that leaves for Telegram. Rules: see the comment
     above _OPAQUE. A heuristic, not a guarantee; its limits are listed in references/waves.md.
-    `owner_paths=False` drops the owner-script exemption (rule 3): text of the wave and other
-    outside text is never trusted to name the dispatcher's own file (see quote)."""
+    `owner_paths` (rule 3): True keeps the path of the owner's merge script `~/.cache/wab/<form>` whose name the
+    dispatcher derived for this run (_owner_script, _note_owner_scripts) and whose file exists (_owner_script_spans;
+    every other mask of the text stays) — the dispatcher's own outputs that name it:
+    owner_event in events.log, _write_status, `wab.py status`, questions[] of chain-result.md, the
+    dispatcher's own wording in render_notice. False drops the exemption: a quote of the wave
+    (quote/_render_quote), any other event, the dashboard — outside text is never trusted to name
+    the dispatcher's own file."""
     for rx in _STRUCTURED:
         text = rx.sub(_mask_structured, text)
     for rx in _HEURISTIC:
@@ -3343,16 +3382,34 @@ def _refuse(reason):
     return {"ok": False, "reason": reason}
 
 
-def _fork_keys(rec):
-    """(answered keys, the key in flight or None) of one wave record of state.json. A mark that is there
+# I-W3 (#113 W3, 1.5.3): THE invariant of the marks of an automatic answer and of the owner's BLOCKED notice.
+# A mark in state.json (policy_key_pending, policy_refusal, policy_episode, policy_keys) is taken only by its full
+# schema: its status/text are eids (EID.fullmatch), the key in flight of the current record is of its wave and of
+# cfg["run_id"], an archived one (attempts[i]) of its wave (a relaunch keeps the record of an earlier run as it is).
+# The 1.4.x migration (upgrade_record) turns into an eid only a legacy string of its own form (a labelled BLOCKED
+# line; the text of a fixed answer). Any deviation is a corrupt mark: a refusal to the owner (FORK_MARKS_CORRUPT, a
+# corrupt policy_refusal / policy_episode), never an automatic answer. A new BLOCKED episode, the owner's notice and
+# its silence rest only on a fresh NON-EMPTY read of status (_episode_read: one stable stamp -> text -> stamp read in
+# _policy_answer; _fresh_status in _tick): an empty or unreadable read never opens an episode and never mutes a notice,
+# a non-empty OTHER read mutes it (the episode is over; the next tick decides). Every episode without an automatic
+# answer (the cap, a refusal, a corrupt mark, the rule gone) notifies the owner exactly once: the episode is accounted
+# at ONE point (_episode_step) on the rule path and on every exit without an answer. Known limit: a corrupt
+# policy_refusal AND a corrupt policy_episode at once — the repeats of the same line stay silent (fail closed). A key in flight whose text was not typed into the window never outlives its delivery.
+
+def _fork_keys(rec, wave, run_id=None):
+    """(answered keys, the key in flight or None) of one wave record of state.json of `wave`. A mark that is there
     but corrupt (`policy_keys` not a list of lists, `policy_key_pending` not an object with a list `key`)
     raises ValueError: it is never read as «nothing was answered» — fixed_answer refuses (fail closed). The
-    schema is the whole one: a key is [wave, run_id, index > 0, task, class, source] as _fork_decision builds
-    it, the key in flight is {key, status, text} with string status/text."""
+    schema is the whole one (I-W3): a key is [wave, run_id, index > 0, task, class, source] as _fork_decision builds
+    it, the key in flight is {key, status, text} with eids status/text and a key of `wave` — and of `run_id` when it
+    is given (the current record: cfg["run_id"]; an archived attempt may hold another run and passes None). An
+    answered key of another wave or run never matches a fork of this one: `policy_keys` keep the key schema only."""
     keys, pend = rec.get("policy_keys", []), rec.get("policy_key_pending")
     if (not isinstance(keys, list) or not all(_fork_key_ok(k) for k in keys)
             or not (pend is None or (isinstance(pend, dict) and _fork_key_ok(pend.get("key"))
-                                     and isinstance(pend.get("status"), str) and isinstance(pend.get("text"), str)))):
+                                     and pend["key"][0] == wave and (run_id is None or pend["key"][1] == run_id)
+                                     and isinstance(pend.get("status"), str) and EID.fullmatch(pend["status"])
+                                     and isinstance(pend.get("text"), str) and EID.fullmatch(pend["text"])))):
         raise ValueError(FORK_MARKS_CORRUPT)
     return keys, pend
 
@@ -3371,12 +3428,12 @@ def _fork_key_ok(k):
             and (k[5] in gate.state.FIX_SOURCES if k[4] == "needs_decision" else k[5] == ""))
 
 
-def _keep_fork_key(w):
+def _keep_fork_key(cfg, wave, w):
     """A typed fixed answer (#89) is given up and may have been submitted: its fork key leaves the flight
     and counts as answered (`policy_keys`) — never just dropped. A corrupt mark stays as it is:
     fixed_answer refuses on it."""
     try:
-        keys, pend = _fork_keys(w)
+        keys, pend = _fork_keys(w, wave, cfg.get("run_id"))
     except ValueError:
         return
     if pend:
@@ -3431,7 +3488,7 @@ def _fixed_answer(cfg, wave, w, label, rule, status):
     if not isinstance(attempts, list) or not all(isinstance(a, dict) for a in attempts):
         return _refuse(FORK_ATTEMPTS_CORRUPT)
     try:  # before anything else, the Enter-only retry included: a corrupt mark of ANY record of the wave
-        marks = [_fork_keys(rec) for rec in [w, *wave_attempts(w)]]
+        marks = [_fork_keys(w, wave, cfg["run_id"])] + [_fork_keys(rec, wave) for rec in wave_attempts(w)]
     except ValueError:
         return _refuse(FORK_MARKS_CORRUPT)
     pend = marks[0][1]
@@ -4516,7 +4573,7 @@ def _abandon_input(cfg, st, wave, w, why, locked=False, target=None):
             w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
             w.pop("policy_pending", None)
             if "policy_key_pending" in w:
-                _keep_fork_key(w)  # a fixed answer (#89) given up, possibly submitted: its fork counts as answered
+                _keep_fork_key(cfg, wave, w)  # a fixed answer (#89) given up, possibly submitted: its fork counts as answered
         w["pending_clear"] = {"what": what, "why": why}
         w.pop("pending_enter", None)
         w.pop("pending_text_eid", None)
@@ -5077,7 +5134,7 @@ def begin_fable_switch(cfg, st, wave, w, blocked=None):
         if what == "policy answer":  # typed, Enter unconfirmed: it may have been submitted — never one free
             w["auto_answers"] = (w["auto_answers"] if _count(w.get("auto_answers")) else 0) + 1
             if "policy_key_pending" in w:
-                _keep_fork_key(w)
+                _keep_fork_key(cfg, wave, w)
         w.pop("policy_pending", None)
         if what == "gate failure" and isinstance(w.get("gate_fail_msg"), dict):
             w["gate_fail_msg"]["sent"] = True  # possibly delivered (then it is in the carried answer): not resent
@@ -5626,6 +5683,33 @@ def owner_script_name(cfg, wave, sha):
     return f"{wave}.{sha[:12]}.{hashlib.sha256(ident.encode('utf-8')).hexdigest()[:16]}.merge"
 
 
+def _owner_script(cfg, wave, sha):
+    """THE derivation of the owner's script name by the dispatcher: owner_script_name, remembered in
+    _OWNER_SCRIPT_NAMES — the only names redact(owner_paths=True) keeps whole (Codex P2 on 1.5.3). Every place
+    that names the script takes it from here (write_owner_script, the reminder, _note_owner_scripts)."""
+    name = owner_script_name(cfg, wave, sha)
+    _OWNER_SCRIPT_NAMES.add(name)
+    return name
+
+
+_GATE_SHA = re.compile(r"[0-9a-f]{12,64}")
+
+
+def _note_owner_scripts(cfg, st):
+    """Re-derive the script names of this run from state.json (a fresh process: `wab.py status`, chain-result.md after
+    a restart): every sha the dispatcher gated or handed to the owner — gate_sha, merge_called, owner_remind.sha of
+    each wave record and its attempts. A text the wave wrote never adds a name here."""
+    for wave, w in (st.get("waves") or {}).items():
+        if not isinstance(w, dict) or not isinstance(wave, str):
+            continue
+        for rec in (w, *wave_attempts(w)):
+            remind = rec.get("owner_remind")
+            for sha in (rec.get("gate_sha"), rec.get("merge_called"),
+                        remind.get("sha") if isinstance(remind, dict) else None):
+                if isinstance(sha, str) and _GATE_SHA.fullmatch(sha):
+                    _owner_script(cfg, wave, sha)
+
+
 def write_owner_script(cfg, wave, sha):
     """~/.cache/wab/<owner_script_name>: executable by the owner only, bound to this run and to the
     gated sha (a re-gate on another sha writes another file: the old notice keeps its script, which
@@ -5633,7 +5717,7 @@ def write_owner_script(cfg, wave, sha):
     text = gate.owner_script(pathlib.Path(__file__).resolve(), cfg["chain_file"], wave, cfg["run_id"], sha)
     folder = pathlib.Path.home() / ".cache" / "wab"
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = folder / owner_script_name(cfg, wave, sha)
+    path = folder / _owner_script(cfg, wave, sha)
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".merge.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -5869,8 +5953,8 @@ def _owner_reminder(cfg, st, wave, w, number, sha, now):
     w["owner_remind"] = {"sha": sha, "at": now, "n": n + 1}
     put_notice(cfg, w, wave, "merge_remind", f"{sha}:{n + 1}", pr=number, minutes=cfg.get("merge_remind_minutes"))
     save_state(cfg, st)
-    event(cfg, f"{wave}: напоминание владельцу #{n + 1}: PR #{number} не смержен; owner runs "
-               f"{home_form(pathlib.Path.home() / '.cache' / 'wab' / owner_script_name(cfg, wave, sha))}")
+    owner_event(cfg, f"{wave}: напоминание владельцу #{n + 1}: PR #{number} не смержен; owner runs "
+                     f"{home_form(pathlib.Path.home() / '.cache' / 'wab' / _owner_script(cfg, wave, sha))}")
     flush_notices(cfg, st, w)
 
 
@@ -6071,7 +6155,7 @@ def _gate_passed(cfg, st, wave, w, wdir, v, recheck=False):
         _owner_wait_started(w, sha, "threads")
         put_notice(cfg, w, wave, "merge_owner", sha, pr=number, threads=len(unresolved), p01=v["old_p01"])
         save_state(cfg, st)
-        event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}")
+        owner_event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}")
         flush_notices(cfg, st, w)
         return True
     if w.get("merge_called") == sha:  # never twice for one sha
@@ -6160,7 +6244,7 @@ def _hand_to_owner(cfg, st, wave, w, wdir, number, sha, reason, log_text, questi
     _owner_wait_started(w, sha, reason)
     put_notice(cfg, w, wave, "merge_refused", sha, pr=number, reason=reason, question=question)
     save_state(cfg, st)
-    event(cfg, f"{wave}: merge gate passed, {log_text}; owner runs {command}")
+    owner_event(cfg, f"{wave}: merge gate passed, {log_text}; owner runs {command}")
     flush_notices(cfg, st, w)
     return True
 
@@ -6496,7 +6580,7 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         _owner_wait_started(w, sha, "merge_unknown")
         put_notice(cfg, w, wave, "merge_unknown", sha, pr=number)
         save_state(cfg, st)
-        event(cfg, f"{wave}: PR #{number} merge result unknown; handed to the owner: {command}")
+        owner_event(cfg, f"{wave}: PR #{number} merge result unknown; handed to the owner: {command}")
         flush_notices(cfg, st, w)
         return True
     if w.get("merge_called") == sha and "merge_rc" not in w and once_per(w, "merge_unknown", sha):
@@ -6810,8 +6894,10 @@ def _say_first(text):
 def note_question(cfg, wave, w, text, now):
     """Record a question to the owner (an owner-facing BLOCKED line) for the chain result: redacted,
     the same text twice in a row once, capped. The record keeps the moment and the eid; the text is in the
-    wave's store (1.4.3). The caller saves it with its change."""
-    text = safe_text(text, 300)
+    wave's store (1.4.3). The caller saves it with its change. A Masked text (the dispatcher's own status line of
+    _write_status, masked with owner_paths=True) keeps its mask: masking it again without the policy made the
+    owner's merge script path «[скрыто]» when its name looked like a phone number (#113 W3)."""
+    text = _clip(text, 300) if isinstance(text, Masked) else safe_text(text, 300)
     _record_question(w, stash_text(cfg, wave, text, w), now)  # already masked (safe_text): the store keeps it masked
 
 
@@ -6869,6 +6955,7 @@ def _question_text(cfg, st, wave, q):
 def write_chain_result(cfg, st):
     """Write `<run_dir>/chain-result.md` (atomically) and return (path, short summary for the
     end-of-chain message). Read-only over the state; nothing leaves the machine from here."""
+    _note_owner_scripts(cfg, st)  # questions[] keep whole only a script name the dispatcher derived for this run
     now = time.time()
     repo = cfg.get("repo")
     rows, questions, prs = [], [], 0
@@ -6916,7 +7003,7 @@ def write_chain_result(cfg, st):
              f"- волн: {len(cfg['waves'])}, PR: {prs}, перезапусков голов: {restarts_heads}, "
              f"перезапусков волн: {restarts_waves}, вопросов: {len(questions)}\n", "## Волны\n", *rows,
              "## Вопросы к владельцу\n"]
-    lines += ([f"- {hum(cfg, num(q.get('at')), date=True)} {wave}: {safe_text(_question_text(cfg, st, wave, q), 300)}"
+    lines += ([f"- {hum(cfg, num(q.get('at')), date=True)} {wave}: {safe_text(_question_text(cfg, st, wave, q), 300, owner_paths=True)}"
                for wave, q in questions] or ["нет"])
     path = cfg["run_dir"] / "chain-result.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -7053,6 +7140,60 @@ def _policy_refuse(cfg, st, wave, w, es, stamp, reason, status, was_typed=False)
     return False
 
 
+def _fresh_status(cfg, wave):
+    """I-W3: THE fresh read of the status file an episode decision rests on — its text, or None when the file is empty
+    or unreadable (the wave mid-rewrite: such a read decides nothing, it neither opens an episode nor mutes a notice)."""
+    return read(wave_dir(cfg, wave) / "status", on_error=None) or None
+
+
+def _episode_read(cfg, wave, status):
+    """I-W3: THE read every episode decision of _policy_answer rests on, taken once per call: (reads, stamp). `reads`:
+    the status file reads as `status` NOW by one stable snapshot (stamp -> text -> stamp, _status_snapshot), and
+    `stamp` is the stamp of that very write — never the stamp of an empty file the line was written over right after
+    the stamp was taken (that would make the next tick see a «new» episode of the same write). Otherwise (empty,
+    unreadable, another line, rewritten during the read) `reads` is False — such a read opens no new episode and
+    records no mark — and `stamp` is the file's current stamp (the same-stamp check of a mark still holds)."""
+    snap = _status_snapshot(cfg, wave)
+    if snap is not None and snap[0] == status:
+        return True, snap[1]
+    return False, _status_stamp(cfg, wave)
+
+
+def _policy_rule(cfg, status):
+    """(label, rule): the rule of decision_policy that fits a BLOCKED line, or rule None when no rule may answer it
+    (no or bad label, red=yes, merge_gate, a class/rec the policy does not name)."""
+    label = parse_blocked_label(status)
+    if label is None or label["red"] or label["class"] == "merge_gate":
+        return label, None
+    rule = next((r for r in decision_policy(cfg)
+                 if r["class"] == label["class"] and r["rec"] in (None, label["rec"])), None)
+    return label, rule
+
+
+def _episode_step(w, es, stamp, reads, create=True):
+    """I-W3: THE accounting of a BLOCKED episode in `policy_episode` — the eid of the line AND the stamp of the status
+    write that reads as it — for the rule path and for every exit without an answer of _policy_answer alike.
+    None: the mark is corrupt; it is kept as it is (fail closed: the rule path refuses on it, an exit without an
+    answer leaves it — it is never read as «a new episode» and never overwritten). True: a NEW episode of the line the
+    mark already holds (the same text under another stamp while the file reads as it), or the first episode of
+    another line after a mark (the caller drops the `blocked` mark of the owner's notice: one notice per episode).
+    False: the same episode (the same stamp, or a read that is not this line now: empty, unreadable, mid-rewrite),
+    or the first mark ever written (a state.json of 1.4.3, or the first episode: its notice is the first one).
+    Nothing is written on a read that is not the line now; `create` False only moves a mark of this very line on."""
+    episode = w.get("policy_episode")
+    if episode is not None and not _episode_ok(episode):
+        return None
+    if isinstance(episode, dict) and _same(episode["status"], es):
+        if episode.get("stamp") == stamp or not reads:
+            return False
+        w["policy_episode"] = {"status": es, "stamp": stamp}
+        return True
+    if not (create and reads):
+        return False
+    w["policy_episode"] = {"status": es, "stamp": stamp}
+    return episode is not None
+
+
 def _policy_answer(cfg, st, wave, w, status, now, attach):
     """Answer a BLOCKED episode by the decision_policy of chain.json. True when it is answered (now
     or earlier in this episode): the owner is then informed (`policy_answer`), not asked. False sends
@@ -7077,35 +7218,61 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     `policy_keys`, one in flight in `policy_key_pending`. THE key in flight lives only inside its episode
     and is never lost: when its typed answer is given up (_abandon_input — it may have been submitted) it
     MOVES to `policy_keys` and counts as answered; it is dropped unanswered only by its own decision and
-    only when nothing reached the window. The path of a rule without `answer` in this function neither
-    reads nor writes `policy_key_pending` / `policy_keys`."""
-    stamp = _status_stamp(cfg, wave)
+    only when nothing reached the window — the status changed before the typing, the delivery failed, or the
+    window died before the paste (_WindowGone with nothing typed: re-raised after the key is dropped, #100 p.17).
+    I-W3: the episode decisions here rest on ONE stable non-empty read of status (_episode_read: stamp -> text ->
+    stamp): the answered episode and a refused one end only when the file reads as the line again under another
+    stamp. The episode is accounted at ONE point (_episode_step) on the rule path and on every exit without an answer
+    (no_answer): a corrupt refusal of a line a rule fits records the episode mark too (the first record opens no
+    second notice), so every later episode of that line — rewritten with or without RUNNING in between — is told
+    to the owner exactly once; a line no rule fits keeps the 1.2.0 dedup by text (only a mark of it already there
+    moves on). A corrupt `policy_episode` is never overwritten. The path of a rule without `answer`
+    in this function neither reads nor writes `policy_key_pending` / `policy_keys`."""
+    reads, stamp = _episode_read(cfg, wave, status)
     es = text_eid(status)  # every mark of an episode in state.json is the eid of its line (1.4.3)
     anew = False  # the very line of the last decision under another stamp: a new episode of the same text
     if _answered(w) == es:
-        if w.get("policy_answered_stamp") in (None, stamp):
+        if w.get("policy_answered_stamp") in (None, stamp) or not reads:
+            # the answered episode: the same stamp, or a file that does not read as this line now (empty or
+            # unreadable mid-rewrite, another line: the next tick decides) — another stamp alone is no episode (I-W3)
             return True
         # the same text, but the file was rewritten since the answer (e.g. RUNNING in between, unseen by
         # the poll): a NEW episode, not the answered one — otherwise the wave would wait silently
         w.get("notified", {}).pop("policy_answer", None)
         w.pop("policy_answered_stamp", None)
         anew = True
+
+    def no_answer(create=False):
+        # I-W3: an exit without an automatic answer, accounted by the same _episode_step as the rule path below. A new
+        # episode of a line answered or decided before (the answer above, or the episode mark of this very line under
+        # another stamp while the file reads as it) is still one notice to the owner: the `blocked` mark the earlier
+        # episode left is dropped, the episode mark moves on (no second notice). `create`: the mark is recorded here
+        # too (a corrupt refusal of a line a rule fits) — otherwise only a mark already there moves on
+        nonlocal anew
+        if _episode_step(w, es, stamp, reads, create):
+            anew = True
+        if anew:
+            drop_notice(w, "blocked")
+        return False
+
     refusal = w.get("policy_refusal")
     if refusal is not None:
-        if not _refusal_ok(refusal) or (_same(refusal["status"], es) and (
-                refusal.get("stamp") == stamp or read(wave_dir(cfg, wave) / "status", on_error=None) != status)):
+        if not _refusal_ok(refusal):
+            # a corrupt refusal reads as a refusal (fail closed) — of every episode, each told once: the episode of a
+            # line a rule fits is accounted here as on the rule path (its mark created), a line no rule fits keeps
+            # the dedup by text
+            return no_answer(create=_policy_rule(cfg, status)[1] is not None)
+        if _same(refusal["status"], es) and (refusal.get("stamp") == stamp or not reads):
             # one decision per episode: this one was refused and stays with the owner. Another stamp alone
             # is not a new episode: the file must read as this very line again (not empty or unreadable)
             return False
         w.pop("policy_refusal")  # the same line written anew: another episode, decided anew
         anew = True
-    label = parse_blocked_label(status)
-    if label is None or label["red"] or label["class"] == "merge_gate":
-        return False
-    rules = decision_policy(cfg)
-    rule = next((r for r in rules if r["class"] == label["class"] and r["rec"] in (None, label["rec"])), None)
+    label, rule = _policy_rule(cfg, status)
     if rule is None:
-        return False
+        # no or bad label, red, merge_gate — or the policy changed between episodes: the new one goes to the owner,
+        # never silently
+        return no_answer()
     fixed = None  # a rule with `answer` (#89); without it every line below is the 1.2.0 path
     # THE episode of a line a rule fits (with `answer` or without): the eid of the line AND the stamp of the status
     # write that reads as it. The `blocked` mark of the owner's notice belongs to the EPISODE, not to the text:
@@ -7114,15 +7281,12 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     # The same stamp, or a status that does not read as the line now (empty/unreadable mid-rewrite, decided on
     # last_status), is the same episode. No mark at all is a state.json of 1.4.3 (the chain upgraded between waves):
     # the current episode is adopted as it is, its `blocked` mark (if any) was set by that episode — no second notice.
-    episode = w.get("policy_episode")
-    if episode is not None and not _episode_ok(episode):
+    step = _episode_step(w, es, stamp, reads)
+    if step is None:
         # a corrupt mark of the episode is never read as «a new episode» (that would answer automatically after
         # the corruption): the machine refusal of this episode, to the owner with its reason (fail closed)
         return _policy_refuse(cfg, st, wave, w, es, stamp, EPISODE_CORRUPT, status)
-    if not (isinstance(episode, dict) and _same(episode.get("status"), es) and (
-            episode.get("stamp") == stamp or read(wave_dir(cfg, wave) / "status", on_error=None) != status)):
-        w["policy_episode"] = {"status": es, "stamp": stamp}
-        anew = anew or episode is not None
+    anew = anew or step
     if anew:
         drop_notice(w, "blocked")
     if owner_answered(cfg, wave, status):  # the owner answered this very episode with `say`
@@ -7193,15 +7357,27 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
         event(cfg, f"{wave}: policy answer not sent: the status changed before delivery")
         return None
     w["policy_pending"] = es
-    if fixed:  # the intent, saved by the same save as policy_pending (before typing): the key is in flight
-        old = _fork_keys(w)[1]
+    if fixed:  # the intent, in memory with policy_pending: the key is in flight. No save before the typing — the
+        # first save that carries it is _deliver's (on_typed: typed, the Enter owed) or one of a failure inside it
+        # (a dead window: _mark_dead); a delivery that typed nothing takes the key back below (None, False, _WindowGone)
+        keys, old = _fork_keys(w, wave, cfg["run_id"])
         if old and old.get("key") != fixed["key"]:  # an earlier answer given up, possibly submitted
-            w["policy_keys"] = [*_fork_keys(w)[0], old.get("key")]
+            w["policy_keys"] = [*keys, old.get("key")]
         w["policy_key_pending"] = {"key": fixed["key"], "status": es, "text": text_eid(fixed["text"])}
-    sent = _deliver(cfg, st, wave, "policy answer", send_text,
-                    fixed["text"] if fixed else POLICY_ANSWER.format(rec=label["rec"]),
-                    precheck=lambda: still(True), recheck_enter=True)  # re-read again UNDER the input lock: `say`
-    # may have answered meanwhile; a fresh text is re-checked once more between its typing and its Enter
+    try:
+        sent = _deliver(cfg, st, wave, "policy answer", send_text,
+                        fixed["text"] if fixed else POLICY_ANSWER.format(rec=label["rec"]),
+                        precheck=lambda: still(True), recheck_enter=True)  # re-read again UNDER the input lock: `say`
+        # may have answered meanwhile; a fresh text is re-checked once more between its typing and its Enter
+    except _WindowGone:
+        if w.get("pending_enter") != "policy answer":
+            # #100 p.17: the window died before anything was typed — the key in flight never outlives a delivery that
+            # typed nothing (after a relaunch it would read as «answered before» and hide the fork from the policy)
+            w.pop("policy_pending", None)
+            if fixed:
+                _forget_fork_key(w, fixed)
+            save_state(cfg, st)
+        raise
     if sent is None:
         w.pop("policy_pending", None)
         if fixed and not retry:
@@ -7227,7 +7403,7 @@ def _policy_answer(cfg, st, wave, w, status, now, attach):
     w.pop("policy_pending", None)
     if fixed:  # the fork is answered: its key outlives the watch and the wave's restart (`attempts`)
         w.pop("policy_key_pending", None)
-        w["policy_keys"] = [*_fork_keys(w)[0], fixed["key"]]
+        w["policy_keys"] = [*_fork_keys(w, wave, cfg["run_id"])[0], fixed["key"]]
     tokens = f"class={label['class']} " + (f"answer={fixed['answer']} " if fixed else "") + f"rec={label['rec']}"
     w.setdefault("notified", {})["policy_answer"] = es
     # the stamp of the status the answer was for, taken BEFORE typing: a fast wave may already have
@@ -7388,7 +7564,7 @@ def _tick(cfg, st):
         w["pending_exit"] = True  # the intent to close the window, in the same save as the phase
         put_notice(cfg, w, wave, "handoff", "1", reason=gate_code, question=read(wdir / "result.md"))
         if gate_text:  # the verdict and the owner's command: for a human at the machine, not for an outside text
-            event(cfg, f"{wave}: hand-off gate: {gate_text}")
+            owner_event(cfg, f"{wave}: hand-off gate: {gate_text}")
         save_state(cfg, st)
         if external:
             event(cfg, f"{wave}: DONE, awaiting merge by the coordinator")
@@ -7492,6 +7668,14 @@ def _tick(cfg, st):
         flush_notices(cfg, st, w)
         return True
     if status.startswith("BLOCKED"):
+        now_read = _fresh_status(cfg, wave)
+        if now_read is not None and now_read != status:
+            # I-W3: the file reads as another non-empty line now (the wave moved on while the delivery failed or the
+            # lock was awaited): this episode is over, its notice is not raised — the next tick decides on the new
+            # line. An empty or unreadable read never mutes a notice
+            save_state(cfg, st)
+            flush_notices(cfg, st, w)
+            return True
         fresh = once_per(w, "blocked", status)
         if fresh:
             if not status.startswith("BLOCKED: merge gate:"):  # the wave fixes a gate failure itself
@@ -8415,6 +8599,7 @@ def merge_overdue_line(cfg, st, wave, now=None):
 
 def status_cmd(cfg):
     st = load_state(cfg)
+    _note_owner_scripts(cfg, st)  # the exemption keeps only the names the dispatcher derived for this run
     print("current:", safe_text(st.get("current"), 200))
     for wave, w in st["waves"].items():  # the texts of the state and of the status file pass safe_text, the numbers stay numbers
         tokens = w.get("tokens", 0)
@@ -8425,7 +8610,7 @@ def status_cmd(cfg):
               + (f"step={safe_text(w['fable_switch'].get('step'), 50)} " if w.get("phase") == "switching"
                  and isinstance(w.get("fable_switch"), dict) else "") +
               f"started={hum(cfg, num(w.get('started')))} "
-              f"status={safe_text(read(cfg['run_dir'] / wave / 'status'), 10 ** 6)}")
+              f"status={safe_text(read(cfg['run_dir'] / wave / 'status'), 10 ** 6, owner_paths=True)}")
         line = manifest_status_line(cfg, wave)
         if line:
             print(safe_text(line, 10 ** 6))
