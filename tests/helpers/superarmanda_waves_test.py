@@ -21744,12 +21744,12 @@ class W3PolicyEpisodes(Base):
                             self.assertIn(flag, cmd, f"state.py refuses --accept without {flag}")
 
 
-OWNER_SCRIPT_VALUES = {"write_owner_script", "owner_script_name", "handoff_gate_line"}
+OWNER_SCRIPT_VALUES = {"write_owner_script", "owner_script_name", "_owner_script", "handoff_gate_line"}
 
 
 def owner_script_events_outside_owner_event(src):
     """Every event() call of wab.py whose text is built from the owner's script path — a call of write_owner_script /
-    owner_script_name / handoff_gate_line in its arguments, or a name assigned from one in the same function (to a
+    owner_script_name / _owner_script / handoff_gate_line in its arguments, or a name assigned from one in the same function (to a
     fixpoint, tuple targets included) — that is not owner_event(): [(function, line)]. Also any event() with
     owner_paths passed by hand outside owner_event (the policy has ONE point)."""
     found = []
@@ -21794,6 +21794,9 @@ class W3OwnerScriptPathEverywhere(GateBase):
             p.start()
             self.addCleanup(p.stop)
         p = mock.patch.object(wab, "owner_script_name", return_value=self.PHONE)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "_OWNER_SCRIPT_NAMES", set())  # every test starts with no derived name (no leak)
         p.start()
         self.addCleanup(p.stop)
         self.merge_mode = "ok"
@@ -21894,11 +21897,51 @@ class W3OwnerScriptPathEverywhere(GateBase):
                 self.assertEqual(src.count(old), 1)
                 self.assertTrue(owner_script_events_outside_owner_event(src.replace(old, new)))
 
+    def test_a_forged_script_of_the_wave_is_masked_even_when_its_file_exists(self):
+        """Codex P2 on f5e2c7a: the wave (the same user) may create ~/.cache/wab/<a name of the right form> and write it
+        into status or a question — an existing file is no proof the dispatcher named it. The exemption covers only a
+        name the dispatcher itself derived (owner_script_name of a wave and sha of this run, from state.json in a fresh
+        process): the forged path is masked in `wab.py status`, questions[] and chain-result.md, the dispatcher's own
+        path stays whole — in this process and in a fresh one (the registry empty, the names re-derived from state)."""
+        forged = "W1.bbbbbbbbbbbb.78297023340d0000.merge"
+        shown_forged = "~/.cache/wab/" + forged
+        self.assertNotEqual(wab.safe_text(shown_forged, 10 ** 9), shown_forged, "the forged name must be maskable")
+        self.merge_refused()
+        own_line = self.status()
+        self.assertIn(self.shown, own_line)
+        (self.home / ".cache" / "wab" / forged).write_text("x", encoding="utf-8")  # the wave plants the file
+        forged_line = f"BLOCKED: run {shown_forged}"
+        cfg = wab.load_chain(self.path, create=False)
+        st = wab.load_state(cfg)
+        w = st["waves"]["W1"]
+        wab._record_question(w, wab.stash_text(cfg, "W1", forged_line, w), self.now)
+        wab._record_question(w, wab.stash_text(cfg, "W1", own_line, w), self.now + 1)
+        wab.save_state(cfg, st)
+        for fresh in (False, True):
+            with self.subTest(fresh_process=fresh):
+                if fresh:
+                    wab._OWNER_SCRIPT_NAMES.clear()
+                self.set_status(self.cfg, "W1", forged_line)
+                out = self.status_out()
+                self.assertNotIn(shown_forged, out, "wab.py status: the wave's forged path")
+                self.set_status(self.cfg, "W1", own_line)
+                self.assertIn(self.shown, self.status_out(), "wab.py status: the dispatcher's own path")
+                if fresh:
+                    wab._OWNER_SCRIPT_NAMES.clear()
+                chain = wab.write_chain_result(self.cfg, wab.load_state(self.cfg))[0].read_text(encoding="utf-8")
+                self.assertNotIn(shown_forged, chain, "chain-result.md: the forged path")
+                self.assertIn(self.shown, chain, "chain-result.md: the dispatcher's own path")
+        # a name the dispatcher never derived is masked even by owner_event / _write_status (the file exists)
+        wab._OWNER_SCRIPT_NAMES.clear()
+        wab.owner_event(self.cfg, f"owner runs {shown_forged}")
+        self.assertNotIn(shown_forged, self.log())
+
     def test_owner_event_keeps_every_other_mask_of_the_line(self):
         folder = self.home / ".cache" / "wab"
         folder.mkdir(parents=True, exist_ok=True)
         (folder / self.PHONE).write_text("x", encoding="utf-8")
         cfg, _ = self.chain()
+        wab._owner_script(cfg, "W1", "a" * 40)  # the dispatcher derived this name (the mock gives PHONE)
         forged = "~/.cache/wab/W1.aaaaaaaaaaaa.78297023340d0000.merge"  # the shape, but no such file: masked as before
         wab.owner_event(cfg, f"token {self.TOKEN} phone 89161234567; owner runs {self.shown} {forged}")
         text = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
@@ -22022,14 +22065,29 @@ class W3PolicyMarksAndNotices(Base):
                  ("policy_refusal", "status", "BLOCKED: no label")),
                 ("a free text in flight stays", {"policy_key_pending": {"key": list(self.other), "status": self.line,
                                                                         "text": "чужой текст"}},
-                 ("policy_key_pending", "text", "чужой текст"))):
+                 ("policy_key_pending", "text", "чужой текст")),
+                # the BLOCKED prefix without a valid label (parse_blocked_label is None): 1.4.x never wrote such a mark
+                ("a refusal line with a junk label stays", {"policy_refusal": {"status": "BLOCKED: [junk] x", "stamp": None,
+                                                                               "reason": "r"}},
+                 ("policy_refusal", "status", "BLOCKED: [junk] x")),
+                ("a line in flight with a junk label stays", {"policy_key_pending": {"key": list(self.other),
+                                                                                     "status": "BLOCKED: [junk] x",
+                                                                                     "text": text}},
+                 ("policy_key_pending", "status", "BLOCKED: [junk] x"))):
             with self.subTest(name):
                 cfg = self.fresh()
                 st = wab.load_state(cfg)
                 st["waves"]["W1"].update(fields)
                 self.put_state(cfg, st)
                 holder, field, value = want
-                self.assertEqual(wab.load_state(cfg)["waves"]["W1"][holder][field], value)
+                rec = wab.load_state(cfg)["waves"]["W1"]
+                self.assertEqual(rec[holder][field], value)
+                if value == "BLOCKED: [junk] x":  # left as it is, the schema reads it as corrupt (never a valid mark)
+                    if holder == "policy_refusal":
+                        self.assertFalse(wab._refusal_ok(rec[holder]))
+                    else:
+                        with self.assertRaises(ValueError):
+                            wab._fork_keys(rec, "W1", cfg["run_id"])
         with self.subTest("the migrated 1.4.2 refusal still holds its episode"):
             cfg = self.fresh()
             self.set_status(cfg, "W1", self.line)
@@ -22087,6 +22145,31 @@ class W3PolicyMarksAndNotices(Base):
                 self.tick(cfg)
                 self.tick(cfg)
                 self.assertEqual(self.count(), want, "(answers, owner notices)")
+
+    def test_iw3_a_new_episode_without_an_earlier_answer_is_told_once(self):
+        """no_answer() on its own (tester-2 P3): the earlier episode of the line had NO auto-answer (refused at the cap),
+        so only its episode mark tells a new episode; the exit without an answer (a corrupt refusal) must still raise
+        BLOCKED once per episode — and an empty or unreadable read of status is no new episode."""
+        path = lambda cfg: cfg["run_dir"] / "W1" / "status"  # noqa: E731
+        for rule in ("WITH", "WITHOUT"):
+            for name, after, want in (("the same line rewritten", self.line, 2), ("empty", "", 1),
+                                      ("missing", None, 1), ("RUNNING", "RUNNING", 1)):
+                with self.subTest(rule=rule, event=name):
+                    cfg = self.fresh(getattr(self, rule), cap=0)
+                    self.tick(cfg, self.line)
+                    self.assertEqual(self.count(), (0, 1), "the first episode: refused at the cap, told once")
+                    st = wab.load_state(cfg)
+                    w = st["waves"]["W1"]
+                    self.assertIsNone(wab._answered(w), "no auto-answer before: only the episode mark tells a new episode")
+                    self.assertTrue(wab._episode_ok(w.get("policy_episode")), w.get("policy_episode"))
+                    w["policy_refusal"] = "x"  # the refusal mark is damaged between the episodes
+                    wab.save_state(cfg, st)
+                    self.rewrite(cfg, after if after is not None else "")
+                    if after is None:
+                        path(cfg).unlink()
+                    self.tick(cfg)
+                    self.tick(cfg)
+                    self.assertEqual(self.count(), (0, want), "(answers, owner notices)")
 
     def test_iw3_a_failed_delivery_notifies_only_on_a_fresh_read(self):
         for rule in ("WITH", "WITHOUT"):

@@ -462,7 +462,8 @@ def event(cfg, text, owner_paths=False):
     # human (the watch window tails it, the dashboard shows it), and a line break (a lone CR, U+2028, NEL)
     # inside a secret would otherwise cut it into two pieces that redact() does not recognise (#81).
     # `owner_paths` (#113 W3): an event of a hand-over to the owner names the owner's merge script, and its
-    # path is exempt from the heuristics only when that file exists (_owner_script_spans) — every other mask stays
+    # path is exempt from the heuristics only for a name the dispatcher derived whose file exists (_owner_script_spans)
+    # — every other mask stays
     text = " ⏎ ".join(l for l in safe_text(text, 10 ** 9, owner_paths).splitlines() if l.strip())
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}Z {text}"
     cfg["run_dir"].mkdir(parents=True, exist_ok=True)
@@ -473,8 +474,9 @@ def event(cfg, text, owner_paths=False):
 
 def owner_event(cfg, text):
     """THE event of a hand-over to the owner: a text that names the owner's merge script (~/.cache/wab/<owner_script_name>,
-    a value of write_owner_script / owner_script_name / handoff_gate_line). Masked with owner_paths=True: the path is
-    exempt from the heuristics (its sha12/id16 may read as a phone number) only while that very file exists
+    a value of write_owner_script / _owner_script / owner_script_name / handoff_gate_line). Masked with owner_paths=True:
+    the path is exempt from the heuristics (its sha12/id16 may read as a phone number) only for a name the dispatcher
+    derived (_OWNER_SCRIPT_NAMES) while that very file exists
     (_owner_script_spans), every other mask of the line stays. The one way to log such a text (#113 W3): a static test
     finds every event() whose text is built from those values."""
     event(cfg, text, owner_paths=True)
@@ -683,11 +685,12 @@ def upgrade_record(w, legacy):
         w["policy_pending"] = mark_eid(w["policy_pending"])
     for holder in (w.get("policy_key_pending"), w.get("policy_refusal")):
         # I-W3 (#113 W3, 1.5.3): only a legacy line of ITS OWN form becomes an eid — 1.4.x wrote these marks for a
-        # labelled BLOCKED line only (the refusal and the key in flight come after parse_blocked_label). Anything else
-        # (an empty string, garbage, a short `sha256:abc`) stays as it is, and the schema reads it as corrupt
-        # (_refusal_ok, _fork_keys): a migration never turns a damaged mark into a valid one
+        # labelled BLOCKED line only (the refusal and the key in flight come after parse_blocked_label, so the line
+        # parses as a label). Anything else (an empty string, garbage, a short `sha256:abc`, `BLOCKED: [junk] x`)
+        # stays as it is, and the schema reads it as corrupt (_refusal_ok, _fork_keys): a migration never turns a
+        # damaged mark into a valid one
         if (isinstance(holder, dict) and isinstance(holder.get("status"), str)
-                and _LABEL.match(holder["status"]) and not EID.fullmatch(holder["status"])):
+                and parse_blocked_label(holder["status"]) is not None and not EID.fullmatch(holder["status"])):
             holder["status"] = text_eid(holder["status"])
     pend = w.get("policy_key_pending")
     if (isinstance(pend, dict) and isinstance(pend.get("text"), str)
@@ -1593,8 +1596,8 @@ TG_MESSAGE_LIMIT = 1200  # whole message; quoted text is capped at TG_LIMIT firs
 #     /commits/ or /tree/. The query and fragment of the URL are not exempt.
 #  3. Explicit exceptions only: a bare 40-64 hex after a SHA label (`commit`, `sha`, `head`, ...),
 #     the github SHA above, an _OPAQUE run made only of word-like parts (_readable_dashed), and the
-#     owner's merge script path `.cache/wab/<wave>.<sha12>.<id16>.merge` when that file exists
-#     (_OWNER_SCRIPT, _owner_script_spans).
+#     owner's merge script path `.cache/wab/<wave>.<sha12>.<id16>.merge` when the dispatcher derived that
+#     name and the file exists (_OWNER_SCRIPT, _OWNER_SCRIPT_NAMES, _owner_script_spans).
 # A long run of base64/base64url characters. Without a dash any 40+ run is a blob; with a dash
 # it stays readable only when every part between -, /, _ and + looks like a word (see
 # _readable_dashed): `kebab-case-words`, paths, dates stay, base64url and UUID-like keys go.
@@ -1696,15 +1699,20 @@ _GITHUB_PATH = re.compile(r"(?i)(?<![^\s\"'`(\[<,])(?:https?://[^/" + _TOKEN_END
 _GITHUB_HOSTS = ("github.com", "www.github.com")
 # The owner's merge script (owner_script_name) in a notice: its sha12 and id16 may look like a phone
 # number (`.71234567890a.`) or a blob to the heuristics, and a masked path is a useless command. Only
-# a path of that shape whose file EXISTS in ~/.cache/wab (written by write_owner_script) is exempt
-# from HEURISTIC: a secret dressed up as such a path in the wave's own text names no file and is
-# masked as before. The check survives a restart of the dispatcher (no in-memory registry).
+# a path of that shape is exempt from HEURISTIC only when the DISPATCHER derived its name (_owner_script: a wave and a
+# sha of this run, in this process or re-derived from state.json by _note_owner_scripts) AND its file exists in
+# ~/.cache/wab. An existing file alone is no proof (Codex P2 on 1.5.3): the wave runs as the same user and may create
+# ~/.cache/wab/<any name of that shape> and write it into status or a question — such a path is masked as before, and
+# so is a secret dressed up as such a path that names no file.
 _OWNER_SCRIPT = re.compile(r"\.cache/wab/([A-Za-z0-9_-]+\.[0-9a-f]{12}\.[0-9a-f]{16}\.merge)(?![\w.])")
+_OWNER_SCRIPT_NAMES = set()  # the names _owner_script derived in this process: the only ones the exemption takes
 
 
 def _owner_script_spans(text):
     spans = []
     for m in _OWNER_SCRIPT.finditer(text):  # the home folder is looked up only for a path of that shape (#85)
+        if m.group(1) not in _OWNER_SCRIPT_NAMES:
+            continue
         try:
             if (pathlib.Path.home() / ".cache" / "wab" / m.group(1)).is_file():
                 spans.append(m.span())
@@ -1786,8 +1794,13 @@ def _mask_structured(m):
 def redact(text, limit=TG_LIMIT, owner_paths=True):
     """Mask secrets and personal data in text that leaves for Telegram. Rules: see the comment
     above _OPAQUE. A heuristic, not a guarantee; its limits are listed in references/waves.md.
-    `owner_paths=False` drops the owner-script exemption (rule 3): text of the wave and other
-    outside text is never trusted to name the dispatcher's own file (see quote)."""
+    `owner_paths` (rule 3): True keeps the path of the owner's merge script `~/.cache/wab/<form>` whose name the
+    dispatcher derived for this run (_owner_script, _note_owner_scripts) and whose file exists (_owner_script_spans;
+    every other mask of the text stays) — the dispatcher's own outputs that name it:
+    owner_event in events.log, _write_status, `wab.py status`, questions[] of chain-result.md, the
+    dispatcher's own wording in render_notice. False drops the exemption: a quote of the wave
+    (quote/_render_quote), any other event, the dashboard — outside text is never trusted to name
+    the dispatcher's own file."""
     for rx in _STRUCTURED:
         text = rx.sub(_mask_structured, text)
     for rx in _HEURISTIC:
@@ -5660,6 +5673,33 @@ def owner_script_name(cfg, wave, sha):
     return f"{wave}.{sha[:12]}.{hashlib.sha256(ident.encode('utf-8')).hexdigest()[:16]}.merge"
 
 
+def _owner_script(cfg, wave, sha):
+    """THE derivation of the owner's script name by the dispatcher: owner_script_name, remembered in
+    _OWNER_SCRIPT_NAMES — the only names redact(owner_paths=True) keeps whole (Codex P2 on 1.5.3). Every place
+    that names the script takes it from here (write_owner_script, the reminder, _note_owner_scripts)."""
+    name = owner_script_name(cfg, wave, sha)
+    _OWNER_SCRIPT_NAMES.add(name)
+    return name
+
+
+_GATE_SHA = re.compile(r"[0-9a-f]{12,64}")
+
+
+def _note_owner_scripts(cfg, st):
+    """Re-derive the script names of this run from state.json (a fresh process: `wab.py status`, chain-result.md after
+    a restart): every sha the dispatcher gated or handed to the owner — gate_sha, merge_called, owner_remind.sha of
+    each wave record and its attempts. A text the wave wrote never adds a name here."""
+    for wave, w in (st.get("waves") or {}).items():
+        if not isinstance(w, dict) or not isinstance(wave, str):
+            continue
+        for rec in (w, *wave_attempts(w)):
+            remind = rec.get("owner_remind")
+            for sha in (rec.get("gate_sha"), rec.get("merge_called"),
+                        remind.get("sha") if isinstance(remind, dict) else None):
+                if isinstance(sha, str) and _GATE_SHA.fullmatch(sha):
+                    _owner_script(cfg, wave, sha)
+
+
 def write_owner_script(cfg, wave, sha):
     """~/.cache/wab/<owner_script_name>: executable by the owner only, bound to this run and to the
     gated sha (a re-gate on another sha writes another file: the old notice keeps its script, which
@@ -5667,7 +5707,7 @@ def write_owner_script(cfg, wave, sha):
     text = gate.owner_script(pathlib.Path(__file__).resolve(), cfg["chain_file"], wave, cfg["run_id"], sha)
     folder = pathlib.Path.home() / ".cache" / "wab"
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = folder / owner_script_name(cfg, wave, sha)
+    path = folder / _owner_script(cfg, wave, sha)
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".merge.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -5904,7 +5944,7 @@ def _owner_reminder(cfg, st, wave, w, number, sha, now):
     put_notice(cfg, w, wave, "merge_remind", f"{sha}:{n + 1}", pr=number, minutes=cfg.get("merge_remind_minutes"))
     save_state(cfg, st)
     owner_event(cfg, f"{wave}: напоминание владельцу #{n + 1}: PR #{number} не смержен; owner runs "
-                     f"{home_form(pathlib.Path.home() / '.cache' / 'wab' / owner_script_name(cfg, wave, sha))}")
+                     f"{home_form(pathlib.Path.home() / '.cache' / 'wab' / _owner_script(cfg, wave, sha))}")
     flush_notices(cfg, st, w)
 
 
@@ -6905,6 +6945,7 @@ def _question_text(cfg, st, wave, q):
 def write_chain_result(cfg, st):
     """Write `<run_dir>/chain-result.md` (atomically) and return (path, short summary for the
     end-of-chain message). Read-only over the state; nothing leaves the machine from here."""
+    _note_owner_scripts(cfg, st)  # questions[] keep whole only a script name the dispatcher derived for this run
     now = time.time()
     repo = cfg.get("repo")
     rows, questions, prs = [], [], 0
@@ -8501,6 +8542,7 @@ def merge_overdue_line(cfg, st, wave, now=None):
 
 def status_cmd(cfg):
     st = load_state(cfg)
+    _note_owner_scripts(cfg, st)  # the exemption keeps only the names the dispatcher derived for this run
     print("current:", safe_text(st.get("current"), 200))
     for wave, w in st["waves"].items():  # the texts of the state and of the status file pass safe_text, the numbers stay numbers
         tokens = w.get("tokens", 0)
