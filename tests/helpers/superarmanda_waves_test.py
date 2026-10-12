@@ -20658,6 +20658,20 @@ class MetricsScript(unittest.TestCase):
             w4 = self.metrics.measure(root)["waves"][0]
             self.assertEqual((w4["fix_cycles"], w4["problems"]), (1, []), w4)
 
+    def test_a_target_file_named_with_the_deleted_suffix_is_read(self):
+        """Codex P2 (metrics.py:130): законный целевой файл, имя которого само оканчивается на « (deleted)», читается —
+        открытый путь сначала сравнивается целиком и только при несовпадении хвост считается пометкой ядра."""
+        manifest = {"version": 1, "wave": {"id": "W4"}, "tasks": {"t1": {"fix_cycles": 1}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            sa = root / "W4" / "superarmanda"
+            sa.mkdir(parents=True)
+            (root / "events.log").write_text("", encoding="utf-8")
+            (sa / "manifest (deleted)").write_text(json.dumps(manifest), encoding="utf-8")
+            (sa / "manifest.json").symlink_to("manifest (deleted)")
+            w4 = self.metrics.measure(root)["waves"][0]
+            self.assertEqual((w4["fix_cycles"], w4["problems"]), (1, []), w4)
+
     def test_an_intermediate_directory_swapped_inside_the_wave_is_refused(self):
         """Codex P2 (metrics.py:127): открыт должен быть ровно разрешённый путь, а не любой файл внутри волны.
         Промежуточный каталог подменён между разрешением и open симлинком на ДРУГОЙ каталог той же волны —

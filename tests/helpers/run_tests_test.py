@@ -59,14 +59,14 @@ class RunTests(unittest.TestCase):
         self.log = d / "fake.log"
         return d
 
-    def run_script(self, tests_dir, jobs=None, extra=None):
+    def run_script(self, tests_dir, jobs=None, extra=None, timeout=120):
         # OMP_NUM_THREADS / OMP_THREAD_LIMIT меняют ответ nproc — число CPU задаёт только сам тест
         env = {k: v for k, v in os.environ.items() if k not in ("RUN_TESTS_JOBS", "OMP_NUM_THREADS", "OMP_THREAD_LIMIT")}
         env.update(TESTS_DIR=str(tests_dir), RUN_TESTS_FAKE_LOG=str(self.log))
         if jobs is not None:
             env["RUN_TESTS_JOBS"] = str(jobs)
         env.update(extra or {})
-        return subprocess.run(["/bin/bash", str(SCRIPT)], capture_output=True, text=True, env=env, timeout=120)
+        return subprocess.run(["/bin/bash", str(SCRIPT)], capture_output=True, text=True, env=env, timeout=timeout)
 
     def events(self):
         return self.log.read_text(encoding="utf-8").split("\n")[:-1] if self.log.exists() else []
@@ -218,9 +218,10 @@ class RunTests(unittest.TestCase):
             self.assertIn("run-tests: 3 parallel", p.stderr)
 
     def test_a_bad_jobs_value_is_refused(self):
-        for bad in ("0", "-1", "x", "1.5", ""):
+        # слишком большие: 2^63 и 20 цифр — без отказа `[ -lt ]` пишет «integer expression expected» и раннер зацикливается
+        for bad in ("0", "-1", "x", "1.5", "", "9223372036854775808", "99999999999999999999"):
             with self.subTest(bad=bad):
-                p = self.run_script(self.suites(a=(0, 0)), jobs=bad)
+                p = self.run_script(self.suites(a=(0, 0)), jobs=bad, timeout=20)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertIn("RUN_TESTS_JOBS", p.stderr)
                 self.assertEqual(self.events(), [])

@@ -2,7 +2,7 @@
 # Run every standalone Superarmanda test suite locally and in CI.
 #
 # Наборы идут параллельно: по умолчанию столько сразу, сколько CPU (nproc, на macOS sysctl hw.ncpu);
-# RUN_TESTS_JOBS=<n> задаёт число явно, RUN_TESTS_JOBS=1 — последовательно, как раньше (вывод сразу в терминал).
+# RUN_TESTS_JOBS=<n> (1–999999) задаёт число явно, RUN_TESTS_JOBS=1 — последовательно, как раньше (вывод сразу в терминал).
 # В параллельном режиме вывод каждого набора (stdout и stderr вместе) копится в файл и печатается целым блоком
 # в исходном порядке наборов, как только набор и все до него закончились. Долгие наборы (SLOW_FIRST) стартуют
 # первыми. Код возврата: 0 — все зелёные, 1 — упал хоть один, 2 — нет наборов или неверный RUN_TESTS_JOBS.
@@ -42,6 +42,11 @@ if [ "${RUN_TESTS_JOBS+set}" = set ]; then
   case "$jobs" in
     ''|*[!0-9]*|0*) printf 'RUN_TESTS_JOBS must be a positive integer, got %s\n' "'$jobs'" >&2; exit 2 ;;
   esac
+  # больше 6 цифр — отказ: за пределом int64 `[ -lt ]` пишет «integer expression expected», и цикл не кончается
+  if [ ${#jobs} -gt 6 ]; then
+    printf 'RUN_TESTS_JOBS must be at most 999999, got %s\n' "'$jobs'" >&2
+    exit 2
+  fi
 else
   jobs="$(cpus)"
 fi

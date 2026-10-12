@@ -106,6 +106,10 @@ FLOAT_EPS = 1e-6  # допуск сравнения виртуальных вр�
 # раннера: Linux — 60 с (запас ~1,8 к замеру), macOS — 150 с (запас ~1,85 к 81 с; одно реальное ожидание лока поверх
 # сценария, 120 с + 33–81 с, его всё равно превышает).
 THREADS_FAST_SECONDS = 150 if sys.platform == "darwin" else 60
+# Порог test_runs_fast сценариев offline, remnants и remnants150 — тоже по замеру. Linux — прежние 40 с. macOS-раннер CI
+# (run 38314774689) дал remnants150 44 с: run-tests.sh гоняет наборы параллельно, и медленный раннер делит CPU между
+# ними; macOS — 90 с (запас ~2 к замеру 44 с при параллельном прогоне).
+CHAIN_FAST_SECONDS = 90 if sys.platform == "darwin" else 40
 DELAY = 20  # virtual seconds between what the dispatcher typed and the session's reaction
 BOT_STATUS = "[class=needs_decision rec=A red=no]"
 CAP_STATUS = "[class=blocked_cap rec=new_run red=no]"
@@ -1591,7 +1595,7 @@ class OfflineChain(unittest.TestCase):
         oracle_cleanup(self.chain)
 
     def test_runs_fast(self):
-        must(self.seconds < 40, f"the scenario took {self.seconds:.0f} s")
+        must(self.seconds < CHAIN_FAST_SECONDS, f"the scenario took {self.seconds:.0f} s")
 
     def test_state_json_holds_no_wave_text(self):
         oracle_no_wave_text(self.chain)
@@ -1628,7 +1632,7 @@ class RemnantsChain(unittest.TestCase):
         oracle_external(self.chain)
 
     def test_runs_fast(self):
-        must(self.seconds < 40, f"the scenario took {self.seconds:.0f} s")
+        must(self.seconds < CHAIN_FAST_SECONDS, f"the scenario took {self.seconds:.0f} s")
 
 
 class Remnants150Chain(unittest.TestCase):
@@ -1662,7 +1666,7 @@ class Remnants150Chain(unittest.TestCase):
         oracle_external(self.chain)
 
     def test_runs_fast(self):
-        must(self.seconds < 40, f"the scenario took {self.seconds:.0f} s")
+        must(self.seconds < CHAIN_FAST_SECONDS, f"the scenario took {self.seconds:.0f} s")
 
 
 class ThreadsChain(unittest.TestCase):

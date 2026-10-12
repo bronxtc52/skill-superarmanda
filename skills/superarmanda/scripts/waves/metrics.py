@@ -126,8 +126,10 @@ def _opened_is(fd, real):
     except OSError:
         opened = None
     if opened is not None:
-        # ядро дописывает пометку только в конец; в середине — имя каталога
-        return Path(opened.removesuffix(DELETED_SUFFIX)) == real
+        # сначала путь как есть: имя самого файла может оканчиваться на « (deleted)»; только при несовпадении хвост —
+        # пометка ядра (её ядро дописывает только в конец; в середине — имя каталога)
+        return Path(opened) == real or (opened.endswith(DELETED_SUFFIX)
+                                        and Path(opened.removesuffix(DELETED_SUFFIX)) == real)
     try:
         st, again = os.fstat(fd), os.stat(real)
     except OSError:
