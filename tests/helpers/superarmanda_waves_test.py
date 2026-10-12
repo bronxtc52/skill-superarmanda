@@ -23006,13 +23006,12 @@ class Release153(unittest.TestCase):
     """The release 1.5.3 (#113 W3; wave W3 of waves-tails2): version, the CHANGELOG section on top, the invariant I-W3 in
     wab.py and in the doc, the row of what is implemented."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.3"\s*$')
+    # the version of SKILL.md moved on to 1.6.0 (#113 W4): Release160 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.3 — 2026-10-12$", "1.5.3 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.5\.3 — 2026-10-12$", "CHANGELOG.md: the section of 1.5.3")
+        self.assertTrue(log.index("## 1.5.3") < log.index("## 1.5.2"), "1.5.3 is above 1.5.2")
         body = re.search(r"(?ms)^## 1\.5\.3 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
         for needle in ("issues/113", "issues/100", "`waves-tails2`", "I-W3", "`W3PolicyMarksAndNotices`", "`_fork_keys`",
                        "`upgrade_record`", "`owner_paths=True`", "`owner_event`", "`W3OwnerScriptPathEverywhere`",
@@ -23029,6 +23028,45 @@ class Release153(unittest.TestCase):
         table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
         self.assertRegex(table, r"(?m)^\| Отметки автоответов по полной схеме[^\n]*реализовано \(1\.5\.3; "
                                 r"[^\n]*`W3PolicyMarksAndNotices`, `W3OwnerScriptPathEverywhere`, `MergeGate` \|$")
+
+
+class Release160(unittest.TestCase):
+    """The release 1.6.0 (#113 W4; wave W4, the last of waves-tails2): version, the CHANGELOG section on top with the
+    releases of the chain, the two cases of «нет данных» added to 1.5.0, the rows of what is implemented."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.6\.0"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.6\.0 — 2026-10-12$", "1.6.0 is the first section")
+        body = re.search(r"(?ms)^## 1\.6\.0 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
+        for needle in ("issues/113", "issues/117", "`waves-tails2`", "pull/120", "pull/121", "pull/122", "pull/116",
+                       "`_manifest_identity`", "`run.index`", "Битый симлинк", "`say-note", "`_IDENTITY_TOLD`",
+                       "`RUN_TESTS_JOBS`", "`Remnants150Chain`", "e2e-1.5.0-state", "`remnants150_no_marks`"):
+            self.assertIn(needle, body)
+        v150 = re.search(r"(?ms)^## 1\.5\.0 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
+        self.assertIn("`fix_cycles` задачи вне 0..1000", v150)
+        self.assertIn("каталог прогона, который не\n  читается, — как каталог без волн, код 2", v150)
+
+    def test_waves_doc_has_the_rows(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
+        for start, tail in (("Замер `metrics.py`: одна проверка идентичности", "`metrics.py`, `MetricsScript`"),
+                            ("Остаток `waves-tails2` W4", "`tests/run-tests.test.sh`"),
+                            ("Сквозная приёмка 1.6.0", "`Remnants150Chain`")):
+            self.assertRegex(table, rf"(?m)^\| {re.escape(start)}[^\n]*реализовано \(1\.6\.0; [^\n]*{re.escape(tail)} \|$")
+
+    def test_the_1_5_0_fixture_is_there_with_its_readme(self):
+        fixture = ROOT / "tests" / "fixtures" / "waves" / "e2e-1.5.0-state"
+        for name in ("README.md", "capture.py", "state.json"):
+            self.assertTrue((fixture / name).is_file(), name)
+        for wave in ("W1", "W2"):
+            texts = list((fixture / "texts" / wave).iterdir())
+            self.assertTrue(texts, wave)
+            for f in texts:  # the store of 1.5.0 as it was: every file is named by the eid of its text
+                self.assertEqual(wab.text_eid(f.read_text(encoding="utf-8")), "sha256:" + f.name)
 
 
 if __name__ == "__main__":
