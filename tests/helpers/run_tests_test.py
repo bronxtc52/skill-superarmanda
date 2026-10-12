@@ -26,6 +26,28 @@ FAKE = textwrap.dedent("""\
     exit {rc}
     """)
 
+# набор, который пишет в журнал окружение, что видит: локаль и запрет байткода
+ENV_FAKE = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    echo "env {name} LC_ALL=${{LC_ALL-unset}} PYTHONDONTWRITEBYTECODE=${{PYTHONDONTWRITEBYTECODE-unset}}" >> "$RUN_TESTS_FAKE_LOG"
+    """)
+
+# локали, где порядок glob отличается от байтового (C): регистр и пунктуация сравниваются иначе
+NATURAL_LOCALES = ("en_US.UTF-8", "en_US.utf8", "de_DE.UTF-8", "de_DE.utf8")
+
+
+def natural_locale():
+    """Первая доступная локаль из NATURAL_LOCALES или None (`locale -a` пишет имена в своём регистре)."""
+    try:
+        have = subprocess.run(["locale", "-a"], capture_output=True, text=True, timeout=10).stdout.split()
+    except OSError:
+        return None
+    norm = {h.lower().replace("-", ""): h for h in have}
+    for want in NATURAL_LOCALES:
+        if want.lower().replace("-", "") in norm:
+            return norm[want.lower().replace("-", "")]
+    return None
+
 
 class RunTests(unittest.TestCase):
     def suites(self, **spec):
@@ -103,6 +125,45 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.blocks(p.stdout), names)
         self.assertIn("failed suites: aaa", p.stderr)
 
+    def env_suites(self, *names):
+        d = self.suites()
+        for name in names:
+            (d / f"{name}.test.sh").write_text(ENV_FAKE.format(name=name), encoding="utf-8")
+        return d
+
+    def test_suite_order_is_byte_order_whatever_the_locale(self):
+        """CI macOS W4: порядок наборов — байтовый (как LC_ALL=C), а не порядок glob локали: в en_US «-» и «_»,
+        регистр и пунктуация сравниваются иначе. Имена подобраны так, что C-порядок и порядок en_US различны
+        целиком; локаль самих наборов при этом не меняется. Нет en_US/de_DE — прогон в локали хоста, имена те же."""
+        names = ["ab", "a-c", "Zed", "superarmanda_x", "superarmanda-state"]
+        want = sorted(names, key=lambda n: n.encode())  # байтовый порядок
+        loc = natural_locale()
+        extra = {"LC_ALL": loc, "LANG": loc} if loc else {}
+        for jobs in (1, 3):
+            with self.subTest(jobs=jobs, locale=loc):
+                d = self.env_suites(*names)
+                p = self.run_script(d, jobs=jobs, extra=extra)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.blocks(p.stdout), want)
+                seen = {e.split()[1]: e.split()[2] for e in self.events()}
+                self.assertEqual(sorted(seen), sorted(names))
+                want_lc = f"LC_ALL={loc}" if loc else f"LC_ALL={os.environ.get('LC_ALL', 'unset')}"
+                self.assertEqual(set(seen.values()), {want_lc}, seen)  # локаль наборов — как у вызова
+        if loc:  # доказательство, что имена различают порядки: та же локаль даёт в glob другой порядок
+            d = self.env_suites(*names)
+            glob = subprocess.run(["/bin/bash", "-c", 'cd "$1" && for f in *.test.sh; do echo "${f%.test.sh}"; done',
+                                   "-", str(d)], capture_output=True, text=True, env={**os.environ, **extra})
+            self.assertNotEqual(glob.stdout.split(), want, f"{loc} sorts like C — the test proves nothing")
+
+    def test_suites_never_write_bytecode(self):
+        """CI W4: наборы идут с PYTHONDONTWRITEBYTECODE=1 — параллельный набор не пишет `__pycache__` в фикстуры,
+        которые в это же время проверяет standalone-layout."""
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                p = self.run_script(self.env_suites("a", "b"), jobs=jobs, extra={"PYTHONDONTWRITEBYTECODE": ""})
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual([e.split()[-1] for e in self.events()], ["PYTHONDONTWRITEBYTECODE=1"] * 2)
+
     def test_long_suites_start_first(self):
         slow = ["superarmanda-state", "superarmanda-waves-e2e", "superarmanda-waves", "superarmanda-review"]
         spec = {n: (0.6, 0) for n in slow}
@@ -148,6 +209,13 @@ class RunTests(unittest.TestCase):
             p = self.run_script(self.suites(a=(0, 0), b=(0, 0)), extra=self.fake_cpus(4))
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("run-tests: 4 parallel", p.stderr)
+        with self.subTest(cpus=3, branch="sysctl"):  # macOS: nproc нет (здесь — падает), число даёт sysctl hw.ncpu
+            extra = self.fake_cpus(3)
+            nproc = Path(extra["PATH"].split(os.pathsep)[0]) / "nproc"
+            nproc.write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
+            p = self.run_script(self.suites(a=(0, 0), b=(0, 0)), extra=extra)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("run-tests: 3 parallel", p.stderr)
 
     def test_a_bad_jobs_value_is_refused(self):
         for bad in ("0", "-1", "x", "1.5", ""):

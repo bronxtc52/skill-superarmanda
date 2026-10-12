@@ -30,7 +30,7 @@
   запасной путь через `manifest.json` при нём не срабатывает. Тест `MetricsScript`
   `test_every_counted_file_passes_one_identity_check`; фикстура `tests/fixtures/waves/metrics-run/` получила
   `version` и `wave.id` в manifest.
-- `metrics.py` (#113 W4, ревью): каждый читаемый файл (`runs.json`, все `manifest*.json` поиска по `run.index`, `events.log`) открывается одним путём с `O_NOFOLLOW|O_NONBLOCK`, только обычный файл и чтение из проверенного дескриптора — FIFO не вешает замер; чужая волна при поиске по номеру — причина про волну, а не «дубль»; два симлинка на один файл — не дубль (тест `test_every_read_file_is_read_from_one_checked_descriptor`); путь разрешается один раз и открывается именно результат, открытый дескриптор сверяется с путём (Linux — `/proc/self/fd`; без /proc промежуточные каталоги не защищены), любой `OSError` (нет доступа, битый симлинк) — причина, а не traceback, файл больше 16 МиБ (events.log — 64 МиБ) — отказ (тесты `test_unreadable_or_oversized_file_is_no_data_not_traceback`, `test_path_is_resolved_once_and_the_opened_file_is_checked`).
+- `metrics.py` (#113 W4, ревью): каждый читаемый файл (`runs.json`, все `manifest*.json` поиска по `run.index`, `events.log`) открывается одним путём с `O_NOFOLLOW|O_NONBLOCK`, только обычный файл и чтение из проверенного дескриптора — FIFO не вешает замер; чужая волна при поиске по номеру — причина про волну, а не «дубль»; два симлинка на один файл — не дубль (тест `test_every_read_file_is_read_from_one_checked_descriptor`); путь разрешается один раз и открывается именно результат, открытый дескриптор обязан быть ровно разрешённым путём, а не любым файлом волны (Linux — путь `/proc/self/fd` равен ему, пометка ` (deleted)` срезается только в конце; без /proc — `st_dev`/`st_ino`, промежуточные каталоги не защищены; тесты `test_an_intermediate_directory_swapped_inside_the_wave_is_refused`, `test_deleted_suffix_is_cut_only_at_the_end_of_the_opened_path`), любой `OSError` (нет доступа, битый симлинк) — причина, а не traceback, файл больше 16 МиБ (events.log — 64 МиБ) — отказ (тесты `test_unreadable_or_oversized_file_is_no_data_not_traceback`, `test_path_is_resolved_once_and_the_opened_file_is_checked`).
 - `wab.py`, `metrics.py`, `dash.py` (#113 W4): служебные строки ответа владельца («marker not written», «status
   rewritten») пишутся отдельным видом события `<волна>: say-note: …` (одна функция `say_note`); `say: ` — только текст,
   ушедший в окно. `metrics.py` узнаёт старые служебные `say:` только в журналах прошлых версий, дашборд показывает
@@ -45,7 +45,9 @@
   постановки.
 - `scripts/run-tests.sh`: наборы идут параллельно, по числу CPU (`RUN_TESTS_JOBS` переопределяет, `1` — прежний
   последовательный цикл, неверное значение — код 2); долгие наборы стартуют первыми, вывод каждого печатается целым
-  блоком в исходном порядке. Совместим с bash 3.2. Набор `tests/run-tests.test.sh`.
+  блоком в исходном порядке. Совместим с bash 3.2. Порядок наборов — байтовый на любой машине (glob под
+  `LC_ALL=C`, локаль наборов не меняется); наборы идут с `PYTHONDONTWRITEBYTECODE=1` — байткод не попадает в
+  `tests/fixtures`, загрузка замороженного гейта 1.0.0 сама не пишет `__pycache__`. Набор `tests/run-tests.test.sh`.
 
 ### Тесты
 

@@ -6,14 +6,22 @@
 # В параллельном режиме вывод каждого набора (stdout и stderr вместе) копится в файл и печатается целым блоком
 # в исходном порядке наборов, как только набор и все до него закончились. Долгие наборы (SLOW_FIRST) стартуют
 # первыми. Код возврата: 0 — все зелёные, 1 — упал хоть один, 2 — нет наборов или неверный RUN_TESTS_JOBS.
+# Наборы идут с PYTHONDONTWRITEBYTECODE=1; порядок наборов — байтовый (glob под LC_ALL=C), локаль наборов не меняется.
 # Совместим с bash 3.2 (macOS /bin/bash): без `wait -n`, ассоциативных массивов и mapfile.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TESTS_DIR="${TESTS_DIR:-$REPO/tests}"
 SLOW_FIRST="superarmanda-state superarmanda-waves-e2e superarmanda-waves superarmanda-review"
+# наборы не пишут __pycache__: параллельный набор иначе кладёт байткод в фикстуры, которые проверяет другой
+export PYTHONDONTWRITEBYTECODE=1
 shopt -s nullglob
+# порядок наборов — байтовый на любой машине: glob сортирует по LC_COLLATE, а LC_ALL его перекрывает; локаль
+# самих наборов после glob возвращается как была
+lc_all_set="${LC_ALL+set}" lc_all="${LC_ALL-}"
+LC_ALL=C
 suites=("$TESTS_DIR"/*.test.sh)
+if [ "$lc_all_set" = set ]; then LC_ALL="$lc_all"; else unset LC_ALL; fi
 
 if [ ${#suites[@]} -eq 0 ]; then
   printf 'no test suites found in %s\n' "$TESTS_DIR" >&2

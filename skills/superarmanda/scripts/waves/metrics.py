@@ -14,8 +14,8 @@
   * запись каталога есть (`lstat`: битый симлинк — присутствующий, но нечитаемый файл, а не «нет файла», и
     fallback на manifest.json при нём не срабатывает); путь разрешается один раз, результат лежит в каталоге
     волны (events.log — прогона) и открывается именно он с O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC; открытый дескриптор
-    сверяется с путём (Linux — `/proc/self/fd`, иначе — st_dev/st_ino, см. `_read_checked`: без /proc
-    промежуточные каталоги не защищены); fstat того же дескриптора — только обычный файл не больше
+    обязан быть ровно разрешённым путём (Linux — путь `/proc/self/fd` равен ему, иначе — st_dev/st_ino, см.
+    `_read_checked`: без /proc промежуточные каталоги не защищены); fstat того же дескриптора — только обычный файл не больше
     `MAX_JSON_BYTES` (`MAX_LOG_BYTES` для events.log; FIFO, каталог, устройство, огромный файл — отказ без
     зависания), и читается тот же дескриптор. Любой OSError (нет доступа, битый симлинк) — причина, не traceback;
   * формат и идентичность: runs.json — `version` 1, `wave` = имя каталога волны, `runs` — список; manifest —
@@ -116,18 +116,18 @@ def _os_reason(name, e, link):
     return f"{name} не читается ({type(e).__name__})"
 
 
-def _opened_is(fd, real, root):
-    """Открытый дескриптор — тот самый файл внутри `root`. Linux: путь `/proc/self/fd/<fd>` (его ведёт ядро, подмена
-    любого компонента пути до open видна) лежит внутри `root`. Без /proc (macOS): (st_dev, st_ino) дескриптора
-    совпадают с повторным stat разрешённого пути — это ловит подмену самого файла, но не промежуточного каталога."""
+def _opened_is(fd, real):
+    """Открытый дескриптор — ровно файл `real` (уже разрешённый и проверенный внутри каталога волны), а не любой
+    файл волны. Linux: путь `/proc/self/fd/<fd>` (его ведёт ядро, подмена любого компонента пути до open видна)
+    равен `real`. Без /proc (macOS): (st_dev, st_ino) дескриптора совпадают с повторным stat `real` — это ловит
+    подмену самого файла, но не промежуточного каталога, вернувшегося на место до stat."""
     try:
         opened = os.readlink(f"/proc/self/fd/{fd}")
     except OSError:
         opened = None
     if opened is not None:
-        if opened.endswith(DELETED_SUFFIX):  # ядро дописывает пометку только в конец; в середине — имя каталога
-            opened = opened[:-len(DELETED_SUFFIX)]
-        return _within(Path(opened), root)
+        # ядро дописывает пометку только в конец; в середине — имя каталога
+        return Path(opened.removesuffix(DELETED_SUFFIX)) == real
     try:
         st, again = os.fstat(fd), os.stat(real)
     except OSError:
@@ -161,7 +161,7 @@ def _read_checked(path, root, limit=MAX_JSON_BYTES):
     except OSError as e:
         return None, None, _os_reason(name, e, link)
     try:
-        if not _opened_is(fd, real, root):
+        if not _opened_is(fd, real):
             return None, None, f"{name} подменён при открытии (вне каталога волны или другой файл)"
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):

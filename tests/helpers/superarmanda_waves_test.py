@@ -25,6 +25,7 @@ import ast
 import atexit
 import calendar
 import datetime
+import errno
 import contextlib
 import fcntl
 import hashlib
@@ -7930,8 +7931,27 @@ def _frozen_gate_100():
     path = Path(__file__).resolve().parents[1] / "fixtures" / "gate-1.0.0" / "scripts" / "waves" / "gate.py"
     spec = importlib.util.spec_from_file_location("frozen_gate_1_0_0", path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # гейт и его соседи грузятся при exec_module: без байткода — фикстура остаётся без `__pycache__`
+    keep, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = keep
     return module
+
+
+class FrozenGateBytecode(unittest.TestCase):
+    """CI W4: загрузка замороженного гейта 1.0.0 не пишет `__pycache__` в tests/fixtures — иначе параллельный
+    `run-tests.sh` отдаёт standalone-layout байткод с путём хоста (`/Users/…`), и проверка фикстур падает."""
+
+    def test_loading_the_frozen_gate_writes_no_bytecode_into_the_fixture(self):
+        scripts = Path(__file__).resolve().parents[1] / "fixtures" / "gate-1.0.0" / "scripts"
+        for cache in (scripts / "__pycache__", scripts / "waves" / "__pycache__"):
+            shutil.rmtree(cache, ignore_errors=True)  # игнорируемый git мусор прошлых прогонов
+        with mock.patch.object(sys, "dont_write_bytecode", False):  # как без -B и PYTHONDONTWRITEBYTECODE
+            _frozen_gate_100()
+            self.assertFalse(sys.dont_write_bytecode)  # флаг возвращён, текущие модули пишут байткод как раньше
+        self.assertEqual(sorted(str(p.relative_to(scripts)) for p in scripts.rglob("*.pyc")), [])
 
 
 def _with_role(role, res, **task):
@@ -20587,7 +20607,8 @@ class MetricsScript(unittest.TestCase):
     def test_deleted_suffix_is_cut_only_at_the_end_of_the_opened_path(self):
         """Внешнее ревью W4: ядро дописывает « (deleted)» только в КОНЕЦ пути /proc/self/fd. Подстрока « (deleted)»
         в середине пути — часть имени каталога: соседний каталог `<волна> (deleted)` не засчитывается как
-        лежащий внутри волны, подмена промежуточного каталога на него — отказ, «нет данных», rc=1."""
+        лежащий внутри волны, подмена промежуточного каталога на него — отказ, «нет данных», rc=1;
+        законный каталог `d (deleted)` внутри волны читается (срез в середине дал бы ложный отказ)."""
         if not os.path.isdir("/proc/self/fd"):
             self.skipTest("без /proc/self/fd путь открытого дескриптора не сверяется")
         manifest = {"version": 1, "wave": {"id": "W4"}, "tasks": {"t1": {"fix_cycles": 1}}}
@@ -20627,6 +20648,67 @@ class MetricsScript(unittest.TestCase):
                 rc = self.metrics.main([str(root)])
             self.assertEqual(rc, 1, out.getvalue())
             self.assertIn("нет данных", out.getvalue())
+        with tempfile.TemporaryDirectory() as tmp:  # законный каталог « (deleted)» внутри волны читается
+            root = Path(tmp) / "run"
+            sa = root / "W4" / "superarmanda"
+            (sa / "d (deleted)").mkdir(parents=True)
+            (root / "events.log").write_text("", encoding="utf-8")
+            (sa / "d (deleted)" / "manifest-real.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (sa / "manifest.json").symlink_to(Path("d (deleted)") / "manifest-real.json")
+            w4 = self.metrics.measure(root)["waves"][0]
+            self.assertEqual((w4["fix_cycles"], w4["problems"]), (1, []), w4)
+
+    def test_an_intermediate_directory_swapped_inside_the_wave_is_refused(self):
+        """Codex P2 (metrics.py:127): открыт должен быть ровно разрешённый путь, а не любой файл внутри волны.
+        Промежуточный каталог подменён между разрешением и open симлинком на ДРУГОЙ каталог той же волны —
+        отказ с причиной «подменён», «нет данных», rc=1 (Linux: путь /proc/self/fd; без него — st_dev/st_ino)."""
+        manifest = {"version": 1, "wave": {"id": "W4"}, "tasks": {"t1": {"fix_cycles": 1}}}
+        other = {**manifest, "tasks": {"t1": {"fix_cycles": 7}}}
+        real_open, real_realpath = os.open, os.path.realpath
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            sa = root / "W4" / "superarmanda"
+            (sa / "d").mkdir(parents=True)
+            (sa / "e").mkdir()
+            (root / "events.log").write_text("", encoding="utf-8")
+            (sa / "d" / "manifest-real.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (sa / "e" / "manifest-real.json").write_text(json.dumps(other), encoding="utf-8")
+            (sa / "manifest.json").symlink_to(Path("d") / "manifest-real.json")
+            inside_real = str(real_realpath(sa / "d" / "manifest-real.json"))
+
+            def opener(p, *a, **k):
+                if os.fspath(p) == inside_real and (sa / "d").is_dir() and not (sa / "d").is_symlink():
+                    (sa / "d").rename(sa / "d-old")
+                    (sa / "d").symlink_to("e")
+                    try:
+                        return real_open(p, *a, **k)
+                    finally:
+                        (sa / "d").unlink()
+                        (sa / "d-old").rename(sa / "d")
+                return real_open(p, *a, **k)
+
+            with mock.patch("os.open", opener):
+                result = self.metrics.measure(root)
+            w4 = result["waves"][0]
+            self.assertIsNone(w4["fix_cycles"], w4)
+            self.assertTrue(any("manifest.json" in p and "подменён" in p for p in w4["problems"]), w4)
+            with mock.patch("os.open", opener), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                rc = self.metrics.main([str(root)])
+            self.assertEqual(rc, 1, out.getvalue())
+            self.assertIn("нет данных", out.getvalue())
+
+            def no_proc(p, *a, **k):  # macOS: /proc нет — сверка по st_dev/st_ino с повторным stat пути
+                if os.fspath(p).startswith("/proc/self/fd/"):
+                    raise FileNotFoundError(errno.ENOENT, "no /proc", p)
+                return real_readlink(p, *a, **k)
+
+            real_readlink = os.readlink
+            with mock.patch("os.open", opener), mock.patch("os.readlink", no_proc):
+                w4 = self.metrics.measure(root)["waves"][0]
+            self.assertIsNone(w4["fix_cycles"], w4)
+            self.assertTrue(any("подменён" in p for p in w4["problems"]), w4)
+            # без подмены тот же каталог читается: отказ — из-за подмены, а не из-за симлинков в пути
+            self.assertEqual(self.metrics.measure(root)["waves"][0]["fix_cycles"], 1)
 
 
 class Release130(unittest.TestCase):
@@ -23265,12 +23347,20 @@ class Release160(unittest.TestCase):
                        "`_read_checked` → `_runs_of` / `_manifest_checked`", "`run.index`", "Битый симлинк", "`say-note", "`_IDENTITY_TOLD`",
                        "`RUN_TESTS_JOBS`", "`Remnants150Chain`", "e2e-1.5.0-state", "`remnants150_no_marks`"):
             self.assertIn(needle, body)
-        # внешнее ревью W4: названные в CHANGELOG и waves.md функции замера существуют в metrics.py
+        # внешнее ревью W4: каждое внутреннее имя (`_x`) из раздела 1.6.0 CHANGELOG и строк 1.6.0 waves.md существует
+        # в коде волн (функция или имя модуля), а функции замера — именно в metrics.py
         waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
-        code = (ROOT / "skills" / "superarmanda" / "scripts" / "waves" / "metrics.py").read_text(encoding="utf-8")
-        for name in set(re.findall(r"`(_[a-z_]+)`", body)) & set(re.findall(r"`(_[a-z_]+)`", waves)):
-            if name != "_IDENTITY_TOLD":
-                self.assertRegex(code, rf"(?m)^def {name}\(", name)
+        rows = "\n".join(l for l in waves.splitlines() if "(1.6.0;" in l)
+        scripts = ROOT / "skills" / "superarmanda" / "scripts" / "waves"
+        code = "\n".join(p.read_text(encoding="utf-8") for p in sorted(scripts.glob("*.py")))
+        metrics = (scripts / "metrics.py").read_text(encoding="utf-8")
+        named = set(re.findall(r"`(_[A-Za-z][A-Za-z_]*)`", body)) | set(re.findall(r"`(_[A-Za-z][A-Za-z_]*)`", rows))
+        self.assertTrue({"_read_checked", "_runs_of", "_manifest_checked"} <= named, named)
+        for name in sorted(named):
+            with self.subTest(name=name):
+                self.assertRegex(code, rf"(?m)^(?:def {name}\(|{name} = )", name)
+        for name in ("_read_checked", "_runs_of", "_manifest_checked"):
+            self.assertRegex(metrics, rf"(?m)^def {name}\(", name)
         v150 = re.search(r"(?ms)^## 1\.5\.0 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
         self.assertIn("`fix_cycles` задачи вне 0..1000", v150)
         self.assertIn("каталог прогона, который не\n  читается, — как каталог без волн, код 2", v150)
