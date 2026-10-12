@@ -47,6 +47,7 @@ BLOCKED_CAP = re.compile(r"BLOCKED: \[class=blocked_cap\b")
 RUNS_FILE_VERSION = 1  # как state.RUNS_FILE_VERSION
 SAY_SERVICE = ("say: owner-answered marker not written", "say: status rewritten while the marker")
 NO_DATA = "нет данных"
+MAX_FIX_CYCLES = 1000  # кап state.py — 3 круга (+ решения владельца); больше — испорченный ввод, не печатаемое число
 
 
 def _load(path):
@@ -169,8 +170,8 @@ def _fix_cycles(path, problems, index=None):
     total = 0
     for name, entry in tasks.items():
         cycles = entry.get("fix_cycles") if isinstance(entry, dict) else None
-        if isinstance(cycles, bool) or not isinstance(cycles, int) or cycles < 0:
-            problems.append(f"{path.name}: fix_cycles задачи {name} не число")
+        if isinstance(cycles, bool) or not isinstance(cycles, int) or not 0 <= cycles <= MAX_FIX_CYCLES:
+            problems.append(f"{path.name}: fix_cycles задачи {name} не число от 0 до {MAX_FIX_CYCLES}")
             return None
         total += cycles
     return total
@@ -210,8 +211,11 @@ def blocked_cap_by_wave(events):
 
 def measure(run_dir):
     run_dir = Path(run_dir)
-    waves = sorted((d for d in run_dir.iterdir() if d.is_dir() and WAVE_DIR.match(d.name)),
-                   key=lambda d: int(WAVE_DIR.match(d.name).group(1))) if run_dir.is_dir() else []
+    try:
+        waves = sorted((d for d in run_dir.iterdir() if d.is_dir() and WAVE_DIR.match(d.name)),
+                       key=lambda d: int(WAVE_DIR.match(d.name).group(1))) if run_dir.is_dir() else []
+    except OSError:
+        waves = []  # каталог прогона не читается — как каталог без волн, код 2
     events_file = run_dir / "events.log"
     try:
         forks = blocked_cap_by_wave(events_file.read_text(encoding="utf-8"))
@@ -221,8 +225,12 @@ def measure(run_dir):
     rows = []
     for d in waves:
         problems = []
-        manifests = _manifest_paths(d, problems)
-        cycles = [_fix_cycles(p, problems, i) for p, i in manifests]
+        try:
+            manifests = _manifest_paths(d, problems)
+            cycles = [_fix_cycles(p, problems, i) for p, i in manifests]
+        except OSError as e:  # каталог волны не читается (права): «нет данных», не traceback
+            manifests, cycles = [], [None]
+            problems.append(f"каталог волны не читается ({type(e).__name__})")
         rows.append({
             "wave": d.name,
             "runs": len(manifests) if manifests else None,  # прогон с потерянным manifest считается: он был

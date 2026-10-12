@@ -19232,6 +19232,33 @@ class MetricsScript(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["waves"][0]["fix_cycles"], 2)
 
+    def test_absurd_counts_and_unreadable_wave_dir_are_no_data(self):
+        """Tester на 4cf014e: каждое значение fix_cycles проходит, а сумма не печатается (больше 4300 цифр), и
+        каталог волны без права чтения — тоже «нет данных», код 1, без traceback (инвариант «никогда traceback»)."""
+        def huge_cycles(w):
+            (w / "superarmanda" / "manifest.json").write_text(json.dumps({"version": 1, "wave": "W1", "tasks": {
+                f"t{i}": {"fix_cycles": int("9" * 4299)} for i in range(12)}}), encoding="utf-8")
+        run, _ = self._lone_wave()
+        huge_cycles(run / "W1")
+        cases = {"huge fix_cycles": run}
+        if os.geteuid() != 0:  # root читает каталог и без прав
+            locked, _ = self._lone_wave()
+            (locked / "W1").chmod(0)
+            self.addCleanup((locked / "W1").chmod, 0o755)
+            cases["unreadable wave dir"] = locked
+        for name, run in cases.items():
+            for fmt in (("--json",), ()):
+                with self.subTest(name, fmt=fmt):
+                    r = self.cli(run, *fmt)
+                    self.assertEqual(r.returncode, 1, r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    if fmt:
+                        w1 = json.loads(r.stdout)["waves"][0]
+                        self.assertIsNone(w1["fix_cycles"], w1)
+                        self.assertTrue(w1["problems"], w1)
+                    else:
+                        self.assertIn("нет данных", r.stdout)
+
     def test_a_broken_or_missing_file_is_named_not_skipped(self):
         def break_it(run):
             (run / "W1" / "runs.json").write_text("{", encoding="utf-8")                      # corrupt
