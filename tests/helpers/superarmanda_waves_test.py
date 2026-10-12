@@ -8410,7 +8410,7 @@ class MergeGate(GateBase):
         token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2"
         line = f"BLOCKED: merge gate passed; token {token} phone 89161234567; owner runs ~/.cache/wab/{self.PHONE_SHAPED}"
         forged = "~/.cache/wab/W1.aaaaaaaaaaaa.78297023340d0000.merge"  # the shape, but no such file: masked as before
-        wab.event(cfg, line + " " + forged, owner_paths=True)
+        wab.owner_event(cfg, line + " " + forged)
         w = {"notified": {}}
         wab.note_question(cfg, "W1", w, wab.safe_text(line + " " + forged, 10 ** 9, owner_paths=True), time.time())
         for name, text in (("events.log", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")),
@@ -21744,6 +21744,169 @@ class W3PolicyEpisodes(Base):
                             self.assertIn(flag, cmd, f"state.py refuses --accept without {flag}")
 
 
+OWNER_SCRIPT_VALUES = {"write_owner_script", "owner_script_name", "handoff_gate_line"}
+
+
+def owner_script_events_outside_owner_event(src):
+    """Every event() call of wab.py whose text is built from the owner's script path — a call of write_owner_script /
+    owner_script_name / handoff_gate_line in its arguments, or a name assigned from one in the same function (to a
+    fixpoint, tuple targets included) — that is not owner_event(): [(function, line)]. Also any event() with
+    owner_paths passed by hand outside owner_event (the policy has ONE point)."""
+    found = []
+    for fn in ast.walk(ast.parse(src)):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        tainted = set()
+
+        def dirty(node):
+            return any((isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in OWNER_SCRIPT_VALUES)
+                       or (isinstance(n, ast.Name) and n.id in tainted) for n in ast.walk(node))
+        while True:
+            before = len(tainted)
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Assign) and dirty(n.value):
+                    for t in n.targets:
+                        tainted |= {x.id for x in ast.walk(t) if isinstance(x, ast.Name)}
+            if len(tainted) == before:
+                break
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "event":
+                by_hand = any(k.arg == "owner_paths" for k in n.keywords) or len(n.args) > 2
+                if (any(dirty(a) for a in n.args) or by_hand) and fn.name != "owner_event":
+                    found.append((fn.name, n.lineno))
+    return found
+
+
+class W3OwnerScriptPathEverywhere(GateBase):
+    """W3 round 2 (#113): ONE table over EVERY place the dispatcher names the owner's merge script — the events of the
+    hand-over (merge result unknown, a refused merge, the reminder, open threads, the hand-off gate of merge_gate
+    external), the status line, questions[], chain-result.md and `wab.py status` — with a name whose id16 reads as a
+    phone number to redact(): the path stays whole everywhere, a secret in the same line is still masked. The static
+    check keeps a new place from forgetting the policy: an event built from the script's path goes through owner_event."""
+    PHONE = "W1.aaaaaaaaaaaa.78297023340d065a.merge"
+    TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2"
+
+    def setUp(self):
+        super().setUp()
+        self.now = 1_800_000_000.0
+        for target, kw in (("time.time", dict(side_effect=lambda: self.now)),):
+            p = mock.patch(target, **kw)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(wab, "owner_script_name", return_value=self.PHONE)
+        p.start()
+        self.addCleanup(p.stop)
+        self.merge_mode = "ok"
+        real = self.handle
+
+        def handle(args):
+            if args[:3] == ("gh", "pr", "merge"):
+                if self.merge_mode == "interrupt":
+                    raise KeyboardInterrupt
+                self.merge_rc, self.merge_err = ((1, f"not mergeable: token {self.TOKEN}") if self.merge_mode == "refuse"
+                                                 else (0, ""))
+            return real(args)
+        self.gh_handler = handle
+        self.shown = "~/.cache/wab/" + self.PHONE
+
+    def status_out(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            wab.status_cmd(wab.load_chain(self.path, create=False))
+        return out.getvalue()
+
+    # the places: each brings the wave to it and returns the needle of its event line and whether the status, the
+    # questions and the chain result name the script too
+    def merge_unknown(self):
+        self.start()
+        self.merge_mode = "interrupt"
+        try:
+            self.tick()
+        except KeyboardInterrupt:
+            pass
+        self.tick()
+        return "merge result unknown; handed to the owner: ", True
+
+    def merge_refused(self):
+        self.start()
+        self.merge_mode = "refuse"
+        self.tick()
+        return "merge gate passed, merge refused: ", True
+
+    def reminder(self):
+        self.merge_refused()
+        self.now += 121 * 60
+        self.tick()
+        return "напоминание владельцу #1: PR #7 не смержен; owner runs ", True
+
+    def open_threads(self):
+        self.start()
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
+        self.tick()
+        return "open threads; owner script ", True
+
+    def external_pass(self):
+        self.start(merge_gate="external")
+        self.tick()
+        return "hand-off gate: Гейт мерджа пройден. Выполни: ", False
+
+    def external_threads(self):
+        self.start(merge_gate="external")
+        self.facts = green_facts(threads=[{"id": "PRRT_a", "isResolved": False}])
+        self.tick()
+        return "hand-off gate: Гейт мерджа пройден, но есть незакрытые треды", False
+
+    def test_the_owner_script_path_is_whole_in_every_place_and_the_rest_stays_masked(self):
+        self.assertNotEqual(wab.safe_text(self.shown, 10 ** 9), self.shown, "the name must be one the heuristic masks")
+        for place in ("merge_unknown", "merge_refused", "reminder", "open_threads", "external_pass", "external_threads"):
+            with self.subTest(place):
+                self.tg.clear()
+                if hasattr(self, "cfg"):  # every place on a clean run directory and without an earlier script file
+                    shutil.rmtree(self.cfg["run_dir"], ignore_errors=True)
+                shutil.rmtree(self.home / ".cache" / "wab", ignore_errors=True)
+                self.facts, self.merge_mode, self.now = green_facts(), "ok", 1_800_000_000.0
+                needle, in_status = getattr(self, place)()
+                self.assertTrue((self.home / ".cache" / "wab" / self.PHONE).is_file())
+                lines = [l for l in self.log().splitlines() if needle in l]
+                self.assertTrue(lines, f"no event of {place}: {self.log()}")
+                self.assertIn(self.shown, lines[-1], "events.log")
+                self.assertNotIn("[скрыто]d065a", self.log())
+                self.assertNotIn(self.TOKEN, self.log())  # the refused merge carries gh's stderr: still masked
+                if place in ("merge_refused", "reminder"):
+                    self.assertIn("not mergeable: token", self.log())
+                if in_status:
+                    self.assertIn(self.shown, self.status(), "status")
+                    self.assertIn(self.shown, self.status_out(), "wab.py status")
+                    self.assertTrue(any(self.shown in (t or "") for t in q_texts(self.cfg, "W1", self.rec())), "questions[]")
+                    chain = wab.write_chain_result(self.cfg, wab.load_state(self.cfg))[0].read_text(encoding="utf-8")
+                    self.assertIn(self.shown, chain, "chain-result.md")
+                for said in self.tg:  # #83: never in an outside text
+                    self.assertNotIn("~/.cache", said)
+
+    def test_every_event_built_from_the_script_path_goes_through_owner_event(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        self.assertEqual(owner_script_events_outside_owner_event(src), [])
+        # the check itself sees a site that forgets the policy (one per kind: a direct call, a tainted name)
+        for old, new in (('owner_event(cfg, f"{wave}: hand-off gate: {gate_text}")', 'event(cfg, f"{wave}: hand-off gate: {gate_text}")'),
+                         ('owner_event(cfg, f"{wave}: merge gate passed, {log_text}; owner runs {command}")',
+                          'event(cfg, f"{wave}: merge gate passed, {log_text}; owner runs {command}")')):
+            with self.subTest(mutant=new):
+                self.assertEqual(src.count(old), 1)
+                self.assertTrue(owner_script_events_outside_owner_event(src.replace(old, new)))
+
+    def test_owner_event_keeps_every_other_mask_of_the_line(self):
+        folder = self.home / ".cache" / "wab"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / self.PHONE).write_text("x", encoding="utf-8")
+        cfg, _ = self.chain()
+        forged = "~/.cache/wab/W1.aaaaaaaaaaaa.78297023340d0000.merge"  # the shape, but no such file: masked as before
+        wab.owner_event(cfg, f"token {self.TOKEN} phone 89161234567; owner runs {self.shown} {forged}")
+        text = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertIn(self.shown, text)
+        for gone in (self.TOKEN, "89161234567", forged):
+            self.assertNotIn(gone, text)
+
+
 class W3PolicyMarksAndNotices(Base):
     """W3 of waves-tails2 (#113, the remainder of #100): ONE invariant (I-W3), ONE brute force over its surface.
     I-W3: a mark of an automatic answer in state.json (policy_key_pending, policy_refusal, policy_episode, policy_keys)
@@ -22403,7 +22566,8 @@ class Release153(unittest.TestCase):
         self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.3 — 2026-10-12$", "1.5.3 is the first section")
         body = re.search(r"(?ms)^## 1\.5\.3 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
         for needle in ("issues/113", "issues/100", "`waves-tails2`", "I-W3", "`W3PolicyMarksAndNotices`", "`_fork_keys`",
-                       "`upgrade_record`", "`owner_paths=True`", "п.17", "п.15", "п.11"):
+                       "`upgrade_record`", "`owner_paths=True`", "`owner_event`", "`W3OwnerScriptPathEverywhere`",
+                       "п.17", "п.15", "п.11"):
             self.assertIn(needle, body)
         self.assertIn("Уточнение 1.5.3: для `policy_refusal`", log)  # the wording of 1.4.4 corrected
 
@@ -22412,9 +22576,10 @@ class Release153(unittest.TestCase):
         self.assertEqual(src.count("# I-W3 (#113 W3, 1.5.3): THE invariant"), 1)
         waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
         self.assertIn("Инвариант I-W3 (1.5.3", waves)
+        self.assertIn("Известное ограничение (следствие I-W3)", waves)
         table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
         self.assertRegex(table, r"(?m)^\| Отметки автоответов по полной схеме[^\n]*реализовано \(1\.5\.3; "
-                                r"[^\n]*`W3PolicyMarksAndNotices`, `MergeGate` \|$")
+                                r"[^\n]*`W3PolicyMarksAndNotices`, `W3OwnerScriptPathEverywhere`, `MergeGate` \|$")
 
 
 if __name__ == "__main__":

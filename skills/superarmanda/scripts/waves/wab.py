@@ -471,6 +471,15 @@ def event(cfg, text, owner_paths=False):
     print(line, flush=True)
 
 
+def owner_event(cfg, text):
+    """THE event of a hand-over to the owner: a text that names the owner's merge script (~/.cache/wab/<owner_script_name>,
+    a value of write_owner_script / owner_script_name / handoff_gate_line). Masked with owner_paths=True: the path is
+    exempt from the heuristics (its sha12/id16 may read as a phone number) only while that very file exists
+    (_owner_script_spans), every other mask of the line stays. The one way to log such a text (#113 W3): a static test
+    finds every event() whose text is built from those values."""
+    event(cfg, text, owner_paths=True)
+
+
 def wave_dir(cfg, wave):
     d = cfg["run_dir"] / wave
     d.mkdir(parents=True, exist_ok=True)
@@ -5894,9 +5903,8 @@ def _owner_reminder(cfg, st, wave, w, number, sha, now):
     w["owner_remind"] = {"sha": sha, "at": now, "n": n + 1}
     put_notice(cfg, w, wave, "merge_remind", f"{sha}:{n + 1}", pr=number, minutes=cfg.get("merge_remind_minutes"))
     save_state(cfg, st)
-    event(cfg, f"{wave}: напоминание владельцу #{n + 1}: PR #{number} не смержен; owner runs "
-               f"{home_form(pathlib.Path.home() / '.cache' / 'wab' / owner_script_name(cfg, wave, sha))}",
-          owner_paths=True)
+    owner_event(cfg, f"{wave}: напоминание владельцу #{n + 1}: PR #{number} не смержен; owner runs "
+                     f"{home_form(pathlib.Path.home() / '.cache' / 'wab' / owner_script_name(cfg, wave, sha))}")
     flush_notices(cfg, st, w)
 
 
@@ -6097,8 +6105,7 @@ def _gate_passed(cfg, st, wave, w, wdir, v, recheck=False):
         _owner_wait_started(w, sha, "threads")
         put_notice(cfg, w, wave, "merge_owner", sha, pr=number, threads=len(unresolved), p01=v["old_p01"])
         save_state(cfg, st)
-        event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}",
-              owner_paths=True)
+        owner_event(cfg, f"{wave}: merge gate passed with {len(unresolved)} open threads; owner script {home_form(path)}")
         flush_notices(cfg, st, w)
         return True
     if w.get("merge_called") == sha:  # never twice for one sha
@@ -6187,7 +6194,7 @@ def _hand_to_owner(cfg, st, wave, w, wdir, number, sha, reason, log_text, questi
     _owner_wait_started(w, sha, reason)
     put_notice(cfg, w, wave, "merge_refused", sha, pr=number, reason=reason, question=question)
     save_state(cfg, st)
-    event(cfg, f"{wave}: merge gate passed, {log_text}; owner runs {command}", owner_paths=True)
+    owner_event(cfg, f"{wave}: merge gate passed, {log_text}; owner runs {command}")
     flush_notices(cfg, st, w)
     return True
 
@@ -6523,7 +6530,7 @@ def _merging_tick(cfg, st, wave, w, wdir, now):
         _owner_wait_started(w, sha, "merge_unknown")
         put_notice(cfg, w, wave, "merge_unknown", sha, pr=number)
         save_state(cfg, st)
-        event(cfg, f"{wave}: PR #{number} merge result unknown; handed to the owner: {command}", owner_paths=True)
+        owner_event(cfg, f"{wave}: PR #{number} merge result unknown; handed to the owner: {command}")
         flush_notices(cfg, st, w)
         return True
     if w.get("merge_called") == sha and "merge_rc" not in w and once_per(w, "merge_unknown", sha):
@@ -7459,7 +7466,7 @@ def _tick(cfg, st):
         w["pending_exit"] = True  # the intent to close the window, in the same save as the phase
         put_notice(cfg, w, wave, "handoff", "1", reason=gate_code, question=read(wdir / "result.md"))
         if gate_text:  # the verdict and the owner's command: for a human at the machine, not for an outside text
-            event(cfg, f"{wave}: hand-off gate: {gate_text}")
+            owner_event(cfg, f"{wave}: hand-off gate: {gate_text}")
         save_state(cfg, st)
         if external:
             event(cfg, f"{wave}: DONE, awaiting merge by the coordinator")
@@ -8504,7 +8511,7 @@ def status_cmd(cfg):
               + (f"step={safe_text(w['fable_switch'].get('step'), 50)} " if w.get("phase") == "switching"
                  and isinstance(w.get("fable_switch"), dict) else "") +
               f"started={hum(cfg, num(w.get('started')))} "
-              f"status={safe_text(read(cfg['run_dir'] / wave / 'status'), 10 ** 6)}")
+              f"status={safe_text(read(cfg['run_dir'] / wave / 'status'), 10 ** 6, owner_paths=True)}")
         line = manifest_status_line(cfg, wave)
         if line:
             print(safe_text(line, 10 ** 6))
