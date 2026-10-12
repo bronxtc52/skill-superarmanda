@@ -75,6 +75,7 @@ SAY_SERVICE = ("say: owner-answered marker not written", "say: status rewritten 
 NO_DATA = "нет данных"
 MAX_JSON_BYTES = 16 << 20  # runs.json и manifest: живые — килобайты; больше — испорченный ввод, не чтение в память
 MAX_LOG_BYTES = 64 << 20  # events.log длинной цепочки — мегабайты; больше — отказ, а не MemoryError
+DELETED_SUFFIX = " (deleted)"  # пометка ядра в конце /proc/self/fd/<fd> у удалённого файла
 MAX_FIX_CYCLES = 1000  # кап state.py — 3 круга (+ решения владельца); больше — испорченный ввод, не печатаемое число
 
 
@@ -124,7 +125,9 @@ def _opened_is(fd, real, root):
     except OSError:
         opened = None
     if opened is not None:
-        return _within(Path(opened.rsplit(" (deleted)", 1)[0]), root)
+        if opened.endswith(DELETED_SUFFIX):  # ядро дописывает пометку только в конец; в середине — имя каталога
+            opened = opened[:-len(DELETED_SUFFIX)]
+        return _within(Path(opened), root)
     try:
         st, again = os.fstat(fd), os.stat(real)
     except OSError:

@@ -20584,6 +20584,50 @@ class MetricsScript(unittest.TestCase):
             self.assertIsNone(w4["fix_cycles"], w4)
             self.assertTrue(any("manifest.json" in p for p in w4["problems"]), w4)
 
+    def test_deleted_suffix_is_cut_only_at_the_end_of_the_opened_path(self):
+        """Внешнее ревью W4: ядро дописывает « (deleted)» только в КОНЕЦ пути /proc/self/fd. Подстрока « (deleted)»
+        в середине пути — часть имени каталога: соседний каталог `<волна> (deleted)` не засчитывается как
+        лежащий внутри волны, подмена промежуточного каталога на него — отказ, «нет данных», rc=1."""
+        if not os.path.isdir("/proc/self/fd"):
+            self.skipTest("без /proc/self/fd путь открытого дескриптора не сверяется")
+        manifest = {"version": 1, "wave": {"id": "W4"}, "tasks": {"t1": {"fix_cycles": 1}}}
+        outside_manifest = {**manifest, "tasks": {"t1": {"fix_cycles": 7}}}
+        real_open, real_realpath = os.open, os.path.realpath
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            sa = root / "W4" / "superarmanda"
+            (sa / "d").mkdir(parents=True)
+            (root / "events.log").write_text("", encoding="utf-8")
+            (sa / "d" / "manifest-real.json").write_text(json.dumps(manifest), encoding="utf-8")
+            outside = root / "W4 (deleted)" / "superarmanda" / "d"
+            outside.mkdir(parents=True)
+            (outside / "manifest-real.json").write_text(json.dumps(outside_manifest), encoding="utf-8")
+            (sa / "manifest.json").symlink_to(Path("d") / "manifest-real.json")
+            inside_real = str(real_realpath(sa / "d" / "manifest-real.json"))
+
+            def opener(p, *a, **k):
+                if os.fspath(p) == inside_real and (sa / "d").is_dir() and not (sa / "d").is_symlink():
+                    (sa / "d").rename(sa / "d-old")
+                    (sa / "d").symlink_to(outside)
+                    try:
+                        return real_open(p, *a, **k)
+                    finally:
+                        (sa / "d").unlink()
+                        (sa / "d-old").rename(sa / "d")
+                return real_open(p, *a, **k)
+
+            with mock.patch("os.open", opener):
+                result = self.metrics.measure(root)
+            self.assertEqual([w["wave"] for w in result["waves"]], ["W4"], result)
+            w4 = result["waves"][0]
+            self.assertNotEqual(w4["fix_cycles"], 7, w4)
+            self.assertIsNone(w4["fix_cycles"], w4)
+            self.assertTrue(any("manifest.json" in p for p in w4["problems"]), w4)
+            with mock.patch("os.open", opener), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                rc = self.metrics.main([str(root)])
+            self.assertEqual(rc, 1, out.getvalue())
+            self.assertIn("нет данных", out.getvalue())
+
 
 class Release130(unittest.TestCase):
     """The release 1.3.0 (W8): version, CHANGELOG, the measuring table, the rows of «Что реализовано»."""
@@ -23218,9 +23262,15 @@ class Release160(unittest.TestCase):
         self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.6\.0 — 2026-10-12$", "1.6.0 is the first section")
         body = re.search(r"(?ms)^## 1\.6\.0 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
         for needle in ("issues/113", "issues/117", "`waves-tails2`", "pull/120", "pull/121", "pull/122", "pull/116",
-                       "`_manifest_identity`", "`run.index`", "Битый симлинк", "`say-note", "`_IDENTITY_TOLD`",
+                       "`_read_checked` → `_runs_of` / `_manifest_checked`", "`run.index`", "Битый симлинк", "`say-note", "`_IDENTITY_TOLD`",
                        "`RUN_TESTS_JOBS`", "`Remnants150Chain`", "e2e-1.5.0-state", "`remnants150_no_marks`"):
             self.assertIn(needle, body)
+        # внешнее ревью W4: названные в CHANGELOG и waves.md функции замера существуют в metrics.py
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        code = (ROOT / "skills" / "superarmanda" / "scripts" / "waves" / "metrics.py").read_text(encoding="utf-8")
+        for name in set(re.findall(r"`(_[a-z_]+)`", body)) & set(re.findall(r"`(_[a-z_]+)`", waves)):
+            if name != "_IDENTITY_TOLD":
+                self.assertRegex(code, rf"(?m)^def {name}\(", name)
         v150 = re.search(r"(?ms)^## 1\.5\.0 — 2026-10-11\n(.*?)(?=^## )", log).group(1)
         self.assertIn("`fix_cycles` задачи вне 0..1000", v150)
         self.assertIn("каталог прогона, который не\n  читается, — как каталог без волн, код 2", v150)

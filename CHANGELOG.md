@@ -23,7 +23,7 @@
 ### Исправлено
 
 - `metrics.py` (#113 W4): каждый файл, из которого берётся число, проходит одну проверку идентичности до счёта
-  (`_read_entry` → `_runs_of` / `_manifest_identity`). Manifest засчитывается, только если `version` — целое 1 или 2
+  (`_read_checked` → `_runs_of` / `_manifest_checked`). Manifest засчитывается, только если `version` — целое 1 или 2
   (не `bool`, не `1.0`, не строка; как `state.check_schema`) и его `wave.id`, если ключ есть, равен имени каталога
   волны; manifest другой волны — «нет данных». Два `superarmanda/manifest*.json` с одним `run.index` — отказ, а не
   первый файл по имени. Битый симлинк `runs.json` или manifest — файл есть, но не читается (а не «нет файла»), и

@@ -27,12 +27,6 @@ FAKE = textwrap.dedent("""\
     """)
 
 
-def cpu_count():
-    if hasattr(os, "sched_getaffinity"):
-        return len(os.sched_getaffinity(0))
-    return os.cpu_count()
-
-
 class RunTests(unittest.TestCase):
     def suites(self, **spec):
         """spec: имя -> (sleep, rc)."""
@@ -44,7 +38,8 @@ class RunTests(unittest.TestCase):
         return d
 
     def run_script(self, tests_dir, jobs=None, extra=None):
-        env = {k: v for k, v in os.environ.items() if k != "RUN_TESTS_JOBS"}
+        # OMP_NUM_THREADS / OMP_THREAD_LIMIT меняют ответ nproc — число CPU задаёт только сам тест
+        env = {k: v for k, v in os.environ.items() if k not in ("RUN_TESTS_JOBS", "OMP_NUM_THREADS", "OMP_THREAD_LIMIT")}
         env.update(TESTS_DIR=str(tests_dir), RUN_TESTS_FAKE_LOG=str(self.log))
         if jobs is not None:
             env["RUN_TESTS_JOBS"] = str(jobs)
@@ -132,10 +127,27 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
                 self.assertIn("failed suites: b", p.stderr)
 
+    def fake_cpus(self, n):
+        """PATH с подставными `nproc` и `sysctl` (ветка macOS), отвечающими `n`: число CPU хоста тест не видит."""
+        d = Path(tempfile.mkdtemp(prefix="run-tests-cpus-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        for tool in ("nproc", "sysctl"):
+            (d / tool).write_text(f"#!/bin/sh\necho {n}\n", encoding="utf-8")
+            (d / tool).chmod(0o755)
+        return {"PATH": f"{d}{os.pathsep}{os.environ.get('PATH', '')}"}
+
     def test_default_is_the_number_of_cpus(self):
-        p = self.run_script(self.suites(a=(0, 0)))
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn(f"run-tests: {cpu_count()} parallel", p.stderr)
+        """Внешнее ревью W4: без RUN_TESTS_JOBS — столько сразу, сколько CPU; при одном CPU — последовательная
+        ветка без строки «parallel». Число CPU подставлено, а не взято с хоста: тест одинаков на 1 и на 64 CPU."""
+        with self.subTest(cpus=1):
+            p = self.run_script(self.suites(a=(0, 0), b=(0, 0)), extra=self.fake_cpus(1))
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertNotIn("parallel", p.stderr)
+            self.assertEqual(self.blocks(p.stdout), ["a", "b"])
+        with self.subTest(cpus=4):
+            p = self.run_script(self.suites(a=(0, 0), b=(0, 0)), extra=self.fake_cpus(4))
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("run-tests: 4 parallel", p.stderr)
 
     def test_a_bad_jobs_value_is_refused(self):
         for bad in ("0", "-1", "x", "1.5", ""):
