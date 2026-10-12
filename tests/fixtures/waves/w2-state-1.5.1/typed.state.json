@@ -1,0 +1,73 @@
+{
+  "current": "W1",
+  "waves": {
+    "W1": {
+      "tmux": "wv-w1",
+      "cwd": "@REPO@",
+      "started": 1791798544.3477945,
+      "restarts": 0,
+      "phase": "running",
+      "notified": {},
+      "sessions": [],
+      "attempts": [
+        {
+          "tmux": "wv-w1",
+          "cwd": "@REPO@",
+          "started": 1791798544.3042662,
+          "restarts": 0,
+          "phase": "running",
+          "notified": {
+            "blocked": "sha256:691f170848ea4ad9f8c54fdb056118d8"
+          },
+          "sessions": [],
+          "last_status_word": "BLOCKED",
+          "last_status_eid": "sha256:691f170848ea4ad9f8c54fdb056118d8",
+          "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+          "pane_changed": 1791798604.3156388,
+          "activity_files": {},
+          "activity_session": null,
+          "questions": [
+            {
+              "at": 1791798604.3156388,
+              "eid": "sha256:691f170848ea4ad9f8c54fdb056118d8"
+            }
+          ]
+        }
+      ],
+      "last_status_word": "BLOCKED",
+      "last_status_eid": "sha256:be53c1b6a0ced591f71a7e352e3a64ae",
+      "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+      "pane_changed": 1791798604.3607533,
+      "activity_files": {},
+      "activity_session": null,
+      "tokens": 0,
+      "peak": 0,
+      "ctx_hist": [
+        0
+      ],
+      "alarm_at": 1791798604.3607533,
+      "policy_episode": {
+        "status": "sha256:be53c1b6a0ced591f71a7e352e3a64ae",
+        "stamp": [
+          1321323,
+          1791798604384343354
+        ]
+      },
+      "policy_pending": "sha256:be53c1b6a0ced591f71a7e352e3a64ae",
+      "policy_key_pending": {
+        "key": [
+          "W1",
+          "2026-10-01",
+          1,
+          "T1",
+          "needs_decision",
+          "tester"
+        ],
+        "status": "sha256:be53c1b6a0ced591f71a7e352e3a64ae",
+        "text": "sha256:0559594de6c4a6fffc7e31971bb11c63"
+      },
+      "pending_enter": "policy answer",
+      "pending_text_eid": "sha256:af17d75c60d10cc774e2c347ac522a84"
+    }
+  }
+}

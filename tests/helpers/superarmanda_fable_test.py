@@ -18,17 +18,19 @@ import datetime
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from superarmanda_waves_test import (  # noqa: E402  (installs the TMUX guard)
-    EMPTY_ANSI, Base, WAVES, asst, live, text_holders)
+    EMPTY_ANSI, Base, DecisionPolicy, WAVES, asst, live, text_holders)
 
 import wab  # noqa: E402
 
@@ -686,7 +688,7 @@ class FableLimitWhileBlocked(FableLimitBase):
         w = self.w()
         self.assertNotIn("blocked", w["notified"])  # no notice of the line handed to the Opus session
         self.assertEqual(len(self.new_sessions()), 1)
-        self.assertEqual(w["fable_blocked_episode"]["status"], wab.eid(self.BLOCKED))  # 1.4.3: the eid of the line
+        self.assertEqual(w["fable_blocked_episode"]["status"], wab.text_eid(self.BLOCKED))  # 1.4.3: the eid of the line
 
     def test_the_line_asked_again_is_a_new_episode(self):
         self.switched(limit_lines()[:1])
@@ -852,7 +854,7 @@ class LostTextStore(FableLimitBase):
         """A wave whose status file is empty (mid-rewrite, or the wave died writing it) and whose last real
         status is known to state.json by word and eid only."""
         st = wab.load_state(self.cfg)
-        st["waves"]["W1"].update(last_status_word=word, last_status_eid=wab.eid(text), **rec)
+        st["waves"]["W1"].update(last_status_word=word, last_status_eid=wab.text_eid(text), **rec)
         st["waves"]["W1"].pop("last_status", None)
         self.put_state(self.cfg, st)
         self.set_status(self.cfg, "W1", "")
@@ -871,7 +873,7 @@ class LostTextStore(FableLimitBase):
         self.fresh()
         self.lose(how)
         e = wab.stash_text(self.cfg, "W1", "BLOCKED: текст")
-        self.assertEqual(e, wab.eid("BLOCKED: текст"))
+        self.assertEqual(e, wab.text_eid("BLOCKED: текст"))
         if how == "file":
             self.assertIn("the wave's text store not written", self.events())
 
@@ -921,12 +923,17 @@ class LostTextStore(FableLimitBase):
         self.assertEqual(len([t for t in self.tg if "ждёт тебя" in t]), 1, self.tg)
         self.assertEqual(self.sent, [])  # nothing typed: no answer by the policy
         self.assertEqual(self.enters, [])
+        # #113 W2 L1 (I2): the episode told without its text is a question of the chain result too, once
+        (q,) = self.w()["questions"]
+        self.assertEqual((q["eid"], q.get("text_lost")), (wab.text_eid("BLOCKED: вопрос волны?"), True))
+        result = Path(wab.write_chain_result(self.cfg, wab.load_state(self.cfg))[0]).read_text(encoding="utf-8")
+        self.assertIn(wab.QUESTION_TEXT_LOST, result)
 
     def row_tick_lost_blocked_told_or_answered(self, how):  # ... but an episode already told/answered is not
         for mark in ("blocked", "policy_answer"):
             self.fresh()
             self.lost_tick(how, "BLOCKED", "BLOCKED: вопрос волны?",
-                           notified={mark: wab.eid("BLOCKED: вопрос волны?")})
+                           notified={mark: wab.text_eid("BLOCKED: вопрос волны?")})
             self.assertTrue(self.tick())
             self.assertEqual(self.tg, [], mark)
             self.assertEqual(self.sent, [], mark)
@@ -966,7 +973,7 @@ class LostTextStore(FableLimitBase):
     def row_deliver_head(self, how):  # _deliver: the head of a typed text lost -> no Enter, the input cleared
         self.fresh()
         self.lost_tick(how, "RUNNING", "RUNNING", pending_enter="checkpoint request",
-                       pending_text_eid=wab.eid("[wab] WAB-CHECKPOINT"))
+                       pending_text_eid=wab.text_eid("[wab] WAB-CHECKPOINT"))
         self.ansi = live("19-folded.ansi")
         with contextlib.redirect_stdout(io.StringIO()):
             ok = wab._deliver(self.cfg, wab.load_state(self.cfg), "W1", "checkpoint request", wab.send_text, "")
@@ -977,7 +984,7 @@ class LostTextStore(FableLimitBase):
     def row_question_text(self, how):  # _question_text: chain-result.md says where the question can be read
         self.fresh()
         st = wab.load_state(self.cfg)
-        st["waves"]["W1"]["questions"] = [{"at": time.time(), "eid": wab.eid("BLOCKED: вопрос волны?")}]
+        st["waves"]["W1"]["questions"] = [{"at": time.time(), "eid": wab.text_eid("BLOCKED: вопрос волны?")}]
         self.put_state(self.cfg, st)
         self.lose(how)
         path = wab.write_chain_result(self.cfg, wab.load_state(self.cfg))
@@ -1044,6 +1051,212 @@ def scaled(units, hours_ago=1):
     d["message"]["usage"].update(input_tokens=0, cache_creation_input_tokens=0, cache_read_input_tokens=0,
                                  output_tokens=int(units * 1_000_000 / 5))
     return json.dumps(d)
+
+
+FOREIGN = "ПОДДЕЛКА: чужой текст в хранилище"
+EID_SHAPED = "sha256:" + "a" * 32  # a free text of the wave that looks like an eid
+STORE_STATES = ("ok", "removed", "file", "forged", "foreign", "eid-text")
+_EID_RE = re.compile(r"sha256:[0-9a-f]{32}")
+
+
+class TextStoreEpisodes(FableLimitBase):
+    """#113 W2 (1.5.2), ONE table: every path that keeps a text of the wave in its store (set_last_status with a
+    BLOCKED line read on, and read back from the store mid-rewrite; note_question; put_notice with the quote under
+    `telegram_quote`; a typed policy answer waiting for its Enter; the Fable -> Opus switch message) × every state of
+    the store: sound; the directory removed after the write; a plain file in its place (nothing is ever written);
+    every file forged with its own eid (`sha256:<h>`); every file holding a foreign text; the wave's own text shaped
+    like an eid. Three ticks each. For every cell: a forged or foreign file is never read as the text (nothing of it
+    reaches Telegram, the window or chain-result.md); a text shaped like an eid is kept and read back (I1); at most one
+    «text store not written» event per episode (I3); a typed answer whose line is lost is cleared from the input and
+    the owner told exactly once, the episode in questions[] and chain-result.md with «текст недоступен» (I2); the Fable
+    message is chosen once, state.json not rewritten on every tick (I3)."""
+
+    TEXT = "BLOCKED: вопрос волны W2Q?"
+    ASK, POLICY = DecisionPolicy.ASK, DecisionPolicy.POLICY
+    mandate = DecisionPolicy.mandate
+
+    def fresh(self, **over):
+        self.cfg, self.path = self.chain(**over)
+        shutil.rmtree(self.cfg["run_dir"], ignore_errors=True)
+        self.cfg["run_dir"].mkdir(parents=True, exist_ok=True)
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(sessions=["s1"])}})
+
+    def spoil(self, how, moment):
+        store = wab.wave_dir(self.cfg, "W1") / ".texts"
+        if how == "file" and moment == "before":  # every write fails (ENOTDIR / EEXIST): the store never takes a text
+            shutil.rmtree(store, ignore_errors=True)
+            store.write_text("не каталог", encoding="utf-8")
+        elif how == "removed" and moment == "after":
+            shutil.rmtree(store, ignore_errors=True)
+        elif how in ("forged", "foreign") and moment == "after" and store.is_dir():
+            for f in store.iterdir():
+                if f.is_file():
+                    f.write_text("sha256:" + f.name if how == "forged" else FOREIGN, encoding="utf-8")
+
+    def told(self):
+        return [t for t in self.tg if "ждёт тебя" in t]
+
+    def store_events(self):
+        return self.events().count("text store not written")
+
+    def result(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            path = wab.write_chain_result(self.cfg, wab.load_state(self.cfg))[0]
+        return Path(path).read_text(encoding="utf-8")
+
+    def assert_nothing_forged_out(self, how, outgoing):
+        for text in outgoing:
+            self.assertNotIn(FOREIGN, text)
+            if how == "forged":
+                self.assertIsNone(_EID_RE.search(text), text)  # the forged content `sha256:<h>` is never a text
+
+    def assert_one_store_event(self, how):
+        self.assertEqual(self.store_events(), 1 if how == "file" else 0, self.events())
+
+    # ----- the paths -----
+    def path_status_steady(self, how):  # set_last_status + note_question + put_notice: the line read on every tick
+        self.fresh()
+        self.spoil(how, "before")
+        self.set_status(self.cfg, "W1", self.TEXT)
+        self.tick()
+        self.spoil(how, "after")
+        for _ in range(2):
+            self.tick()
+        w = self.w()
+        self.assertEqual(len(self.told()), 1, self.tg)
+        self.assertEqual(len(w["questions"]), 1)
+        self.assert_one_store_event(how)
+        result = self.result()
+        if how == "file":
+            self.assertIn(wab.QUESTION_TEXT_LOST, result)
+        else:  # a removed or forged file is written again by the next keeping of the same text
+            self.assertIn(self.TEXT, result)
+        self.assert_nothing_forged_out(how, self.tg + [result])
+
+    def path_status_rewrite(self, how):  # the last status read back from the store mid-rewrite (the file empty)
+        self.fresh()
+        text = EID_SHAPED if how == "eid-text" else self.TEXT
+        self.spoil(how, "before")
+        self.set_status(self.cfg, "W1", text)
+        self.tick()
+        self.spoil(how, "after")
+        self.set_status(self.cfg, "W1", "")
+        for _ in range(2):
+            self.assertTrue(self.tick())
+        w = self.w()
+        self.assertLessEqual(self.events().count("is not in the store"), 1)  # status_text_lost: once per episode
+        self.assert_one_store_event(how)
+        if how == "eid-text":  # I1: kept and read back, never taken for its own eid
+            self.assertNotEqual(w["last_status_eid"], EID_SHAPED)
+            self.assertEqual(wab.last_status_text(self.cfg, "W1", w), EID_SHAPED)
+            self.assertNotIn("status_text_lost", w["notified"])
+            return
+        self.assertEqual(len(self.told()), 1, self.tg)  # told on the first tick, not again for the same episode
+        self.assertEqual(len(w["questions"]), 1)
+        result = self.result()
+        if how == "ok":
+            self.assertIn(self.TEXT, result)
+            self.assertNotIn("status_text_lost", w["notified"])
+        else:
+            self.assertIsNone(wab.last_status_text(self.cfg, "W1", w))
+            self.assertIn(wab.QUESTION_TEXT_LOST, result)
+        self.assert_nothing_forged_out(how, self.tg + [result])
+
+    def path_quote(self, how):  # put_notice with the quote: the outbox keeps its eid, the drain reads the store
+        self.fresh(telegram_quote=True)
+        self.spoil(how, "before")
+        self.set_status(self.cfg, "W1", self.TEXT)
+        with mock.patch.object(wab, "_send_telegram", side_effect=OSError("telegram down")):
+            self.tick()
+        st = wab.load_state(self.cfg)
+        self.assertIn("quote_eid", st["waves"]["W1"]["outbox"]["blocked"])
+        st["waves"]["W1"]["outbox"]["blocked"]["next_at"] = 0  # the retry moment is due now (no sleep in the test)
+        wab.save_state(self.cfg, st)
+        self.spoil(how, "after")
+        for _ in range(2):
+            self.tick()
+        (told,) = self.told()  # sent once, by the drain of the next tick
+        if how == "ok":
+            self.assertIn("вопрос волны W2Q?", told)
+        self.assert_one_store_event(how)
+        self.assert_nothing_forged_out(how, self.tg)
+
+    def path_typed_answer(self, how):  # a policy answer typed, the watch died before its Enter; then the line is read
+        self.cfg, self.path = self.mandate()
+        shutil.rmtree(self.cfg["run_dir"] / "W1", ignore_errors=True)
+        (self.cfg["run_dir"] / "events.log").unlink(missing_ok=True)
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec("W1")}})
+        self.spoil(how, "before")
+
+        def typed_then_watch_dies(name, text, on_typed=None, **kw):
+            self.sent.append(("text", name, text))
+            on_typed()
+            raise KeyboardInterrupt
+        self.set_status(self.cfg, "W1", self.ASK)
+        with mock.patch.object(wab, "send_text", typed_then_watch_dies), self.assertRaises(KeyboardInterrupt):
+            self.tick()
+        self.assertEqual(self.w()["pending_enter"], "policy answer")
+        self.spoil(how, "after")
+        self.set_status(self.cfg, "W1", "")  # the status mid-rewrite: decided on the last real status
+        self.ansi = live("19-folded.ansi")  # the typed answer sits in the input line
+        for _ in range(2):
+            self.assertTrue(self.tick())
+        w = self.w()
+        self.assertEqual(self.enters, [])  # never a blind Enter
+        self.assertLessEqual(len(self.told()), 1, self.tg)
+        self.assert_one_store_event(how)
+        result = self.result()
+        if how != "ok":  # I2: the line is lost: the typed answer is given up and cleared, the owner told once
+            self.assertTrue(self.clear_keys)
+            self.assertNotIn("pending_enter", w)
+            self.assertNotIn("policy_pending", w)
+            self.assertEqual(wab.auto_answers_used(w), 1)  # it may have been submitted: charged
+            self.assertEqual(len(self.told()), 1, self.tg)
+            self.assertIs(w["questions"][-1].get("text_lost"), True)
+            self.assertEqual(w["questions"][-1]["eid"], w["last_status_eid"])
+            self.assertIn(wab.QUESTION_TEXT_LOST, result)
+        self.assert_nothing_forged_out(how, self.tg + [t for _, _, t in self.sent] + [result])
+
+    def path_fable_switch(self, how):  # the Fable -> Opus message: chosen once, kept by its eid
+        self.cfg, self.path = self.chain(model=FABLE)
+        shutil.rmtree(self.cfg["run_dir"], ignore_errors=True)
+        self.cfg["run_dir"].mkdir(parents=True, exist_ok=True)
+        sw = {"sid": str(uuid.uuid4()), "step": "sending", "from": "s1", "text_eid": wab.text_eid("old message")}
+        self.put_state(self.cfg, {"current": "W1", "waves": {"W1": self.wave_rec(
+            sessions=["s1"], phase="switching", fable_switch=sw)}, "defaults": "1.4"})
+        self.spoil(how, "before")
+        builds, saves, delivered = [], [], []
+        real_msg, real_save = wab.fable_switch_message, wab.save_state
+
+        def deliver(cfg, st, wave, what, send, text, **kw):
+            delivered.append(text)
+            return False  # the delivery fails every tick: the next tick tries again
+        with mock.patch.object(wab, "fable_switch_message", side_effect=lambda *a: builds.append(1) or real_msg(*a)), \
+                mock.patch.object(wab, "save_state", side_effect=lambda *a: saves.append(1) or real_save(*a)), \
+                mock.patch.object(wab, "_deliver", side_effect=deliver), contextlib.redirect_stdout(io.StringIO()):
+            for n in range(3):
+                if n == 1:
+                    self.spoil(how, "after")
+                    saves[:] = []
+                st = wab.load_state(self.cfg)
+                self.assertTrue(wab._fable_switch_tick(self.cfg, st, "W1", st["waves"]["W1"]))
+        self.assertEqual(len(builds), 1)  # chosen once, not on every tick
+        self.assertEqual(saves, [])  # nothing changed after the first tick: state.json is not rewritten
+        self.assertEqual(len(set(delivered)), 1)  # the same text every time
+        self.assert_one_store_event(how)
+        self.assert_nothing_forged_out(how, delivered)
+
+    def test_every_path_with_every_state_of_the_store(self):
+        paths = [self.path_status_steady, self.path_status_rewrite, self.path_quote, self.path_typed_answer,
+                 self.path_fable_switch]
+        for path in paths:
+            for how in STORE_STATES:
+                if how == "eid-text" and path != self.path_status_rewrite:
+                    continue  # the only path whose text the wave writes whole: a status line
+                with self.subTest(path=path.__name__, store=how):
+                    self.sent[:], self.enters[:], self.clear_keys[:], self.tg[:] = [], [], [], []
+                    self.alive, self.ansi, self.pane, self.tmux_calls[:] = True, EMPTY_ANSI, "", []
+                    path(how)
 
 
 class FableUsage(unittest.TestCase):

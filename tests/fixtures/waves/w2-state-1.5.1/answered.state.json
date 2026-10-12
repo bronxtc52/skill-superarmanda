@@ -1,0 +1,86 @@
+{
+  "current": "W1",
+  "waves": {
+    "W1": {
+      "tmux": "wv-w1",
+      "cwd": "@REPO@",
+      "started": 1791798544.0825,
+      "restarts": 0,
+      "phase": "running",
+      "notified": {
+        "policy_answer": "sha256:be53c1b6a0ced591f71a7e352e3a64ae",
+        "blocked": "sha256:be53c1b6a0ced591f71a7e352e3a64ae"
+      },
+      "sessions": [],
+      "attempts": [
+        {
+          "tmux": "wv-w1",
+          "cwd": "@REPO@",
+          "started": 1791798544.0480921,
+          "restarts": 0,
+          "phase": "running",
+          "notified": {
+            "blocked": "sha256:691f170848ea4ad9f8c54fdb056118d8"
+          },
+          "sessions": [],
+          "last_status_word": "BLOCKED",
+          "last_status_eid": "sha256:691f170848ea4ad9f8c54fdb056118d8",
+          "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+          "pane_changed": 1791798604.056507,
+          "activity_files": {},
+          "activity_session": null,
+          "questions": [
+            {
+              "at": 1791798604.056507,
+              "eid": "sha256:691f170848ea4ad9f8c54fdb056118d8"
+            }
+          ]
+        }
+      ],
+      "last_status_word": "BLOCKED",
+      "last_status_eid": "sha256:be53c1b6a0ced591f71a7e352e3a64ae",
+      "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+      "pane_changed": 1791798604.0907228,
+      "activity_files": {},
+      "activity_session": null,
+      "tokens": 0,
+      "peak": 0,
+      "ctx_hist": [
+        0
+      ],
+      "alarm_at": 1791798604.0907228,
+      "policy_episode": {
+        "status": "sha256:be53c1b6a0ced591f71a7e352e3a64ae",
+        "stamp": [
+          1321556,
+          1791798604114009792
+        ]
+      },
+      "policy_keys": [
+        [
+          "W1",
+          "2026-10-01",
+          1,
+          "T1",
+          "needs_decision",
+          "tester"
+        ]
+      ],
+      "policy_answered_stamp": [
+        1321556,
+        1791798604114009792
+      ],
+      "auto_answers": 1,
+      "outbox": {
+        "policy_answer": {
+          "value": "sha256:be53c1b6a0ced591f71a7e352e3a64ae",
+          "fields": {
+            "cls": "needs_decision",
+            "variant": "invariant"
+          },
+          "next_at": 1791798904.143414
+        }
+      }
+    }
+  }
+}

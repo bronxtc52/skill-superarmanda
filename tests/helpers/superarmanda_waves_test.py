@@ -625,7 +625,7 @@ class Supervision(Base):
         self.assertEqual(len(self.tg), 1)
         self.assertIn("ждёт тебя", self.tg[0])
         self.assertNotIn("need a decision", self.tg[0])  # #83: the wave's question is not in the notice (no telegram_quote)
-        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["notified"]["blocked"], wab.eid("BLOCKED: need a decision"))
+        self.assertEqual(self.get_state(cfg)["waves"]["W1"]["notified"]["blocked"], wab.text_eid("BLOCKED: need a decision"))
         # a different question is a new notification
         self.set_status(cfg, "W1", "BLOCKED: another one")
         wab.tick(cfg, wab.load_state(cfg))
@@ -3987,7 +3987,7 @@ class W4Round28(Base):
     def test_started(self):
         cfg, path = self.chain()
         self.alive = False
-        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("started") == wab.eid("1")
+        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("started") == wab.text_eid("1")
         self.crash(wab.launch, cfg, "W1", self.prompt())
         self.alive = True
         self.set_status(cfg, "W1", "RUNNING")
@@ -4019,7 +4019,7 @@ class W4Round28(Base):
         cfg, path = self.chain(merge_gate="external")
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec()}})
         self.set_status(cfg, "W1", "DONE")
-        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("no_next") == wab.eid("1")
+        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("no_next") == wab.text_eid("1")
         self.crash(wab.watch, cfg, path, max_ticks=1)
         wab.watch(cfg, path, max_ticks=1)
         wab.watch(cfg, path, max_ticks=1)
@@ -4030,7 +4030,7 @@ class W4Round28(Base):
         self.put_state(cfg, {"current": "W1", "waves": {"W1": self.auto_rec()}})
         self.set_status(cfg, "W1", "DONE")
         (wab.wave_dir(cfg, "W1") / "next-prompt.md").write_text("go\n", encoding="utf-8")
-        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("done") == wab.eid("1")
+        self.crash_when = lambda st: st["waves"]["W1"].get("notified", {}).get("done") == wab.text_eid("1")
         self.crash(wab.watch, cfg, path, max_ticks=1)
         self.alive = False  # the old window closed; W2 gets a new one
         wab.watch(cfg, path, max_ticks=1)
@@ -5108,7 +5108,7 @@ class W4Round30PendingEnterStarted(Base):
         self.assertEqual(len(self.enters), 1)
         rec = self.get_state(cfg)["waves"]["W1"]
         self.assertEqual(rec["phase"], "running")
-        self.assertEqual(rec["notified"].get("started"), wab.eid("1"))
+        self.assertEqual(rec["notified"].get("started"), wab.text_eid("1"))
         self.assertEqual(len([t for t in self.tg if "стартовала волна W1" in t]), 1, self.tg)
         self.assertIn("W1: launched in tmux", (cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
 
@@ -12690,7 +12690,7 @@ class FixedAnswerPolicy(Base):
                 self.tick(cfg, self.ND.format(rec="invariant"))
         w = wab.load_state(cfg)["waves"]["W1"]  # a new watch reads state.json
         self.assertEqual(w["policy_key_pending"]["key"], ["W1", cfg["run_id"], 1, "T1", "needs_decision", "tester"])
-        self.assertEqual(w["policy_pending"], wab.eid(self.ND.format(rec="invariant")))
+        self.assertEqual(w["policy_pending"], wab.text_eid(self.ND.format(rec="invariant")))
         self.assertNotIn("policy_keys", w)
         self.tick(cfg, "RUNNING")  # the wave took the typed answer (or not): charged, the key counts as answered
         st = self.tick(cfg, self.ND.format(rec="cut_surface"))  # the same fork, a new episode
@@ -12715,7 +12715,7 @@ class FixedAnswerPolicy(Base):
             with self.assertRaises(KeyboardInterrupt):
                 self.tick(cfg, status)
         w = wab.load_state(cfg)["waves"]["W1"]
-        self.assertEqual((w["pending_enter"], w["policy_pending"]), ("policy answer", wab.eid(status)))
+        self.assertEqual((w["pending_enter"], w["policy_pending"]), ("policy answer", wab.text_eid(status)))
         self.ansi = live("19-folded.ansi")
         return cfg, w["policy_key_pending"]["key"]
 
@@ -12885,7 +12885,7 @@ class FixedAnswerPolicy(Base):
         self.fork(cfg, "blocked", index=5)
         status = self.BC.format(rec="new_run")
         st = self.tick(cfg, status)
-        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], wab.eid(status))
+        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], wab.text_eid(status))
         self.assertEqual(st["waves"]["W1"]["policy_refusal"]["stamp"], wab._status_stamp(cfg, "W1"))
         cfg["max_runs"] = 6  # the owner raised the ceiling: the reason of the refusal is gone...
         self.assertTrue(self.decide(cfg, "blocked_cap", rec="new_run")["ok"])
@@ -12895,7 +12895,7 @@ class FixedAnswerPolicy(Base):
             self.assertEqual(self.answers(), [])
         self.assertEqual(len(self.owner_asked()), 1)
         self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
-        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], wab.eid(status))
+        self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], wab.text_eid(status))
         self.assertNotIn("auto_answers", st["waves"]["W1"])
         self.rewrite(cfg, status)  # the wave wrote the line again: a new episode, decided anew
         st = self.tick(cfg)
@@ -12959,7 +12959,7 @@ class FixedAnswerPolicy(Base):
                 self.assertIn("уже получила автоответ", self.log(cfg))  # #83: the reason is in events.log, not in the notice
                 self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
                 self.assertEqual(q_texts(cfg, "W1", st["waves"]["W1"])[-1], wab.safe_text(status, 300))
-                self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], wab.eid(status))
+                self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], wab.text_eid(status))
                 st = self.tick(cfg)  # the same episode: nothing new
                 self.assertEqual(len(self.answers()), 1)
                 self.assertEqual(len(self.owner_asked()), 1)
@@ -13030,7 +13030,7 @@ class FixedAnswerPolicy(Base):
         self.assertEqual(len(self.owner_asked()), 1)
         self.tick(cfg)  # the same stamp: the same episode
         self.assertEqual(len(self.owner_asked()), 1)
-        self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], wab.eid(status))
+        self.assertEqual(st["waves"]["W1"]["notified"]["blocked"], wab.text_eid(status))
         self.assertNotIn("policy_refusal", st["waves"]["W1"])
 
     def test_f2_corrupt_marks_in_state_json_go_to_the_owner(self):
@@ -13143,7 +13143,7 @@ class FixedAnswerPolicy(Base):
                         with mock.patch.object(wab, "_deliver", return_value=failed):
                             w = self.tick(cfg, self.QN)["waves"]["W1"]
                     # 1.4.3: the mark is kept with the eids of its line and text (load_state migrates a 1.4.x one)
-                    kept = dict(mark, status=wab.eid(mark["status"]), text=wab.eid("t")) if isinstance(mark, dict) else mark
+                    kept = dict(mark, status=wab.mark_eid(mark["status"]), text=wab.mark_eid("t")) if isinstance(mark, dict) else mark
                     self.assertEqual(w["policy_key_pending"], kept)
                     self.assertNotIn("policy_keys", w)
 
@@ -13158,7 +13158,7 @@ class FixedAnswerPolicy(Base):
         for step in ("empty", "missing"):
             with mock.patch.object(wab, "fixed_answer", side_effect=AssertionError(f"re-checked on a {step} status")):
                 st = self.tick(cfg)
-            self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], wab.eid(status))
+            self.assertEqual(st["waves"]["W1"]["policy_refusal"]["status"], wab.text_eid(status))
             self.assertEqual(self.answers(), [])
             self.assertEqual(self.log(cfg).count("policy answer not sent"), 1)
             self.assertEqual(len(self.owner_asked()), 1)
@@ -13985,7 +13985,7 @@ class W3NextLaunchClosesDone(Base):
         self.assertEqual(st["current"], "W2")
         self.assertNotIn("done", st["waves"]["W1"].get("attention") or {})
         self.assertEqual(_attention_exit(cfg), 0)
-        self.assertEqual(st["waves"]["W1"].get("notified", {}).get("done"), wab.eid("1"))  # the dedup mark stays
+        self.assertEqual(st["waves"]["W1"].get("notified", {}).get("done"), wab.text_eid("1"))  # the dedup mark stays
 
     def test_a_coordinator_launch_still_acknowledges(self):
         cfg, _ = self.chain(telegram=None, merge_gate="auto")
@@ -16991,9 +16991,9 @@ _allow("wab.py", "_owner_merge_take", _SHA, "sha[:12]")  # 1.5.1, review of W1 r
 _allow("wab.py", "_alarm_tick", _DEDUP, "_exc_text(e)[:150]", "str(facts['error'])[:150]")
 _allow("wab.py", "_alarm_tick", _SHA, "head[:12]")
 _allow("wab.py", "_pending_alarm_enter", _DEDUP, "_exc_text(e)[:150]")
-_allow("wab.py", "note_question", _LIST, "qs[:-QUESTIONS_CAP]")
-_allow("wab.py", "eid", "the opaque id of a text (32 hex characters of its sha256): a name, no outside text",
-       "hashlib.sha256(text.encode('utf-8')).hexdigest()[:32]")
+_allow("wab.py", "_record_question", _LIST, "qs[:-QUESTIONS_CAP]")  # 1.5.2: note_question -> _record_question
+_allow("wab.py", "_bytes_eid", "the opaque id of a text (32 hex characters of its sha256): a name, no outside text",
+       "hashlib.sha256(raw).hexdigest()[:32]")  # 1.5.2 (#113 W2): text_eid and stashed_text hash the bytes
 _allow("wab.py", "write_chain_result", _SHA, "str(sha)[:12]")
 _allow("wab.py", "blocked_fields", "the question was masked by safe_text above; it is split at `Варианты:`", "question[:m.start()]")
 _allow("dash.py", "fold_events", "the time of an events.log line `HH:MM:SS`", "line[11:19]", "ts[:5]")
@@ -19886,6 +19886,7 @@ class W7NoticeTemplates(Base):
             self.assertIn(key.value, wab.NOTICE_TEMPLATES, f"line {node.lineno}")
             names = {k.arg for k in node.keywords}
             self.assertNotIn(None, names, f"no **kwargs at line {node.lineno}")
+            names.discard("value_is_mark")  # 1.5.2 (#113 W2, I1): how `value` is read, a flag of put_notice, no field
             self.assertTrue(names <= set(wab.NOTICE_TEMPLATES[key.value]["fields"]), f"line {node.lineno}: {names}")
 
     # ----- docs -----
@@ -20631,8 +20632,10 @@ class W2StateHoldsNoWaveText(Base):
         self.fresh()
         e = wab.stash_text(self.cfg, "W1", f"{W2_MARK} текст")
         self.assertRegex(e, r"^sha256:[0-9a-f]{32}$")
-        self.assertEqual(e, wab.eid(f"{W2_MARK} текст"))
-        self.assertEqual(wab.eid(e), e)  # idempotent: an eid is recognised, never hashed again
+        self.assertEqual(e, wab.text_eid(f"{W2_MARK} текст"))
+        # I1 (#113 W2): the normalizer of a saved mark is idempotent, the hash of a text never is
+        self.assertEqual(wab.mark_eid(e), e)
+        self.assertNotEqual(wab.text_eid(e), e)
         self.assertEqual(wab.stashed_text(self.cfg, "W1", e), f"{W2_MARK} текст")
         store = wab.wave_dir(self.cfg, "W1") / ".texts"
         self.assertEqual(stat.S_IMODE(store.stat().st_mode), 0o700)
@@ -20666,7 +20669,7 @@ class W2StateHoldsNoWaveText(Base):
         self.fresh(**rec.pop("over", {}))
         text = text if text is not None else f"BLOCKED: {W2_MARK} вопрос?"
         st = wab.load_state(self.cfg)
-        st["waves"]["W1"].update(last_status_word=word, last_status_eid=wab.eid(text), **rec)
+        st["waves"]["W1"].update(last_status_word=word, last_status_eid=wab.text_eid(text), **rec)
         self.put_state(self.cfg, st)
         self.set_status(self.cfg, "W1", "")  # the wave died mid-rewrite: the file stays empty
         shutil.rmtree(wab.wave_dir(self.cfg, "W1") / ".texts", ignore_errors=True)
@@ -20699,7 +20702,7 @@ class W2StateHoldsNoWaveText(Base):
             self.assertIn("idle", raw_state(self.cfg)["waves"]["W1"]["outbox"])
 
         def blocked_without_text():  # the episode decisions that need the text are off, the refusal stays
-            refusal = {"status": wab.eid(f"BLOCKED: {W2_MARK} вопрос?"), "stamp": None, "reason": "r"}
+            refusal = {"status": wab.text_eid(f"BLOCKED: {W2_MARK} вопрос?"), "stamp": None, "reason": "r"}
             self.lost("BLOCKED", over={"decision_policy": [{"class": "needs_decision", "answer": "invariant"}]},
                       policy_refusal=refusal, tokens=10 ** 6, phase="running")
             before = log().count("not in the store")
@@ -20712,7 +20715,7 @@ class W2StateHoldsNoWaveText(Base):
 
         def pending_enter_with_lost_head():  # F1: never an unverified Enter over what may be the owner's draft
             self.lost("RUNNING", text="RUNNING", pending_enter="checkpoint request",
-                      pending_text_eid=wab.eid("[wab] WAB-CHECKPOINT"))
+                      pending_text_eid=wab.text_eid("[wab] WAB-CHECKPOINT"))
             self.ansi = live("19-folded.ansi")  # something sits in the input line
             st = wab.load_state(self.cfg)
             with contextlib.redirect_stdout(io.StringIO()):
@@ -20893,7 +20896,7 @@ class W2LegacyStateMigration(Base):
         self.assertEqual(self.blocked_told(), [])  # and no BLOCKED notice for the answered line
         self.assertEqual(len([t for t in self.tg if "W1" in t]), 1, self.tg)  # the unsent notice of the answer, once
         self.assertEqual((w["auto_answers"], w["policy_keys"]), (1, st["waves"]["W1"]["policy_keys"]))
-        self.assertEqual(w["notified"]["policy_answer"], wab.eid(status))
+        self.assertEqual(w["notified"]["policy_answer"], wab.text_eid(status))
         self.assert_text_free(cfg, texts)
         self.new_episode(cfg)
 
@@ -20903,7 +20906,7 @@ class W2LegacyStateMigration(Base):
         self.tick(cfg)
         self.assertEqual(self.answers(), [])
         self.assertIn("policy_refusal", w)
-        self.assertEqual(w["policy_refusal"]["status"], wab.eid(st["waves"]["W1"]["last_status"]))
+        self.assertEqual(w["policy_refusal"]["status"], wab.text_eid(st["waves"]["W1"]["last_status"]))
         self.assertEqual(len(self.blocked_told()), 1, self.tg)  # the unsent BLOCKED notice, once; not asked again
         self.assertNotIn("policy answer not sent", self.log(cfg))  # never re-checked
         self.assertEqual((w["auto_answers"], w["policy_keys"]), (1, st["waves"]["W1"]["policy_keys"]))
@@ -20952,11 +20955,191 @@ class W2LegacyStateMigration(Base):
                 for wave, w in doc["waves"].items():
                     if isinstance(w.get("last_status"), str):
                         got = saved["waves"][wave]
-                        self.assertEqual(got["last_status_eid"], wab.eid(w["last_status"]))
+                        self.assertEqual(got["last_status_eid"], wab.text_eid(w["last_status"]))
                         self.assertEqual(wab.stashed_text(cfg, wave, got["last_status_eid"]), w["last_status"])
                     for key, value in (w.get("notified") or {}).items():
-                        self.assertEqual(saved["waves"][wave]["notified"][key], wab.eid(value))
+                        self.assertEqual(saved["waves"][wave]["notified"][key], wab.text_eid(value))
 
+
+
+# ---------- #113 W2 (1.5.2): the hash of a text and the mark of state.json; marks stable across versions ----------
+
+W2_STATE_151 = ROOT / "tests" / "fixtures" / "waves" / "w2-state-1.5.1"
+EID_SHAPED = "sha256:" + "a" * 32  # a text of the wave that looks like an eid
+
+
+def sha_eid(text):
+    """THE formula of an eid since 1.4.3, pinned here independently of wab.py (#113 W2: it does not change, so a mark
+    kept by 1.4.3-1.5.1 is the hash of the same text now): `sha256:` + 32 hex of SHA-256 of the UTF-8 bytes."""
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
+def eid_marks(doc):
+    """Every eid of a state.json document by its path (notified.*, policy_*, fable_*, outbox.*.value/quote_eid,
+    questions[].eid, last_status_eid, pending_text_eid — of the records and of their attempts)."""
+    return {p: s for p, s in json_strings(doc) if "<key " not in p and re.fullmatch(r"sha256:[0-9a-f]{32}", s)}
+
+
+class W2TextHashAndMark(Base):
+    """#113 W2 п.1 (I1): the hash of a free text and the normalization of a saved mark are two functions; the store
+    keeps any text (one shaped like an eid too) and reads a file only when the SHA-256 of its BYTES is the eid."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg, _ = self.chain()
+
+    def test_the_hash_of_a_text_and_the_mark_of_state_json_are_two_functions(self):
+        for text in ("", "RUNNING", f"BLOCKED: {W2_MARK} вопрос?", EID_SHAPED):
+            with self.subTest(text=text):
+                self.assertEqual(wab.text_eid(text), sha_eid(text))  # always the hash, the same formula as 1.5.1
+        self.assertNotEqual(wab.text_eid(EID_SHAPED), EID_SHAPED)
+        self.assertEqual(wab.mark_eid(EID_SHAPED), EID_SHAPED)  # a saved mark (an eid) is kept: idempotent
+        self.assertEqual(wab.mark_eid(wab.mark_eid("BLOCKED: x")), sha_eid("BLOCKED: x"))  # a 1.4.x line -> its hash
+
+    def test_the_store_keeps_any_text_and_reads_only_a_file_of_its_eid(self):
+        text = f"BLOCKED: {W2_MARK} вопрос?"
+        store = wab.wave_dir(self.cfg, "W1") / ".texts"
+
+        def own(e):  # the file of the eid holds the eid itself: its SHA-256 is not the eid
+            return e
+
+        rows = [  # name, the text kept, what the file of its eid holds afterwards (None = untouched), the read
+            ("a text", text, None, text),
+            ("a text shaped like an eid", EID_SHAPED, None, EID_SHAPED),
+            ("forged: the file holds its own eid", text, own, None),
+            ("forged: the file holds another eid", text, lambda e: sha_eid("другой текст"), None),
+            ("a foreign text in the file", text, lambda e: "чужой текст", None),
+            ("the eid-shaped text forged by its own eid", EID_SHAPED, own, None),
+        ]
+        for name, kept, forge, read in rows:
+            with self.subTest(name):
+                shutil.rmtree(store, ignore_errors=True)
+                e = wab.stash_text(self.cfg, "W1", kept)
+                self.assertEqual(e, sha_eid(kept))
+                if forge:
+                    (store / e.split(":", 1)[1]).write_text(forge(e), encoding="utf-8")
+                self.assertEqual(wab.stashed_text(self.cfg, "W1", e), read)
+                if forge:  # the next keeping of the text repairs the forged file instead of taking it as kept
+                    self.assertEqual(wab.stash_text(self.cfg, "W1", kept), e)
+                    self.assertEqual(wab.stashed_text(self.cfg, "W1", e), kept)
+
+
+class W2StoreFailureOncePerEpisode(Base):
+    """#113 W2 (I3): «the wave's text store not written» is one event per episode of the failure, whichever caller
+    keeps a text (the mark `notified.text_store` of the record); the episode ends with the next successful write."""
+
+    def test_one_event_per_episode_and_a_new_one_after_a_good_write(self):
+        cfg, _ = self.chain()
+        store = wab.wave_dir(cfg, "W1") / ".texts"
+        w = {}
+
+        def events():
+            p = cfg["run_dir"] / "events.log"
+            return p.read_text(encoding="utf-8").count("text store not written") if p.exists() else 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            store.write_text("не каталог", encoding="utf-8")
+            for text in ("BLOCKED: a", "BLOCKED: a", "BLOCKED: b", "голова"):  # several callers, several texts
+                wab.stash_text(cfg, "W1", text, w)
+            self.assertEqual(events(), 1)
+            store.unlink()
+            wab.stash_text(cfg, "W1", "BLOCKED: c", w)  # written: the episode is over
+            self.assertNotIn("text_store", w["notified"])
+            shutil.rmtree(store)
+            store.write_text("не каталог", encoding="utf-8")
+            for _ in range(3):
+                wab.stash_text(cfg, "W1", "BLOCKED: d", w)
+        self.assertEqual(events(), 2)  # a new episode of the failure: one more event
+        self.assertEqual(eid_marks(w), {"$.notified.text_store": sha_eid("1")})  # a mark, no path or text
+
+
+class W2MarksStableAcrossVersions(Base):
+    """#113 W2 п.1: a state.json of a running chain written by 1.4.x (texts in its fields, w2-legacy-1.4) or by
+    1.5.1 (eids, texts in the wave's store, w2-state-1.5.1; 1.5.0 writes the same form) goes through load -> save ->
+    load -> save with every mark unchanged (a 1.5.1 mark stays the one 1.5.1 wrote, a 1.4.x line becomes the hash of
+    the same text once), and the next ticks raise no repeated event or notice (blocked, status_text_lost,
+    policy_answer). By hand, as in W2LegacyStateMigration: the placeholders, the status file written with the last
+    status, its stamp in the stamps of the record, the retry moment of the unsent notice due now."""
+    ND = FixedAnswerPolicy.ND
+    BOTH = FixedAnswerPolicy.BOTH
+    mandate, answers, log = DecisionPolicy.mandate, DecisionPolicy.answers, DecisionPolicy.log
+    forge, fork = FixedAnswerPolicy.__dict__["forge"], FixedAnswerPolicy.fork
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with mock.patch.dict(os.environ):
+            cls.bases = cls.forge()
+
+    def load(self, version, name):
+        cfg, _ = self.mandate(policy=self.BOTH, max_runs=5)
+        shutil.rmtree(cfg["run_dir"] / "W1", ignore_errors=True)  # the run of the previous row
+        (cfg["run_dir"] / "events.log").unlink(missing_ok=True)
+        self.fork(cfg)
+        d = W2_LEGACY if version == "1.4" else W2_STATE_151
+        raw = (d / f"{name}.state.json").read_text(encoding="utf-8")
+        raw = raw.replace("@RUN_DIR@", str(cfg["run_dir"])).replace("@REPO@", self.cwd).replace("@TMP@", str(self.tmp))
+        st = json.loads(raw)
+        w = st["waves"]["W1"]
+        if version == "1.4":
+            status = w["last_status"]
+        else:
+            store = wab.wave_dir(cfg, "W1") / ".texts"
+            shutil.copytree(d / f"{name}.texts", store)
+            os.chmod(store, 0o700)
+            for f in store.iterdir():
+                os.chmod(f, 0o600)
+            status = (store / w["last_status_eid"].split(":", 1)[1]).read_text(encoding="utf-8")
+        self.set_status(cfg, "W1", status)
+        stamp = wab._status_stamp(cfg, "W1")
+        for holder in (w, w.get("policy_refusal") or {}, w.get("policy_episode") or {}):
+            for k in ("policy_answered_stamp", "stamp"):
+                if k in holder:
+                    holder[k] = stamp
+        for item in (w.get("outbox") or {}).values():
+            item["next_at"] = 0
+        self.put_state(cfg, st)
+        return cfg, st, status
+
+    def test_every_mark_is_stable_and_the_next_ticks_repeat_nothing(self):
+        for version in ("1.4", "1.5.1"):
+            for name in ("answered", "refused", "typed"):
+                with self.subTest(version=version, fixture=name):
+                    self.tg[:], self.sent[:], self.enters[:] = [], [], []
+                    self.ansi = live("19-folded.ansi") if name == "typed" else EMPTY_ANSI
+                    cfg, st, status = self.load(version, name)
+                    old = st["waves"]["W1"]
+                    unsent = set(old.get("outbox") or {})
+                    wab.save_state(cfg, wab.load_state(cfg))
+                    first = eid_marks(raw_state(cfg))
+                    wab.save_state(cfg, wab.load_state(cfg))
+                    self.assertEqual(eid_marks(raw_state(cfg)), first, "a second save changed a mark")
+                    if version == "1.5.1":  # the marks 1.5.1 wrote are kept as they are, none rehashed
+                        self.assertEqual(first, eid_marks(st))
+                    else:  # a 1.4.x line became the hash of the same text (the formula did not change)
+                        self.assertEqual(raw_state(cfg)["waves"]["W1"]["last_status_eid"], sha_eid(status))
+                        for k, v in (old.get("notified") or {}).items():
+                            self.assertEqual(raw_state(cfg)["waves"]["W1"]["notified"][k], sha_eid(v), k)
+                    for _ in range(2):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            wab.tick(cfg, wab.load_state(cfg))
+                    w = raw_state(cfg)["waves"]["W1"]
+                    log = self.log(cfg)
+                    self.assertEqual(self.answers(), [])  # no second answer (typed: its Enter only)
+                    self.assertNotIn("status_text_lost", w.get("notified", {}))
+                    self.assertNotIn("without its text", log)
+                    self.assertNotIn("text store not written", log)
+                    told = [t for t in self.tg if t.startswith("⏸")]
+                    self.assertEqual(len(told), int("blocked" in unsent), self.tg)  # an unsent one once, no other
+                    answered = [t for t in self.tg if "по политике" in t]
+                    self.assertLessEqual(len(answered), 1, self.tg)
+                    if name == "typed":  # the Enter-only retry of the same answer completes the episode
+                        self.assertEqual(self.enters, ["wv-w1"])
+                        self.assertEqual(wab.auto_answers_used(w), 1)
+                        self.assertEqual(w["notified"].get("policy_answer"), w["last_status_eid"])
+                    else:  # the episode's marks stay the ones of the fixture
+                        self.assertEqual(w["notified"].get("blocked"), first.get("$.waves.W1.notified.blocked"), log)
+                        self.assertEqual(w["notified"].get("policy_answer"),
+                                         first.get("$.waves.W1.notified.policy_answer"))
 
 
 class W3PolicyEpisodes(Base):
@@ -21116,7 +21299,7 @@ class W3PolicyEpisodes(Base):
     def test_i3_any_deviation_of_the_fork_marks_refuses_as_corrupt(self):
         key = ["W1", RUN_ID, 2, "T1", "needs_decision", "tester"]  # a valid key of ANOTHER fork (run 2)
         status = self.ND.format(rec="invariant")
-        flight = {"key": key, "status": wab.eid(status), "text": wab.eid("t")}
+        flight = {"key": key, "status": wab.text_eid(status), "text": wab.text_eid("t")}
         cfg, _ = self.mandate(policy=[self.WITH], max_runs=5)
         self.fork(cfg)
         for where, w in (("keys", {"policy_keys": [key]}), ("pending", {"policy_key_pending": flight}),
@@ -21487,7 +21670,7 @@ class W3PolicyEpisodes(Base):
             shutil.rmtree(cfg["run_dir"], ignore_errors=True)
 
     def test_i3_a_corrupt_episode_mark_is_a_refusal_not_a_new_episode(self):
-        good = {"status": wab.eid("x"), "stamp": [1, 2]}
+        good = {"status": wab.text_eid("x"), "stamp": [1, 2]}
         for name, episode in (("not an object", "x"), ("a list", [1]), ("status not a string", dict(good, status=5)),
                               ("no status", {"stamp": [1, 2]}), ("stamp a string", dict(good, stamp="1")),
                               ("stamp of one", dict(good, stamp=[1])), ("stamp of strings", dict(good, stamp=["1", "2"])),
@@ -21880,13 +22063,12 @@ class Release151(unittest.TestCase):
     """The release 1.5.1 (#117, #113 W1 п.2; wave W1 of waves-tails2): version, the CHANGELOG section on top, the row of
     what is implemented, the fields of chain.json in the doc."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.1"\s*$')
+    # the version of SKILL.md moved on to 1.5.2 (#113 W2): Release152 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.1 — 2026-10-12$", "1.5.1 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.5\.1 — 2026-10-12$", "CHANGELOG.md: the section of 1.5.1")
+        self.assertTrue(log.index("## 1.5.1") < log.index("## 1.5.0"), "1.5.1 is above 1.5.0")
         body = re.search(r"(?ms)^## 1\.5\.1 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
         for needle in ("issues/117", "issues/113", "`waves-tails2`", "`merge_remind_minutes`", "`merge_attention_minutes`",
                        "`ThreadsChain`", "`merge_remind`", "`pr_review.py`"):
@@ -21900,6 +22082,28 @@ class Release151(unittest.TestCase):
         for field in ("merge_remind_minutes", "merge_attention_minutes"):
             self.assertRegex(waves, rf"(?m)^\| `{field}` \| число \|")
         self.assertIn("**Решение о мердже в фазе `merging`", waves)
+
+
+class Release152(unittest.TestCase):
+    """The release 1.5.2 (#113 W2; wave W2 of waves-tails2): version, the CHANGELOG section on top, the paragraph of
+    the store of texts in the doc (I1-I3)."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.5\.2"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.5\.2 — 2026-10-12$", "1.5.2 is the first section")
+        body = re.search(r"(?ms)^## 1\.5\.2 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
+        for needle in ("issues/113", "`waves-tails2`", "`text_eid`", "`mark_eid`", "`stashed_text`", "`text_lost`",
+                       "текст недоступен", "`TextStoreEpisodes`", "`W2MarksStableAcrossVersions`", "w2-state-1.5.1"):
+            self.assertIn(needle, body)
+
+    def test_waves_doc_names_the_three_invariants_of_the_store(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        for needle in ("`text_eid`", "`mark_eid`", "`notified.text_store`", "`text_lost`", "текст недоступен"):
+            self.assertIn(needle, waves)
 
 
 if __name__ == "__main__":
