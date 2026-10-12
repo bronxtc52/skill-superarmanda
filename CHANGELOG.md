@@ -58,6 +58,8 @@
   уведомления outbox 1.5.0 доставлены по одному разу, каждый повтор строки капа — одно уведомление владельцу, вопрос
   из хранилища 1.5.0 дошёл до итога. Мутация `remnants150_no_marks` (фикстура без отметок отвеченного эпизода W2)
   доказывает, что оракул эпизодов видит фикстуру.
+  Порог `test_runs_fast` у `OfflineChain`, `RemnantsChain` и `Remnants150Chain` — по платформе (`CHAIN_FAST_SECONDS`):
+  Linux 40 с, как раньше, macOS 90 с (при параллельном `run-tests.sh` раннер CI дал 44 с на `Remnants150Chain`).
 - `MetricsScript`, `DashEvents`, `W4DashReload`, `W4GateRoles`, `W4GateEventOnce`, `W4OwnerTimeWithoutRich`,
   `W4NoticeMinutes`, `W4MaskBoundaries`, `Release160`.
 
