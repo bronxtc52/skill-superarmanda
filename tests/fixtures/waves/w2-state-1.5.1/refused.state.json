@@ -1,0 +1,103 @@
+{
+  "current": "W1",
+  "waves": {
+    "W1": {
+      "tmux": "wv-w1",
+      "cwd": "@REPO@",
+      "started": 1791798544.1899228,
+      "restarts": 0,
+      "phase": "running",
+      "notified": {
+        "blocked": "sha256:010e782fe22277661045293ed598772b"
+      },
+      "sessions": [],
+      "attempts": [
+        {
+          "tmux": "wv-w1",
+          "cwd": "@REPO@",
+          "started": 1791798544.1572654,
+          "restarts": 0,
+          "phase": "running",
+          "notified": {
+            "blocked": "sha256:691f170848ea4ad9f8c54fdb056118d8"
+          },
+          "sessions": [],
+          "last_status_word": "BLOCKED",
+          "last_status_eid": "sha256:691f170848ea4ad9f8c54fdb056118d8",
+          "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+          "pane_changed": 1791798604.1670313,
+          "activity_files": {},
+          "activity_session": null,
+          "questions": [
+            {
+              "at": 1791798604.1670313,
+              "eid": "sha256:691f170848ea4ad9f8c54fdb056118d8"
+            }
+          ]
+        }
+      ],
+      "last_status_word": "BLOCKED",
+      "last_status_eid": "sha256:010e782fe22277661045293ed598772b",
+      "pane_digest": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+      "pane_changed": 1791798604.2001636,
+      "activity_files": {},
+      "activity_session": null,
+      "tokens": 0,
+      "peak": 0,
+      "ctx_hist": [
+        0,
+        0
+      ],
+      "alarm_at": 1791798604.2001636,
+      "policy_episode": {
+        "status": "sha256:010e782fe22277661045293ed598772b",
+        "stamp": [
+          1321356,
+          1791798604256147032
+        ]
+      },
+      "policy_keys": [
+        [
+          "W1",
+          "2026-10-01",
+          1,
+          "T1",
+          "needs_decision",
+          "tester"
+        ]
+      ],
+      "policy_answered_stamp": [
+        1321356,
+        1791798604221433482
+      ],
+      "auto_answers": 1,
+      "policy_refusal": {
+        "status": "sha256:010e782fe22277661045293ed598772b",
+        "stamp": [
+          1321356,
+          1791798604256147032
+        ],
+        "reason": "развилка задачи T1 уже получила автоответ в прогоне 1"
+      },
+      "questions": [
+        {
+          "at": 1791798604.2665145,
+          "eid": "sha256:010e782fe22277661045293ed598772b"
+        }
+      ],
+      "outbox": {
+        "blocked": {
+          "value": "sha256:010e782fe22277661045293ed598772b",
+          "fields": {
+            "cls": "needs_decision",
+            "red": false,
+            "variant": "cut_surface",
+            "reason": "policy_refused",
+            "tmux": "wv-w1"
+          },
+          "next_at": 1791798904.2900987
+        }
+      }
+    }
+  }
+}
