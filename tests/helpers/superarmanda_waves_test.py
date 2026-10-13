@@ -20127,7 +20127,7 @@ class MetricsScript(unittest.TestCase):
     def cli(self, *argv):
         env = {k: v for k, v in os.environ.items() if not k.startswith("WAB_")}
         return subprocess.run([sys.executable, str(self.SCRIPT), *map(str, argv)], capture_output=True, text=True,
-                              encoding="utf-8", env=env)
+                              encoding="utf-8", env=env, timeout=60)  # FIFO не вешает тест
 
     def rows(self, result):
         return {r["wave"]: (r["runs"], r["fix_cycles"], r["blocked_cap"]) for r in result["waves"]}
@@ -20290,6 +20290,87 @@ class MetricsScript(unittest.TestCase):
         w1 = json.loads(r.stdout)["waves"][0]
         self.assertIsNone(w1["fix_cycles"])
         self.assertTrue(w1["problems"])
+
+    def test_an_existing_runs_json_entry_is_read_as_is_never_replaced_by_its_name(self):
+        """Ревью W4 прогон 3 (Astra, metrics.py:379): существующая запись пути из runs.json внутри волны — любого вида
+        (битый симлинк внутрь и наружу, FIFO, каталог, симлинк наружу, испорченный файл, файл с чужим номером; имя вне
+        маски manifest*.json, путь относительный и абсолютный) — читается как есть через `_read_checked` и отвергается
+        (I1: «нет данных» и по прогонам, runs None, код 1), а не подменяется `superarmanda/<имя>` и не становится
+        «не найден» (потерянный прогон). Валидный `superarmanda/custom.json` рядом не засчитывается вместо неё.
+        Подстановка имени — только когда записи нет или путь внешний; нет и подстановки — «не найден», runs 1."""
+        def manifest(index=1, cycles=3):
+            return json.dumps({"version": 2, "wave": {"id": "W1"}, "run": {"index": index},
+                               "tasks": {"t": {"fix_cycles": cycles}}})
+
+        def regular(text):
+            return lambda f, base: f.write_text(text, encoding="utf-8")
+
+        def outward_valid(f, base):
+            (base / "outside.json").write_text(manifest(), encoding="utf-8")
+            f.symlink_to(base / "outside.json")
+
+        # вид записи: (создать запись, причина)
+        kinds = {
+            "a dangling symlink inside": (lambda f, base: f.symlink_to("nowhere.json"), "не читается (битый симлинк)"),
+            "a dangling symlink outward": (lambda f, base: f.symlink_to(base / "gone.json"), "вне каталога волны"),
+            "a FIFO": (lambda f, base: os.mkfifo(f), "не читается (не файл)"),
+            "a directory": (lambda f, base: f.mkdir(), "не читается (не файл)"),
+            "a symlink outward to a valid manifest": (outward_valid, "вне каталога волны"),
+            "broken JSON": (regular("{"), "не читается"),
+            "another run": (regular(manifest(index=2)), "номер прогона в run не 1"),
+        }
+        # запись runs.json: (путь записи от волны, значение для runs.json или None — абсолютный путь к записи)
+        places = {"W1/custom.json": ("custom.json", "custom.json"),
+                  "W1/custom.json (absolute)": ("custom.json", None),
+                  "W1/superarmanda/custom.json": ("superarmanda/custom.json", "superarmanda/custom.json")}
+
+        def build(base, rel, value, make=None, substitute=False):
+            run = base / "run"
+            w = run / "W1"
+            (w / "superarmanda").mkdir(parents=True)
+            (run / "events.log").write_text("", encoding="utf-8")
+            if substitute:
+                (w / "superarmanda" / "custom.json").write_text(manifest(), encoding="utf-8")
+            if make:
+                (w / rel).parent.mkdir(parents=True, exist_ok=True)
+                make(w / rel, base)
+            (w / "runs.json").write_text(json.dumps({"version": 1, "wave": "W1", "runs": [
+                {"index": 1, "manifest": value if value is not None else str(w / rel)}]}), encoding="utf-8")
+            return run
+
+        n = 0
+        for place, (rel, value) in places.items():
+            for kind, (make, reason) in kinds.items():
+                for substitute in ((False, True) if not rel.startswith("superarmanda/") else (False,)):
+                    with self.subTest(place=place, kind=kind, substitute=substitute), \
+                            tempfile.TemporaryDirectory() as tmp:
+                        n += 1
+                        run = build(Path(tmp), rel, value, make, substitute)
+                        data = self._assert_no_data(run, "W1", reason)  # runs None: отвергнута, не потеряна
+                        problems = data["waves"][0]["problems"]
+                        self.assertFalse([p for p in problems if "не найден" in p], problems)
+                        self.assertTrue(all("custom.json" in p for p in problems), problems)
+                        self.assertEqual(data["total"]["runs"], 0, data)
+        self.assertEqual(n, len(kinds) * 5)
+        # контрольные: законная запись засчитывается; нет записи — подстановка имени; нет и её — потерянный прогон
+        controls = {
+            "valid W1/custom.json": (lambda b: build(b, "custom.json", "custom.json", regular(manifest())), 0, 1, 3),
+            "valid W1/custom.json (absolute)": (lambda b: build(b, "custom.json", None, regular(manifest())), 0, 1, 3),
+            "absent W1/custom.json, valid superarmanda/custom.json":
+                (lambda b: build(b, "custom.json", "custom.json", substitute=True), 0, 1, 3),
+            "absent W1/gone/custom.json, valid superarmanda/custom.json":
+                (lambda b: build(b, "gone/custom.json", "gone/custom.json", substitute=True), 0, 1, 3),
+            "absent W1/custom.json and no substitute": (lambda b: build(b, "custom.json", "custom.json"), 1, 1, None),
+        }
+        for name, (make, code, runs, cycles) in controls.items():
+            with self.subTest(control=name), tempfile.TemporaryDirectory() as tmp:
+                r = self.cli(make(Path(tmp)), "--json")
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+                w1 = json.loads(r.stdout)["waves"][0]
+                self.assertEqual((w1["runs"], w1["fix_cycles"]), (runs, cycles), w1)
+                if code:
+                    self.assertEqual(w1["problems"], ["manifest прогона 1 не найден"], w1)
 
     def test_symlink_manifest_pointing_out_is_never_read(self):
         run, outside = self._lone_wave(in_copy=False)
@@ -21290,6 +21371,18 @@ class MetricsScript(unittest.TestCase):
                     cases[(f"a runs.json path into the other wave (absolute={absolute})", "runs.json", with_run,
                            orig)] = runs_path(absolute)
 
+        def entry_symlink(root, branch, with_run, orig, other):
+            # запись runs.json ЕСТЬ в волне (имя вне маски manifest*.json) и ведёт симлинком в manifest другой волны:
+            # не подменяется именем (Astra, прогон 3) и не «вне каталога волны» — «тот же файл» (I4)
+            (root / other).mkdir()
+            (root / other / "custom.json").symlink_to(f"../{orig}/superarmanda/manifest.json")
+            runs_json(root / other, ["custom.json"])
+
+        for with_run in (False, True):
+            for orig in ("W1", "W2"):
+                cases[("a runs.json path into the other wave (an entry symlink in the wave)", "runs.json", with_run,
+                       orig)] = entry_symlink
+
         failed = []
         for (label, branch, with_run, orig), make in cases.items():
             other = "W2" if orig == "W1" else "W1"
@@ -21334,7 +21427,8 @@ class MetricsScript(unittest.TestCase):
                         errors.append(f"I1: волна с дублем засчитана: {by['W1']}")
                 if errors:
                     failed.append(((label, branch, with_run, orig), errors))
-        self.assertEqual(len(cases), 80)  # 6 способов внутри волны × 2 + 5 × 3 ветки × 2 × 2 + путь runs.json 2 × 2 × 2
+        # 6 способов внутри волны × 2 + 5 × 3 ветки × 2 × 2 + путь runs.json 2 × 2 × 2 + запись-симлинк в волне 2 × 2
+        self.assertEqual(len(cases), 84)
         self.assertFalse(failed, f"{len(failed)} из {len(cases)} сочетаний нарушают инвариант:\n"
                          + "\n".join(f"{case}: {errors}" for case, errors in failed))
 
