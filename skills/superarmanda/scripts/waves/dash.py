@@ -581,6 +581,9 @@ def _wave_rules():
          lambda m: (f"🧵 {m['w']}: в окне висят фоновые хвосты", m["t"], WARN_YELLOW)),
         (w(r"дерево процессов недоступно: (?P<t>.*)"),
          lambda m: (f"⚠ {m['w']}: дерево процессов недоступно, хвосты не проверены", m["t"], WARN_YELLOW)),
+        # служебная строка say о маркере owner-answered: вид `say-note:` (с 1.6.0) и легаси-форма под `say: `
+        (w(r"(?:say-note: |say: (?=owner-answered marker not written|status rewritten while the marker))(?P<t>.*)"),
+         lambda m: (f"📝 {m['w']}: отметка ответа владельца не сработала", m["t"], WARN_YELLOW)),
         (w(r"say: (?P<t>.*)"),
          lambda m: (f"💬 {m['w']}: в окно волны написали", m["t"], INFO_GREY)),
         (w(r"workdir (?P<d>\S+) detached on (?P<t>.*)"),
@@ -812,11 +815,12 @@ def reload_cfg(cfg, path):
     else:
         sig = json.dumps([[k, want.get(k)] for k in changed], default=str, sort_keys=True)
         if _IDENTITY_TOLD.get(mark) != sig:
-            _IDENTITY_TOLD[mark] = sig
             try:
                 wab.event(cfg, f"dash: chain.json identity changed ({', '.join(changed)}); keeping {cfg.get('run_dir')}")
             except Exception:  # noqa: BLE001 - a log failure never fails the frame
-                pass
+                pass  # не помечено: следующий кадр повторит запись
+            else:
+                _IDENTITY_TOLD[mark] = sig  # «сказано» — только когда событие легло в events.log
     return out
 
 

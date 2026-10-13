@@ -1,6 +1,8 @@
 {
   "version": 1,
-  "wave": "W1",
+  "wave": {
+    "id": "W1"
+  },
   "run": {
     "index": 1,
     "max": 2

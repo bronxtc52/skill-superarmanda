@@ -43,6 +43,10 @@ Since 1.0.1-1.0.3 the same run also covers (W4, #68/#72/#57):
 (tests/fixtures/waves/e2e-1.4.1-state); W2 дважды пишет ту же строку BLOCKED, владелец отвечает, цепочка доходит до
 chain-result.md. Инвариант — у oracle_no_wave_text.
 
+Режим `remnants150` (W4 цепочки waves-tails2, релиз 1.6.0, #113, класс Remnants150Chain): тот же сценарий и та же точка
+перезапуска, но state.json и хранилище текстов `.texts/` сняты диспетчером 1.5.0 (tests/fixtures/waves/e2e-1.5.0-state):
+текущий диспетчер читает отметки и outbox 1.5.0, не отвечает повторно и доставляет уведомления outbox.
+
 Режим `threads` (W1 цепочки waves-tails2, #117, класс ThreadsChain): гейт W1 проходит с открытым тредом (скрипт
 владельца); пока скрипт не запущен, владельцу приходят напоминания с интервалом chain.json `merge_remind_minutes`, а
 `wab.py status` и дашборд после `merge_attention_minutes` показывают ATTENTION; тред закрыт на том же HEAD — следующий
@@ -102,6 +106,10 @@ FLOAT_EPS = 1e-6  # допуск сравнения виртуальных вр�
 # раннера: Linux — 60 с (запас ~1,8 к замеру), macOS — 150 с (запас ~1,85 к 81 с; одно реальное ожидание лока поверх
 # сценария, 120 с + 33–81 с, его всё равно превышает).
 THREADS_FAST_SECONDS = 150 if sys.platform == "darwin" else 60
+# Порог test_runs_fast сценариев offline, remnants и remnants150 — тоже по замеру. Linux — прежние 40 с. macOS-раннер CI
+# (run 38314774689) дал remnants150 44 с: run-tests.sh гоняет наборы параллельно, и медленный раннер делит CPU между
+# ними; macOS — 90 с (запас ~2 к замеру 44 с при параллельном прогоне).
+CHAIN_FAST_SECONDS = 90 if sys.platform == "darwin" else 40
 DELAY = 20  # virtual seconds between what the dispatcher typed and the session's reaction
 BOT_STATUS = "[class=needs_decision rec=A red=no]"
 CAP_STATUS = "[class=blocked_cap rec=new_run red=no]"
@@ -117,6 +125,7 @@ NUDGE_MINUTES = 5  # chain.json idle_nudge_minutes of the scenario
 CAP_REPEATS = 2
 CAP_REPEAT_AFTER = 7 * 60
 LEGACY_141 = FIXTURES / "waves" / "e2e-1.4.1-state"
+LEGACY_150 = FIXTURES / "waves" / "e2e-1.5.0-state"  # state.json и `.texts/` диспетчера 1.5.0 той же точки (режим remnants150)
 # режим threads (#117): интервал напоминания и порог ATTENTION цепочки (tunable-поля chain.json), когда закрыть тред
 REMIND_MINUTES = 20
 ATTENTION_MINUTES = 10
@@ -868,9 +877,11 @@ def put_legacy_state(run):
     (tests/fixtures/waves/e2e-1.4.1-state, см. README). Руками, как названо в README: плейсхолдеры получают значения
     ЭТОГО прогона (корень мира, его HOME, срез имени каталога журналов, id сессий, sha коммитов по их темам), моменты @T:±с@ —
     «сейчас» виртуальных часов плюс сдвиг, [inode, mtime] файла status (@STAMP:W@) — штамп файла status этого прогона;
-    хранилище текстов `.texts/` волн удаляется: у 1.4.1 его не было, текст есть только в самом state.json."""
+    хранилище текстов `.texts/` волн удаляется: у 1.4.1 его не было, текст есть только в самом state.json.
+    Режим remnants150: то же из tests/fixtures/waves/e2e-1.5.0-state, а хранилище `.texts/` волн заменяется снятым
+    диспетчером 1.5.0 (файлы названы eid своего текста и копируются как есть, 0600 в каталоге 0700)."""
     w, a = run.world, run.actor
-    raw = (LEGACY_141 / "state.json").read_text(encoding="utf-8")
+    raw = (run.fixture / "state.json").read_text(encoding="utf-8")
     raw = raw.replace("@SLUG@", re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(w.workdir)))
     raw = raw.replace("@HOME@", str(w.home)).replace("@ROOT@", str(w.root))
     for s in a.sessions.values():
@@ -899,10 +910,20 @@ def put_legacy_state(run):
                 return [st.st_ino, st.st_mtime_ns]
         return node
     doc = walk(json.loads(raw))
+    if run.mode == "remnants150_no_marks":  # мутант фикстуры: отметок отвеченного эпизода 1.5.0 у W2 нет
+        for key in ("policy_episode", "policy_answered_stamp", "policy_keys"):
+            doc["waves"]["W2"].pop(key, None)
     left = re.findall(r"@(?:ROOT|HOME|SLUG|SID|REV|T|STAMP)[^@]*@", json.dumps(doc, ensure_ascii=False))
-    must(not left, f"placeholders of the 1.4.1 fixture left: {left}")
+    must(not left, f"placeholders of the {run.fixture.name} fixture left: {left}")
     for wave in ("W1", "W2"):
-        shutil.rmtree(w.run_dir / wave / wab.TEXTS_DIR, ignore_errors=True)
+        store = w.run_dir / wave / wab.TEXTS_DIR
+        shutil.rmtree(store, ignore_errors=True)
+        texts = run.fixture / "texts" / wave
+        if texts.is_dir():  # 1.5.0: the store of the wave as the old dispatcher left it
+            store.mkdir(mode=0o700)
+            for f in sorted(texts.iterdir()):
+                (store / f.name).write_bytes(f.read_bytes())
+                os.chmod(store / f.name, 0o600)
     wab.state_path({"run_dir": w.run_dir}).write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n",
                                                       encoding="utf-8")
     return doc
@@ -916,10 +937,11 @@ def run_scenario(mode="normal", limit=90 * 60):
     lowered to medium and one review) | no_final_check (the high wave W1 records both reviews and no final
     check) | no_children_check (the nudge ignores the process tree) | no_nudge (no idle
     nudge at all) | rabbit_blocks (a CodeRabbit that is `unavailable` blocks the gate) | kill_any (the cleanup
-    does not check whose a pane is)."""
+    does not check whose a pane is) | remnants (restart on the 1.4.1 state.json) | remnants150 (restart on the
+    state.json and `.texts/` of 1.5.0) | remnants150_no_marks (the same without the marks of W2's answered episode)."""
     base = Path(tempfile.mkdtemp(prefix="wabe2e-"))
     atexit.register(shutil.rmtree, base, True)
-    legacy = mode.startswith("remnants")  # remnants | remnants_no_upgrade | remnants_no_episode
+    legacy = mode.startswith("remnants")  # remnants | remnants_no_upgrade | remnants_no_episode | remnants150*
     world = World(base, policy=mode != "no_policy", quote=mode == "telegram_quote",
                   max_auto_answers=1 if legacy else None, threads=mode == "threads")
     world.setup()
@@ -931,7 +953,8 @@ def run_scenario(mode="normal", limit=90 * 60):
     run.attention = []  # every text of the ATTENTION file as the dispatcher wrote it
     run.telegram = []  # what Telegram would carry: render_notice() of EVERY notice that reaches notify()
     run.notices = []  # (виртуальное время, волна, текст) того же
-    run.restart_at = None  # режим remnants: виртуальный момент перезапуска диспетчера на state.json 1.4.1
+    run.restart_at = None  # режим remnants: виртуальный момент перезапуска диспетчера на state.json прошлой версии
+    run.fixture = LEGACY_150 if mode.startswith("remnants150") else LEGACY_141  # чей state.json подкладывается
     run.legacy = None  # state.json 1.4.1 с подставленными значениями этого прогона
     run.first_write = None  # state.json после первой записи перезапущенного диспетчера
     run.outbox_sent = []  # (время, волна, ключ) записей outbox, отправленных после перезапуска
@@ -1413,12 +1436,23 @@ def oracle_legacy_restart(run):
     после первой записи перезапущенного диспетчера его нет; (2) повторного автоответа нет — ни в окне, ни в
     policy-decisions.log, ни в счётчике; (3) каждое неотправленное уведомление outbox фикстуры отправлено, пока жив его
     эпизод (до первой повторной записи строки), ровно один раз; (4) текст вопроса, мигрированный из state.json
-    (хранилища `.texts/` у 1.4.1 нет), дошёл до chain-result.md."""
+    (хранилища `.texts/` у 1.4.1 нет), дошёл до chain-result.md.
+    Рестарт на state.json 1.5.0 (режим remnants150): (1) текста волны нет уже в фикстуре — он в её хранилище `.texts/`,
+    и вопрос владельцу из `questions[].eid` там есть; (2)–(4) — те же: отметки и outbox 1.5.0 прочитаны текущим
+    диспетчером, вопрос дошёл до chain-result.md из хранилища 1.5.0."""
     a, w = run.actor, run.world
-    must(run.restart_at is not None and run.legacy, "the dispatcher was never restarted on the 1.4.1 state.json")
+    old = "1.5.0" if run.fixture == LEGACY_150 else "1.4.1"
+    must(run.restart_at is not None and run.legacy, f"the dispatcher was never restarted on the {old} state.json")
     legacy = json.dumps(run.legacy, ensure_ascii=False)
-    for marker in (QUESTION_MARKERS["W2"], QUESTION_MARKERS["W2-owner"], "Дубай"):
-        must(marker in legacy, f"the 1.4.1 fixture has no {marker!r}: the check below would be empty")
+    if old == "1.4.1":
+        for marker in (QUESTION_MARKERS["W2"], QUESTION_MARKERS["W2-owner"], "Дубай"):
+            must(marker in legacy, f"the 1.4.1 fixture has no {marker!r}: the check below would be empty")
+    else:
+        oracle_no_wave_text(run, run.legacy, "the state.json of the 1.5.0 fixture")
+        store = run.fixture / "texts" / "W2"
+        asked = [(store / q["eid"].split(":", 1)[1]) for q in run.legacy["waves"]["W2"].get("questions") or []]
+        must(any(f.exists() and QUESTION_MARKERS["W2-owner"] in f.read_text(encoding="utf-8") for f in asked),
+             f"the 1.5.0 fixture keeps no question of W2 in its store: {asked}")
     oracle_no_wave_text(run, run.first_write, "state.json after the first write of the restarted dispatcher")
     oracle_no_wave_text(run)
     # (2) one fork, one automatic answer
@@ -1430,20 +1464,20 @@ def oracle_legacy_restart(run):
     must(run.events_log.count("W2: policy auto-answer") == 1, "events: W2 auto-answered more than once")
     # (3) the unsent notices of the fixture: delivered once each, while their episode lived
     owed = sorted((wave, key) for wave, rec in run.legacy["waves"].items() for key in (rec.get("outbox") or {}))
-    must(owed == [("W1", "done"), ("W2", "policy_answer"), ("W2", "started")], f"outbox of the 1.4.1 fixture: {owed}")
+    must(owed == [("W1", "done"), ("W2", "policy_answer"), ("W2", "started")], f"outbox of the {old} fixture: {owed}")
     for wave, key in owed:
         sent = [t for t, x, k in run.outbox_sent if (x, k) == (wave, key)]
-        must(len(sent) == 1, f"the unsent {wave}/{key} of the 1.4.1 state.json was sent {len(sent)} times after the restart")
+        must(len(sent) == 1, f"the unsent {wave}/{key} of the {old} state.json was sent {len(sent)} times after the restart")
         must(sent[0] < a.cap_repeats[0], f"{wave}/{key} was sent after its episode could end")
     told = [t for at, x, t in run.notices if at >= run.restart_at]
     for wave, head in (("W1", "волна W1 завершена"), ("W2", "стартовала волна W2"),
                        ("W2", "волна W2: развилка закрыта по политике")):
-        must(sum(head in t.splitlines()[0] for t in told) == 1, f"the notice «{head}» of the 1.4.1 outbox was lost")
+        must(sum(head in t.splitlines()[0] for t in told) == 1, f"the notice «{head}» of the {old} outbox was lost")
     for wave in ("W1", "W2"):
         must(not run.state["waves"][wave].get("outbox"), f"{wave}: notices left undelivered: {run.state['waves'][wave]}")
-    # (4) the question of the 1.4.1 record reached chain-result.md from the store it was migrated into
+    # (4) the question of the old record reached chain-result.md from the store (1.4.1: migrated into it; 1.5.0: its own)
     result = (w.run_dir / "chain-result.md").read_text(encoding="utf-8")
-    must(QUESTION_MARKERS["W2-owner"] in result, "the question of W2 kept only in the 1.4.1 state.json is lost")
+    must(QUESTION_MARKERS["W2-owner"] in result, f"the question of W2 kept only in the {old} state is lost")
 
 
 def oracle_flow(run):
@@ -1561,7 +1595,7 @@ class OfflineChain(unittest.TestCase):
         oracle_cleanup(self.chain)
 
     def test_runs_fast(self):
-        must(self.seconds < 40, f"the scenario took {self.seconds:.0f} s")
+        must(self.seconds < CHAIN_FAST_SECONDS, f"the scenario took {self.seconds:.0f} s")
 
     def test_state_json_holds_no_wave_text(self):
         oracle_no_wave_text(self.chain)
@@ -1598,7 +1632,41 @@ class RemnantsChain(unittest.TestCase):
         oracle_external(self.chain)
 
     def test_runs_fast(self):
-        must(self.seconds < 40, f"the scenario took {self.seconds:.0f} s")
+        must(self.seconds < CHAIN_FAST_SECONDS, f"the scenario took {self.seconds:.0f} s")
+
+
+class Remnants150Chain(unittest.TestCase):
+    """Сквозная приёмка релиза 1.6.0 (W4 цепочки waves-tails2, #113): тот же сценарий, что у RemnantsChain, но диспетчер
+    перезапущен на state.json и хранилище `.texts/`, снятых диспетчером 1.5.0 в той же точке
+    (tests/fixtures/waves/e2e-1.5.0-state): цепочка доходит до chain-result.md без повторного автоответа, outbox 1.5.0
+    доставлен по разу, эпизоды повторов строки капа — по уведомлению."""
+    chain = None
+
+    @classmethod
+    def setUpClass(cls):
+        t = time.monotonic()
+        cls.chain = run_scenario("remnants150")
+        cls.seconds = time.monotonic() - t
+
+    def test_a_state_json_holds_no_wave_text_after_the_chain(self):
+        oracle_no_wave_text(self.chain)
+
+    def test_b_each_repeat_of_the_blocked_line_at_the_cap_notifies_the_owner_once(self):
+        oracle_cap_repeat(self.chain)
+
+    def test_c_restart_on_the_1_5_0_state_json_no_second_answer_no_lost_notice(self):
+        oracle_legacy_restart(self.chain)
+
+    def test_the_chain_still_runs_to_chain_result(self):
+        oracle_flow(self.chain)
+        oracle_gate(self.chain)
+        oracle_blocked_cap(self.chain)
+
+    def test_every_external_text_is_still_clean(self):
+        oracle_external(self.chain)
+
+    def test_runs_fast(self):
+        must(self.seconds < CHAIN_FAST_SECONDS, f"the scenario took {self.seconds:.0f} s")
 
 
 class ThreadsChain(unittest.TestCase):
@@ -1731,6 +1799,13 @@ class Mutations(unittest.TestCase):
         """Без штампа записи status эпизод — только текст строки: повтор той же строки на капе молчит, а отвеченный эпизод
         после рестарта читается как новый и спрашивает владельца (oracle видит первое из двух)."""
         run = run_scenario("remnants_no_episode")
+        with self.assertRaisesRegex(AssertionError, "notices to the owner after each repeat|the owner was asked about the cap"):
+            oracle_cap_repeat(run)
+
+    def test_a_1_5_0_state_json_without_the_marks_of_the_answered_episode_is_seen(self):
+        """Чувствительность Remnants150Chain к фикстуре: те же state.json и `.texts/` 1.5.0 без отметок отвеченного эпизода
+        W2 (policy_episode, policy_answered_stamp, policy_keys) — оракул эпизодов видит неверные уведомления на повторах."""
+        run = run_scenario("remnants150_no_marks")
         with self.assertRaisesRegex(AssertionError, "notices to the owner after each repeat|the owner was asked about the cap"):
             oracle_cap_repeat(run)
 

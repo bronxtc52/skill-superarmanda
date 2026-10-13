@@ -2321,7 +2321,8 @@ def _duration_field(cfg, value):
 
 def _minutes_field(cfg, value):
     """A duration given in minutes (may be fractional): «12 мин», «30 с», «1 мин 30 с»; a positive value that rounds
-    to 0 s is «<1 с» (only 0 itself is «0 мин»); anything else «?»."""
+    to 0 s is «<1 с» (only 0 itself is «0 мин»); from an hour on — hours, the way _human_dur shows them («1ч30м»);
+    anything else «?»."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "?"
     if value != value or value < 0 or value >= 10 ** 6:
@@ -2329,10 +2330,32 @@ def _minutes_field(cfg, value):
     secs = int(round(value * 60))
     if secs == 0 and value > 0:
         return "<1 с"
+    if secs >= 3600:  # от часа — как в отчётах и ATTENTION (_human_dur), без секунд
+        return _human_dur(secs)
     m, sec = divmod(secs, 60)
     if sec == 0:
         return f"{m} мин"
     return f"{m} мин {sec} с" if m else f"{sec} с"
+
+
+def _minutes_value(value):
+    """Число минут, которое _minutes_field покажет (не «?»), иначе None."""
+    return None if _minutes_field({}, value) == "?" else value
+
+
+def _outbox_minutes(cfg, key, item):
+    """Минуты, которые показывает текст записи outbox сейчас (`_outbox_fields` — тот же источник, что у
+    outbox_notice): сохранённые `minutes` (у 1.4.3 и старше — `n`), а при битом или отсутствующем числе — настройка
+    chain.json на момент доставки. None — для шаблона без поля `minutes` (там `n` — счётчик, а не минуты)."""
+    if key not in NOTICE_TEMPLATES or "minutes" not in NOTICE_TEMPLATES[key]["fields"]:
+        return None
+    return _minutes_value(_outbox_fields(cfg, key, item).get("minutes"))
+
+
+def _minutes_default(cfg, key):
+    """Настройка chain.json, которую показывает шаблон `key` без числа минут (NOTICE_MINUTES_DEFAULT), или None."""
+    default = NOTICE_MINUTES_DEFAULT.get(key)
+    return cfg.get(default) if default else None
 
 
 def _status_field(cfg, value):
@@ -2498,9 +2521,8 @@ def external_attach(name):
 
 def _notice_values(cfg, wave, tpl, fields, key=None):
     given = dict(fields, chain=cfg.get("chain"), wave=wave)
-    default = NOTICE_MINUTES_DEFAULT.get(key)
-    if "minutes" in tpl["fields"] and given.get("minutes") is None and default:
-        given["minutes"] = cfg.get(default)  # an entry without the number: the chain.json setting
+    if "minutes" in tpl["fields"] and given.get("minutes") is None:
+        given["minutes"] = _minutes_default(cfg, key)  # an entry without the number: the chain.json setting
     if "tmux" in tpl["fields"] and given.get("tmux") is None:
         given["tmux"] = f"{cfg.get('tmux_prefix') or 'wab-'}{str(wave).lower()}"
     return {n: NOTICE_FIELDS[n][1](cfg, given.get(n)) for n in tpl["fields"]}, given
@@ -2622,16 +2644,28 @@ def put_notice(cfg, w, wave, key, value, value_is_mark=False, **fields):
         box[key] = item
 
 
-def outbox_notice(cfg, wave, w, key, item):
-    """The notice of an outbox entry as it is sent now: its template + its stored fields. An entry of an older
-    dispatcher (no `fields`; its text has the wave's quote) is made again by the template of its key from the fields
-    of the registry that are still known (chain, wave, session): its free text is dropped."""
+def _outbox_fields(cfg, key, item):
+    """The stored fields of an outbox entry that its template takes, as outbox_notice shows them: `n` of 1.4.3 and
+    older is the minutes; a broken or missing number of minutes is the chain.json setting NOW (the one source of the
+    number both the delivered text and its ATTENTION signal keep, _outbox_minutes)."""
     stored = item.get("fields") if isinstance(item.get("fields"), dict) else {}
     tpl = NOTICE_TEMPLATES[key]
     stored = dict(stored)
     if "minutes" in tpl["fields"] and "minutes" not in stored and "n" in stored:
         stored["minutes"] = stored["n"]  # an entry of 1.4.3 and older kept the minutes as `n`
-    fields = {k: v for k, v in stored.items() if k in tpl["fields"] and k in NOTICE_FIELDS}
+    if "minutes" in stored and _minutes_value(stored["minutes"]) is None:
+        stored.pop("minutes")  # испорченное число (строка, bool, nan): как запись без числа — настройка, не «?»
+    if "minutes" in tpl["fields"] and "minutes" not in stored and _minutes_value(_minutes_default(cfg, key)) is not None:
+        stored["minutes"] = _minutes_default(cfg, key)
+    return {k: v for k, v in stored.items() if k in tpl["fields"] and k in NOTICE_FIELDS}
+
+
+def outbox_notice(cfg, wave, w, key, item):
+    """The notice of an outbox entry as it is sent now: its template + its stored fields. An entry of an older
+    dispatcher (no `fields`; its text has the wave's quote) is made again by the template of its key from the fields
+    of the registry that are still known (chain, wave, session): its free text is dropped."""
+    tpl = NOTICE_TEMPLATES[key]
+    fields = _outbox_fields(cfg, key, item)
     if "tmux" in tpl["fields"] and isinstance(w.get("tmux"), str):
         fields["tmux"] = w["tmux"]
     fields.pop("question", None)  # a 1.4.x entry: its text is not taken from the record
@@ -2706,6 +2740,14 @@ def _status_stamp(cfg, wave):
 
 
 OWNER_ANSWERED = "owner-answered"
+# служебные строки `say` (о маркере owner-answered) — отдельный вид события: `say: ` в events.log остаётся
+# только за текстом, ушедшим в окно волны (metrics.py считает его ответом владельца на развилку)
+SAY_NOTE = "say-note"
+
+
+def say_note(cfg, wave, text):
+    """Единственная точка записи служебной строки `say` в events.log: `<wave>: say-note: <text>`."""
+    event(cfg, f"{wave}: {SAY_NOTE}: {text}")
 
 
 def write_owner_answered(cfg, wave):
@@ -2720,7 +2762,7 @@ def write_owner_answered(cfg, wave):
     text = read(wdir / "status", on_error=None)
     if _status_stamp(cfg, wave) != stamp:
         stamp = None
-        event(cfg, f"{wave}: say: status rewritten while the marker was taken; the marker answers no episode")
+        say_note(cfg, wave, "status rewritten while the marker was taken; the marker answers no episode")
     doc = {"status": text, "stamp": stamp, "at": _utc(time.time())}
     fd, tmp = tempfile.mkstemp(dir=wdir, prefix=".owner-answered.", suffix=".tmp")
     try:
@@ -2926,22 +2968,30 @@ def ack_wave_notices(w):
 INFO_NOTICES = ("started", "chain_done", "policy_answer", "done")  # policy_answer: told, nothing to answer
 
 
-def note_attention(w, key, notice, now):
+def note_attention(w, key, notice, now, minutes=None):
     """A notice went out only locally (no Telegram): an open signal of its episode, IN MEMORY; the
     caller's save writes ATTENTION (sync_attention). drop_notice and ack_wave_notices close it. What is kept is the
     first line of the TEMPLATE's text; attention_text() makes the signal again from the notice's key, so a line of
-    an older dispatcher (with a wave's quote) is never shown."""
-    w.setdefault("attention", {})[key] = {"at": now, "line": _first_line(notice, 300)}
+    an older dispatcher (with a wave's quote) is never shown. `minutes` — число минут эпизода на момент постановки
+    (поле `minutes` записи outbox): сигнал показывает его, а не настройку chain.json, поменянную позже."""
+    item = {"at": now, "line": _first_line(notice, 300)}
+    if _minutes_value(minutes) is not None:
+        item["minutes"] = minutes
+    w.setdefault("attention", {})[key] = item
 
 
 def attention_path(cfg):
     return cfg["run_dir"] / "ATTENTION"
 
 
-def attention_signal(cfg, wave, key):
-    """The signal of ATTENTION: the first line of the notice's template (chain, wave and a key of the table only)."""
+def attention_signal(cfg, wave, key, minutes=None):
+    """The signal of ATTENTION: the first line of the notice's template (chain, wave and a key of the table only).
+    `minutes` — минуты эпизода на момент постановки (note_attention); нет или испорчены — настройка chain.json."""
     if key in NOTICE_TEMPLATES:
-        return _first_line(notice_text(cfg or {}, wave, key, 0), 300)
+        fields = {}
+        if "minutes" in NOTICE_TEMPLATES[key]["fields"] and _minutes_value(minutes) is not None:
+            fields["minutes"] = minutes
+        return _first_line(notice_text(cfg or {}, wave, key, 0, **fields), 300)
     return "❗ волне требуется внимание"
 
 
@@ -2963,7 +3013,7 @@ def attention_text(st, cfg=None):
     wave, w, key, item = latest
     shown = NOTICE_FIELDS["wave"][1](cfg, wave)
     text = (f"time: {hum(cfg, num(item.get('at')))}\nwave: {shown}\n"
-            f"signal: {attention_signal(cfg, shown, key)}\n"
+            f"signal: {attention_signal(cfg, shown, key, item.get('minutes'))}\n"
             f"attach: {external_attach(w.get('tmux'))}\n")
     if total > 1:
         text += f"open signals: {total} (wab.py status, events.log)\n"
@@ -3027,7 +3077,7 @@ def flush_notices(cfg, st, w, force=False):
         if notify(cfg, notice, wave):
             box.pop(key, None)
             if local and key not in INFO_NOTICES:
-                note_attention(w, key, notice, now)
+                note_attention(w, key, notice, now, _outbox_minutes(cfg, key, item))
         else:
             item["next_at"] = now + NOTIFY_RETRY_SECONDS
     if not box:
@@ -8526,7 +8576,7 @@ def say_cmd(cfg, wave, text_file):
                 try:      # the Enter fails later
                     write_owner_answered(cfg, wave)
                 except OSError as e:
-                    event(cfg, f"{wave}: say: owner-answered marker not written ({e.strerror or e})")
+                    say_note(cfg, wave, f"owner-answered marker not written ({e.strerror or e})")
             send_text(name, text, on_typed=typed)
     except (subprocess.CalledProcessError, OSError, NotSubmitted) as e:
         why = _exc_text(e) if isinstance(e, NotSubmitted) else type(e).__name__
