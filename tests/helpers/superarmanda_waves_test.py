@@ -1921,6 +1921,18 @@ def stop_tmux_server(exe, sock, env, flag="-L"):
     wait_for(lambda: _tmux_server_gone(exe, flag, sock, env), f"tmux server {sock} to stop")
 
 
+def _remove_test_socket(path):
+    """After the server has exited: unlink its socket file (tmux leaves it behind) — only a socket named `wabtest-…`
+    (the test's own, fresh_tmux_socket), never another name and never a non-socket."""
+    if not path.name.startswith("wabtest-"):
+        return
+    try:
+        if stat.S_ISSOCK(os.lstat(path).st_mode):
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def start_tmux_server(test, exe, kind, env, flag="-L", sock=None):
     """One helper for every test that drives a real tmux server: a fresh private socket (`-L` name, or the `-S`
     path given), the server started with a keeper session and waited for ready, `stop_tmux_server` at cleanup.
@@ -1929,17 +1941,80 @@ def start_tmux_server(test, exe, kind, env, flag="-L", sock=None):
     server, and `has-session` right after the kill races that exit — «server exited unexpectedly» / «no current
     target» instead of «can't find session» (2-3 % under 8x `yes`), which wab._session_gone rightly reads as
     «unknown». The owner's server outlives a chain's sessions (the coordinator's own session is on it); so does
-    the test server."""
+    the test server. The socket file tmux leaves after the exit is removed at cleanup (`_remove_test_socket`)."""
     sock = fresh_tmux_socket(kind) if sock is None else sock
     r = subprocess.run([exe, flag, str(sock), "-f", "/dev/null", "new-session", "-d", "-s", TMUX_KEEPER,
                         "-x", "80", "-y", "24", "sleep 86400"], capture_output=True, text=True, encoding="utf-8",
                        env=env, timeout=TMUX_WAIT)
     test.assertEqual(r.returncode, 0, r.stderr)
-    test.addCleanup(stop_tmux_server, exe, sock, env, flag)
+    socket_files = []  # the server's own socket path, as tmux reports it (TMUX_TMPDIR or its /tmp fallback)
+
+    def stop():
+        stop_tmux_server(exe, sock, env, flag)  # the server is gone first: then its socket file is not in use
+        for path in socket_files:
+            _remove_test_socket(path)
+    test.addCleanup(stop)
     wait_for(lambda: subprocess.run([exe, flag, str(sock), "has-session", "-t", f"={TMUX_KEEPER}"],
                                     capture_output=True, env=env, timeout=TMUX_WAIT).returncode == 0,
              f"tmux server {sock} to be ready")
+    r = subprocess.run([exe, flag, str(sock), "display-message", "-p", "#{socket_path}"], capture_output=True,
+                       text=True, encoding="utf-8", env=env, timeout=TMUX_WAIT)
+    test.assertEqual(r.returncode, 0, r.stderr)
+    socket_files.append(Path(r.stdout.strip()))
     return sock
+
+
+def _wabtest_sockets():
+    """Socket files of THIS process's test servers (`wabtest-<pid>-*`) in every place tmux may put a `-L` socket:
+    TMUX_TMPDIR of the guard, the temp dir, and /tmp (tmux falls back to it when TMUX_TMPDIR does not exist —
+    Base sets one that is never created)."""
+    prefix, found = f"wabtest-{os.getpid()}-", set()
+    for base in {TMUX_GUARD_DIR, tempfile.gettempdir(), "/tmp"}:
+        d = Path(base) / f"tmux-{os.getuid()}"
+        try:
+            found |= {str(e) for e in d.iterdir() if e.name.startswith(prefix)}
+        except OSError:
+            pass
+    return found
+
+
+class TmuxSocketCleanup(unittest.TestCase):
+    """W4 #113 (tester P3): a stopped test server leaves no socket file behind — only its own, only `wabtest-`."""
+
+    def setUp(self):
+        self.exe = shutil.which("tmux")
+        if not self.exe:
+            self.skipTest("tmux is not installed")
+        self.env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+
+    def socket_path(self, flag, sock):
+        r = subprocess.run([self.exe, flag, str(sock), "display-message", "-p", "#{socket_path}"], capture_output=True,
+                           text=True, encoding="utf-8", env=self.env, timeout=TMUX_WAIT)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return Path(r.stdout.strip())
+
+    def test_the_socket_file_of_a_stopped_server_is_removed(self):
+        owner = unittest.TestCase()
+        sock = start_tmux_server(owner, self.exe, "sc", self.env)
+        path = self.socket_path("-L", sock)
+        self.assertTrue(stat.S_ISSOCK(os.lstat(path).st_mode), path)
+        owner.doCleanups()
+        self.assertFalse(os.path.lexists(path), path)
+
+    def test_a_socket_not_named_wabtest_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sock = Path(tmp) / "other.sock"
+            owner = unittest.TestCase()
+            start_tmux_server(owner, self.exe, None, self.env, flag="-S", sock=sock)
+            owner.doCleanups()
+            self.assertTrue(os.path.lexists(sock), sock)  # not ours by name: never unlinked
+
+    def test_chain_cleanup_leaves_no_socket_files(self):
+        before = _wabtest_sockets()
+        result = unittest.TestResult()
+        unittest.defaultTestLoader.loadTestsFromTestCase(ChainCleanup).run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(_wabtest_sockets() - before, set())
 
 
 class ExactTargets(Base):
@@ -20815,22 +20890,22 @@ class MetricsScript(unittest.TestCase):
                                                          lambda w: os.link(w / "superarmanda" / "manifest.json",
                                                                            w / "superarmanda" / "copy.json")),
         }
-        for name, (names, extra) in cases.items():
-            for with_run in (False, True):
-                with self.subTest(name, with_run=with_run), tempfile.TemporaryDirectory() as tmp:
-                    root = Path(tmp)
-                    names_ = [n if n is not None else str(root / "W1" / "superarmanda" / "manifest.json") for n in names]
-                    build(root, names_, extra, with_run)
-                    data = self._assert_no_data(root, "W1", "")
-                    self.assertNotEqual(data["total"]["fix_cycles"], 4, data)
-                    # отказ по дублю — волна «нет данных» и по прогонам: один файл не даёт двух прогонов в итоге.
-                    # С `run` второй путь, найденный поиском по run.index, не подставляется (файл называет себя
-                    # прогоном 1): прогон 2 — потерянный manifest, а он по runs.json считается (как в
-                    # test_a_broken_or_missing_file_is_named_not_skipped); дубль без `run` и вне manifest*.json — нет
-                    dup = any("тот же файл" in p for p in data["waves"][0]["problems"])
-                    self.assertTrue(dup or with_run, data)
-                    expected = (None, 0) if dup else (2, 2)
-                    self.assertEqual((data["waves"][0]["runs"], data["total"]["runs"]), expected, data)
+        # исход задан явно на каждую пару (случай, with_run): один физический файл у двух прогонов — всегда одна
+        # причина «тот же файл» и волна «нет данных» и по прогонам (runs None, итог 0), с `run` и без, для
+        # симлинка и hardlink одинаково (W4 #113 прогон 3: симлинк с `run` давал runs=2 и «manifest прогона 2 не найден»)
+        expected = {(name, with_run): (None, 0) for name in cases for with_run in (False, True)}
+        for (name, with_run), (runs, total_runs) in expected.items():
+            names, extra = cases[name]
+            with self.subTest(name, with_run=with_run), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                names_ = [n if n is not None else str(root / "W1" / "superarmanda" / "manifest.json") for n in names]
+                build(root, names_, extra, with_run)
+                data = self._assert_no_data(root, "W1", "тот же файл")
+                self.assertNotEqual(data["total"]["fix_cycles"], 4, data)
+                problems = data["waves"][0]["problems"]
+                self.assertFalse(any("не найден" in p for p in problems), problems)
+                self.assertEqual((data["waves"][0]["runs"], data["total"]["runs"]), (runs, total_runs), data)
+                self.assertIsNone(data["waves"][0]["fix_cycles"], data)
         # контроль: два РАЗНЫХ файла — два прогона, код 0
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -20856,6 +20931,35 @@ class MetricsScript(unittest.TestCase):
             by = {w["wave"]: w for w in data["waves"]}
             self.assertEqual((by["W1"]["runs"], by["W2"]["runs"]), (1, None), data)
             self.assertEqual(data["total"]["runs"], 1, data)
+
+    def test_a_wave_symlink_to_another_wave_is_one_wave_dir_in_every_branch(self):
+        """W4 #113 прогон 3 (tester P2): W2 -> W1 внутри прогона — один каталог волны засчитывается один раз во всех
+        ветках (runs.json есть / легаси с `wave` / легаси без `wave`): W2 — «нет данных» по прогонам и фикс-кругам с
+        причиной «тот же, что у W1», без чтения её файлов; W1 — как есть; итог — один прогон W1."""
+        def runs_json(w):
+            (w / "runs.json").write_text(json.dumps({"version": 1, "wave": "W1", "runs": [
+                {"index": 1, "manifest": "superarmanda/manifest.json"}]}), encoding="utf-8")
+        manifests = {
+            "runs.json": ({"version": 2, "wave": {"id": "W1"}, "run": {"index": 1}}, runs_json),
+            "legacy with wave": ({"version": 2, "wave": {"id": "W1"}}, lambda w: None),
+            "legacy without wave": ({"version": 1}, lambda w: None),
+        }
+        for branch, (head, extra) in manifests.items():
+            for absolute in (False, True):
+                with self.subTest(branch, absolute=absolute), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / "W1" / "superarmanda").mkdir(parents=True)
+                    (root / "events.log").write_text("", encoding="utf-8")
+                    (root / "W1" / "superarmanda" / "manifest.json").write_text(
+                        json.dumps({**head, "tasks": {"t": {"fix_cycles": 3}}}), encoding="utf-8")
+                    extra(root / "W1")
+                    (root / "W2").symlink_to(root / "W1" if absolute else "W1")
+                    data = self._assert_no_data(root, "W2", "тот же, что у W1")
+                    by = {w["wave"]: w for w in data["waves"]}
+                    self.assertEqual((by["W1"]["runs"], by["W1"]["fix_cycles"], by["W1"]["problems"]), (1, 3, []), data)
+                    self.assertEqual((by["W2"]["runs"], by["W2"]["fix_cycles"]), (None, None), data)
+                    self.assertEqual(len(by["W2"]["problems"]), 1, data)  # её файлы не читаются: одна причина
+                    self.assertEqual((data["total"]["runs"], data["total"]["fix_cycles"]), (1, 3), data)
 
     def test_a_wave_dir_leading_out_of_the_run_dir_is_not_counted(self):
         """W4 #113 ревью P3: `<run_dir>/W1 -> ../other-chain/W1` — волна чужой цепочки не засчитывается («нет данных»,

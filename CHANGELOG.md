@@ -63,6 +63,17 @@
   чужую цепочку (тесты `test_without_runs_json_a_second_run_manifest_is_refused`,
   `test_a_run_manifest_missing_from_runs_json_is_refused`, `test_a_wave_entry_that_is_not_a_readable_dir_is_named_not_dropped`,
   `test_legacy_wave_ignores_a_stray_manifest_that_claims_no_run`, `test_the_wave_root_is_resolved_once`).
+- `metrics.py` (#113 W4, прогон 3): один каталог волны (`st_dev`, `st_ino` разрешённого корня) засчитывается один
+  раз во всех ветках — `runs.json`, легаси с `wave` и без: волна-симлинк `W2 -> W1` второй раз не читается, «нет
+  данных» по прогонам и фикс-кругам с причиной «тот же, что у W1», итог — один прогон (раньше легаси с
+  `"wave":{"id":"W1"}` давал W2 = 1 прогон и итог 2; тест
+  `test_a_wave_symlink_to_another_wave_is_one_wave_dir_in_every_branch`). Один физический manifest у двух прогонов
+  `runs.json` — одна причина «тот же файл» и «нет данных» по прогонам и для симлинка, и для hardlink (раньше
+  симлинк с `run` давал 2 прогона и «manifest прогона 2 не найден»); в `test_one_physical_file_is_never_two_runs`
+  исход задан явно на каждую пару (случай, `run`).
+- Тесты: `start_tmux_server` после остановки сервера удаляет его файл-сокет (tmux его оставляет) — только свой,
+  только с именем `wabtest-…`; после `ChainCleanup` файлов `wabtest-<pid>-*` не прибавляется (класс
+  `TmuxSocketCleanup`).
 - Тесты с настоящим tmux (`ExactTargets`, `KeysAndRegistry`, `ChainCleanup`) поднимают сервер одним помощником
   `start_tmux_server`: свежий сокет, сессия-хранитель (сервер не выходит, когда тест закрывает последнюю сессию —
   иначе `has-session` сразу после закрытия ловит выход сервера, «server exited unexpectedly», и закрытие не
