@@ -4,7 +4,10 @@
 Nothing here talks to a user's tmux server: every tmux/claude/Telegram interaction goes
 through module functions that are patched, TMUX is removed from the environment and
 TMUX_TMPDIR points into a throw-away directory. Real tmux runs only on private sockets
-`-L wabtest-<pid>-<kind><n>`, a new one per test (fresh_tmux_socket), killed afterwards.
+`-L wabtest-<pid>-<kind><n>`, a new one per test (fresh_tmux_socket), killed afterwards. A test that drives a
+real server takes it from start_tmux_server: a fresh socket, a keeper session (the server outlives the last
+session a test closes, as the owner's server does), waited for ready, killed and waited for gone at cleanup.
+Waiting is on a condition (wait_for), never on a fixed sleep.
 
 The module enforces this itself (TMUX_GUARD below, active before any test runs):
   * TMUX_TMPDIR is a fresh temporary directory, TMUX/TMUX_PANE/WAB_TMUX_SOCKET are unset;
@@ -1889,6 +1892,56 @@ def fresh_tmux_socket(kind):
     return f"wabtest-{os.getpid()}-{kind}{next(_SOCKETS)}"
 
 
+TMUX_KEEPER = "wabtest-keeper"  # the session start_tmux_server keeps on every test server; listings leave it out
+TMUX_WAIT = 30  # seconds: a bound for a condition, not a sleep (a loaded runner takes seconds, not milliseconds)
+
+
+def wait_for(cond, what, timeout=TMUX_WAIT, step=0.05):
+    """Poll `cond` until it is true (returns its value) or fail after `timeout` seconds — instead of a fixed sleep."""
+    end = time.monotonic() + timeout
+    while True:
+        value = cond()
+        if value:
+            return value
+        if time.monotonic() > end:
+            raise AssertionError(f"timed out after {timeout}s waiting for {what}")
+        time.sleep(step)
+
+
+def _tmux_server_gone(exe, flag, sock, env):
+    r = subprocess.run([exe, flag, str(sock), "list-sessions"], capture_output=True, text=True, encoding="utf-8",
+                       env=env, timeout=TMUX_WAIT)
+    err = r.stderr.lower()
+    return r.returncode != 0 and ("no server running" in err or "no such file or directory" in err)
+
+
+def stop_tmux_server(exe, sock, env, flag="-L"):
+    """kill-server and wait until the server is really gone (kill-server returns before it exits)."""
+    subprocess.run([exe, flag, str(sock), "kill-server"], capture_output=True, env=env, timeout=TMUX_WAIT)
+    wait_for(lambda: _tmux_server_gone(exe, flag, sock, env), f"tmux server {sock} to stop")
+
+
+def start_tmux_server(test, exe, kind, env, flag="-L", sock=None):
+    """One helper for every test that drives a real tmux server: a fresh private socket (`-L` name, or the `-S`
+    path given), the server started with a keeper session and waited for ready, `stop_tmux_server` at cleanup.
+
+    The keeper is the root of the ChainCleanup flake (W4 #113): when a test closes the LAST session, tmux exits the
+    server, and `has-session` right after the kill races that exit — «server exited unexpectedly» / «no current
+    target» instead of «can't find session» (2-3 % under 8x `yes`), which wab._session_gone rightly reads as
+    «unknown». The owner's server outlives a chain's sessions (the coordinator's own session is on it); so does
+    the test server."""
+    sock = fresh_tmux_socket(kind) if sock is None else sock
+    r = subprocess.run([exe, flag, str(sock), "-f", "/dev/null", "new-session", "-d", "-s", TMUX_KEEPER,
+                        "-x", "80", "-y", "24", "sleep 86400"], capture_output=True, text=True, encoding="utf-8",
+                       env=env, timeout=TMUX_WAIT)
+    test.assertEqual(r.returncode, 0, r.stderr)
+    test.addCleanup(stop_tmux_server, exe, sock, env, flag)
+    wait_for(lambda: subprocess.run([exe, flag, str(sock), "has-session", "-t", f"={TMUX_KEEPER}"],
+                                    capture_output=True, env=env, timeout=TMUX_WAIT).returncode == 0,
+             f"tmux server {sock} to be ready")
+    return sock
+
+
 class ExactTargets(Base):
     def setUp(self):
         super().setUp()
@@ -1900,10 +1953,8 @@ class ExactTargets(Base):
         if ver is None or ver < (3, 2):
             self.skipTest(f"tmux {out.strip()!r} is older than 3.2")
         self.exe = exe
-        self.sock = fresh_tmux_socket("t")
         self.env = {k: v for k, v in os.environ.items() if k != "TMUX"}
-        self.addCleanup(lambda sock=self.sock: subprocess.run([exe, "-L", sock, "kill-server"],
-                                                              capture_output=True, env=self.env))
+        self.sock = start_tmux_server(self, exe, "t", self.env)
         self.w = load_orig("wab_targets")  # unpatched copy: real tmux functions
         self.w.TMUX_SOCKET = self.sock
 
@@ -1919,19 +1970,12 @@ class ExactTargets(Base):
         self.assertEqual(self.w.pane_text("x-w1"), "")
         with self.assertRaises(subprocess.CalledProcessError):
             self.w.send_command("x-w1", "echo LEAK")
-        time.sleep(0.3)
-        self.assertNotIn("LEAK", self.w.pane_text("x-w10"))
-        for _ in range(100):  # a slow runner: wait until the shell has printed something
-            if self.w.pane_text("x-w10").strip():
-                break
-            time.sleep(0.1)
+        wait_for(lambda: self.w.pane_text("x-w10").strip(), "the shell prompt")  # a slow runner
         self.w.send_command("x-w10", "echo MARK123")
-        for _ in range(100):
-            if "MARK123" in self.w.pane_text("x-w10").replace("echo MARK123", ""):
-                break
-            time.sleep(0.1)
-        else:
-            self.fail("send_command did not reach the exact session")
+        wait_for(lambda: "MARK123" in self.w.pane_text("x-w10").replace("echo MARK123", ""),
+                 "send_command to reach the exact session")
+        # the refused send to x-w1 (above, before MARK123) left nothing: the pane shows what it ran after it
+        self.assertNotIn("LEAK", self.w.pane_text("x-w10"))
 
     def test_no_bare_session_targets_remain(self):
         src = (WAVES / "wab.py").read_text(encoding="utf-8")
@@ -2555,7 +2599,7 @@ class KeysAndRegistry(Base):
     def test_our_binding_lists_exactly_like_the_reference_on_a_private_server(self):
         exe = self.tmux3()
         env = {k: v for k, v in os.environ.items() if k != "TMUX"}
-        sock = f"wabkeys-{os.getpid()}"
+        sock = start_tmux_server(self, exe, "keys", env)
         ours = self.tmp / "ours.tmux"
         ours.write_text(wab.keys_conf(), encoding="utf-8")
         ref = self.tmp / "ref.tmux"  # as a foreign chain wrote it: the same binding in `list-keys` spelling
@@ -2568,26 +2612,19 @@ class KeysAndRegistry(Base):
         def cstar():
             out = run("list-keys", "-T", "root").stdout
             return [ln for ln in out.splitlines() if ln.split()[3:4] == ["C-\\\\"]]
-        try:
-            self.assertEqual(run("new-session", "-d", "-s", "keep", "sleep 60", ";", "source-file",
-                                 str(ref)).returncode, 0)
-            first = cstar()
-            self.assertEqual(len(first), 1, first)
-            r = run("source-file", str(ours))
-            self.assertEqual((r.returncode, r.stderr.strip()), (0, ""), r.stderr)
-            self.assertEqual(cstar(), first)  # re-sourcing ours over theirs changes nothing
-        finally:
-            run("kill-server")
-        sock2 = sock + "b"
-        try:
-            subprocess.run([exe, "-L", sock2, "-f", "/dev/null", "new-session", "-d", "-s", "keep", "sleep 60", ";",
-                            "source-file", str(ours)],
-                           capture_output=True, env=env)
-            out = subprocess.run([exe, "-L", sock2, "list-keys", "-T", "root"], capture_output=True, text=True,
-                                 encoding="utf-8", env=env).stdout
-            self.assertEqual([ln for ln in out.splitlines() if ln.split()[3:4] == ["C-\\\\"]], first)
-        finally:
-            subprocess.run([exe, "-L", sock2, "kill-server"], capture_output=True, env=env)
+        self.assertEqual(run("source-file", str(ref)).returncode, 0)
+        first = cstar()
+        self.assertEqual(len(first), 1, first)
+        r = run("source-file", str(ours))
+        self.assertEqual((r.returncode, r.stderr.strip()), (0, ""), r.stderr)
+        self.assertEqual(cstar(), first)  # re-sourcing ours over theirs changes nothing
+        sock2 = start_tmux_server(self, exe, "keys", env)  # a second, clean server: ours alone
+        r = subprocess.run([exe, "-L", sock2, "source-file", str(ours)], capture_output=True, text=True,
+                           encoding="utf-8", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = subprocess.run([exe, "-L", sock2, "list-keys", "-T", "root"], capture_output=True, text=True,
+                             encoding="utf-8", env=env).stdout
+        self.assertEqual([ln for ln in out.splitlines() if ln.split()[3:4] == ["C-\\\\"]], first)
 
     def test_register_dash_sets_the_option_on_its_own_server_only(self):
         cfg, path = self.chain()
@@ -2653,30 +2690,28 @@ class KeysAndRegistry(Base):
         cfg, path = self.chain()
         sock = self.tmp / "p.sock"
         env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        start_tmux_server(self, exe, None, env, flag="-S", sock=sock)
         run = lambda *a: subprocess.run([exe, "-S", str(sock), "-f", "/dev/null", *a],  # noqa: E731
                                         capture_output=True, text=True, encoding="utf-8", env=env)
-        try:
-            self.assertEqual(run("new-session", "-d", "-s", "s", "sleep 60").returncode, 0)
-            p1 = run("display", "-p", "-t", "=s:", "#{pane_id}").stdout.strip()
-            p2 = run("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", "=s:", "sleep 60").stdout.strip()
-            cfg2, path2 = self.chain(waves=["W1"])
-            path2 = path2.with_name("chain2.json")
-            path2.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-            with mock.patch.object(wab, "sh", REAL_SH):
-                self.assertTrue(wab.register_dash(cfg, path, "s", str(sock), p1))
-                self.assertTrue(wab.register_dash(cfg, path2, "s", str(sock), p2))
-                val = lambda pane: run("display", "-p", "-t", pane, "#{@wab_open}").stdout.strip()  # noqa: E731
-                self.assertTrue(val(p1).endswith(str(path.resolve())), val(p1))
-                self.assertTrue(val(p2).endswith(str(path2.resolve())), val(p2))
-                # the binding's if-shell -F format sees the pane option of the active pane
-                run("select-pane", "-t", p2)
-                run("if-shell", "-F", "-t", p2, "#{@wab_open}", "set -g @r yes", "set -g @r no")
-                self.assertEqual(run("show-options", "-gv", "@r").stdout.strip(), "yes")
-                wab.unregister_dash("s", str(sock), p1)
-                self.assertEqual(val(p1), "")
-                self.assertTrue(val(p2).endswith(str(path2.resolve())), val(p2))
-        finally:
-            run("kill-server")
+        self.assertEqual(run("new-session", "-d", "-s", "s", "sleep 600").returncode, 0)
+        p1 = run("display", "-p", "-t", "=s:", "#{pane_id}").stdout.strip()
+        p2 = run("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", "=s:", "sleep 600").stdout.strip()
+        cfg2, path2 = self.chain(waves=["W1"])
+        path2 = path2.with_name("chain2.json")
+        path2.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        with mock.patch.object(wab, "sh", REAL_SH):
+            self.assertTrue(wab.register_dash(cfg, path, "s", str(sock), p1))
+            self.assertTrue(wab.register_dash(cfg, path2, "s", str(sock), p2))
+            val = lambda pane: run("display", "-p", "-t", pane, "#{@wab_open}").stdout.strip()  # noqa: E731
+            self.assertTrue(val(p1).endswith(str(path.resolve())), val(p1))
+            self.assertTrue(val(p2).endswith(str(path2.resolve())), val(p2))
+            # the binding's if-shell -F format sees the pane option of the active pane
+            run("select-pane", "-t", p2)
+            run("if-shell", "-F", "-t", p2, "#{@wab_open}", "set -g @r yes", "set -g @r no")
+            self.assertEqual(run("show-options", "-gv", "@r").stdout.strip(), "yes")
+            wab.unregister_dash("s", str(sock), p1)
+            self.assertEqual(val(p1), "")
+            self.assertTrue(val(p2).endswith(str(path2.resolve())), val(p2))
 
     def test_unsafe_chain_path_is_refused_without_touching_tmux(self):
         cfg, path = self.chain()
@@ -2735,20 +2770,18 @@ class KeysAndRegistry(Base):
         cfg, path = self.chain()
         sock = self.tmp / "waves.sock"
         env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        start_tmux_server(self, exe, None, env, flag="-S", sock=sock)
         run = lambda *a: subprocess.run([exe, "-S", str(sock), "-f", "/dev/null", *a],  # noqa: E731
                                         capture_output=True, text=True, encoding="utf-8", env=env)
-        try:
-            self.assertEqual(run("new-session", "-d", "-s", "dash", "sleep 60").returncode, 0)
-            with mock.patch.object(wab, "sh", REAL_SH):
-                self.assertTrue(wab.register_dash(cfg, path, "dash", str(sock)))
-                got = run("show-options", "-v", "-t", "=dash:", "@wab_open").stdout.strip()
-                self.assertEqual(got, f"{WAVES / 'wab-open'} {path.resolve()}")
-                keys = run("list-keys", "-T", "root").stdout
-                self.assertEqual(len([ln for ln in keys.splitlines() if ln.split()[3:4] == ["C-\\\\"]]), 1)
-                wab.unregister_dash("dash", str(sock))
-                self.assertEqual(run("show-options", "-v", "-t", "=dash:", "@wab_open").stdout.strip(), "")
-        finally:
-            run("kill-server")
+        self.assertEqual(run("new-session", "-d", "-s", "dash", "sleep 600").returncode, 0)
+        with mock.patch.object(wab, "sh", REAL_SH):
+            self.assertTrue(wab.register_dash(cfg, path, "dash", str(sock)))
+            got = run("show-options", "-v", "-t", "=dash:", "@wab_open").stdout.strip()
+            self.assertEqual(got, f"{WAVES / 'wab-open'} {path.resolve()}")
+            keys = run("list-keys", "-T", "root").stdout
+            self.assertEqual(len([ln for ln in keys.splitlines() if ln.split()[3:4] == ["C-\\\\"]]), 1)
+            wab.unregister_dash("dash", str(sock))
+            self.assertEqual(run("show-options", "-v", "-t", "=dash:", "@wab_open").stdout.strip(), "")
 
     def test_dash_cleans_up_on_sigterm_and_sighup_and_ignores_sigquit(self):
         src = (WAVES / "dash.py").read_text(encoding="utf-8")
@@ -15626,10 +15659,8 @@ class ChainCleanup(Base):
         if ver is None or ver < (3, 2):
             self.skipTest(f"tmux {out.strip()!r} is older than 3.2")
         self.exe = exe
-        self.sock = fresh_tmux_socket("cc")
         self.env = {k: v for k, v in os.environ.items() if k != "TMUX"}
-        self.addCleanup(lambda sock=self.sock: subprocess.run([exe, "-L", sock, "kill-server"],
-                                                              capture_output=True, env=self.env))
+        self.sock = start_tmux_server(self, exe, "cc", self.env)
         self.w = load_orig("wab_cleanup")
         self.w.TMUX_SOCKET = self.sock
         self.w._send_telegram = lambda cfg, text: None  # nothing leaves the machine
@@ -15641,28 +15672,27 @@ class ChainCleanup(Base):
 
     def use_fresh_server(self):
         """Switch to a new, empty server (instead of `kill-server` and reusing the name: see fresh_tmux_socket)."""
-        self.sock = self.w.TMUX_SOCKET = fresh_tmux_socket("cc")
-        self.addCleanup(lambda sock=self.sock: subprocess.run([self.exe, "-L", sock, "kill-server"],
-                                                              capture_output=True, env=self.env))
+        self.sock = self.w.TMUX_SOCKET = start_tmux_server(self, self.exe, "cc", self.env)
 
     def session(self, name, tag=None, run_dir=None, cmd="sleep 600", env=None):
         envs = [a for k, v in (env or {}).items() for a in ("-e", f"{k}={v}")]
         r = self.tm("new-session", "-d", "-s", name, "-x", "80", "-y", "24", *envs, cmd)
         self.assertEqual(r.returncode, 0, r.stderr)
-        if tag:
-            self.tm("set-option", "-t", f"={name}:", "@wab_run", tag)
-            self.tm("set-option", "-p", "-t", f"={name}:", "@wab_run", tag)
-        if run_dir:
-            self.tm("set-option", "-t", f"={name}:", "@wab_run_dir", str(run_dir))
-            self.tm("set-option", "-p", "-t", f"={name}:", "@wab_run_dir", str(run_dir))
+        marks = [(opt, value) for opt, value in (("@wab_run", tag), ("@wab_run_dir", run_dir)) if value]
+        for opt, value in marks:
+            for level in ([], ["-p"]):
+                r = self.tm("set-option", *level, "-t", f"={name}:", opt, str(value))
+                self.assertEqual(r.returncode, 0, r.stderr)
 
     def alive_names(self):
+        """Sessions of the test; the keeper of start_tmux_server is not one of them."""
         r = self.tm("list-sessions", "-F", "#{session_name}")
-        return set(r.stdout.split()) if r.returncode == 0 else set()
+        return set(r.stdout.split()) - {TMUX_KEEPER} if r.returncode == 0 else set()
 
     def pane_ids(self):
-        r = self.tm("list-panes", "-a", "-F", "#{pane_id}")
-        return set(r.stdout.split()) if r.returncode == 0 else set()
+        r = self.tm("list-panes", "-a", "-F", "#{pane_id}\t#{session_name}")
+        return ({p for p, _, sess in (ln.partition("\t") for ln in r.stdout.splitlines()) if sess != TMUX_KEEPER}
+                if r.returncode == 0 else set())
 
     def cfg(self, **over):
         cfg, path = self.chain(**over)
@@ -15774,8 +15804,8 @@ class ChainCleanup(Base):
         self.assertIn("dispatcher of this chain is alive", str(ctx.exception))
         self.assertEqual(self.alive_names(), {"wv-w1"})
         first = self.w.cleanup_cmd(cfg)
-        self.assertEqual(first["sessions"], ["wv-w1"])
         events = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+        self.assertEqual(first["sessions"], ["wv-w1"], events)
         again = self.w.cleanup_cmd(cfg)  # a repeat: no error, nothing closed, no new event
         self.assertEqual((again["sessions"], again["panes"], again["warnings"]), ([], [], []))
         self.assertEqual((cfg["run_dir"] / "events.log").read_text(encoding="utf-8"), events)
@@ -15951,9 +15981,9 @@ class ChainCleanup(Base):
         self.w.clear_input = lambda name: seen.append(name)
         st = self.get_state(cfg)
         self.assertTrue(self.w.close_window(cfg, st, st["waves"]["W2"]))
-        time.sleep(0.3)
         self.assertEqual(seen, [ours])
-        self.assertIn("/exit", self.screen(ours))
+        # wait for the echo itself, not a fixed 0.3 s (a loaded runner renders the pane later: W4 #113 flake)
+        wait_for(lambda: "/exit" in self.screen(ours), "/exit in our pane")
         self.assertNotIn("/exit", self.screen(foreign))
 
     def test_a_session_marked_by_another_run_gets_no_exit_and_the_intent_is_dropped(self):
@@ -20793,6 +20823,14 @@ class MetricsScript(unittest.TestCase):
                     build(root, names_, extra, with_run)
                     data = self._assert_no_data(root, "W1", "")
                     self.assertNotEqual(data["total"]["fix_cycles"], 4, data)
+                    # отказ по дублю — волна «нет данных» и по прогонам: один файл не даёт двух прогонов в итоге.
+                    # С `run` второй путь, найденный поиском по run.index, не подставляется (файл называет себя
+                    # прогоном 1): прогон 2 — потерянный manifest, а он по runs.json считается (как в
+                    # test_a_broken_or_missing_file_is_named_not_skipped); дубль без `run` и вне manifest*.json — нет
+                    dup = any("тот же файл" in p for p in data["waves"][0]["problems"])
+                    self.assertTrue(dup or with_run, data)
+                    expected = (None, 0) if dup else (2, 2)
+                    self.assertEqual((data["waves"][0]["runs"], data["total"]["runs"]), expected, data)
         # контроль: два РАЗНЫХ файла — два прогона, код 0
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -20814,6 +20852,10 @@ class MetricsScript(unittest.TestCase):
             (root / "W2").symlink_to("W1")
             data = self._assert_no_data(root, "W2", "W1")
             self.assertEqual(data["total"]["fix_cycles"], 3, data)
+            # тот же принцип, что у волны-симлинка наружу: W2 — «нет данных» по прогонам, итог — один прогон
+            by = {w["wave"]: w for w in data["waves"]}
+            self.assertEqual((by["W1"]["runs"], by["W2"]["runs"]), (1, None), data)
+            self.assertEqual(data["total"]["runs"], 1, data)
 
     def test_a_wave_dir_leading_out_of_the_run_dir_is_not_counted(self):
         """W4 #113 ревью P3: `<run_dir>/W1 -> ../other-chain/W1` — волна чужой цепочки не засчитывается («нет данных»,
@@ -20853,6 +20895,153 @@ class MetricsScript(unittest.TestCase):
             self.assertIsNone(w1["blocked_cap"], w1)
             self.assertTrue(any("events.log" in p for p in w1["problems"]), w1)
 
+
+    def test_without_runs_json_a_second_run_manifest_is_refused(self):
+        """W4 #113 ревью P3: без runs.json засчитывается только manifest.json; другой файл волны, сам называющий себя
+        прогоном (`run.index`), не выпадает молча — «нет данных», код 1. Один manifest с run.index 1 без runs.json и
+        симлинк на него внутри волны (тот же файл) — законно, код 0."""
+        def wave(root, extra):
+            sa = root / "W1" / "superarmanda"
+            sa.mkdir(parents=True)
+            (root / "events.log").write_text("", encoding="utf-8")
+            (sa / "manifest.json").write_text(json.dumps(
+                {"version": 2, "run": {"index": 1}, "tasks": {"t": {"fix_cycles": 2}}}), encoding="utf-8")
+            extra(sa)
+
+        second = lambda index: lambda sa: (sa / "manifest-run9.json").write_text(json.dumps(  # noqa: E731
+            {"version": 2, "run": {"index": index}, "tasks": {"t": {"fix_cycles": 3}}}), encoding="utf-8")
+        for name, extra in {"another run": second(2), "the same run number": second(1)}.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                wave(Path(tmp), extra)
+                self._assert_no_data(Path(tmp), "W1", "manifest-run9.json")
+        # manifest.json старого формата (без run) рядом с файлом прогона — тот же отказ
+        def old_format_beside(sa):
+            (sa / "manifest-run1.json").write_text((sa / "manifest.json").read_text(encoding="utf-8"), encoding="utf-8")
+            (sa / "manifest.json").write_text(json.dumps({"version": 1, "tasks": {}}), encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wave(Path(tmp), old_format_beside)
+            self._assert_no_data(Path(tmp), "W1", "manifest-run1.json")
+        for name, extra in {"one manifest": lambda sa: None,
+                            "a symlink to it": lambda sa: (sa / "manifest-run1.json").symlink_to("manifest.json")}.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                wave(Path(tmp), extra)
+                r = self.cli(Path(tmp))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("| W1 | 1 | 2 | 0 |", r.stdout)
+
+    def test_a_run_manifest_missing_from_runs_json_is_refused(self):
+        """Тот же класс с runs.json: state.py пишет runs.json ДО manifest, поэтому файл волны с `run.index`, которого
+        нет в runs.json, — испорченный ввод, а не прогон, который можно молча не засчитать."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sa = root / "W1" / "superarmanda"
+            sa.mkdir(parents=True)
+            (root / "events.log").write_text("", encoding="utf-8")
+            for i in (1, 2):
+                (sa / f"manifest-run{i}.json").write_text(json.dumps(
+                    {"version": 2, "run": {"index": i}, "tasks": {"t": {"fix_cycles": i}}}), encoding="utf-8")
+            (root / "W1" / "runs.json").write_text(json.dumps({"version": 1, "wave": "W1", "runs": [
+                {"index": 1, "manifest": "superarmanda/manifest-run1.json"}]}), encoding="utf-8")
+            self._assert_no_data(root, "W1", "manifest-run2.json")
+            # контроль: прогон 2 записан в runs.json — оба засчитаны
+            (root / "W1" / "runs.json").write_text(json.dumps({"version": 1, "wave": "W1", "runs": [
+                {"index": i, "manifest": f"superarmanda/manifest-run{i}.json"} for i in (1, 2)]}), encoding="utf-8")
+            r = self.cli(root)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("| W1 | 2 | 3 | 0 |", r.stdout)
+
+    def test_a_wave_entry_that_is_not_a_readable_dir_is_named_not_dropped(self):
+        """W4 #113 ревью P3: висячий симлинк `W*` (внутрь и наружу каталога прогона) и `W*`-файл не исчезают из
+        таблицы молча — волна в таблице с «нет данных», код 1."""
+        def run(tmp, make):
+            root = Path(tmp) / "run"
+            (root / "W1" / "superarmanda").mkdir(parents=True)
+            (root / "W1" / "superarmanda" / "manifest.json").write_text(
+                json.dumps({"version": 1, "tasks": {"t": {"fix_cycles": 1}}}), encoding="utf-8")
+            (root / "events.log").write_text("", encoding="utf-8")
+            make(root / "W2")
+            return root
+
+        cases = {
+            "a dangling symlink inside": lambda w: w.symlink_to("archive/W2"),
+            "a dangling symlink outside": lambda w: w.symlink_to("../elsewhere/W2"),
+            "a dangling absolute symlink outside": lambda w: w.symlink_to("/nonexistent-metrics-test/W2"),
+            "a symlink loop": lambda w: w.symlink_to("W2"),
+            "a regular file": lambda w: w.write_text("", encoding="utf-8"),
+        }
+        for name, make in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                root = run(tmp, make)
+                r = self.cli(root, "--json")
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                data = json.loads(r.stdout)
+                by = {w["wave"]: w for w in data["waves"]}
+                self.assertIn("W2", by, data)
+                self.assertEqual((by["W2"]["runs"], by["W2"]["fix_cycles"]), (None, None), data)
+                self.assertTrue(by["W2"]["problems"], data)
+                self.assertEqual((by["W1"]["runs"], by["W1"]["fix_cycles"], by["W1"]["problems"]), (1, 1, []), data)
+                self.assertEqual(data["total"]["runs"], 1, data)
+
+    def test_legacy_wave_ignores_a_stray_manifest_that_claims_no_run(self):
+        """Codex P2 на 01de39b: без runs.json засчитывается manifest.json, как в 1.5.0; посторонний manifest*.json,
+        который не читается, не разбирается, чужой волны или не заявляет `run`, — не отказ (код 0). Отказ — только
+        если другой физический файл валидно заявляет `run`."""
+        def legacy(root, stray):
+            sa = root / "W1" / "superarmanda"
+            sa.mkdir(parents=True)
+            (root / "events.log").write_text("", encoding="utf-8")
+            (sa / "manifest.json").write_text(json.dumps({"version": 1, "tasks": {"t": {"fix_cycles": 2}}}),
+                                              encoding="utf-8")
+            stray(sa / "manifest-old.json")
+
+        strays = {
+            "broken JSON": lambda f: f.write_text("{", encoding="utf-8"),
+            "not a manifest": lambda f: f.write_text("[]", encoding="utf-8"),
+            "unsupported version": lambda f: f.write_text(json.dumps({"version": 9}), encoding="utf-8"),
+            "another wave": lambda f: f.write_text(json.dumps({"version": 2, "wave": {"id": "W7"}, "run": {"index": 1},
+                                                               "tasks": {}}), encoding="utf-8"),
+            "old format without run": lambda f: f.write_text(json.dumps({"version": 1, "tasks": {}}), encoding="utf-8"),
+            "a dangling symlink": lambda f: f.symlink_to("nowhere.json"),
+            "a FIFO": lambda f: os.mkfifo(f),
+            "a broken run": lambda f: f.write_text(json.dumps({"version": 2, "run": {"index": 0}, "tasks": {}}),
+                                                   encoding="utf-8"),
+        }
+        for name, stray in strays.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                legacy(Path(tmp), stray)
+                r = self.cli(Path(tmp))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("| W1 | 1 | 2 | 0 |", r.stdout)
+        with tempfile.TemporaryDirectory() as tmp:  # a valid claim of a run by another file — refused
+            legacy(Path(tmp), lambda f: f.with_name("manifest-run1.json").write_text(json.dumps(
+                {"version": 2, "run": {"index": 1}, "tasks": {"t": {"fix_cycles": 5}}}), encoding="utf-8"))
+            self._assert_no_data(Path(tmp), "W1", "manifest-run1.json")
+
+    def test_the_wave_root_is_resolved_once(self):
+        """Codex P2 на 01de39b: `W1` — симлинк внутрь прогона; его подменяют на цель вне прогона ПОСЛЕ проверки
+        границы и до чтения manifest. Корень волны разрешается один раз: читается то, что проверено, файлы чужой
+        цепочки не засчитываются."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run, other = Path(tmp) / "run", Path(tmp) / "other-chain"
+            for root, cycles in ((run / "archive", 1), (other, 9)):
+                (root / "W1" / "superarmanda").mkdir(parents=True)
+                (root / "W1" / "superarmanda" / "manifest.json").write_text(json.dumps(
+                    {"version": 2, "wave": {"id": "W1"}, "tasks": {"t": {"fix_cycles": cycles}}}), encoding="utf-8")
+            (run / "events.log").write_text("", encoding="utf-8")
+            (run / "W1").symlink_to("archive/W1")
+            real = self.metrics._manifest_paths
+
+            def swapped(*args, **kw):  # the attacker's move between the boundary check and the reads
+                (run / "W1").unlink()
+                (run / "W1").symlink_to(other / "W1")
+                return real(*args, **kw)
+            with mock.patch.object(self.metrics, "_manifest_paths", swapped):
+                result = self.metrics.measure(run)
+            w1 = result["waves"][0]
+            self.assertNotEqual(w1["fix_cycles"], 9, result)
+            self.assertEqual((w1["runs"], w1["fix_cycles"], w1["problems"]), (1, 1, []), result)
 
 class Release130(unittest.TestCase):
     """The release 1.3.0 (W8): version, CHANGELOG, the measuring table, the rows of «Что реализовано»."""

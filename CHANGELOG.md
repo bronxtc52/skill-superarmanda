@@ -51,6 +51,24 @@
   `test_one_physical_file_is_never_two_runs`, `test_one_physical_file_is_never_runs_of_two_waves`). Граница чтения
   одна — каталог прогона: волна-симлинк наружу (`W1 -> ../other-chain/W1`) не засчитывается, симлинк волны внутри
   прогона допустим (тест `test_a_wave_dir_leading_out_of_the_run_dir_is_not_counted`).
+- `metrics.py` (#113 W4, ревью): испорченный ввод не пропускается молча и не засчитывается. Волна с дублем
+  физического manifest — «нет данных» и в столбце «прогонов», как волна-симлинк наружу: один файл не даёт двух прогонов
+  ни в волне, ни в итоге (прогон из `runs.json` с потерянным manifest по-прежнему считается). Без `runs.json`
+  засчитывается только `manifest.json`, а другой физический файл волны, валидно называющий себя прогоном
+  (`run.index`), — отказ (один manifest с `run.index` 1 без `runs.json` законен); посторонний `manifest*.json`
+  (битый, чужой волны, без `run`) легаси-волну 1.5.0 по-прежнему не ломает — поиск по номеру идёт только при
+  `runs.json`; с `runs.json` — отказ, если `run.index` файла в нём нет (state.py пишет `runs.json` до manifest).
+  Висячий симлинк `W*` (внутрь и наружу), петля и `W*`-файл остаются в таблице строкой «нет данных», код 1, а не
+  исчезают. Корень волны разрешается один раз: подмена симлинка `W*` после проверки границы не уводит чтение в
+  чужую цепочку (тесты `test_without_runs_json_a_second_run_manifest_is_refused`,
+  `test_a_run_manifest_missing_from_runs_json_is_refused`, `test_a_wave_entry_that_is_not_a_readable_dir_is_named_not_dropped`,
+  `test_legacy_wave_ignores_a_stray_manifest_that_claims_no_run`, `test_the_wave_root_is_resolved_once`).
+- Тесты с настоящим tmux (`ExactTargets`, `KeysAndRegistry`, `ChainCleanup`) поднимают сервер одним помощником
+  `start_tmux_server`: свежий сокет, сессия-хранитель (сервер не выходит, когда тест закрывает последнюю сессию —
+  иначе `has-session` сразу после закрытия ловит выход сервера, «server exited unexpectedly», и закрытие не
+  подтверждается), ожидание готовности, остановка с ожиданием. Ожидание — по условию (`wait_for`), а не
+  фиксированным `sleep`. Флейки под нагрузкой `test_cleanup_refused_with_a_live_dispatcher_or_without_chain_result`
+  и `test_close_window_types_exit_only_into_our_pane` закрыты.
 - `scripts/run-tests.sh`: наборы идут параллельно, по числу CPU (`RUN_TESTS_JOBS` переопределяет, `1` — прежний
   последовательный цикл, неверное значение или больше 999999 — код 2); долгие наборы стартуют первыми, вывод каждого
   печатается целым блоком в исходном порядке. Совместим с bash 3.2. Порядок наборов — байтовый на любой машине (glob
