@@ -10,7 +10,7 @@
 Инвариант идентичности: каждый файл, который читается (`runs.json` волны, каждый `superarmanda/manifest*.json` —
 и засчитанный, и просмотренный при поиске по `run.index`, — `events.log`), открывается ОДНОЙ функцией
 `_read_checked` (JSON — через `_read_json` → `_runs_of` для runs.json и `_manifest_checked` для manifest в
-`_by_index`, `_legacy_claims` и `_fix_cycles`; `events.log` — прямо из `measure`) и читается из того же
+`_homes`, `_by_index`, `_legacy_claims` и `_fix_cycles`; `events.log` — прямо из `measure`) и читается из того же
 дескриптора, который проверен:
   * запись каталога есть (`lstat`: битый симлинк — присутствующий, но нечитаемый файл, а не «нет файла», и
     fallback на manifest.json при нём не срабатывает); путь разрешается один раз, результат лежит в каталоге
@@ -26,16 +26,35 @@
   * `run.index` однозначен: два РАЗНЫХ файла (`st_dev`, `st_ino`) волны с одним номером — отказ, а не первый по
     имени; два пути (симлинки внутри волны) на один файл — один прогон. Файл, не прошедший проверку при поиске по
     номеру (чужая волна, испорченный, FIFO), — отказ с его причиной, а не пропуск и не «дубль».
-  * один физический файл (`st_dev`, `st_ino` открытого дескриптора) — один прогон во всём каталоге прогона: тот же
-    путь дважды в runs.json, другая запись пути, симлинк, hardlink — повтор не засчитывается (с `run` и без, одна
-    причина «тот же файл»), а не удваивает фикс-круги; один каталог волны (`st_dev`, `st_ino` разрешённого корня) —
-    одна волна: волна-симлинк на другую волну прогона второй раз не читается ни в одной ветке (runs.json, легаси с
-    `wave` и без) — «нет данных» с причиной «тот же, что у Wn»;
+  * один физический файл и один каталог волны — см. инвариант прогонов I1–I4 ниже;
   * граница чтения одна — каталог прогона: волна (`W*`, в том числе симлинк) засчитывается, только если после
     разрешения симлинков лежит внутри него; симлинк волны внутри прогона допустим, наружу (чужая цепочка) — отказ.
-    Корень волны разрешается ОДИН раз (`measure`), и всё дальше читается от него: подмена симлинка волны после
+    Корень волны разрешается ОДИН раз (`_wave_roots`), и всё дальше читается от него: подмена симлинка волны после
     проверки границы чтение не уводит; имя волны для сверки `wave`/`runs.json` — имя записи `W*`.
 Нарушение — строка в `problems` с причиной, волна «нет данных», код 1, без traceback.
+
+Инвариант прогонов (W4 #113, класс целиком; проверяется перебором в MetricsScript):
+  I1. Каждый физический manifest (`st_dev`, `st_ino`) даёт не больше одного прогона во всём каталоге прогона, и
+      только если прошёл проверку (`_read_checked` + `_manifest_fields` + номер `run` + tasks/fix_cycles в
+      `_fix_cycles`). Отвергнутый файл не даёт прогона ни в одной ветке (runs.json / легаси с `wave` / легаси без
+      `wave`): волна с ним — «нет данных» и по прогонам, а не «прогонов 1, фикс-круги нет данных». Единственная
+      оговорка — прогон из runs.json, у которого файла НЕТ (`manifest прогона N не найден`): прогон был, его
+      записал state.py до manifest, считается в runs, фикс-круги «нет данных». I1 это не нарушает: у потерянного
+      прогона нет inode, повторить его нечем. Файл-самозванец (есть, но называет себя другим прогоном, чужой волны,
+      лежит в другой волне) не потерян — он отвергнут, и прогона не даёт.
+  I2. total.runs = сумма runs волн (волна «нет данных» не входит), и total.runs ≤ число различных физических
+      проверенных manifest + число потерянных; ни один inode не участвует в runs двух волн: у каждого физического
+      manifest один дом (`_homes`) — первая по номеру волна, где он лежит внутри корня и прошёл проверку (иначе —
+      первая, где лежит); любое его появление в другой волне — отказ до чтения (`_foreign`), внутри волны —
+      `counted` (ключ дескриптора регистрируется ДО сверки полей).
+  I3. Корень волны: каталог-не-симлинк имеет приоритет перед симлинком на него, независимо от порядка номеров
+      (`_wave_roots`): W1 -> W2 засчитывает W2, а W1 — «тот же, что у W2», её файлы не читаются; из нескольких
+      симлинков на один каталог — первый по номеру. Так же для файла: симлинк наружу волны в manifest другой волны
+      не дом, засчитывается настоящий файл.
+  I4. Одна причина на один факт: повтор физического файла (тот же путь, другая запись пути, симлинк файла или
+      каталога `superarmanda`, hardlink, `cp -al`, путь runs.json в другую волну) — всегда «тот же файл, что у …»
+      в любой ветке, а не «вне каталога волны», «принадлежит волне», «заявлен двумя файлами» или «не найден»;
+      повтор каталога волны — «тот же, что у Wn».
 
 <run_dir> — каталог прогона цепочки (`runs/<цепочка>/<run_id>`). Читается только он, ничего не пишется:
   * `W*/runs.json` — прогоны волны (state.py `init --from-plan`); у каждого свой manifest. runs.json проверяется
@@ -54,7 +73,8 @@
   * `events.log` — развилки blocked_cap.
 
 По волне:
-  * прогонов  — число прогонов (manifest); волна с дублем физического manifest — «нет данных»;
+  * прогонов  — число прогонов (manifest); волна с отвергнутым или повторённым физическим manifest — «нет
+    данных» (I1);
   * фикс-круги — сумма `tasks.<id>.fix_cycles` по всем manifest волны;
   * blocked_cap — число развилок. Одна развилка — один эпизод: непрерывный период, когда текущий статус волны (строки `BLOCKED…`,
     `DONE`/`RUNNING`, `phase=… status=`, ответ политики) — одна и та же строка `BLOCKED: [class=blocked_cap …`;
@@ -125,6 +145,22 @@ def _key(path):
 def _same_file(name, whose):
     """Единая причина «один физический файл у двух прогонов» — и в `_manifest_paths`, и в `_fix_cycles`."""
     return f"{name}: тот же файл, что у {whose}; один файл не может быть двумя прогонами"
+
+
+def _whose(home):
+    """Подпись владельца физического файла для причины «тот же файл»: (волна, номер прогона или None)."""
+    wave, run = home
+    return f"прогона {run} волны {wave}" if run is not None else f"волны {wave}"
+
+
+def _foreign(path, wave, homes):
+    """Причина «тот же файл», если физический файл по пути (с переходом по симлинкам: только stat, не чтение) —
+    manifest ДРУГОЙ волны прогона (I1/I4): его дом (`_homes`) — другая волна. Иначе None. Проверяется ДО чтения и
+    до сверки полей, поэтому у повтора одна причина в любой ветке, а не «вне каталога волны»/«принадлежит волне»."""
+    home = homes.get(_key(path)) if homes else None
+    if home is not None and home[0] != wave:
+        return _same_file(path.name, _whose(home))
+    return None
 
 
 def _is_kind(path, kind=stat.S_ISREG):
@@ -276,35 +312,42 @@ def _runs_of(wave_dir, runs_file, wave):
     return data["runs"], None
 
 
-def _legacy_claims(wave_dir, wave, fallback):
-    """Без runs.json (волна 1.5.0): имена других физических файлов `manifest*.json`, ВАЛИДНО заявляющих прогон
-    (`run.index` — положительное целое). Файл, который не читается, не разбирается, чужой волны или без `run`, —
-    посторонний и, как в 1.5.0, не мешает засчитать manifest.json; читается он той же `_read_checked`."""
+def _legacy_claims(wave_dir, wave, fallback, homes):
+    """Без runs.json (волна 1.5.0): (имена других физических файлов `manifest*.json`, ВАЛИДНО заявляющих прогон
+    (`run.index` — положительное целое), причина «тот же файл» или None). Файл, который не читается, не
+    разбирается, чужой волны или без `run`, — посторонний и, как в 1.5.0, не мешает засчитать manifest.json;
+    читается он той же `_read_checked`. Файл, физически являющийся manifest другой волны прогона (`_foreign`), —
+    не посторонний, а повтор: отказ «тот же файл»."""
     _, own, _ = _read_checked(fallback, wave_dir)  # нечитаемый manifest.json назовёт _fix_cycles
     out = []
     for path in sorted((wave_dir / "superarmanda").glob("manifest*.json")):
+        if foreign := _foreign(path, wave, homes):
+            return out, foreign
         data, key, why = _manifest_checked(path, wave_dir, wave)
         run = data.get("run") if not why else None
         if isinstance(run, dict) and _is_index(run.get("index")) and key != own:
             out.append(path.name)
-    return out
+    return out, None
 
 
-def _manifest_paths(wave_dir, problems, wave):
+def _manifest_paths(wave_dir, problems, wave, homes=None):
     """Файлы manifest волны: по runs.json, а без него — manifest.json. [] с причиной в `problems`, если не из чего.
-    `wave_dir` — корень волны, разрешённый ОДИН раз в `measure`; `wave` — имя записи волны."""
+    `wave_dir` — корень волны, разрешённый ОДИН раз в `measure`; `wave` — имя записи волны; `homes` — дом каждого
+    физического manifest прогона (`_homes`): файл другой волны — отказ «тот же файл» в любой ветке."""
     runs_file = wave_dir / "runs.json"
     if not os.path.lexists(runs_file):  # битый симлинк runs.json — не «нет файла»: идёт через отказ runs.json
         fallback = wave_dir / "superarmanda" / "manifest.json"
         if not os.path.lexists(fallback):
             return _fail(problems, "нет ни runs.json, ни superarmanda/manifest.json")
         # засчитывается один manifest.json; другой файл волны, валидно называющий себя прогоном, молча не выпадает
-        other = _legacy_claims(wave_dir, wave, fallback)
+        other, foreign = _legacy_claims(wave_dir, wave, fallback, homes)
+        if foreign:
+            return _fail(problems, foreign)
         if other:
             return _fail(problems, "без runs.json засчитывается только manifest.json, а прогоном (run.index) "
                                    f"называет себя и {', '.join(other)}")
         return [(fallback, None)]  # идентичность проверит _fix_cycles
-    by_index, keys, why = _by_index(wave_dir, wave)
+    by_index, keys, why = _by_index(wave_dir, wave, homes)
     if why:
         return _fail(problems, why)
     runs, why = _runs_of(wave_dir, runs_file, wave)
@@ -330,6 +373,9 @@ def _manifest_paths(wave_dir, problems, wave):
             path = Path(raw)
             if not path.is_absolute():
                 path = wave_dir / path
+            if foreign := _foreign(path, wave, homes):
+                # путь runs.json ведёт в manifest другой волны: не «потерян» (файл есть) и не подменяется именем
+                return _fail(problems, foreign)
             if not (_inside(path, wave_dir) and _is_kind(path)):
                 # пути нет или он ведёт вне каталога волны (каталог перенесли/скопировали): то же имя рядом
                 path = wave_dir / "superarmanda" / Path(raw).name
@@ -348,7 +394,7 @@ def _manifest_paths(wave_dir, problems, wave):
     return found
 
 
-def _by_index(wave_dir, wave):
+def _by_index(wave_dir, wave, homes=None):
     """({номер прогона: файл}, {номер и путь: (st_dev, st_ino)}, None) по `run.index` внутри
     `superarmanda/manifest*.json` (файлы переименовывают) или (None, None, причина). Каждый файл проходит ту же проверку идентичности (`_manifest_checked`), что и засчитанный:
     файл вне каталога волны, не обычный файл (FIFO), испорченный или чужой волны — отказ с его причиной, а не
@@ -356,6 +402,8 @@ def _by_index(wave_dir, wave):
     один файл (`st_dev`, `st_ino`) — один прогон."""
     out, keys = {}, {}  # keys: {номер: ключ файла} и {путь: ключ файла} каждого просмотренного manifest
     for path in sorted((wave_dir / "superarmanda").glob("manifest*.json")):
+        if foreign := _foreign(path, wave, homes):
+            return None, None, foreign
         data, key, why = _manifest_checked(path, wave_dir, wave)
         if why:
             return None, None, why
@@ -375,41 +423,45 @@ def _fail(problems, why):
     return []
 
 
-def _fix_cycles(path, problems, wave_dir, wave, index=None, counted=None, dups=None):
-    """Фикс-круги manifest прогона `index` (None — прогон без runs.json): заявленный в файле номер обязан совпасть.
-    `counted` — {(st_dev, st_ino): (волна, номер)} уже засчитанных файлов каталога прогона: один физический файл
-    (тот же путь, другая запись пути, симлинк, hardlink, волна-симлинк на другую волну) — один прогон; повтор —
-    отказ с причиной, а не второе слагаемое, и ключ в `dups` (волна с дублем — «нет данных» и по прогонам).
-    Ключ — от открытого и прочитанного дескриптора (`_read_checked`)."""
+def _fix_cycles(path, problems, wave_dir, wave, index=None, counted=None, homes=None):
+    """(фикс-круги, отвергнут) manifest прогона `index` (None — прогон без runs.json): заявленный в файле номер
+    обязан совпасть. Отвергнутый файл (не прочитан, не прошёл `_manifest_fields`, повтор, испорчены tasks) — не
+    прогон: (None, True), волна «нет данных» и по прогонам. Прогон из runs.json без файла (`path` None) — (None,
+    False): потерянный manifest, прогон был; неверный номер в runs.json — (None, True).
+    `counted` — {(st_dev, st_ino): (волна, номер)} уже прочитанных файлов каталога прогона (ключ — от открытого и
+    прочитанного дескриптора `_read_checked`, регистрируется ДО сверки полей): повтор физического файла (тот же
+    путь, другая запись пути, симлинк, hardlink) — одна причина «тот же файл», а не второе слагаемое. `homes` —
+    дом каждого manifest прогона: файл другой волны — «тот же файл» до чтения (`_foreign`)."""
     if path is None:
-        return None
-    data, key, why = _manifest_checked(path, wave_dir, wave)
+        return None, not _is_index(index)
+    if foreign := _foreign(path, wave, homes):
+        problems.append(foreign)
+        return None, True
+    data, key, why = _read_json(path, wave_dir)
     if not why and counted is not None:
         if key in counted:
-            wave, run = counted[key]
-            whose = f"прогона {run} волны {wave}" if run is not None else f"волны {wave}"
-            problems.append(_same_file(path.name, whose))
-            if dups is not None:
-                dups.append(key)
-            return None
+            problems.append(_same_file(path.name, _whose(counted[key])))
+            return None, True
         counted[key] = (wave, index)
+    if not why:
+        data, why = _manifest_fields(path, wave, data)
     tasks = data.get("tasks") if isinstance(data, dict) else None
     if why or not isinstance(tasks, dict):
         problems.append(why or f"{path.name}: нет tasks")
-        return None
+        return None, True
     if "run" in data:  # без `run` — manifest старого формата; заявленный номер — испорченный или чужой ввод
         declared = data["run"].get("index") if isinstance(data["run"], dict) else None
         if not _is_index(declared) or (index is not None and declared != index):
             problems.append(f"{path.name}: номер прогона в run не {index if index is not None else 'положительное целое'}")
-            return None
+            return None, True
     total = 0
     for name, entry in tasks.items():
         cycles = entry.get("fix_cycles") if isinstance(entry, dict) else None
         if isinstance(cycles, bool) or not isinstance(cycles, int) or not 0 <= cycles <= MAX_FIX_CYCLES:
             problems.append(f"{path.name}: fix_cycles задачи {name} не число от 0 до {MAX_FIX_CYCLES}")
-            return None
+            return None, True
         total += cycles
-    return total
+    return total, False
 
 
 def blocked_cap_by_wave(events):
@@ -444,6 +496,65 @@ def blocked_cap_by_wave(events):
     return counts
 
 
+def _wave_roots(run_dir, waves):
+    """I3: {имя волны: (корень, None)} для засчитываемых волн и {имя: (None, причина)} для остальных. Корень
+    разрешается ОДИН раз. Один каталог волны (`st_dev`, `st_ino` корня) — одна волна: его хозяин — запись-каталог
+    (не симлинк), а при нескольких симлинках — первая по номеру; остальные записи — «тот же, что у Wn», и их
+    файлы не читаются. Порядок номеров не важен: W1 -> W2 засчитывает W2."""
+    out, entries = {}, []
+    for d in waves:
+        try:
+            if not _is_kind(d, stat.S_ISDIR):  # висячий симлинк, петля, файл — запись волны есть, каталога нет
+                out[d.name] = (None, "каталог волны не читается (битый симлинк)" if os.path.islink(d)
+                               else "запись волны — не каталог")
+            elif not _within(root := _real(d), run_dir):
+                # граница одна — каталог прогона: волна-симлинк наружу (чужая цепочка) не читается и не засчитывается
+                out[d.name] = (None, "каталог волны ведёт вне каталога прогона")
+            else:
+                entries.append((os.path.islink(d), len(entries), d.name, root, _key(root)))
+        except OSError as e:
+            out[d.name] = (None, f"каталог волны не читается ({type(e).__name__})")
+    owners = {}
+    for is_link, _, name, root, key in sorted(entries):  # сначала каталоги, потом симлинки; внутри — по номеру
+        if key is not None and key in owners:
+            out[name] = (None, f"каталог волны — тот же, что у {owners[key]}; одна волна не считается дважды")
+            continue
+        if key is not None:
+            owners[key] = name
+        out[name] = (root, None)
+    return {d.name: out[d.name] for d in waves}  # порядок номеров волн — для «первой по номеру» в `_homes`
+
+
+def _homes(roots):
+    """I1/I4: дом каждого физического manifest прогона — {(st_dev, st_ino): (волна, номер прогона или None)}.
+    Кандидаты — `superarmanda/manifest*.json` каждой засчитываемой волны, лежащие внутри её корня (симлинк наружу
+    — не дом). Дом — первая по номеру волна, где файл прошёл `_manifest_checked` (hardlink-копия с чужим `wave` не
+    перебивает настоящую волну); если нигде не прошёл — первая, где он лежит. Любое появление того же файла в
+    другой волне — «тот же файл, что у волны <дом>» (`_foreign`), независимо от ветки и порядка."""
+    seen, order = {}, 0
+    for name, (root, _) in roots.items():  # roots — в порядке номеров волн
+        if root is None:
+            continue
+        try:
+            paths = sorted((root / "superarmanda").glob("manifest*.json"))
+        except OSError:
+            continue
+        for path in paths:
+            key = _key(path)
+            if key is None or not _inside(path, root):
+                continue
+            data, _, why = _manifest_checked(path, root, name)
+            run = data.get("run") if not why else None
+            index = run.get("index") if isinstance(run, dict) and _is_index(run.get("index")) else None
+            seen.setdefault(key, []).append((why is not None, order, name, index))
+            order += 1
+    homes = {}
+    for key, cands in seen.items():
+        _, _, name, index = min(cands)  # прошедший проверку раньше отвергнутого, затем — первый по номеру волны
+        homes[key] = (name, index)
+    return homes
+
+
 def measure(run_dir):
     run_dir = Path(run_dir)
     try:
@@ -452,8 +563,9 @@ def measure(run_dir):
                        key=lambda d: int(WAVE_DIR.match(d.name).group(1))) if _is_kind(run_dir, stat.S_ISDIR) else []
     except OSError:
         waves = []  # каталог прогона не читается — как каталог без волн, код 2
-    counted = {}  # (st_dev, st_ino) засчитанных manifest — по всему каталогу прогона, не по волне
-    roots = {}  # (st_dev, st_ino) уже засчитанных корней волн: один каталог волны — одна волна во всех ветках
+    roots = _wave_roots(run_dir, waves)  # I3: корень каждой волны разрешён ОДИН раз, хозяин каталога — не симлинк
+    homes = _homes(roots)  # I1/I4: дом каждого физического manifest прогона
+    counted = {}  # (st_dev, st_ino) прочитанных manifest — по всему каталогу прогона, не по волне
     raw, _, forks_problem = _read_checked(run_dir / "events.log", run_dir, MAX_LOG_BYTES)  # та же проверка: FIFO не вешает замер
     forks = None
     if not forks_problem:
@@ -463,36 +575,27 @@ def measure(run_dir):
             forks_problem = f"events.log не читается ({type(e).__name__})"
     rows = []
     for d in waves:
-        problems, dups = [], []
+        problems, refused = [], True
+        root, why = roots[d.name]
+        manifests, cycles = [], [None]
         try:
-            if not _is_kind(d, stat.S_ISDIR):  # висячий симлинк, петля, файл — запись волны есть, каталога нет
-                manifests, cycles = [], [None]
-                problems.append("каталог волны не читается (битый симлинк)" if os.path.islink(d)
-                                else "запись волны — не каталог")
-            elif not _within(root := _real(d), run_dir):
-                # граница одна — каталог прогона: волна-симлинк наружу (чужая цепочка) не читается и не засчитывается
-                manifests, cycles = [], [None]
-                problems.append("каталог волны ведёт вне каталога прогона")
-            elif (root_key := _key(root)) in roots:
-                # волна-симлинк на другую волну прогона: тот же каталог второй раз не читается ни в одной ветке
-                # (runs.json / легаси с `wave` / без) — «нет данных» по прогонам и фикс-кругам, итог не удваивается
-                manifests, cycles = [], [None]
-                problems.append(f"каталог волны — тот же, что у {roots[root_key]}; одна волна не считается дважды")
+            if why:
+                problems.append(why)
             else:
-                # корень волны разрешён ОДИН раз: дальше читается от `root`, а не от `d` — подмена симлинка волны
-                # после проверки границы не уводит чтение в чужую цепочку
-                if root_key is not None:
-                    roots[root_key] = d.name
-                manifests = _manifest_paths(root, problems, d.name)
-                cycles = [_fix_cycles(p, problems, root, d.name, i, counted, dups) for p, i in manifests]
+                # дальше читается от `root`, а не от `d`: подмена симлинка волны после проверки границы не уводит
+                # чтение в чужую цепочку
+                manifests = _manifest_paths(root, problems, d.name, homes)
+                results = [_fix_cycles(p, problems, root, d.name, i, counted, homes) for p, i in manifests]
+                cycles = [c for c, _ in results]
+                refused = any(r for _, r in results)
         except OSError as e:  # каталог волны не читается (права): «нет данных», не traceback
-            manifests, cycles = [], [None]
+            manifests, cycles, refused = [], [None], True
             problems.append(f"каталог волны не читается ({type(e).__name__})")
         rows.append({
             "wave": d.name,
-            # прогон с потерянным manifest считается: он был; волна с дублем физического manifest — «нет данных», как
-            # волна-симлинк наружу: один файл не даёт двух прогонов ни в волне, ни в итоге
-            "runs": len(manifests) if manifests and not dups else None,
+            # I1: прогон — только проверенный manifest или потерянный (из runs.json, файла нет); волна с отвергнутым
+            # или повторённым файлом — «нет данных» и по прогонам, как волна-симлинк наружу
+            "runs": len(manifests) if manifests and not refused else None,
             "fix_cycles": sum(cycles) if cycles and None not in cycles else None,
             "blocked_cap": None if forks is None else forks.get(d.name, 0),
             "problems": problems + ([forks_problem] if forks_problem else [])})

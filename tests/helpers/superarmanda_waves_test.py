@@ -21147,6 +21147,226 @@ class MetricsScript(unittest.TestCase):
             self.assertNotEqual(w1["fix_cycles"], 9, result)
             self.assertEqual((w1["runs"], w1["fix_cycles"], w1["problems"]), (1, 1, []), result)
 
+    def _sweep_measure(self, root):
+        result = self.metrics.measure(root)
+        rc = 2 if not result["waves"] else (0 if result["ok"] else 1)
+        return result, rc
+
+    def test_invariant_one_physical_manifest_is_at_most_one_run_exhaustive(self):
+        """Инвариант I1–I4 (W4 #113 прогон 3, решение владельца: класс целиком) — перебор {ветка: runs.json, легаси с
+        `wave`, легаси без `wave`} × {способ дубля} × {с `run` / без} × {в какой волне оригинал}. Свойства, а не
+        точечные числа: I1 — total.runs ≤ 1 (физический manifest один) и фикс-круги не удваиваются; I2 — total.runs =
+        сумма runs волн, ни один inode не участвует в runs двух волн; I3 — настоящий каталог/файл засчитан, а
+        симлинк на него — нет, независимо от порядка номеров; I4 — у повтора одна причина «тот же …», без «заявлен
+        двумя файлами», «вне каталога волны», «принадлежит волне», «не найден». Код 1."""
+        BRANCHES = ("runs.json", "legacy with wave", "legacy without wave")
+        FORBIDDEN = ("заявлен двумя", "вне каталога", "принадлежит волне", "не найден", "называет себя")
+
+        def manifest(branch, wave, with_run, cycles=3):
+            data = {"version": 2, "tasks": {"t": {"fix_cycles": cycles}}}
+            if branch != "legacy without wave":
+                data["wave"] = {"id": wave}
+            if with_run:
+                data["run"] = {"index": 1}
+            return json.dumps(data)
+
+        def runs_json(w, names):
+            (w / "runs.json").write_text(json.dumps({"version": 1, "wave": w.name, "runs": [
+                {"index": i, "manifest": n} for i, n in enumerate(names, 1)]}), encoding="utf-8")
+
+        def wave(root, name, branch, with_run, names=("superarmanda/manifest.json",)):
+            w = root / name
+            (w / "superarmanda").mkdir(parents=True)
+            (w / "superarmanda" / "manifest.json").write_text(manifest(branch, name, with_run), encoding="utf-8")
+            if branch == "runs.json":
+                runs_json(w, list(names))
+            return w
+
+        def counted_inodes(root, w):
+            """(st_dev, st_ino) всех manifest, которые волна могла засчитать: manifest*.json и пути runs.json."""
+            d = root / w
+            paths = list((d / "superarmanda").glob("manifest*.json")) if (d / "superarmanda").is_dir() else []
+            try:
+                for r in json.loads((d / "runs.json").read_text(encoding="utf-8"))["runs"]:
+                    p = Path(r["manifest"])
+                    paths.append(p if p.is_absolute() else d / p)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            keys = set()
+            for p in paths:
+                try:
+                    st = os.stat(p)
+                    keys.add((st.st_dev, st.st_ino))
+                except OSError:
+                    pass
+            return keys
+
+        # --- дубль внутри одной волны (только runs.json: без него два прогона волне не назвать) ---
+        def in_wave(extra, second):
+            def make(root, branch, with_run, orig):
+                runs_json(root / "W1", ["superarmanda/manifest.json", second])
+                extra(root / "W1" / "superarmanda")
+            return make
+        cases = {}
+        for label, extra, second in (
+                ("the same path", lambda sa: None, "superarmanda/manifest.json"),
+                ("another spelling of the path", lambda sa: None, "./superarmanda/../superarmanda/manifest.json"),
+                ("a file symlink in the wave", lambda sa: (sa / "manifest-b.json").symlink_to("manifest.json"),
+                 "superarmanda/manifest-b.json"),
+                ("a hardlink manifest-b", lambda sa: os.link(sa / "manifest.json", sa / "manifest-b.json"),
+                 "superarmanda/manifest-b.json"),
+                ("a hardlink manifest2", lambda sa: os.link(sa / "manifest.json", sa / "manifest2.json"),
+                 "superarmanda/manifest2.json"),
+                ("a hardlink outside the glob", lambda sa: os.link(sa / "manifest.json", sa / "copy.json"),
+                 "superarmanda/copy.json")):
+            for with_run in (False, True):
+                cases[(label, "runs.json", with_run, "W1")] = in_wave(extra, second)
+
+        # --- дубль поперёк волн: оригинал в `orig`, повтор в другой волне ---
+        def file_symlink(root, branch, with_run, orig, other):
+            (root / other / "superarmanda").mkdir(parents=True)
+            (root / other / "superarmanda" / "manifest.json").symlink_to(f"../../{orig}/superarmanda/manifest.json")
+            if branch == "runs.json":
+                runs_json(root / other, ["superarmanda/manifest.json"])
+
+        def dir_symlink(root, branch, with_run, orig, other):
+            (root / other).mkdir()
+            (root / other / "superarmanda").symlink_to(f"../{orig}/superarmanda")
+            if branch == "runs.json":
+                runs_json(root / other, ["superarmanda/manifest.json"])
+
+        def wave_symlink(root, branch, with_run, orig, other):
+            (root / other).symlink_to(orig)
+
+        def hardlink(root, branch, with_run, orig, other):
+            (root / other / "superarmanda").mkdir(parents=True)
+            os.link(root / orig / "superarmanda" / "manifest.json", root / other / "superarmanda" / "manifest.json")
+            if branch == "runs.json":
+                runs_json(root / other, ["superarmanda/manifest.json"])
+
+        def cp_al(root, branch, with_run, orig, other):  # `cp -al`: каталоги новые, файлы — hardlink
+            shutil.copytree(root / orig, root / other, symlinks=True, copy_function=os.link)
+
+        def runs_path(absolute):
+            def make(root, branch, with_run, orig, other):
+                (root / other).mkdir()
+                target = root / orig / "superarmanda" / "manifest.json"
+                runs_json(root / other, [str(target) if absolute else f"../{orig}/superarmanda/manifest.json"])
+            return make
+
+        cross = {"a file symlink": file_symlink, "a superarmanda dir symlink": dir_symlink,
+                 "a wave dir symlink": wave_symlink, "a hardlink": hardlink, "cp -al": cp_al}
+        for label, make in cross.items():
+            for branch in BRANCHES:
+                for with_run in (False, True):
+                    for orig in ("W1", "W2"):
+                        cases[(label, branch, with_run, orig)] = make
+        for absolute in (False, True):
+            for with_run in (False, True):
+                for orig in ("W1", "W2"):
+                    cases[(f"a runs.json path into the other wave (absolute={absolute})", "runs.json", with_run,
+                           orig)] = runs_path(absolute)
+
+        failed = []
+        for (label, branch, with_run, orig), make in cases.items():
+            other = "W2" if orig == "W1" else "W1"
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "events.log").write_text("", encoding="utf-8")
+                wave(root, orig, branch, with_run)
+                if make.__code__.co_argcount == 4:
+                    make(root, branch, with_run, orig)
+                else:
+                    make(root, branch, with_run, orig, other)
+                result, rc = self._sweep_measure(root)
+                by = {w["wave"]: w for w in result["waves"]}
+                problems = [p for w in result["waves"] for p in w["problems"]]
+                errors = []
+                if rc != 1:
+                    errors.append(f"rc={rc}")
+                if result["total"]["runs"] != sum(w["runs"] for w in result["waves"] if w["runs"] is not None):
+                    errors.append("I2: total.runs != сумма runs волн")
+                if result["total"]["runs"] > 1:
+                    errors.append(f"I1: total.runs={result['total']['runs']}")
+                if result["total"]["fix_cycles"] not in (0, 3):
+                    errors.append(f"I1: total.fix_cycles={result['total']['fix_cycles']}")
+                counted = [w for w in by if by[w]["runs"] is not None]
+                inodes = [counted_inodes(root, w) for w in counted]
+                if len(counted) > 1 and set.intersection(*inodes):
+                    errors.append(f"I2: один inode в runs волн {counted}")
+                if not any("тот же" in p for p in problems):
+                    errors.append("I4: нет причины «тот же …»")
+                if bad := [p for p in problems if any(f in p for f in FORBIDDEN)]:
+                    errors.append(f"I4: другая причина у повтора: {bad}")
+                if label in cross or label.startswith("a runs.json path"):
+                    # I3: засчитан настоящий файл/каталог; при hardlink без `wave` их не различить — первая по номеру
+                    home = "W1" if (label in ("a hardlink", "cp -al") and branch == "legacy without wave") else orig
+                    dup = "W2" if home == "W1" else "W1"
+                    if (by[home]["runs"], by[home]["fix_cycles"], by[home]["problems"]) != (1, 3, []):
+                        errors.append(f"I3: {home} не засчитана целиком: {by[home]}")
+                    if (by[dup]["runs"], by[dup]["fix_cycles"]) != (None, None):
+                        errors.append(f"I1: повтор {dup} засчитан: {by[dup]}")
+                else:
+                    if (by["W1"]["runs"], by["W1"]["fix_cycles"]) != (None, None):
+                        errors.append(f"I1: волна с дублем засчитана: {by['W1']}")
+                if errors:
+                    failed.append(((label, branch, with_run, orig), errors))
+        self.assertEqual(len(cases), 80)  # 6 способов внутри волны × 2 + 5 × 3 ветки × 2 × 2 + путь runs.json 2 × 2 × 2
+        self.assertFalse(failed, f"{len(failed)} из {len(cases)} сочетаний нарушают инвариант:\n"
+                         + "\n".join(f"{case}: {errors}" for case, errors in failed))
+
+    def test_invariant_controls_are_counted_exactly(self):
+        """Законные контрольные к перебору I1–I4: rc 0 и точные числа."""
+        def put(root, rel, value):
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
+
+        def two_manifests(root):
+            for n, c in (("manifest.json", 3), ("manifest-run2.json", 4)):
+                put(root, f"W1/superarmanda/{n}", {"version": 2, "wave": {"id": "W1"}, "tasks": {"t": {"fix_cycles": c}}})
+            put(root, "W1/runs.json", {"version": 1, "wave": "W1", "runs": [
+                {"index": 1, "manifest": "superarmanda/manifest.json"},
+                {"index": 2, "manifest": "superarmanda/manifest-run2.json"}]})
+
+        def one_with_run(root):
+            put(root, "W1/superarmanda/manifest.json",
+                {"version": 2, "wave": {"id": "W1"}, "run": {"index": 1}, "tasks": {"t": {"fix_cycles": 3}}})
+
+        def legacy_with_strays(root):
+            put(root, "W1/superarmanda/manifest.json", {"version": 1, "tasks": {"t": {"fix_cycles": 3}}})
+            put(root, "W1/superarmanda/manifest-broken.json", "{")
+            put(root, "W1/superarmanda/manifest-other.json", {"version": 2, "wave": {"id": "W7"}, "run": {"index": 1}})
+            put(root, "W1/superarmanda/manifest-old.json", {"version": 1, "tasks": {}})
+
+        def two_waves_every_branch(root):
+            put(root, "W1/superarmanda/manifest.json", {"version": 1, "tasks": {"t": {"fix_cycles": 1}}})
+            put(root, "W2/superarmanda/manifest.json", {"version": 2, "wave": {"id": "W2"}, "tasks": {"t": {"fix_cycles": 2}}})
+            put(root, "W3/superarmanda/manifest.json",
+                {"version": 2, "wave": {"id": "W3"}, "run": {"index": 1}, "tasks": {"t": {"fix_cycles": 3}}})
+            put(root, "W3/runs.json", {"version": 1, "wave": "W3", "runs": [
+                {"index": 1, "manifest": "superarmanda/manifest.json"}]})
+
+        def wave_symlink_into_archive(root):
+            put(root, "archive/W1/superarmanda/manifest.json",
+                {"version": 2, "wave": {"id": "W1"}, "tasks": {"t": {"fix_cycles": 3}}})
+            (root / "W1").symlink_to("archive/W1")
+
+        controls = {"two different manifests with runs.json": (two_manifests, (2, 7)),
+                    "one manifest.json with run.index 1": (one_with_run, (1, 3)),
+                    "legacy 1.5.0 with stray manifest*": (legacy_with_strays, (1, 3)),
+                    "three waves, three branches": (two_waves_every_branch, (3, 6)),
+                    "a wave symlink into the run dir": (wave_symlink_into_archive, (1, 3))}
+        for name, (make, (runs, cycles)) in controls.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "events.log").write_text("", encoding="utf-8")
+                make(root)
+                result, rc = self._sweep_measure(root)
+                self.assertEqual(rc, 0, result)
+                self.assertEqual((result["total"]["runs"], result["total"]["fix_cycles"]), (runs, cycles), result)
+
+
 class Release130(unittest.TestCase):
     """The release 1.3.0 (W8): version, CHANGELOG, the measuring table, the rows of «Что реализовано»."""
 
