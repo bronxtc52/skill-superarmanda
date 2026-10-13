@@ -20333,6 +20333,7 @@ class MetricsScript(unittest.TestCase):
                 self.assertNotIn("Traceback", r.stderr)
                 w1 = json.loads(r.stdout)["waves"][0]
                 self.assertIsNone(w1["fix_cycles"], w1)
+                self.assertIsNone(w1["runs"], w1)  # I1: отвергнутый manifest не даёт прогона
                 self.assertTrue(w1["problems"], w1)
         r = self.cli(with_run({"index": 1}), "--json")  # исправное заявление — засчитывается
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -20383,6 +20384,7 @@ class MetricsScript(unittest.TestCase):
                 self.assertNotIn("Traceback", r.stderr)
                 w1 = json.loads(r.stdout)["waves"][0]
                 self.assertIsNone(w1["fix_cycles"], w1)
+                self.assertIsNone(w1["runs"], w1)  # I1: отвергнутый источник не даёт прогона
                 self.assertTrue(w1["problems"], w1)
         # Astra на 3f1b376: текст из чужого файла (одиночный суррогат) не роняет вывод ни в одном формате
         for fmt in (("--json",), ()):
@@ -20397,6 +20399,7 @@ class MetricsScript(unittest.TestCase):
                 if fmt:
                     w1 = json.loads(r.stdout)["waves"][0]
                     self.assertIsNone(w1["fix_cycles"], w1)
+                    self.assertIsNone(w1["runs"], w1)
                     self.assertTrue(w1["problems"], w1)
                 else:
                     self.assertIn("нет данных", r.stdout)
@@ -20550,6 +20553,14 @@ class MetricsScript(unittest.TestCase):
                 self.assertIn("| W4 | ", r.stdout)
                 row = next(line for line in r.stdout.splitlines() if line.startswith("| W4 |"))
                 self.assertIn("нет данных", row)
+                # I1: отвергнутый файл не даёт прогона ни в ветке с runs.json, ни в легаси без него — «нет данных» и по
+                # прогонам (`runs` None, итог 0), а не «прогонов 1, фикс-круги нет данных»; строка таблицы этого не различает
+                j = self.cli(root, "--json")
+                self.assertEqual(j.returncode, code, j.stdout + j.stderr)
+                data = json.loads(j.stdout)
+                w4 = {w["wave"]: w for w in data["waves"]}["W4"]
+                self.assertEqual((w4["runs"], w4["fix_cycles"]), (None, None), w4)
+                self.assertEqual(data["total"]["runs"], 0, data)
 
     def test_every_read_file_is_read_from_one_checked_descriptor(self):
         """Ревью W4 waves-tails2: каждый читаемый файл (runs.json, manifest*.json в поиске по run.index, events.log)
@@ -20609,6 +20620,14 @@ class MetricsScript(unittest.TestCase):
                 self.assertTrue(any(reason in p for p in problems), (reason, problems))
                 row = next(line for line in r.stdout.splitlines() if line.startswith("| W4 |"))
                 self.assertIn("нет данных", row)
+                # I1: отвергнутый файл (FIFO manifest, runs.json, чужая волна) — «нет данных» и по прогонам; FIFO events.log
+                # не трогает manifest — прогон и фикс-круги засчитаны, «нет данных» только у развилок
+                j = subprocess.run([sys.executable, str(self.SCRIPT), str(root), "--json"], capture_output=True, text=True,
+                                   encoding="utf-8", env=env, timeout=20)
+                self.assertEqual(j.returncode, code, j.stdout + j.stderr)
+                w4 = {w["wave"]: w for w in json.loads(j.stdout)["waves"]}["W4"]
+                expected = (1, 1) if name == "FIFO events.log" else (None, None)
+                self.assertEqual((w4["runs"], w4["fix_cycles"]), expected, w4)
 
     def test_unreadable_or_oversized_file_is_no_data_not_traceback(self):
         """Ревью W4 круг 2: любой OSError на пути к файлу (каталог без прав за симлинком events.log) и файл больше
@@ -20846,12 +20865,16 @@ class MetricsScript(unittest.TestCase):
             # без подмены тот же каталог читается: отказ — из-за подмены, а не из-за симлинков в пути
             self.assertEqual(self.metrics.measure(root)["waves"][0]["fix_cycles"], 1)
 
-    def _assert_no_data(self, root, wave, reason):
+    def _assert_no_data(self, root, wave, reason, runs=None):
+        """Волна «нет данных» с причиной `reason`. По I1 отвергнутый manifest не даёт прогона: `runs` волны None.
+        Единственная оговорка I1 — потерянный manifest из runs.json (файла нет): прогон засчитан, тогда вызывающий
+        передаёт ожидаемое число `runs` явно."""
         r = self.cli(root, "--json")
         self.assertNotIn("Traceback", r.stderr)
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         row = {w["wave"]: w for w in json.loads(r.stdout)["waves"]}[wave]
         self.assertIsNone(row["fix_cycles"], row)
+        self.assertEqual(row["runs"], runs, row)
         self.assertTrue(any(reason in p for p in row["problems"]), (reason, row["problems"]))
         return json.loads(r.stdout)
 
