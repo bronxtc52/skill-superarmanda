@@ -3659,6 +3659,30 @@ class W4Round24(Base):
         self.assertTrue(wab.launch(cfg, "W2", self.prompt()))
         self.assertEqual(self.git(clone, "rev-parse", "HEAD"), sq)
 
+    def test_narrow_refspec_clone_sees_the_fresh_base_branch(self):  # #87
+        # an admission clone fetches only the default branch: `git fetch origin <base>` would update
+        # FETCH_HEAD alone and leave origin/<base> at the base of wave 1, before its squash merge
+        origin, clone = self.repos()
+        self.git(clone, "push", "-q", "origin", "main:release/x")
+        self.git(clone, "fetch", "-q", "origin")
+        self.git(clone, "config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+        self.wave1_branch(clone)
+        other = self.tmp / "sq"
+        subprocess.run(["git", "clone", "-q", "-b", "release/x", str(origin), str(other)], check=True,
+                       capture_output=True)
+        (other / "b.txt").write_text("b\n", encoding="utf-8")
+        self.git(other, "add", "b.txt")
+        self.git(other, "commit", "-q", "-m", "wave 1 (squash)")
+        self.git(other, "push", "-q", "origin", "HEAD:release/x")
+        sq = self.git(other, "rev-parse", "HEAD")
+        self.gh_shim(f'echo \'{{"state":"MERGED","mergeCommit":{{"oid":"{sq}"}}}}\'')
+        cfg, _ = self.chain(workdir=str(clone), base_branch="release/x")
+        self.put_state(cfg, {"current": "W1", "waves": {"W1": self.wave_rec(phase="done")}})
+        self.alive = False
+        self.assertTrue(wab.launch(cfg, "W2", self.prompt()))
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"), sq)
+        self.assertEqual(self.git(clone, "rev-parse", "refs/remotes/origin/release/x"), sq)
+
     def test_previous_pr_not_merged_refuses_the_next_wave(self):
         _, clone = self.repos()
         self.wave1_branch(clone)
@@ -11454,6 +11478,13 @@ class OwnerHandover(GateBase):  # #36 п.2: the owner merged the wave's PR himse
         self.assertIn(" watch ", out)
         st = wab.load_state(self.cfg)
         wab._check_launch_allowed(self.cfg, st, "W2", "wv-w2")  # no refusal: the next wave may follow
+
+    def test_handover_in_a_narrow_refspec_clone(self):  # #87: fetch must move origin/<base> itself
+        self.git("config", "remote.origin.fetch", "+refs/heads/dev:refs/remotes/origin/dev")
+        self.git("update-ref", "refs/remotes/origin/main", f"{self.merge}^")  # stale: before the merge
+        self.run_it()
+        self.assertEqual(self.rec()["phase"], "awaiting_merge")
+        self.assertEqual(self.git("rev-parse", "refs/remotes/origin/main"), self.merge)
 
     def test_handover_drops_stale_notices_of_the_wave(self):
         st = wab.load_state(self.cfg)
@@ -24150,13 +24181,12 @@ class Release160(unittest.TestCase):
     """The release 1.6.0 (#113 W4; wave W4, the last of waves-tails2): version, the CHANGELOG section on top with the
     releases of the chain, the two cases of «нет данных» added to 1.5.0, the rows of what is implemented."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.6\.0"\s*$')
+    # the version of SKILL.md moved on to 1.6.1 (#87): Release161 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.6\.0 — 2026-10-12$", "1.6.0 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.6\.0 — 2026-10-12$", "CHANGELOG.md: the section of 1.6.0")
+        self.assertTrue(log.index("## 1.6.0") < log.index("## 1.5.3"), "1.6.0 is above 1.5.3")
         body = re.search(r"(?ms)^## 1\.6\.0 — 2026-10-12\n(.*?)(?=^## )", log).group(1)
         for needle in ("issues/113", "issues/117", "`waves-tails2`", "pull/120", "pull/121", "pull/122", "pull/116",
                        "`_read_checked` → `_runs_of` / `_manifest_checked`", "`run.index`", "Битый симлинк", "`say-note", "`_IDENTITY_TOLD`",
@@ -24224,6 +24254,35 @@ class Release160(unittest.TestCase):
             self.assertTrue(texts, wave)
             for f in texts:  # the store of 1.5.0 as it was: every file is named by the eid of its text
                 self.assertEqual(wab.text_eid(f.read_text(encoding="utf-8")), "sha256:" + f.name)
+
+
+class Release161(unittest.TestCase):
+    """The release 1.6.1 (#87; #92 the owner's decision in the doc): version, the CHANGELOG section on top, the row of
+    what is implemented, the explicit refspec of the base in both fetches."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.6\.1"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.6\.1 — 2026-10-18$", "1.6.1 is the first section")
+        body = re.search(r"(?ms)^## 1\.6\.1 — 2026-10-18\n(.*?)(?=^## )", log).group(1)
+        for needle in ("#87", "#92", "`base_refspec`", "`refresh_workdir`", "`owner-handover`",
+                       "`test_narrow_refspec_clone_sees_the_fresh_base_branch`",
+                       "`OwnerHandover.test_handover_in_a_narrow_refspec_clone`"):
+            self.assertIn(needle, body)
+
+    def test_both_fetches_of_the_base_use_the_explicit_refspec(self):
+        src = (WAVES / "wab.py").read_text(encoding="utf-8")
+        self.assertEqual(src.count('git("fetch", "origin", base_refspec(base))'), 2)
+        self.assertNotIn('git("fetch", "origin", base)', src)
+
+    def test_waves_doc_has_the_row(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
+        self.assertRegex(table, r"(?m)^\| Клон с узким refspec[^\n]*реализовано \(1\.6\.1; \[#87\][^\n]*"
+                                r"`OwnerHandover\.test_handover_in_a_narrow_refspec_clone` \|$")
 
 
 if __name__ == "__main__":
