@@ -3218,6 +3218,13 @@ def base_branch_of(cfg, cwd):
     return name[len("origin/"):] if r.returncode == 0 and name.startswith("origin/") else None
 
 
+def base_refspec(base):
+    """The refspec that moves origin/<base> itself (#87). An admission clone fetches only the default
+    branch, and `git fetch origin <base>` outside that refspec updates FETCH_HEAD alone: origin/<base>
+    would stay at the start of the chain and every later merge check would read the stale ref."""
+    return f"+refs/heads/{base}:refs/remotes/origin/{base}"
+
+
 def verify_previous_merge(cfg, wave, cwd, branch, base, target):
     """Squash merges (the repositories' standard) leave the wave branch's commits out of
     origin/<base>, so the check is by PR: `gh pr view <branch>` must say MERGED and its merge
@@ -3263,7 +3270,7 @@ def refresh_workdir(cfg, wave, cwd):
         raise SystemExit(f"wave {wave} refused: workdir {cwd} is not clean (git status --porcelain "
                          f"--untracked-files=all is not empty); commit, stash or remove the changes "
                          f"of the previous wave")
-    fetch = git("fetch", "origin", base)
+    fetch = git("fetch", "origin", base_refspec(base))
     if fetch.returncode != 0:
         raise SystemExit(f"wave {wave} refused: git fetch origin {base} failed: {fetch.stderr.strip()}")
     target = git("rev-parse", "--verify", "-q", f"refs/remotes/origin/{base}^{{commit}}")
@@ -6528,7 +6535,7 @@ def owner_handover(cfg, wave, run_id):
         if dirty.stdout.strip():
             raise SystemExit(f"wab: {what}: the wave's working copy {cwd} is not clean (uncommitted or untracked "
                              f"changes: not what was merged); commit or remove them; nothing done")
-        fetch = git("fetch", "origin", base)
+        fetch = git("fetch", "origin", base_refspec(base))
         if fetch.returncode != 0:
             raise SystemExit(f"wab: {what}: git fetch origin {base} failed: "
                              f"{_masked_line(fetch.stderr, 200)}; nothing done")

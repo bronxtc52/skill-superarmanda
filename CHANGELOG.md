@@ -3,6 +3,22 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 1.6.1 — 2026-10-18
+
+### Исправлено
+
+- `wab.py` (#87): цепочка с `base_branch`, отличной от дефолтной ветки репозитория, больше не встаёт после первой
+  волны. Клон допуска (`cc-autonomy prepare`) тянет только дефолтную ветку, и `git fetch origin <base>` вне этого
+  refspec обновлял один `FETCH_HEAD`: `origin/<base>` оставался на старте цепочки, и `launch` следующей волны
+  отказывал `previous wave not merged into origin/<base>` при смерженном PR. `refresh_workdir` и `owner-handover`
+  теперь тянут базу явным refspec `+refs/heads/<base>:refs/remotes/origin/<base>` (`base_refspec`). Тесты:
+  `test_narrow_refspec_clone_sees_the_fresh_base_branch`, `OwnerHandover.test_handover_in_a_narrow_refspec_clone`.
+
+### Документация
+
+- `references/profiles.md` (#92): решение владельца — задачи high ведутся только на Claude Code host; поведение
+  (отказ `task-result` со слабой моделью, `unavailable` и `BLOCKED` на Codex-хосте) не меняется.
+
 ## 1.6.0 — 2026-10-12
 
 Итог цепочки `waves-tails2` (четыре волны): остаток прошлых цепочек
