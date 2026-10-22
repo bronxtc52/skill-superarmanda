@@ -1534,6 +1534,23 @@ class GhBoundaryContract(unittest.TestCase):
             "review evidence changed while collecting evidence", result["limitations"]
         )
 
+    def test_untrusted_author_change_during_second_snapshot_keeps_pass(self):
+        # 1.7.0: evaluate reads Codex only, so a retired CodeRabbit (or anyone else) editing
+        # the PR between the two snapshots must not turn a clean Codex result incomplete.
+        rabbit = gactor("coderabbitai", "Bot")
+        srv = Server().standard(
+            reviews=Snap(
+                [g_review()],
+                [g_review(), g_review("COMMENTED", HEAD, "walkthrough", 2, rabbit)],
+            )
+        )
+        proc, result, _ = run_check(srv.entries)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(result["status"], "pass", result["limitations"])
+        self.assertNotIn(
+            "review evidence changed while collecting evidence", result["limitations"]
+        )
+
 
 
 if __name__ == "__main__":

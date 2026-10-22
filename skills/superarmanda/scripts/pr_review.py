@@ -651,6 +651,11 @@ def check(args):
             fetch_issue_comments(owner, name, args.pr),
         )
 
+    def codex_only(snap):
+        # Stability is judged on the evidence evaluate reads: another author editing the PR
+        # (a retired CodeRabbit summary, a person) does not move a Codex result.
+        return tuple([item for item in part if trusted(item, CODEX)] for part in snap)
+
     first = fetch_header(owner, name, args.pr)
     reviews, review_comments, issue_comments = snapshot()
     check_runs, checks = fetch_checks(owner, name, first["head"]["sha"])
@@ -672,7 +677,7 @@ def check(args):
         result["status"] = "incomplete"
         result["current_head"] = last["head"]["sha"]
         result["limitations"].append("PR HEAD changed while collecting evidence")
-    elif second != (reviews, review_comments, issue_comments):
+    elif codex_only(second) != codex_only((reviews, review_comments, issue_comments)):
         result["status"] = "incomplete"
         result["limitations"].append(
             "review evidence changed while collecting evidence"

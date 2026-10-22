@@ -23,6 +23,9 @@ PR (`github_codex_review`) и внешним ревьюером плана и з
 
 - Новая запись `task-result --role coderabbit` и `fix-loop --source coderabbit` — отказ с причиной
   `coderabbit was removed in 1.7.0`.
+- `pr_review.py check`: устойчивость снимка (два чтения ревью и комментариев) сверяется только по записям Codex —
+  тем, что читает разбор. Правка PR другим автором (сводка ещё установленного CodeRabbit, человек) больше не делает
+  чистый результат Codex `incomplete`. Тест: `test_untrusted_author_change_during_second_snapshot_keeps_pass`.
 - Совместимость: manifest, записанный до 1.7.0, читается как прежде. Роль `coderabbit` в нём — legacy
   (`state.LEGACY_ROLES`): её результаты, сессии и `deferrals` хранятся без изменений, не попадают в `where`
   (`verdicts`, `open_findings`, `artifacts`), не требуют разбора и не дают проблем гейта при любом статусе. Тесты:
