@@ -3,6 +3,45 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `version` в
 `skills/superarmanda/SKILL.md`.
 
+## 1.7.0 — 2026-10-22
+
+Решение владельца: CodeRabbit больше не ревьюер. Независимое ревью остаётся за обязательным GitHub Codex review на
+PR (`github_codex_review`) и внешним ревьюером плана и задач (`cross_provider_reviewer`, `second_reviewer`).
+
+### Удалено
+
+- Необязательный канал CodeRabbit в `pr_review.py check`: поле `coderabbit` вывода, `coderabbit_verdict`, распознавание
+  шаблонов и сводки CodeRabbit (`RABBIT_*`, `rabbit_boilerplate`, `rabbit_summary`). Ревью и комментарии
+  `coderabbitai[bot]` больше не доказательство и не находка — как у любого автора, кроме Codex.
+- Роль `coderabbit` из ролей и источников `state.py` (`ROLES`, `FIX_SOURCES`, `DEFER_SOURCES`, разбор находок в
+  `derive_step`), исключение «`coderabbit` `unavailable` не блокирует» в гейте мерджа (`waves/gate.py`) и столбец
+  вердикта на дашборде (`waves/dash.py`).
+- Тесты поведения канала CodeRabbit и фикстуры `tests/fixtures/pr-review/coderabbit/`; сценарий e2e с отказом
+  CodeRabbit и его мутация `rabbit_blocks`.
+
+### Изменено
+
+- Новая запись `task-result --role coderabbit` и `fix-loop --source coderabbit` — отказ с причиной
+  `coderabbit was removed in 1.7.0`.
+- `pr_review.py check`: устойчивость снимка (два чтения ревью и комментариев) сверяется только по записям Codex —
+  тем, что читает разбор. Правка PR другим автором (сводка ещё установленного CodeRabbit, человек) больше не делает
+  чистый результат Codex `incomplete`. Тест: `test_untrusted_author_change_during_second_snapshot_keeps_pass`.
+- Совместимость: manifest, записанный до 1.7.0, читается как прежде. Роль `coderabbit` в нём — legacy
+  (`state.LEGACY_ROLES`): её результаты, сессии и `deferrals` хранятся без изменений, не попадают в `where`
+  (`verdicts`, `open_findings`, `artifacts`), не требуют разбора и не дают проблем гейта при любом статусе. Тесты:
+  `LegacyCoderabbitRole` (живая фикстура `v1-medium-waves-tails-W2.json`), `GateLegacyCoderabbit`.
+- Инструкции: `SKILL.md`, `references/pr-review.md`, `workflow.md`, `waves.md`, `role-briefs.md`, `profiles.md`
+  (строка optional PR review), `AGENTS.md`.
+
+### Известные ограничения (прогоны, начатые до 1.7.0)
+
+- Находки CodeRabbit на HEAD без `--defer` больше не держат гейт мерджа, а принятые `--accept` ограничения
+  CodeRabbit не попадают в заметки вердикта и тело PR — это и есть вывод канала.
+- Задача в `needs_decision` с `decision_required_for=coderabbit` продолжается `fix-loop --decision … --note …`
+  без `--source`; автоответ диспетчера на такую развилку отказывает, решает владелец.
+- Ключ автоответа `[…, "needs_decision", "coderabbit"]`, уже записанный в `policy_keys` живой цепочки, читается как
+  порченая метка: автоответы этой волны отказывают (безопасная сторона), решает владелец.
+
 ## 1.6.1 — 2026-10-18
 
 ### Исправлено

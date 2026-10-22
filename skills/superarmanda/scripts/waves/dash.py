@@ -284,7 +284,7 @@ def waves_table(cfg, st):
 MANIFEST_POLL_SECONDS = 15  # `state.py where` is a subprocess: not more often than this per manifest
 WHERE_TIMEOUT = 10
 MANIFEST_CACHE = {}  # manifest path -> (signature, taken at, result)
-VERDICT_ROLES = ("tester", "cross_provider_reviewer", "github_codex_review", "coderabbit")
+VERDICT_ROLES = ("tester", "cross_provider_reviewer", "github_codex_review")
 SECOND_REVIEWER = "second_reviewer"  # manifest version 2: the second task review (required for a high-risk task)
 ARTIFACT_LIMIT = 2 * 1024 * 1024  # bytes of a findings artifact read for the frame
 SEVERITIES = ("critical", "high", "medium", "low", "P0", "P1", "P2", "P3")

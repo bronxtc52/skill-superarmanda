@@ -510,14 +510,15 @@ def manifest_problems(manifest, head, cwd_fingerprint, plan=None):
         elif version == 2 and status == "ready_for_pr_review" and not _ready_by_state(entry, results, risk, head, review_policy, models):
             problems.append(f"задача {name}: статус ready_for_pr_review не подтверждён пересчётом по правилам "
                             f"state.py (риск {risk}); гейт не верит сохранённому статусу")
-        for role, other in sorted(results.items()):  # github_codex_review, coderabbit, ...
+        for role, other in sorted(results.items()):  # github_codex_review, ...
             if (role not in ("coder", "tester", "cross_provider_reviewer") and isinstance(other, dict)
                     # the Fable subagent roles are records here. `internal_reviewer` and `final_check` of a task
                     # judged as high are judged below by state.fable_role_gaps (policy 1.2.4), with a reason
                     # that names the action; a manifest of the policy 1.2.1 there is refused as a whole
                     and role not in state.FABLE_ROLES
                     and other.get("head") == head and other.get("status") != "pass"
-                    and not (role == "coderabbit" and other.get("status") == "unavailable")
+                    # a role removed from the skill (a manifest of before 1.7.0): kept, judged by nobody
+                    and role not in state.LEGACY_ROLES
                     # high: judged below with its own reasons; below high the second review is optional, like in
                     # state.py derive_step: only its findings need a disposition
                     and not (role == "second_reviewer" and (risk == "high" or other.get("status") != "findings"))

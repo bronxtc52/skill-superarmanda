@@ -59,8 +59,8 @@ model: <поле "model" из state.py role-model --manifest <path> --task <id> 
 или `findings`, модель не слабее политики; записывать на чистом дереве того HEAD, который уйдёт в пакет, —
 кредит привязан к HEAD, дереву и эпохе задачи, любая запись роли готовности, `fix-loop`, правка
 дерева или смена риска до пакета его сбрасывают) до первого внешнего пакета задачи и на его HEAD. Первый внешний пакет
-— первая запись ЛЮБОЙ роли из `cross_provider_reviewer`, `second_reviewer`, `github_codex_review`,
-`coderabbit` при любом статусе (включая `unavailable`): после неё внутреннее ревью в этом прогоне не
+— первая запись ЛЮБОЙ роли из `cross_provider_reviewer`, `second_reviewer`, `github_codex_review`
+при любом статусе (включая `unavailable`): после неё внутреннее ревью в этом прогоне не
 засчитывается, задача готовой не станет (`workflow.md`, «Обязательные роли задачи high»).
 
 ```text
@@ -85,8 +85,8 @@ model: <поле "model" из state.py role-model --manifest <path> --task <id> 
 
 ## Триаж (`triage`) — шаг 6, при находках внешнего ревью
 
-Применим, когда внешнее ревью (`cross_provider_reviewer`, `second_reviewer`, GitHub Codex,
-CodeRabbit) дало находки. Готовит решение по каждой находке; записывает решение координатор.
+Применим, когда внешнее ревью (`cross_provider_reviewer`, `second_reviewer`, GitHub Codex) дало
+находки. Готовит решение по каждой находке; записывает решение координатор.
 
 ```text
 Роль: triage, задача <id>, свежая сессия.

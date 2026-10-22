@@ -2,7 +2,7 @@
 name: superarmanda
 description: "По /superarmanda и на порученной реализации сложного или рискованного изменения поддерживаемого ПО, где риск оправдывает независимую проверку: связанные компоненты, совместимость, миграция данных, безопасность, платежи, сложная логика. Одна фича от требований до проверенного PR с независимыми coder, tester и подписочным ревью. НЕ для разведки, аудита, ревью готового diff, документов, аналитики, браузера, правок правил/skills и небольших исправлений."
 metadata:
-  version: "1.6.1"
+  version: "1.7.0"
   canon-version: "1.1"
 license: MIT
 ---
@@ -143,7 +143,7 @@ Fable (`claude-fable-5-1`) обязательна только как второ
    `task-result --role internal_reviewer` (pass или findings) обязана стоять ДО первого внешнего
    пакета и на его HEAD — `state.py` засчитывает только её (`where` ведёт к ней после tester).
    Первый внешний пакет — первая запись ЛЮБОЙ роли из `cross_provider_reviewer`,
-   `second_reviewer`, `github_codex_review`, `coderabbit` при любом статусе (включая
+   `second_reviewer`, `github_codex_review` при любом статусе (включая
    `unavailable`): после неё внутреннее ревью в этом прогоне не засчитывается;
    без неё задача high в этом прогоне готовой не станет, `next_action` называет «новый прогон».
    Затем
@@ -164,7 +164,7 @@ Fable (`claude-fable-5-1`) обязательна только как второ
    готовит решение (`fix`, `--defer`, `accept_limitation`, `cut_surface`) с обоснованием;
    записывает решение координатор командами ниже.
    После каждого изменения повтори tester и review, указывая источник находки в
-   `fix-loop --outcome failed --source <cross_provider_reviewer|second_reviewer|github_codex_review|coderabbit|tester>`.
+   `fix-loop --outcome failed --source <cross_provider_reviewer|second_reviewer|github_codex_review|tester>`.
    `fix-loop` хранит максимум три неудачных цикла; после третьего status `blocked`,
    с воспроизведением и вариантами для пользователя. Правило двух кругов на источник:
    если один и тот же источник даёт вторую подряд находку (без учёта уже принятых по
@@ -177,7 +177,7 @@ Fable (`claude-fable-5-1`) обязательна только как второ
    задача возвращается в `needs_fix`, и цикл продолжается. Одно решение покупает ровно
    один дополнительный круг по этому источнику; общий кап в три неудачных цикла работает
    как прежде и имеет приоритет над повторным `needs_decision`. Если ВСЕ находки результата
-   ревьюера (`cross_provider_reviewer`, `second_reviewer`, `github_codex_review`, `coderabbit`) — low/P3 (nit,
+   ревьюера (`cross_provider_reviewer`, `second_reviewer`, `github_codex_review`) — low/P3 (nit,
    minor), coordinator переносит их в остаток следующей волны/задачи через
    `fix-loop --defer --source <ревьюер> --note "<что отложено и куда>"`: кап и счётчик
    источника не тратятся, задача с отложенными находками ревьюера считается готовой. Для tester
@@ -185,9 +185,8 @@ Fable (`claude-fable-5-1`) обязательна только как второ
    `fix-loop --accept --source <ревьюер> --severity <low|medium|high> --note "<что и почему>"`,
    с записью в секции «Принятые ограничения» тела PR. Подробный порядок — в [workflow.md](references/workflow.md).
 7. Перед PR проверь итоговый diff. Создай только draft, пока нет завершённого
-   GitHub Codex review текущего HEAD; его находки должны быть разобраны. CodeRabbit
-   дополнительный: его результат берётся из поля `coderabbit` вывода `pr_review.py check`;
-   `unavailable` — только по явному отказу или таймауту, гейт его не блокирует. Не снимай
+   GitHub Codex review текущего HEAD; его находки должны быть разобраны. Других
+   PR-ревьюеров нет: CodeRabbit удалён в 1.7.0, роль `coderabbit` не записывается. Не снимай
    draft и не подменяй reviewer/API fallback ради обхода недоступности. Перед
    этим этапом обязательно прочитай [pr-review.md](references/pr-review.md).
    Для задачи high перед снятием draft идёт финальная сверка с ТЗ (`final_check`):
