@@ -7724,7 +7724,7 @@ class GateVerdict(unittest.TestCase):
         self.assertEqual(self.ev(manifest=green_manifest(status="ready_for_pr_review"))["verdict"], "pass")
 
     def test_other_sources_findings_on_head_fail(self):  # r6 HIGH
-        for role in ("github_codex_review", "coderabbit"):
+        for role in ("github_codex_review",):
             for status in ("findings", "fail"):
                 with self.subTest(role=role, status=status):
                     m = green_manifest()
@@ -7816,7 +7816,7 @@ class GateVerdict(unittest.TestCase):
             m["tasks"]["T1"]["results"][role] = res
             m["tasks"]["T1"]["deferrals"] = deferrals_of(res)
             return m
-        for role in ("cross_provider_reviewer", "github_codex_review", "coderabbit"):
+        for role in ("cross_provider_reviewer", "github_codex_review"):
             cases = [
                 ("no deferral", lambda r: [], "fail"),
                 ("deferral of this exact result", lambda r, role=role: [deferral(r, role)], "pass"),
@@ -7854,7 +7854,7 @@ class GateVerdict(unittest.TestCase):
             m["tasks"]["T1"]["results"][role] = res
             m["tasks"]["T1"]["acceptances"] = acceptances_of(res)
             return m
-        for role in ("cross_provider_reviewer", "github_codex_review", "coderabbit"):
+        for role in ("cross_provider_reviewer", "github_codex_review"):
             for severity in ("low", "medium", "high"):
                 with self.subTest(role=role, severity=severity):
                     v = self.ev(manifest=manifest(lambda r: [acceptance(r, role, severity)], role))
@@ -7968,7 +7968,7 @@ class GateVerdict(unittest.TestCase):
         self.assertEqual(wab.gate.accepted_notes({"tasks": ["T1"]}, HEAD), [])
         self.assertEqual(wab.gate.accepted_notes({"tasks": {"T1": {"results": {"coder": res},
                                                                    "acceptances": 5}}}, HEAD), [])
-        self.assertIsNone(state.accepted_record({"acceptances": 5}, "coderabbit", res))
+        self.assertIsNone(state.accepted_record({"acceptances": 5}, "github_codex_review", res))
 
     def test_pr_head_other_than_the_gated_one_waits(self):
         facts = green_facts()
@@ -8067,7 +8067,7 @@ def routes_for(repo="o/r", number=5, **over):
     return r
 
 
-# ---------------------------------------------------------------- 1.0.2: coderabbit unavailable does not block
+# ---------------------------------------------------------------- 1.7.0: a legacy coderabbit result is judged by nobody
 def _frozen_gate_100():
     """The 1.0.0 gate (tests/fixtures/gate-1.0.0), loaded under private names with ITS OWN state.py and
     pr_review.py: it resolves siblings relative to its own file, so the current modules are untouched."""
@@ -8103,11 +8103,16 @@ def _with_role(role, res, **task):
     return m
 
 
-class GateCoderabbitUnavailable(unittest.TestCase):  # #72
+class GateLegacyCoderabbit(unittest.TestCase):  # 1.7.0 (before: #72, an unavailable CodeRabbit did not block)
+    """CodeRabbit is no review channel since 1.7.0: a result of the role in a manifest written before it is
+    kept and judged by nobody — at any status, covered or not."""
+
+    STATUSES = ("pass", "findings", "unavailable", "error", "incomplete", "pending")
+
     def problems(self, manifest, module=None):
         return (module or gate).manifest_problems(manifest, HEAD, FP)
 
-    def covered(self, kind, role="coderabbit"):
+    def covered(self, kind, role="github_codex_review"):
         res = result("findings")
         record = {"source": role, "note": "low", "head": HEAD, "result_sha256": gate.state.result_digest(res),
                   "result_recorded_at": res.get("recorded_at"), "recorded_at": res.get("recorded_at")}
@@ -8115,48 +8120,31 @@ class GateCoderabbitUnavailable(unittest.TestCase):  # #72
             record["severity"] = "medium"
         return _with_role(role, res, **{kind: [record]})
 
-    def test_unavailable_on_head_is_not_a_problem(self):
-        self.assertEqual(self.problems(_with_role("coderabbit", result("unavailable"))), [])
-
-    def test_unavailable_on_head_gives_a_pass_verdict(self):
-        v = gate.evaluate(green_facts(), HEAD, _with_role("coderabbit", result("unavailable")), WORK, "main")
-        self.assertEqual((v["verdict"], v["reasons"]), ("pass", []))
-
-    def test_other_non_pass_statuses_still_block(self):
-        for status in ("error", "incomplete", "pending", "findings"):
+    def test_a_legacy_result_of_any_status_is_not_a_problem(self):
+        for status in self.STATUSES:
             with self.subTest(status=status):
-                self.assertTrue(self.problems(_with_role("coderabbit", result(status))))
-
-    def test_findings_with_defer_or_accept_pass(self):
-        for kind in ("deferrals", "acceptances"):
-            with self.subTest(kind=kind):
-                self.assertEqual(self.problems(self.covered(kind)), [])
+                m = _with_role("coderabbit", result(status))
+                self.assertEqual(self.problems(m), [])
+                v = gate.evaluate(green_facts(), HEAD, m, WORK, "main")
+                self.assertEqual((v["verdict"], v["reasons"]), ("pass", []))
 
     def test_github_codex_review_unavailable_still_blocks(self):
         self.assertTrue(self.problems(_with_role("github_codex_review", result("unavailable"))))
 
     def test_missing_tester_and_unresolved_reviewer_findings_still_block(self):
-        m = _with_role("coderabbit", result("unavailable"))
+        m = _with_role("coderabbit", result("pass"))
         del m["tasks"]["T1"]["results"]["tester"]
         self.assertTrue(self.problems(m))
         self.assertTrue(self.problems(_with_role("cross_provider_reviewer", result("findings"))))
 
-    def test_unavailable_of_another_head_is_not_this_heads_business(self):
-        self.assertEqual(self.problems(_with_role("coderabbit", result("unavailable", head=OLD))), [])
-
-    def test_verdicts_match_the_1_0_0_gate_except_coderabbit_unavailable(self):
+    def test_verdicts_match_the_1_0_0_gate_except_the_legacy_role(self):
         old = _frozen_gate_100()
         self.assertIsNot(old.state, gate.state)
         cases = [
             ("all pass", green_manifest(), False),
-            ("coderabbit pass", _with_role("coderabbit", result("pass")), False),
-            ("coderabbit findings without a decision", _with_role("coderabbit", result("findings")), True),
-            ("coderabbit findings + defer", self.covered("deferrals"), False),
-            ("coderabbit findings + accept", self.covered("acceptances"), False),
-            ("coderabbit error", _with_role("coderabbit", result("error")), True),
-            ("coderabbit incomplete", _with_role("coderabbit", result("incomplete")), True),
             ("github_codex_review unavailable", _with_role("github_codex_review", result("unavailable")), True),
-            ("github_codex_review findings + defer", self.covered("deferrals", "github_codex_review"), False),
+            ("github_codex_review findings + defer", self.covered("deferrals"), False),
+            ("github_codex_review findings + accept", self.covered("acceptances"), False),
             ("no tester", self._without("tester"), True),
             ("reviewer findings without a decision", _with_role("cross_provider_reviewer", result("findings")), True),
         ]
@@ -8170,11 +8158,13 @@ class GateCoderabbitUnavailable(unittest.TestCase):  # #72
         del m["tasks"]["T1"]["results"][role]
         return m
 
-    def test_the_only_intended_difference_is_coderabbit_unavailable(self):
+    def test_the_only_intended_difference_is_the_legacy_role(self):
         old = _frozen_gate_100()
-        m = _with_role("coderabbit", result("unavailable"))
-        self.assertTrue(self.problems(m, old))  # the 1.0.0 gate refuses it (closed failure is fine)
-        self.assertEqual(self.problems(m), [])
+        for status in ("findings", "unavailable", "error", "incomplete"):
+            with self.subTest(status=status):
+                m = _with_role("coderabbit", result(status))
+                self.assertTrue(self.problems(m, old))  # the 1.0.0 gate refuses it (closed failure is fine)
+                self.assertEqual(self.problems(m), [])
 
 
 class GateCollect(unittest.TestCase):
@@ -12666,7 +12656,7 @@ class FixedAnswerPolicy(Base):
             ("cut_surface", ND, "cut_surface", "invariant", {}, (True, ["вариант cut_surface.", "--decision cut_surface", "result.md"], ["новый прогон"])),
             # state.py takes `--accept` for DEFER_SOURCES only (W3 I4): the answer names both commands, and a source
             # it does not accept is refused to the owner
-            ("accept_limitation", ND, "accept_limitation", "invariant", {"edit": self.task_edit(decision_required_for="coderabbit")}, (True, ["--decision accept_limitation", "fix-loop --accept --source coderabbit", "Принятые ограничения"], ["новый прогон"])),
+            ("accept_limitation", ND, "accept_limitation", "invariant", {"edit": self.task_edit(decision_required_for="github_codex_review")}, (True, ["--decision accept_limitation", "fix-loop --accept --source github_codex_review", "Принятые ограничения"], ["новый прогон"])),
             ("accept_limitation of a source state.py does not accept", ND, "accept_limitation", "invariant", {}, (False, "принять нельзя")),
             ("acc02 blocked_cap invariant over rec new_run", BC, "invariant", "new_run", bl, (True, ["вариант invariant.", "не латай", "новый прогон", "прогон 2 из 5", "(рекомендация волны: new_run)"], ["своей рекомендации", "ещё один круг"])),
             ("acc06 run 4 of 5 is answered", BC, "invariant", "new_run", dict(bl, index=4), (True, ["прогон 5 из 5"], [])),
@@ -12791,7 +12781,7 @@ class FixedAnswerPolicy(Base):
                         if cls == "needs_decision" and answer == "accept_limitation":  # `--accept` needs a DEFER source
                             kw = dict(kw, edit=lambda doc, kw=kw: ((kw["edit"](doc) if "edit" in kw else None),
                                                                   doc["tasks"]["T1"].update(
-                                                                      decision_required_for="coderabbit")))
+                                                                      decision_required_for="github_codex_review")))
                         self.fork(cfg, index=2, **kw)
                         got = self.decide(cfg, cls, answer, "x")
                         self.assertTrue(got["ok"], got)
@@ -21633,7 +21623,7 @@ class Release142(unittest.TestCase):
         self.assertNotIn("manifest политики `1.2.1` судится как раньше", flow)
         self.assertIn("`1.2.1` `state.py` судит как 1.2.3, а гейт", flow)
         self.assertIn("Закрывает круг запись ЛЮБОЙ такой\n  роли, не обязательно источника, открывшего круг", flow)
-        self.assertIn("запись PR-гейта (`github_codex_review` или `coderabbit`, любой статус) в `needs_fix`", flow)
+        self.assertIn("запись PR-гейта (`github_codex_review`, любой статус) в `needs_fix`", flow)
         self.assertIn("запись\n  `github_codex_review` (Codex на draft PR) раньше первого пакета `review.py`", flow)
         self.assertIn("эпоха равна текущей\n  `task_epoch`", flow)
         self.assertNotIn("причина свидетеля не называет (остаток, issue #95)", flow)
@@ -24260,13 +24250,12 @@ class Release161(unittest.TestCase):
     """The release 1.6.1 (#87; #92 the owner's decision in the doc): version, the CHANGELOG section on top, the row of
     what is implemented, the explicit refspec of the base in both fetches."""
 
-    def test_version(self):
-        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.6\.1"\s*$')
+    # the version of SKILL.md moved on to 1.7.0: Release170 pins it
 
     def test_changelog_section_on_top(self):
         log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.6\.1 — 2026-10-18$", "1.6.1 is the first section")
+        self.assertRegex(log, r"(?m)^## 1\.6\.1 — 2026-10-18$", "CHANGELOG.md: the section of 1.6.1")
+        self.assertTrue(log.index("## 1.6.1") < log.index("## 1.6.0"), "1.6.1 is above 1.6.0")
         body = re.search(r"(?ms)^## 1\.6\.1 — 2026-10-18\n(.*?)(?=^## )", log).group(1)
         for needle in ("#87", "#92", "`base_refspec`", "`refresh_workdir`", "`owner-handover`",
                        "`test_narrow_refspec_clone_sees_the_fresh_base_branch`",
@@ -24283,6 +24272,39 @@ class Release161(unittest.TestCase):
         table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
         self.assertRegex(table, r"(?m)^\| Клон с узким refspec[^\n]*реализовано \(1\.6\.1; \[#87\][^\n]*"
                                 r"`OwnerHandover\.test_handover_in_a_narrow_refspec_clone` \|$")
+
+
+class Release170(unittest.TestCase):
+    """The release 1.7.0 (the owner's decision, no issue): CodeRabbit is no review channel. Version, the CHANGELOG
+    section on top, the row of what is implemented marked as removed, no CodeRabbit role or field in the code."""
+
+    def test_version(self):
+        skill = (ROOT / "skills" / "superarmanda" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(skill, r'(?m)^\s*version:\s*"1\.7\.0"\s*$')
+
+    def test_changelog_section_on_top(self):
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(log, r"(?m)\A(?:(?!^## ).*\n)*^## 1\.7\.0 — 2026-10-22$", "1.7.0 is the first section")
+        body = re.search(r"(?ms)^## 1\.7\.0 — 2026-10-22\n(.*?)(?=^## )", log).group(1)
+        for needle in ("### Удалено", "### Изменено", "`coderabbit_verdict`", "`state.LEGACY_ROLES`",
+                       "`LegacyCoderabbitRole`", "`GateLegacyCoderabbit`", "coderabbit was removed in 1.7.0"):
+            self.assertIn(needle, body)
+
+    def test_the_role_is_legacy_only(self):
+        state = gate.state
+        self.assertEqual(state.LEGACY_ROLES, {"coderabbit"})
+        for name in ("ROLES", "FIX_SOURCES", "DEFER_SOURCES", "EXTERNAL_REVIEW_ROLES"):
+            with self.subTest(name=name):
+                self.assertNotIn("coderabbit", getattr(state, name))
+        dash_src = (WAVES / "dash.py").read_text(encoding="utf-8")  # dash needs rich: read, not imported
+        self.assertRegex(dash_src, r'(?m)^VERDICT_ROLES = \("tester", "cross_provider_reviewer", "github_codex_review"\)$')
+        src = (ROOT / "skills" / "superarmanda" / "scripts" / "pr_review.py").read_text(encoding="utf-8")
+        self.assertNotIn("rabbit", src.lower())
+
+    def test_waves_doc_marks_the_row_removed(self):
+        waves = (ROOT / "skills" / "superarmanda" / "references" / "waves.md").read_text(encoding="utf-8")
+        table = waves[waves.index("## Что реализовано"):waves.index("Каждая строка таблицы закреплена тестами")]
+        self.assertRegex(table, r"(?m)^\| результат CodeRabbit по факту ревью HEAD[^\n]*\| удалено в 1\.7\.0 [^\n]*\|$")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,6 @@
 | субагентские роли: `architect`, `internal_reviewer`, `triage`, `investigator`, `final_check` | по политике ролей: Opus (`claude-opus-5-5`), свежая сессия | моделей Claude на этом host нет: запись `unavailable`, без подмены (#92) |
 | context / drafts | `reader`/`drafter@haiku` | `reader`/`drafter@gpt-5.6-luna` |
 | required PR review | GitHub Codex | GitHub Codex |
-| optional PR review | CodeRabbit | CodeRabbit |
 
 ## Модель роли по риску (1.4.0, #108)
 

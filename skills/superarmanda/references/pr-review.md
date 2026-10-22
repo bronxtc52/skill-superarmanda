@@ -28,53 +28,15 @@ every finding before recording approval. Never use shell exit status as approval
 It does not use the local cross-provider `packet_hash`: GitHub evidence is bound
 to the PR's full commit SHA.
 
-The mandatory identity is exactly `chatgpt-codex-connector[bot]` with GitHub actor type `Bot`; CodeRabbit
-(`coderabbitai[bot]`) is optional. An `APPROVED` Codex review for the exact current full SHA is
+The only trusted identity is exactly `chatgpt-codex-connector[bot]` with GitHub actor type `Bot`;
+reviews and comments of any other author or bot are no evidence. An `APPROVED` Codex review for the exact current full SHA is
 clean only when it has no body or attached review comments. A `COMMENTED` review with findings,
 and all substantive trusted-bot review/comment threads, are emitted as findings for coordinator
-disposition. They are never silently erased. CodeRabbit unavailability does not block, but any
-actual CodeRabbit finding remains a finding.
+disposition. They are never silently erased.
 
-### CodeRabbit: результат по факту ревью HEAD (1.0.2, #72)
-
-`check` кладёт в результат поле `coderabbit` = `{"status", "reason", "evidence_url"}`; оно есть всегда. Если HEAD PR или evidence изменились между снимками, `coderabbit` тоже `pending` (как и `status` = `incomplete`).
-(при HEAD ≠ ожидаемому — `pending`). Основной `status` и список `findings` оно не меняет. Учитываются
-только элементы с login `coderabbitai[bot]` и типом `Bot`.
-
-- `findings` — inline-комментарий CodeRabbit на HEAD (не шаблон-заглушка), либо его review на HEAD с
-  непустым телом, с прикреплёнными комментариями или в состоянии `CHANGES_REQUESTED`/`DISMISSED`.
-  Находки перекрывают любое доказательство.
-- `pass` — нет находок на HEAD и есть доказательство ревью HEAD по любому из двух каналов:
-  1. review CodeRabbit с `commit_id` = HEAD в состоянии `COMMENTED`/`APPROVED`/`CHANGES_REQUESTED`
-     (в том числе с пустым телом);
-  2. сводный issue comment CodeRabbit (тела review этот канал не дают), где среди строк вне блок-цитат (первая непробельная
-     литера `>` — цитата) есть `No actionable comments were generated` или `Actionable comments posted: N`
-     И диапазон `between <полный SHA> and <полный SHA>` (40 или 64 hex), конец которого равен HEAD
-     без учёта регистра. Маркер и диапазон — в одном и том же комментарии. Сокращённые SHA не принимаются.
-- `unavailable` — доказательства и находок нет, но в теле доверенного комментария/review есть явный отказ
-  (`review limit reached`, `rate limited`, `no credits available`, `reviews are disabled`, без учёта
-  регистра) и в том же теле есть диапазон `between X and Y`, конец которого равен HEAD (диапазон может
-  быть в цитате). Отказ без диапазона или с диапазоном на другой HEAD не считается: это `pending`, а
-  `unavailable` по таймауту даёт правило координатора ниже. `reason` называет фразу, `evidence_url` — комментарий.
-- `pending` — всё остальное (`no CodeRabbit review bound to current HEAD yet`; для известного шаблона
-  пропуска черновика — `CodeRabbit skipped the draft PR`). Скрипт не ждёт.
-
-Правило координатора. Пока `coderabbit.status == pending`, повторять `check`. Если CodeRabbit не дал
-доказательства за 30 минут после завершения Codex на HEAD — записать
-`task-result --role coderabbit --status unavailable` с причиной timeout. Запись роли `coderabbit` по полю:
-`pass` → `pass`, `findings` → `findings`, `unavailable` → `unavailable`. `unavailable` гейт мерджа не
-блокирует; `findings` разбираются (исправление, `fix-loop --defer` или `--accept`).
-Фикстуры — `tests/fixtures/pr-review/coderabbit/` (PR #70, #71, #75, #116, #118, #592).
-
-**Сводка CodeRabbit — не находка (1.5.1, #113 W1 п.2).** Issue comment, который CodeRabbit держит на PR и
-переписывает (walkthrough, «review in progress», «Draft PR not reviewed», флажок autopilot, подсказки), — шаблон бота,
-а не находка: в `findings` он не попадает, в `limitations` — строка `CodeRabbit walkthrough/status metadata is not a
-finding`. Распознаётся по машинным маркерам шаблона на всём теле: первая строка — `<!-- This is an auto-generated
-comment: summarize by coderabbit.ai -->`, последняя — `<!-- tips_end -->` (`pr_review.rabbit_summary`), только у
-доверенного `coderabbitai[bot]` с типом `Bot`. Слова шаблона внутри другого текста, маркер в середине, тело без
-закрывающего маркера или с текстом после него, ответ бота на команду (`<!-- This is an auto-generated reply by
-CodeRabbit -->`) остаются находкой. Inline-находки и review CodeRabbit на HEAD — находки, как и раньше. Канал
-доказательства `coderabbit` (сводка с `No actionable comments…` и диапазоном до HEAD) это не меняет.
+CodeRabbit is no review channel since 1.7.0: `check` has no `coderabbit` field, its reviews and comments
+are not evidence, and the role `coderabbit` is no longer recorded (`state.py` refuses it; a manifest
+written before keeps its records, judged by nobody — `workflow.md`).
 
 Two clean-comment formats are accepted, each a structure, not a wording list. The legacy format
 (unchanged by #442) is:
@@ -122,9 +84,7 @@ for PR #71 (`pr71-graphql.json`) replay the whole `check` against a fake `gh`.
 
 Each trusted current-HEAD inline comment is emitted independently of its parent review with its
 `commit_id` and `original_commit_id`; its reason states that it applies to the current HEAD. A stale,
-missing or unrelated parent cannot hide it. CodeRabbit boilerplate is ignored only for supported
-whole-message templates (including the known draft-skip template); markers and status words inside
-other text never suppress a finding.
+missing or unrelated parent cannot hide it.
 
 After the user has authorized a PR review, the coordinator may make one manual request with
 `gh pr comment ... --body-file` whose exact two lines are

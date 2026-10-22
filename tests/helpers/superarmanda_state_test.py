@@ -1172,12 +1172,12 @@ class StateContract(unittest.TestCase):
         stale = self.record("coder", head=self.base, check=False)
         self.assertNotEqual(stale.returncode, 0)
 
-    def test_coder_or_optional_coderabbit_pass_cannot_complete_task(self):
+    def test_coder_pass_or_a_pr_review_result_cannot_complete_task(self):
         self.record("coder")
         self.assertEqual(
             self.manifest_data()["tasks"]["implement"]["status"], "in_progress"
         )
-        self.record("coderabbit")
+        self.record("github_codex_review", status="incomplete")
         self.assertNotEqual(
             self.manifest_data()["tasks"]["implement"]["status"], "ready_for_pr_review"
         )
@@ -1199,7 +1199,7 @@ class StateContract(unittest.TestCase):
         # Three distinct sources keep every per-source counter below the
         # needs_decision threshold, so this exercises the unchanged global
         # cap in isolation from the new per-source gate.
-        for source in ("tester", "github_codex_review", "coderabbit"):
+        for source in ("tester", "github_codex_review", "cross_provider_reviewer"):
             self.cli(
                 "fix-loop",
                 "--task",
@@ -1452,7 +1452,7 @@ class StateContract(unittest.TestCase):
             "--note",
             "wrong source guess",
             "--source",
-            "coderabbit",
+            "github_codex_review",
             check=False,
         )
         self.assertNotEqual(
@@ -2094,7 +2094,7 @@ class StateContract(unittest.TestCase):
         self.assertGreaterEqual(deferral["recorded_at"], deferral["result_recorded_at"])
 
     def test_defer_for_optional_reviewers_is_accepted(self):
-        for role in ("github_codex_review", "coderabbit"):
+        for role in ("github_codex_review",):
             self.record(role, status="findings", session=f"{role}-1")
             entry = json.loads(self.defer(source=role).stdout)
             self.assertEqual(entry["fix_cycles"], 0)
@@ -3078,7 +3078,7 @@ class WavesContract(unittest.TestCase):
     def test_where_blocked_task(self):
         self.init_wave()
         self.record("coder")
-        for source in ("tester", "tester", "coderabbit"):
+        for source in ("tester", "tester", "github_codex_review"):
             proc = self.run_state(
                 "fix-loop", "--task", "implement", "--outcome", "failed",
                 "--source", source,
@@ -3287,7 +3287,6 @@ class WavesContract(unittest.TestCase):
             (("coder",), "tester", "findings"),
             (("coder", "tester"), "cross_provider_reviewer", "findings"),
             (("coder", "tester", "cross_provider_reviewer"), "github_codex_review", "findings"),
-            (("coder", "tester", "cross_provider_reviewer", "github_codex_review"), "coderabbit", "findings"),
         ]
         for before, role, status in cases:
             with self.subTest(role=role, status=status, before=len(before)):
@@ -3335,8 +3334,6 @@ class WavesContract(unittest.TestCase):
     def test_where_done_only_when_no_current_result_is_non_pass(self):
         self.init_wave()
         self.passes("coder", "tester", "cross_provider_reviewer", "github_codex_review")
-        self.assertTrue(self.where()["next_action"].startswith("done"))
-        self.record_any("coderabbit", "pass")
         self.assertTrue(self.where()["next_action"].startswith("done"))
 
     def test_where_precedence_disposition_before_coder_progression(self):
@@ -3421,16 +3418,14 @@ class WavesContract(unittest.TestCase):
         self.assertEqual(info["task"], "b")
         self.assertTrue(info["next_action"].startswith("done"))
 
-    def test_where_selects_task_with_fresh_codex_or_coderabbit_findings(self):
+    def test_where_selects_task_with_fresh_codex_findings(self):
         full = ("coder", "tester", "cross_provider_reviewer", "github_codex_review")
-        for role in ("github_codex_review", "coderabbit"):
+        for role in ("github_codex_review",):
             with self.subTest(role=role):
                 if self.manifest.exists():
                     self.manifest.unlink()
                 self.init_wave()
                 self.passes_for("a", "coder", "tester", "cross_provider_reviewer")
-                if role == "coderabbit":
-                    self.record_any("github_codex_review", "pass", task="a")
                 self.record_any(role, "findings", task="a")
                 self.passes_for("b", *full)
                 self.cli("mark", "--task", "b", "--step", 7, "--safe-point", "true")
@@ -3882,7 +3877,6 @@ class WhereDerivationExhaustive(unittest.TestCase):
         "tester",
         "cross_provider_reviewer",
         "github_codex_review",
-        "coderabbit",
     )
     VALUES = (None, "pass", "findings", "incomplete", "error", "unavailable")
 
@@ -3903,8 +3897,6 @@ class WhereDerivationExhaustive(unittest.TestCase):
         for name, _ in reviewers:
             if verdict.get(name) == "findings":
                 return (6, "coordinator", False, name)
-        if verdict.get("coderabbit") == "findings":
-            return (6, "coordinator", False, "coderabbit")
         for name, step in reviewers:
             if verdict.get(name) in ("error", "unavailable"):
                 return (step, name, True, None)
@@ -3946,34 +3938,7 @@ class WhereDerivationExhaustive(unittest.TestCase):
                 if actual != expected:
                     self.fail(f"{task_status} {verdict}: {actual} != {expected}")
                 count += 1
-        self.assertEqual(count, 4 * 6**5)
-
-    def test_named_coderabbit_cases(self):
-        module = self.load()
-        required = {
-            "coder": "pass",
-            "tester": "pass",
-            "cross_provider_reviewer": "pass",
-            "github_codex_review": "pass",
-        }
-        for status in ("unavailable", "error", "incomplete", "pass"):
-            with self.subTest(status=status):
-                verdict = dict(required, coderabbit=status)
-                self.assertEqual(
-                    self.observed(module, "in_progress", verdict),
-                    (7, None, False, None),
-                )
-        verdict = dict(required, coderabbit="findings")
-        self.assertEqual(
-            self.observed(module, "in_progress", verdict),
-            (6, "coordinator", False, "coderabbit"),
-        )
-        # coderabbit noise never masks a required-role problem
-        verdict = dict(required, tester="error", coderabbit="findings")
-        self.assertEqual(
-            self.observed(module, "in_progress", verdict),
-            (6, "coordinator", False, "coderabbit"),
-        )
+        self.assertEqual(count, 4 * 6**4)
 
     def test_named_incomplete_cases(self):
         module = self.load()
@@ -4523,7 +4488,7 @@ class HighRiskModels(PolicyBase):
         for wrong in ("", "gpt-6-astra", "Sonnet", "sonnet-lite"):
             self.record_refused("tester", model=wrong)
         # the model of a reviewer comes from its verified report, never from a flag
-        for role in ("cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit"):
+        for role in ("cross_provider_reviewer", "second_reviewer", "github_codex_review"):
             self.record_refused(role, status="incomplete", model="fable")
 
     def test_unavailable_policy_model_is_recorded_and_never_replaced_by_a_weaker_model(self):
@@ -5814,9 +5779,54 @@ class LiveVersion1Manifests(PolicyBase):
                 self.refused(command, *args, needle="review_policy")
 
 
+class LegacyCoderabbitRole(PolicyBase):
+    """1.7.0: CodeRabbit is no PR review channel any more. A manifest written before it may carry results,
+    sessions and deferrals of the role `coderabbit`: they are read without failing and judged by nobody
+    (no disposition, no gate problem, no line in `where`); a new record of the role is refused."""
+
+    RISK = "low"
+    load_live = LiveVersion1Manifests.load_live
+    REMOVED = "coderabbit was removed in 1.7.0"
+    problems = W2GateRules.problems
+
+    def setUp(self):
+        super().setUp()
+        self.gate = _load("superarmanda_gate_for_legacy_coderabbit", GATE)
+
+    def test_legacy_coderabbit_findings_are_read_and_ignored(self):
+        live = self.load_live("v1-medium-waves-tails-W2.json")
+        entry = live["tasks"][self.TASK]
+        self.assertEqual(entry["results"]["coderabbit"]["status"], "findings")
+        self.assertIn("coderabbit", entry["session_roles"].values())
+        # without the deferral that covered it the legacy finding is still judged by nobody
+        entry["deferrals"] = [d for d in entry["deferrals"] if d["source"] != "coderabbit"]
+        self.manifest.write_text(json.dumps(live, indent=2, sort_keys=True), encoding="utf-8")
+        status = self.ok("status")
+        self.assertEqual(status["tasks"][self.TASK]["status"], "ready_for_pr_review")
+        where = self.where()
+        self.assertIn("done", where["next_action"])
+        for key in ("open_findings", "artifacts"):
+            self.assertNotIn("coderabbit", [item["role"] for item in where[key]], key)
+        self.assertEqual(self.problems(MEDIUM_WAVE, self.data()), [])
+        self.assertEqual(self.data()["tasks"][self.TASK]["results"]["coderabbit"],
+                         entry["results"]["coderabbit"])  # kept as it was, never rewritten
+
+    def test_new_coderabbit_records_are_refused(self):
+        for live in (False, True):
+            with self.subTest(live=live):
+                if live:
+                    self.load_live("v1-medium-waves-tails-W2.json")
+                self.record_refused("coderabbit", needle=self.REMOVED)
+                self.record_refused("coderabbit", "unavailable", needle=self.REMOVED)
+                for flags in (("--outcome", "failed"), ("--defer", "--note", "n"),
+                              ("--accept", "--severity", "low", "--note", "n")):
+                    self.refused("fix-loop", "--task", self.TASK, *flags, "--source", "coderabbit",
+                                 needle=self.REMOVED)
+
+
 # ---------------------------------------------------------------- 1.2.3 (W3, #86 п.5-10): Fable subagent roles
 FABLE_ROLES = ("architect", "internal_reviewer", "triage", "investigator", "final_check")
-EXTERNAL_REVIEW_ROLES = ("cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit")
+EXTERNAL_REVIEW_ROLES = ("cross_provider_reviewer", "second_reviewer", "github_codex_review")
 
 
 class W3FableRoles(PolicyBase):
@@ -6022,7 +6032,7 @@ class W3InternalReviewSource(PolicyBase):
 
     def test_internal_source_closes_with_the_first_external_packet_until_the_end_of_the_run(self):
         statuses = {"cross_provider_reviewer": "unavailable", "second_reviewer": "error",
-                    "github_codex_review": "findings", "coderabbit": "unavailable"}
+                    "github_codex_review": "findings"}
         for role in EXTERNAL_REVIEW_ROLES:
             with self.subTest(external=role):
                 self.init()
@@ -6114,7 +6124,7 @@ class W3Version1(PolicyBase):
         self.assertNotIn("internal_rounds", entry)
         # a version 1 manifest carrying the records of 1.2.3 by hand is malformed
         live = self.data()
-        for key, value in (("internal_rounds", []), ("external_review", {"role": "coderabbit"})):
+        for key, value in (("internal_rounds", []), ("external_review", {"role": "github_codex_review"})):
             with self.subTest(key=key):
                 forged = copy.deepcopy(live)
                 forged["tasks"][self.TASK][key] = value
@@ -6673,7 +6683,6 @@ class W4MandatoryFableRoles(W4Base):
         for case, change in {
             "github_codex_review pass": lambda: self.record(
                 "github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1"),
-            "coderabbit unavailable": lambda: self.record("coderabbit", "unavailable"),
             "architect": lambda: self.record("architect", model="fable"),
             "triage": lambda: self.record("triage", "findings", model="fable"),
             "investigator": lambda: self.record("investigator", model="fable"),
@@ -6818,14 +6827,13 @@ class W4MandatoryFableRoles(W4Base):
         self.assertEqual(entry["status"], "in_progress")
         self.assert_not_ready("final_check", "recorded before")
         self.assertEqual(self.final()["status"], "ready_for_pr_review")
-        # the PR reviews are no part of the comparison (and raise no task_epoch either)
+        # the PR review is no part of the comparison (and raises no task_epoch either)
         self.record("github_codex_review", reviewed_head=self.head(), artifact="https://example.invalid/pr/1")
-        self.record("coderabbit", "unavailable")
         self.assertEqual(self.entry()["status"], "ready_for_pr_review")
         self.assertIn("done", self.where()["next_action"])
 
     def test_internal_review_after_the_first_external_packet_is_not_counted(self):
-        for first in ("cross_provider_reviewer", "github_codex_review", "coderabbit"):
+        for first in ("cross_provider_reviewer", "github_codex_review"):
             with self.subTest(first_external=first):
                 self.init()
                 self.packet()
@@ -7037,8 +7045,8 @@ class W4MandatoryFableRoles(W4Base):
         action = self.assert_not_ready("internal_reviewer", "new run")
         self.assertTrue(action.startswith("BLOCKED: internal_reviewer"), action)
         # the honest path is untouched: a fresh task gets its marker with the first external record
-        entry = self.record("coderabbit", "unavailable", task="t2")
-        self.assertEqual(entry["external_review"]["role"], "coderabbit")
+        entry = self.record("github_codex_review", "unavailable", task="t2")
+        self.assertEqual(entry["external_review"]["role"], "github_codex_review")
 
     def test_records_of_the_mandatory_roles_count_only_with_the_policy_model(self):
         """Internal review F2: like coder/tester of a high-risk task, a final_check and the internal review
@@ -7204,7 +7212,7 @@ class W4GateRoles(W4Base):
         # internal review F1/F2: the marker is not the only anchor, the model is part of the record
         cases["external_review removed"] = (lambda t: t.pop("external_review"), "internal_reviewer",
                                             "новый прогон волны")
-        cases["external_review without head"] = (lambda t: t.update(external_review={"role": "coderabbit"}),
+        cases["external_review without head"] = (lambda t: t.update(external_review={"role": "github_codex_review"}),
                                                  "internal_reviewer", "новый прогон волны")
         cases["final_check without model"] = (lambda t: t["results"]["final_check"].pop("model"), "final_check",
                                               "claude-opus-5-5")

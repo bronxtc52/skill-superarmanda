@@ -8,7 +8,7 @@
 | `scripts/pr_review.py` | `a2ce66ace9b74382e2b989b52818e8d3f646a3d10494525dba2d7283f771a482` |
 | `scripts/waves/gate.py` | `960c4a7f5b68dadd34d962cd7862c115b560fa972332a5b0846a161d79677eb8` |
 
-Зачем: тест совместимости (`GateCoderabbitUnavailable` в `tests/helpers/superarmanda_waves_test.py`)
+Зачем: тест совместимости (`GateLegacyCoderabbit` в `tests/helpers/superarmanda_waves_test.py`)
 сравнивает вердикты `manifest_problems` гейта 1.0.0 и текущего на одних и тех же manifest-ах. CI
 клонирует репозиторий с глубиной 1, `git show` там недоступен. `gate.py` грузит соседей
 (`state.py`, `pr_review.py`) по пути относительно себя, поэтому раскладка `scripts/` сохранена, а

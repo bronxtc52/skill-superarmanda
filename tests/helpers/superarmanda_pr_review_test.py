@@ -471,66 +471,33 @@ class EvaluateContract(unittest.TestCase):
         self.assertEqual(result["status"], "findings")
         self.assertTrue(result["findings"])
 
-    def test_coderabbit_is_optional_but_substantive_comment_is_a_finding(self):
-        no_rabbit = self.evaluate(reviews=[review()])
+    def test_coderabbit_evidence_of_any_shape_is_not_evidence_since_1_7_0(self):
+        # 1.7.0: CodeRabbit is no review channel; its reviews and comments are untrusted
+        # bot noise like any other bot's: no finding, no limitation, no field of its own.
         rabbit = actor("coderabbitai[bot]", "Bot")
-        substantive = self.evaluate(
+        noise = {
+            "user": rabbit,
+            "body": "SQL injection remains reachable from this query.",
+            "commit_id": HEAD,
+            "html_url": "https://comment/rabbit",
+            "pull_request_review_id": 41,
+        }
+        result = self.evaluate(
             reviews=[
                 review(),
-                review(
-                    "COMMENTED", body="SQL injection in search", ident=9, who=rabbit
-                ),
-            ]
-        )
-        self.assertEqual(no_rabbit["status"], "pass")
-        self.assertEqual(substantive["status"], "findings")
-
-    def test_coderabbit_skipped_boilerplate_does_not_block_a_codex_clean_result(self):
-        rabbit = actor("coderabbitai[bot]", "Bot")
-        skipped = issue(
-            "<!-- coderabbitai-review-status -->\nReview skipped: no credits available.",
-            rabbit,
-        )
-        result = self.evaluate(reviews=[review()], issues=[skipped])
-        self.assertEqual(result["status"], "pass")
-
-    def test_exact_coderabbit_draft_skip_template_is_unavailable_but_appended_finding_is_not(
-        self,
-    ):
-        rabbit = actor("coderabbitai[bot]", "Bot")
-        with self.subTest(case="known template"):
-            result = self.evaluate(
-                reviews=[review()], issues=[issue(CODERABBIT_DRAFT_SKIP, rabbit)]
-            )
-            self.assertEqual(result["status"], "pass")
-        with self.subTest(case="appended finding"):
-            result = self.evaluate(
-                reviews=[review()],
-                issues=[
-                    issue(
-                        CODERABBIT_DRAFT_SKIP
-                        + "\n\nrate limit exhausted: SQL injection remains reachable.",
-                        rabbit,
-                    )
-                ],
-            )
-            self.assertEqual(result["status"], "findings")
-
-    def test_empty_coderabbit_commented_review_on_head_proves_completion_not_incompleteness(
-        self,
-    ):
-        # Изменено в 1.0.2 (#72): пустое ревью CodeRabbit на HEAD — доказательство
-        # завершения, а не неполнота; основной статус от него больше не зависит.
-        rabbit = actor("coderabbitai[bot]", "Bot")
-        result = self.evaluate(
-            reviews=[review(), review("COMMENTED", body="", ident=13, who=rabbit)]
+                review("COMMENTED", body="SQL injection in search", ident=41, who=rabbit),
+                review("CHANGES_REQUESTED", body="", ident=42, who=rabbit),
+            ],
+            comments=[noise],
+            issues=[
+                issue(CODERABBIT_DRAFT_SKIP, rabbit, ident=2),
+                issue("Actionable comments posted: 3", rabbit, ident=3),
+            ],
         )
         self.assertEqual(result["status"], "pass")
-        self.assertEqual(result["coderabbit"]["status"], "pass")
-        self.assertIn(
-            "empty CodeRabbit COMMENTED review on HEAD proves completion",
-            result["limitations"],
-        )
+        self.assertEqual(result["findings"], [])
+        self.assertNotIn("coderabbit", result)
+        self.assertFalse([item for item in result["limitations"] if "CodeRabbit" in item])
 
     def test_historical_inline_comment_from_an_old_commit_is_recorded_as_history_not_a_current_finding(
         self,
@@ -594,46 +561,6 @@ class EvaluateContract(unittest.TestCase):
         self.assertEqual(result["findings"][0]["commit_id"], HEAD)
         self.assertEqual(result["findings"][0]["original_commit_id"], OLD)
         self.assertEqual(result["findings"][0]["reason"], "applies to current HEAD")
-
-    def test_coderabbit_metadata_words_do_not_hide_body_or_attached_finding(self):
-        rabbit = actor("coderabbitai[bot]", "Bot")
-        status = review(
-            "COMMENTED",
-            HEAD,
-            "Review skipped after rate limit: no credits. Walkthrough follows.",
-            ident=41,
-            who=rabbit,
-        )
-        attached = {
-            "user": rabbit,
-            "body": "SQL injection remains reachable from this query.",
-            "commit_id": HEAD,
-            "html_url": "https://comment/rabbit",
-            "pull_request_review_id": 41,
-        }
-        with self.subTest(status_word="attached"):
-            result = self.evaluate(reviews=[review(), status], comments=[attached])
-            self.assertEqual(result["status"], "findings")
-        for status_word in (
-            "rate limit",
-            "walkthrough",
-            "review skipped",
-            "no credits",
-        ):
-            with self.subTest(status_word=status_word):
-                result = self.evaluate(
-                    reviews=[
-                        review(),
-                        review(
-                            "COMMENTED",
-                            HEAD,
-                            f"{status_word}: SQL injection remains reachable.",
-                            ident=42,
-                            who=rabbit,
-                        ),
-                    ]
-                )
-                self.assertEqual(result["status"], "findings")
 
     def test_exact_clean_codex_summary_in_current_commented_review_is_clean(self):
         clean = (
@@ -1293,21 +1220,17 @@ class LivePr71Fixture(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         # Codex оставил чистый комментарий на 98b72fc (он распознан и резолвится в HEAD),
         # но inline-тред с 9306e85 перенесён GitHub на текущий HEAD (commit.oid == HEAD,
-        # originalCommit.oid == 9306e85), а два ответа CodeRabbit на команды — не шаблон
-        # (сводка CodeRabbit с 1.5.1 — шаблон бота, не находка, #113). Поэтому честный
-        # статус — findings, а не pass.
+        # originalCommit.oid == 9306e85). Поэтому честный статус — findings, а не pass.
+        # Комментарии CodeRabbit в снимке с 1.7.0 не доказательство вовсе: канал удалён.
         self.assertEqual(result["status"], "findings")
         self.assertEqual(result["current_head"], self.LIVE_HEAD)
-        self.assertIn(result["coderabbit"]["status"], ("pass", "findings"))
+        self.assertNotIn("coderabbit", result)
         threads = [f for f in result["findings"] if f["source"] == "review_comment"]
         self.assertEqual([f["url"] for f in threads], [self.THREAD_URL])
         self.assertEqual(threads[0]["commit_id"], self.LIVE_HEAD)
         self.assertEqual(threads[0]["original_commit_id"], self.OLD_HEAD)
-        self.assertEqual(
-            [f["author"] for f in result["findings"] if f["source"] == "issue_comment"],
-            ["coderabbitai[bot]"] * 2,
-        )
-        self.assertIn("CodeRabbit walkthrough/status metadata is not a finding", result["limitations"])
+        self.assertEqual([f for f in result["findings"] if f["source"] == "issue_comment"], [])
+        self.assertNotIn("coderabbitai[bot]", [f["author"] for f in result["findings"]])
         self.assertNotIn(
             "https://github.com/bronxtc52/skill-superarmanda/pull/71#issuecomment-5977422763",
             [f["url"] for f in result["findings"]],
@@ -1338,48 +1261,6 @@ class LivePr71Fixture(unittest.TestCase):
     def test_fixture_has_no_leaked_coderabbit_scope_token(self):
         raw = (FIXTURES / "pr71-graphql.json").read_text("utf-8")
         self.assertNotIn("scope=ghh_", raw)
-
-
-class CodeRabbitResetOnMovingEvidence(unittest.TestCase):
-    """Смена HEAD или evidence между снимками сбрасывает и status, и coderabbit."""
-
-    LIVE_HEAD = LivePr71Fixture.LIVE_HEAD
-
-    def entries(self):
-        return json.loads((FIXTURES / "pr71-graphql.json").read_text("utf-8"))["entries"]
-
-    def run71(self, entries):
-        return run_check(
-            entries, head=self.LIVE_HEAD, repo="bronxtc52/skill-superarmanda", pr_no="71"
-        )
-
-    def assert_pending(self, result, text):
-        self.assertEqual(result["status"], "incomplete")
-        self.assertIn(text, result["limitations"])
-        cr = result["coderabbit"]
-        self.assertEqual(cr["status"], "pending")
-        self.assertTrue(isinstance(cr["reason"], str) and cr["reason"])
-        self.assertIsNone(cr["evidence_url"])
-        self.assertEqual(set(cr), {"status", "reason", "evidence_url"})
-
-    def test_head_change_between_snapshots_makes_coderabbit_pending(self):
-        entries = self.entries()
-        header = next(e for e in entries if e["name"] == "Header")
-        header["responses"][1]["data"]["repository"]["pullRequest"]["headRefOid"] = (
-            "f" * 40
-        )
-        proc, result, _ = self.run71(entries)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assert_pending(result, "PR HEAD changed while collecting evidence")
-
-    def test_evidence_change_between_snapshots_makes_coderabbit_pending(self):
-        entries = self.entries()
-        ic = next(e for e in entries if e["name"] == "IssueComments")
-        nodes = ic["responses"][1]["data"]["repository"]["pullRequest"]["comments"]["nodes"]
-        nodes[-1]["body"] = nodes[-1]["body"] + "\nedited between snapshots"
-        proc, result, _ = self.run71(entries)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assert_pending(result, "review evidence changed while collecting evidence")
 
 
 class GraphQLFailClosed(unittest.TestCase):
@@ -1653,333 +1534,6 @@ class GhBoundaryContract(unittest.TestCase):
             "review evidence changed while collecting evidence", result["limitations"]
         )
 
-
-
-class CodeRabbitFact(unittest.TestCase):
-    """Результат CodeRabbit по факту ревью HEAD (issue #72); фикстуры сняты с живых PR."""
-
-    H70 = "4930cffa099e1164f6c0777196fc741d915396e8"
-    H71 = "98b72fc0900086732249dea82c6014c380500893"
-    H592 = "c1fe47b26b91f046c58b02213b9aa20b85b49b70"
-    OTHER = "1234567890abcdef1234567890abcdef12345678"
-    RABBIT = "coderabbitai[bot]"
-
-    def load(self, n):
-        raw = (FIXTURES / "coderabbit" / f"pr{n}-rest.json").read_text("utf-8")
-        return json.loads(raw)
-
-    def run_eval(self, data, head=None):
-        head = head or data["head"]["sha"]
-        return MODULE.evaluate(
-            {"head": {"sha": data["head"]["sha"]}, "draft": False},
-            data["reviews"],
-            data["review_comments"],
-            data["issue_comments"],
-            head,
-            lambda ref: None,
-        )
-
-    def rabbit(self, data, key="issue_comments"):
-        return [x for x in data[key] if x["user"]["login"] == self.RABBIT]
-
-    def summary71(self, data):
-        return next(x for x in self.rabbit(data) if "No actionable comments" in x["body"])
-
-    def only_rabbit_evidence(self, data):
-        for key in ("reviews", "review_comments", "issue_comments"):
-            data[key] = [x for x in data[key] if x["user"]["login"] == self.RABBIT]
-        return data
-
-    def test_pr71_summary_range_is_pass(self):
-        result = self.run_eval(self.load(71))
-        self.assertEqual(result["coderabbit"]["status"], "pass", result["coderabbit"])
-        self.assertTrue(result["coderabbit"]["evidence_url"])
-
-    def test_pr70_empty_review_on_head_is_pass_and_not_incomplete(self):
-        result = self.run_eval(self.load(70))
-        self.assertEqual(result["coderabbit"]["status"], "pass", result["coderabbit"])
-        # the empty CodeRabbit review is not what keeps the result open: only the Codex evidence of this fixture
-        # (its clean comment names a short SHA that the stub resolver does not resolve) does, since 1.5.1 the
-        # summary comment of CodeRabbit is no finding to hide it (#113)
-        self.assertIn("empty CodeRabbit COMMENTED review on HEAD proves completion", result["limitations"])
-        self.assertIn("no completed, clean GitHub Codex review bound to current HEAD", result["limitations"])
-        self.assertEqual(result["findings"], [])
-        self.assertNotIn(
-            "empty CodeRabbit COMMENTED review is incomplete", result["limitations"]
-        )
-
-    def test_pr592_limit_reached_is_unavailable(self):
-        result = self.run_eval(self.load(592))
-        verdict = result["coderabbit"]
-        self.assertEqual(verdict["status"], "unavailable", verdict)
-        self.assertTrue(verdict["reason"].startswith("CodeRabbit refused: "))
-        self.assertTrue(verdict["evidence_url"])
-
-    def test_field_present_when_head_differs(self):
-        result = self.run_eval(self.load(71), head=self.OTHER)
-        self.assertEqual(result["coderabbit"]["status"], "pending")
-        self.assertTrue(result["coderabbit"]["reason"])
-        self.assertIsNone(result["coderabbit"]["evidence_url"])
-
-    def test_range_end_replaced_is_not_pass(self):
-        data = self.load(71)
-        item = self.summary71(data)
-        item["body"] = item["body"].replace(self.H71, self.OTHER)
-        self.assertNotEqual(self.run_eval(data)["coderabbit"]["status"], "pass")
-
-    def test_range_end_uppercase_is_still_pass(self):
-        data = self.load(71)
-        item = self.summary71(data)
-        item["body"] = item["body"].replace(self.H71, self.H71.upper())
-        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "pass")
-
-    def test_abbreviated_range_end_is_not_pass(self):
-        data = self.load(71)
-        item = self.summary71(data)
-        item["body"] = item["body"].replace(self.H71, self.H71[:12])
-        self.assertNotEqual(self.run_eval(data)["coderabbit"]["status"], "pass")
-
-    def quote_lines(self, body, needles):
-        return "\n".join(
-            "> " + line if any(n in line for n in needles) else line
-            for line in body.split("\n")
-        )
-
-    def test_marker_in_blockquote_is_not_pass(self):
-        data = self.load(71)
-        item = self.summary71(data)
-        item["body"] = self.quote_lines(item["body"], ["No actionable comments"])
-        self.assertNotEqual(self.run_eval(data)["coderabbit"]["status"], "pass")
-
-    def test_range_in_blockquote_is_not_pass(self):
-        data = self.load(71)
-        item = self.summary71(data)
-        item["body"] = self.quote_lines(item["body"], ["between "])
-        self.assertNotEqual(self.run_eval(data)["coderabbit"]["status"], "pass")
-
-    def test_empty_review_on_other_commit_is_not_pass(self):
-        data = self.only_rabbit_evidence(self.load(70))
-        data["issue_comments"] = []
-        for item in data["reviews"]:
-            item["commit_id"] = self.OTHER
-        self.assertNotEqual(self.run_eval(data)["coderabbit"]["status"], "pass")
-
-    def test_same_login_but_user_type_is_ignored(self):
-        data = self.only_rabbit_evidence(self.load(70))
-        data["issue_comments"] = []
-        for item in data["reviews"]:
-            item["user"]["type"] = "User"
-        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "pending")
-        data = self.load(71)
-        for item in data["issue_comments"]:
-            if item["user"]["login"] == self.RABBIT:
-                item["user"]["type"] = "User"
-        self.assertNotEqual(self.run_eval(data)["coderabbit"]["status"], "pass")
-
-    def rabbit_inline(self, ident, commit):
-        return {
-            "id": ident,
-            "user": {"login": self.RABBIT, "type": "Bot"},
-            "body": "Потенциальная проблема: проверьте границы.",
-            "commit_id": commit,
-            "html_url": f"https://github.com/x/y/pull/1#discussion_r{ident}",
-        }
-
-    def test_inline_comment_on_head_is_findings(self):
-        data = self.load(71)
-        data["review_comments"].append(self.rabbit_inline(1, self.H71))
-        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "findings")
-
-    def test_inline_comment_on_old_commit_is_not_findings(self):
-        data = self.load(71)
-        data["review_comments"].append(self.rabbit_inline(1, self.OTHER))
-        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "pass")
-
-    def test_review_with_body_on_head_is_findings(self):
-        data = self.load(70)
-        data["reviews"].append(
-            {
-                "id": 77,
-                "user": {"login": self.RABBIT, "type": "Bot"},
-                "state": "COMMENTED",
-                "body": "Замечание по коду.",
-                "commit_id": self.H70,
-                "html_url": "https://github.com/x/y/pull/1#pullrequestreview-77",
-            }
-        )
-        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "findings")
-
-    def test_changes_requested_on_head_is_findings(self):
-        data = self.load(70)
-        data["reviews"].append(
-            {
-                "id": 78,
-                "user": {"login": self.RABBIT, "type": "Bot"},
-                "state": "CHANGES_REQUESTED",
-                "body": "",
-                "commit_id": self.H70,
-                "html_url": "https://github.com/x/y/pull/1#pullrequestreview-78",
-            }
-        )
-        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "findings")
-
-    def test_refusal_with_range_not_ending_at_head_is_not_unavailable(self):
-        data = self.load(592)
-        for item in data["issue_comments"]:
-            item["body"] = item["body"].replace(self.H592, self.OTHER)
-        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "pending")
-
-    def test_refusal_without_range_is_pending_not_unavailable(self):
-        # Изменено в 1.0.2 (круг 2): отказ без диапазона не привязан к HEAD.
-        data = self.load(592)
-        data["issue_comments"] = [
-            {
-                "id": 5,
-                "user": {"login": self.RABBIT, "type": "Bot"},
-                "body": "Review rate limited. Try later.",
-                "html_url": "https://github.com/x/y/pull/1#issuecomment-5",
-            }
-        ]
-        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "pending")
-
-    def test_historical_rate_limited_does_not_bypass_new_head(self):
-        data = self.load(71)
-        data["head"]["sha"] = self.OTHER
-        for key in ("reviews", "review_comments"):
-            data[key] = [x for x in data[key] if x.get("commit_id") != self.H71]
-        self.assertTrue(
-            any("rate limited" in x["body"].lower() for x in self.rabbit(data)),
-            "в фикстуре #71 есть исторический отказ без диапазона",
-        )
-        verdict = self.run_eval(data)["coderabbit"]
-        self.assertNotEqual(verdict["status"], "unavailable", verdict)
-        self.assertEqual(verdict["status"], "pending", verdict)
-
-    def test_done_marker_and_range_in_review_body_is_not_proof(self):
-        data = self.only_rabbit_evidence(self.load(70))
-        data["issue_comments"] = []
-        data["reviews"] = [
-            {
-                "id": 90,
-                "user": {"login": self.RABBIT, "type": "Bot"},
-                "state": "COMMENTED",
-                "body": "No actionable comments were generated in the review of "
-                f"changes between {self.OTHER} and {self.H70}.",
-                "commit_id": self.OTHER,
-                "html_url": "https://github.com/x/y/pull/1#pullrequestreview-90",
-            }
-        ]
-        data["review_comments"] = []
-        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "pending")
-
-    def test_no_evidence_is_pending(self):
-        data = self.load(592)
-        data["issue_comments"] = []
-        verdict = self.run_eval(data)["coderabbit"]
-        self.assertEqual(verdict["status"], "pending")
-        self.assertIn("no CodeRabbit review bound to current HEAD yet", verdict["reason"])
-
-    def test_draft_skip_is_pending_with_specific_reason(self):
-        data = self.load(592)
-        data["issue_comments"] = [
-            {
-                "id": 6,
-                "user": {"login": self.RABBIT, "type": "Bot"},
-                "body": CODERABBIT_DRAFT_SKIP,
-                "html_url": "https://x/6",
-            }
-        ]
-        verdict = self.run_eval(data)["coderabbit"]
-        self.assertEqual(verdict["status"], "pending")
-        self.assertIn("draft", verdict["reason"])
-
-    def test_findings_with_proof_stay_findings(self):
-        data = self.load(71)
-        data["review_comments"].append(self.rabbit_inline(2, self.H71))
-        self.assertEqual(self.run_eval(data)["coderabbit"]["status"], "findings")
-
-    def test_main_status_unchanged_for_pr71(self):
-        # Issue-комментарии CodeRabbit по-прежнему находки: слова внутри текста их не гасят.
-        result = self.run_eval(self.load(71))
-        self.assertEqual(result["status"], "findings")
-        self.assertTrue([f for f in result["findings"] if f["source"] == "issue_comment"])
-
-
-class CodeRabbitServiceComment(unittest.TestCase):
-    """#113 W1 п.2 (1.5.1): the summary comment CodeRabbit keeps rewriting on a PR (walkthrough, «review in progress»,
-    the autopilot checkbox, the draft skip) is the bot's template, not a finding. Recognised by the machine markers of the
-    template (the first line `<!-- This is an auto-generated comment: summarize by coderabbit.ai -->` and the closing
-    `<!-- tips_end -->`), never by words that a real finding may contain. Live samples: tests/fixtures/pr-review/
-    coderabbit/pr{75,116,118,120}-rest.json (README there)."""
-
-    RABBIT = "coderabbitai[bot]"
-
-    def load(self, n):
-        return json.loads((FIXTURES / "coderabbit" / f"pr{n}-rest.json").read_text("utf-8"))
-
-    def run_eval(self, data):
-        head = data["head"]["sha"]
-        return MODULE.evaluate({"head": {"sha": head}, "draft": False}, data["reviews"], data["review_comments"],
-                               data["issue_comments"], head, lambda ref: None)
-
-    def rabbit_issue_findings(self, result):
-        return [f for f in result["findings"] if f["source"] == "issue_comment" and f["author"] == self.RABBIT]
-
-    def test_live_service_comments_are_not_findings(self):
-        for n, what in ((118, "review in progress"), (116, "Recent review info"), (75, "summarize by coderabbit.ai"),
-                        (120, "Draft PR not reviewed")):
-            with self.subTest(pr=n):
-                data = self.load(n)
-                bodies = [c["body"] for c in data["issue_comments"] if c["user"]["login"] == self.RABBIT]
-                self.assertTrue(bodies and all(what in b for b in bodies), "the live sample is what it claims")
-                self.assertTrue(all("<!-- autopilot:start -->" in b for b in bodies))
-                result = self.run_eval(data)
-                self.assertEqual(self.rabbit_issue_findings(result), [], result["findings"])
-                self.assertIn("CodeRabbit walkthrough/status metadata is not a finding", result["limitations"])
-
-    def test_draft_not_reviewed_in_the_live_template_is_not_a_finding(self):
-        # the live comment «Draft PR not reviewed» of PR #120 (issue comment 6118957590), as GitHub returned it
-        data = self.load(120)
-        self.assertTrue(data["draft"])
-        item = next(c for c in data["issue_comments"] if c["user"]["login"] == self.RABBIT)
-        self.assertEqual(item["id"], 6118957590)
-        self.assertIn("> ## Draft PR not reviewed", item["body"])
-        self.assertIn("<!-- autopilot:start -->", item["body"])
-        result = self.run_eval(data)
-        self.assertEqual(self.rabbit_issue_findings(result), [], result["findings"])
-        self.assertIn("CodeRabbit walkthrough/status metadata is not a finding", result["limitations"])
-
-    def test_a_real_coderabbit_finding_is_still_a_finding(self):
-        data = self.load(75)
-        result = self.run_eval(data)
-        inline = [f for f in result["findings"] if f["author"] == self.RABBIT and f["source"] == "review_comment"]
-        self.assertTrue(inline, "the live inline finding of CodeRabbit on PR #75 stays a finding")
-        self.assertEqual(result["status"], "findings")
-
-    def test_template_words_outside_the_template_markers_stay_a_finding(self):
-        data = self.load(118)
-        live = next(c for c in data["issue_comments"] if c["user"]["login"] == self.RABBIT)["body"]
-        variants = {
-            "words only": "Draft PR not reviewed; review in progress; autopilot — but the null check in gate.py:12 is wrong.",
-            "marker quoted inside a finding": "Please fix gate.py:12.\n\n" + live,
-            "no closing marker": live.rsplit("<!-- tips_start -->", 1)[0] + "\nAlso: gate.py:12 drops the error.",
-            "text after the template": live + "\n\nAlso: gate.py:12 drops the error.",
-            "a reply of the bot": "<!-- This is an auto-generated reply by CodeRabbit -->\nThe null check in gate.py:12 is wrong.",
-        }
-        for name, body in variants.items():
-            with self.subTest(case=name):
-                d = self.load(118)
-                d["issue_comments"] = [{"id": 1, "user": {"login": self.RABBIT, "type": "Bot"}, "body": body,
-                                        "html_url": "https://x/1"}]
-                self.assertEqual(len(self.rabbit_issue_findings(self.run_eval(d))), 1)
-
-    def test_the_template_of_another_author_is_not_trusted(self):
-        data = self.load(116)
-        for c in data["issue_comments"]:
-            if c["user"]["login"] == self.RABBIT:
-                c["user"] = {"login": self.RABBIT, "type": "User"}  # a person named like the bot: not the bot
-        result = self.run_eval(data)
-        self.assertEqual(self.rabbit_issue_findings(result), [])  # untrusted: not evidence at all, as before
 
 
 if __name__ == "__main__":

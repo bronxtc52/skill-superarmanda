@@ -31,9 +31,6 @@ chain-result.md.
 Since 1.0.1-1.0.3 the same run also covers (W4, #68/#72/#57):
   * the idle nudge: W1 is RUNNING and silent past `idle_nudge_minutes` while a background shell of its
     Claude lives (the `ps` stand-in shows it): NO nudge; when the shell is gone the wave gets exactly ONE;
-  * an unavailable CodeRabbit: W2 records `coderabbit` = `unavailable` (the verdict of the real
-    pr_review.coderabbit_verdict on the live refusal comment, tests/fixtures/pr-review/coderabbit) and the
-    gate still passes;
   * the cleanup of a finished chain with panes that are not the run's: an unmarked pane and a pane of
     another run share the wave sessions, the owner's own dashboard of this chain sits next to the owner's
     shell and a dashboard of an older run: only the run's own dashboard pane is closed.
@@ -55,7 +52,7 @@ chain-result.md. Инвариант — у oracle_no_wave_text.
 
 Mutations (same scenario, broken dispatcher, the oracle must notice): no merge gate, no session
 binding after /clear, no decision policy, an idle nudge with the process tree ignored (or no nudge at all),
-an unavailable CodeRabbit that blocks the gate, a cleanup that does not check whose a pane is.
+a cleanup that does not check whose a pane is.
 """
 
 import atexit
@@ -91,7 +88,6 @@ for _var in ["SUPERARMANDA_TZ", *(k for k in os.environ if k.startswith(("WAB_",
     os.environ.pop(_var, None)
 
 import wab  # noqa: E402
-import pr_review  # noqa: E402
 
 REPO = "acme/waves-demo"
 CHAIN = "e2e"
@@ -786,22 +782,8 @@ class Actor:
         self.write_status(s, "RUNNING")
         self.after(40, "w2 done", lambda: self.w2_done(s))
 
-    def record_coderabbit_refusal(self, s):
-        """CodeRabbit refused the review of this head: its live refusal comment (pr592 of the fixtures; the range
-        end is the head of THIS PR), classified by the real pr_review.coderabbit_verdict, recorded as the role."""
-        head = self.w.git("rev-parse", "HEAD")
-        d = json.loads((FIXTURES / "pr-review" / "coderabbit" / "pr592-rest.json").read_text(encoding="utf-8"))
-        old = d["head"]["sha"]
-        comments = json.loads(json.dumps(d["issue_comments"]).replace(old, head))
-        verdict = pr_review.coderabbit_verdict(head, d["reviews"], d["review_comments"], comments)
-        must(verdict["status"] == "unavailable", f"the live refusal is not classified as unavailable: {verdict}")
-        self.state_py("task-result", "--manifest", str(self.manifest_path(s)), "--task", "T1", "--role", "coderabbit",
-                      "--status", verdict["status"], "--session-id", f"e2e-{s.wave}-coderabbit", "--head", head)
-        self.did(s, f"coderabbit {verdict['status']}")
-
     def w2_done(self, s):
         self.record_results(s)
-        self.record_coderabbit_refusal(s)
         s.journal.turn(11_000)
         if self.mode == "threads":  # the gate of W2 also passes with an open thread
             self.w.gh_set(max(int(n) for n in self.w.gh()["prs"]), thread="open")
@@ -859,7 +841,6 @@ class Actor:
         self.state_py("resume", "--manifest", self.manifest_path(s), "--repo", self.w.workdir,
                       "--base", self.w.git("rev-parse", "origin/main"), "--head", self.w.git("rev-parse", "HEAD"), s=s)
         self.record_results(s)
-        self.record_coderabbit_refusal(s)
         self.threads[s.wave]["new_head"] = self.w.git("rev-parse", "HEAD")
         self.threads[s.wave]["pushed_at"] = self.clock.offset
         self.did(s, "a new commit pushed, the thread closed")
@@ -936,7 +917,7 @@ def run_scenario(mode="normal", limit=90 * 60):
     (the context is never measured) | lowered_policy (the high wave W1 builds its manifest with the level
     lowered to medium and one review) | no_final_check (the high wave W1 records both reviews and no final
     check) | no_children_check (the nudge ignores the process tree) | no_nudge (no idle
-    nudge at all) | rabbit_blocks (a CodeRabbit that is `unavailable` blocks the gate) | kill_any (the cleanup
+    nudge at all) | kill_any (the cleanup
     does not check whose a pane is) | remnants (restart on the 1.4.1 state.json) | remnants150 (restart on the
     state.json and `.texts/` of 1.5.0) | remnants150_no_marks (the same without the marks of W2's answered episode)."""
     base = Path(tempfile.mkdtemp(prefix="wabe2e-"))
@@ -1041,17 +1022,6 @@ def run_scenario(mode="normal", limit=90 * 60):
             stack.enter_context(mock.patch.object(wab, "wave_children", lambda cfg, w: []))
         if mode == "no_nudge":
             stack.enter_context(mock.patch.object(wab, "_idle_nudge_tick", lambda *a, **kw: None))
-        if mode == "rabbit_blocks":
-            real = wab.gate.manifest_problems
-
-            def strict(manifest, head, fingerprint, plan=None):
-                out = real(manifest, head, fingerprint, plan)
-                for name, entry in ((manifest or {}).get("tasks") or {}).items():
-                    r = (entry.get("results") or {}).get("coderabbit") or {}
-                    if r.get("head") == head and r.get("status") == "unavailable":
-                        out.append(f"задача {name}: coderabbit unavailable")
-                return out
-            stack.enter_context(mock.patch.object(wab.gate, "manifest_problems", strict))
         if mode == "kill_any":
             stack.enter_context(mock.patch.object(wab, "_ours", lambda cfg, session=None, pane=None: "ours"))
         run.env_seen = {"wab_tmux": sorted(k for k in os.environ if k.startswith(("WAB_", "TMUX"))),
@@ -1276,19 +1246,6 @@ def oracle_nudge(run):
                           f"lived until +{a.bg_until - a.bg_since:.0f} s")
     must(run.events_log.count("W1: idle nudge sent") == 1, "events: idle nudge sent is not exactly once")
     must(not any(msg.startswith("[wab] Толчок") and msg != text for _, _, msg in a.received), "another nudge text")
-
-
-def oracle_coderabbit(run):
-    """An unavailable CodeRabbit (#72): the wave recorded the role, the gate did not count it against the PR."""
-    w = run.world
-    runs = json.loads((w.run_dir / "W2" / "runs.json").read_text(encoding="utf-8"))["runs"]
-    manifest = json.loads(Path(runs[-1]["manifest"]).read_text(encoding="utf-8"))
-    rabbit = manifest["tasks"]["T1"]["results"].get("coderabbit")
-    must(rabbit and rabbit["status"] == "unavailable", f"W2 did not record coderabbit=unavailable: {rabbit}")
-    must(rabbit["head"] == manifest["head"], "the refusal was recorded on another head than the PR's")
-    must(w.gh()["prs"]["2"]["state"] == "MERGED", "W2's PR was not merged although only CodeRabbit refused")
-    must("coderabbit" not in " ".join(l for l in run.events_log.splitlines() if "W2: merge gate failed" in l),
-         "the gate counted the unavailable CodeRabbit against W2")
 
 
 def check_reminder_times(at, gate_at, closed_at):
@@ -1588,9 +1545,6 @@ class OfflineChain(unittest.TestCase):
     def test_idle_nudge_waits_for_background_work_then_pushes_once(self):
         oracle_nudge(self.chain)
 
-    def test_unavailable_coderabbit_does_not_block_the_gate(self):
-        oracle_coderabbit(self.chain)
-
     def test_cleanup_closes_only_the_runs_own_panes(self):
         oracle_cleanup(self.chain)
 
@@ -1774,10 +1728,6 @@ class Mutations(unittest.TestCase):
     def test_without_the_idle_nudge_the_silent_wave_is_never_pushed(self):
         with self.assertRaises(Stalled):
             run_scenario("no_nudge", limit=60 * 60)
-
-    def test_a_blocking_unavailable_coderabbit_stalls_the_chain(self):
-        with self.assertRaises(Stalled):
-            run_scenario("rabbit_blocks", limit=70 * 60)
 
     def test_a_cleanup_that_does_not_check_ownership_kills_foreign_panes(self):
         run = run_scenario("kill_any")

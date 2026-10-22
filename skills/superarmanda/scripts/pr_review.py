@@ -11,7 +11,6 @@ import tempfile
 from pathlib import Path
 
 CODEX = "chatgpt-codex-connector[bot]"
-RABBIT = "coderabbitai[bot]"
 REPOSITORY = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 MARKER = "<!-- codex-pull-request-review-summary -->"
 CLEAN_LEGACY = re.compile(
@@ -32,40 +31,6 @@ CLEAN_OBSERVED = re.compile(
     r"</details>\Z",
     re.DOTALL,
 )
-RABBIT_BOILERPLATE = re.compile(
-    r"\A<!-- coderabbitai-review-status -->\nReview skipped: no credits available\.\Z",
-    re.DOTALL,
-)
-RABBIT_DRAFT_SKIP = re.compile(
-    r"\A<!-- This is an auto-generated comment: summarize by coderabbit\.ai -->\n"
-    r"<!-- This is an auto-generated comment: skip review by coderabbit\.ai -->\n\n"
-    r"> \[!IMPORTANT\]\n> ## Draft PR not reviewed\n> \n"
-    r"> Draft PRs are not automatically reviewed by default\.\n> \n"
-    r'> - \[ \] <!-- \{"checkboxId":"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"\} --> Trigger a manual review\n'
-    r"> \n> To automatically review draft PRs, update your CodeRabbit configuration:\n> \n"
-    r"> ```yaml\n> reviews:\n>   auto_review:\n>     drafts: true\n> ```\n\n"
-    r"<!-- end of auto-generated comment: skip review by coderabbit\.ai -->\n\n"
-    r"<!-- tips_start -->\n\n---\n\n\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands\.</sub>\n\n<!-- tips_end -->\Z",
-    re.DOTALL,
-)
-# The summary comment CodeRabbit keeps rewriting on a PR (walkthrough, «review in progress», «Draft PR not reviewed»,
-# the autopilot checkbox, the tips): the bot's own template, opened by its machine marker on the first line and closed
-# by the end marker of its tips block (#113 W1 п.2). Recognised by these two markers of the whole body, never by words
-# that a real finding could quote; text after the closing marker, or a body without it, is not the template.
-RABBIT_SUMMARY_OPEN = "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n"
-RABBIT_SUMMARY_CLOSE = "\n<!-- tips_end -->"
-RABBIT_DONE = re.compile(
-    r"No actionable comments were generated|Actionable comments posted: \d+"
-)
-RABBIT_RANGE = re.compile(
-    r"between ([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)(?![0-9a-fA-F])"
-    r" and ([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)(?![0-9a-fA-F])"
-)
-RABBIT_REFUSAL = re.compile(
-    r"review limit reached|rate limited|no credits available"
-    r"|reviews? (?:are |is )?disabled",
-    re.IGNORECASE,
-)
 
 
 def login(item):
@@ -83,15 +48,6 @@ def url(item):
 
 def text(item):
     return (item.get("body") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-
-
-def rabbit_boilerplate(body):
-    return bool(RABBIT_BOILERPLATE.fullmatch(body) or RABBIT_DRAFT_SKIP.fullmatch(body))
-
-
-def rabbit_summary(body):
-    """The PR summary comment of CodeRabbit (an issue comment only): its template from the first to the last line."""
-    return body.startswith(RABBIT_SUMMARY_OPEN) and body.endswith(RABBIT_SUMMARY_CLOSE)
 
 
 def clean_commit(body):
@@ -115,88 +71,6 @@ def finding(source, item, reason):
     return value
 
 
-def outside_quotes(body):
-    """Строки тела вне блок-цитат: первая непробельная литера `>` — цитата."""
-    return "\n".join(
-        line for line in body.split("\n") if not line.lstrip().startswith(">")
-    )
-
-
-def range_ends(body):
-    return [match.group(2).lower() for match in RABBIT_RANGE.finditer(body)]
-
-
-def coderabbit_verdict(expected_head, reviews, review_comments, issue_comments):
-    """Результат CodeRabbit на HEAD по факту ревью; чистая функция без I/O.
-
-    Два канала доказательства: (а) review на HEAD; (б) сводный issue comment с
-    маркером завершения и диапазоном, кончающимся ровно на HEAD (тела review не
-    считаются). Явный отказ засчитывается, только если в его теле есть диапазон
-    с концом на HEAD. Остальное — pending: ждёт координатор.
-    """
-    head = (expected_head or "").lower()
-    verdict = lambda status, reason, evidence=None: {  # noqa: E731
-        "status": status,
-        "reason": reason,
-        "evidence_url": evidence,
-    }
-    attached = {}
-    found = None  # url первой HEAD-находки
-    for comment in review_comments:
-        body = text(comment)
-        if not trusted(comment, RABBIT) or not body:
-            continue
-        if (comment.get("commit_id") or "").lower() != head:
-            continue
-        attached.setdefault(comment.get("pull_request_review_id"), []).append(comment)
-        if not rabbit_boilerplate(body):
-            found = found or url(comment) or "inline comment"
-    proof = None  # url первого доказательства ревью HEAD
-    for review in reviews:
-        if not trusted(review, RABBIT):
-            continue
-        body, state = text(review), (review.get("state") or "").upper()
-        if (review.get("commit_id") or "").lower() == head:
-            if state in ("COMMENTED", "APPROVED", "CHANGES_REQUESTED"):
-                proof = proof or url(review)
-            has_text = bool(body) and not rabbit_boilerplate(body)
-            if has_text or attached.get(review.get("id")) or state in (
-                "CHANGES_REQUESTED",
-                "DISMISSED",
-            ):
-                found = found or url(review) or "review"
-    bodies = [
-        (url(item), text(item))
-        for item in (*reviews, *issue_comments)
-        if trusted(item, RABBIT) and text(item)
-    ]
-    summaries = [
-        (url(item), text(item))
-        for item in issue_comments
-        if trusted(item, RABBIT) and text(item)
-    ]
-    for where, body in summaries:
-        quoted_free = outside_quotes(body)
-        if RABBIT_DONE.search(quoted_free) and head in range_ends(quoted_free):
-            proof = proof or where
-    if found:
-        return verdict("findings", "CodeRabbit left findings on current HEAD", found)
-    if proof:
-        return verdict("pass", "CodeRabbit review of current HEAD is proven", proof)
-    for where, body in bodies:
-        match = RABBIT_REFUSAL.search(body)
-        if match and head in range_ends(body):
-            return verdict(
-                "unavailable", f"CodeRabbit refused: {match.group(0).lower()}", where
-            )
-    if any(
-        trusted(item, RABBIT) and RABBIT_DRAFT_SKIP.fullmatch(text(item))
-        for item in issue_comments
-    ):
-        return verdict("pending", "CodeRabbit skipped the draft PR")
-    return verdict("pending", "no CodeRabbit review bound to current HEAD yet")
-
-
 def evaluate(
     pr,
     reviews,
@@ -214,26 +88,18 @@ def evaluate(
         "evidence_urls": [],
         "findings": [],
         "limitations": [],
-        "coderabbit": {
-            "status": "pending",
-            "reason": "PR HEAD differs from expected SHA",
-            "evidence_url": None,
-        },
     }
     if head != expected_head:
         result["limitations"].append("PR HEAD differs from expected SHA")
         return result
-    result["coderabbit"] = coderabbit_verdict(
-        expected_head, reviews, review_comments, issue_comments
-    )
     codex_approved = False
     codex_clean_comment = False
     codex_seen = False
     blocking_incomplete = False
     comments_by_review = {}
     for comment in review_comments:
-        who, commit, body = login(comment), comment.get("commit_id"), text(comment)
-        if not (trusted(comment, CODEX) or trusted(comment, RABBIT)) or not body:
+        commit, body = comment.get("commit_id"), text(comment)
+        if not trusted(comment, CODEX) or not body:
             continue
         result["evidence_urls"].append(url(comment))
         if commit != expected_head:
@@ -247,60 +113,43 @@ def evaluate(
         # Inline findings are independently current-HEAD evidence. GitHub can
         # omit, stale, or reassign their parent review, so parent aggregation
         # must never decide whether this evidence is emitted.
-        if who != RABBIT or not rabbit_boilerplate(body):
-            result["findings"].append(
-                finding("review_comment", comment, "applies to current HEAD")
-            )
-    for review in reviews:
-        who, state, commit = (
-            login(review),
-            (review.get("state") or "").upper(),
-            review.get("commit_id"),
+        result["findings"].append(
+            finding("review_comment", comment, "applies to current HEAD")
         )
-        if not (trusted(review, CODEX) or trusted(review, RABBIT)):
+    for review in reviews:
+        state, commit = (review.get("state") or "").upper(), review.get("commit_id")
+        if not trusted(review, CODEX):
             continue
         result["evidence_urls"].append(url(review))
-        if who == CODEX:
-            codex_seen = True
+        codex_seen = True
         if commit != expected_head:
-            if who == CODEX:
-                result["limitations"].append(
-                    "Codex review is stale or lacks the full current commit_id"
-                )
+            result["limitations"].append(
+                "Codex review is stale or lacks the full current commit_id"
+            )
             continue
         attached = comments_by_review.get(review.get("id"), [])
         body = text(review)
         clean_sha = clean_commit(body) if body else None
         clean_review = (
-            who == CODEX
-            and state in ("APPROVED", "COMMENTED")
+            state in ("APPROVED", "COMMENTED")
             and clean_sha is not None
             and resolve_commit(clean_sha) == expected_head
             and not attached
         )
         if clean_review:
             codex_approved = True
-        elif state == "APPROVED" and who == CODEX and not body and not attached:
+        elif state == "APPROVED" and not body and not attached:
             codex_approved = True
         elif state == "COMMENTED":
             if body or attached:
-                if who == RABBIT and rabbit_boilerplate(body) and not attached:
-                    result["limitations"].append(
-                        "CodeRabbit walkthrough/status metadata is not a finding"
+                result["findings"].append(
+                    finding(
+                        "review",
+                        review,
+                        "COMMENTED review requires coordinator disposition",
                     )
-                else:
-                    result["findings"].append(
-                        finding(
-                            "review",
-                            review,
-                            "COMMENTED review requires coordinator disposition",
-                        )
-                    )
-            elif who == RABBIT:
-                result["limitations"].append(
-                    "empty CodeRabbit COMMENTED review on HEAD proves completion"
                 )
-            elif who == CODEX:
+            else:
                 result["limitations"].append(
                     "Codex COMMENTED review is not an explicit clean result"
                 )
@@ -309,51 +158,37 @@ def evaluate(
             result["findings"].append(
                 finding("review", review, "review requires coordinator disposition")
             )
-        elif who == CODEX:
+        else:
             result["limitations"].append(
                 "Codex review is pending or has an unknown format"
             )
             blocking_incomplete = True
     for comment in issue_comments:
-        who, body = login(comment), text(comment)
-        if not (trusted(comment, CODEX) or trusted(comment, RABBIT)) or not body:
+        body = text(comment)
+        if not trusted(comment, CODEX) or not body:
             continue
         result["evidence_urls"].append(url(comment))
-        if who == CODEX:
-            codex_seen = True
-            clean_sha = clean_commit(body)
-            if clean_sha:
-                full = resolve_commit(clean_sha)
-                if full == expected_head:
-                    codex_clean_comment = True
-                    continue
-                result["limitations"].append(
-                    "Codex clean comment does not resolve to current full SHA"
-                )
+        codex_seen = True
+        clean_sha = clean_commit(body)
+        if clean_sha:
+            full = resolve_commit(clean_sha)
+            if full == expected_head:
+                codex_clean_comment = True
                 continue
-            if MARKER in body:
-                result["limitations"].append(
-                    "Codex summary marks completion only; it is not a clean result"
-                )
-                continue
-            result["findings"].append(
-                finding(
-                    "issue_comment",
-                    comment,
-                    "unknown current-HEAD Codex comment requires disposition",
-                )
+            result["limitations"].append(
+                "Codex clean comment does not resolve to current full SHA"
             )
             continue
-        if rabbit_boilerplate(body) or rabbit_summary(body):
+        if MARKER in body:
             result["limitations"].append(
-                "CodeRabbit walkthrough/status metadata is not a finding"
+                "Codex summary marks completion only; it is not a clean result"
             )
             continue
         result["findings"].append(
             finding(
                 "issue_comment",
                 comment,
-                "bot-provided comment requires coordinator disposition",
+                "unknown current-HEAD Codex comment requires disposition",
             )
         )
     result["evidence_urls"] = sorted({item for item in result["evidence_urls"] if item})
@@ -816,10 +651,6 @@ def check(args):
             fetch_issue_comments(owner, name, args.pr),
         )
 
-    def moved(reason):
-        # Результат CodeRabbit посчитан по первому снимку: данные сдвинулись, он недействителен.
-        return {"status": "pending", "reason": reason, "evidence_url": None}
-
     first = fetch_header(owner, name, args.pr)
     reviews, review_comments, issue_comments = snapshot()
     check_runs, checks = fetch_checks(owner, name, first["head"]["sha"])
@@ -841,13 +672,11 @@ def check(args):
         result["status"] = "incomplete"
         result["current_head"] = last["head"]["sha"]
         result["limitations"].append("PR HEAD changed while collecting evidence")
-        result["coderabbit"] = moved("PR HEAD changed while collecting evidence")
     elif second != (reviews, review_comments, issue_comments):
         result["status"] = "incomplete"
         result["limitations"].append(
             "review evidence changed while collecting evidence"
         )
-        result["coderabbit"] = moved("review evidence changed while collecting evidence")
     write(output, result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["status"] in ("pass", "findings", "incomplete") else 1

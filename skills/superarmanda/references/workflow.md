@@ -35,8 +35,7 @@ worktree с собственным origin пользователя. Устано
    fresh tester, единственный coordinator вызывает `fix-loop --outcome failed --source <источник>`,
    где источник — `cross_provider_reviewer` (решающий task reviewer; при риске high второй
    решающий — `second_reviewer`),
-   `github_codex_review` (PR-гейт), `coderabbit` (advisory: его находки разбираются, но его два
-   круга тоже ведут к решению) или `tester`; coder → tester → reviewer повторяется. Это ручная
+   `github_codex_review` (PR-гейт) или `tester`; coder → tester → reviewer повторяется. Это ручная
    дисциплина coordinator, а не автономное доказательство durable enforcement. Третья неудача
    блокирует задачу. Правило двух кругов на источник: вторая подряд неудача от одного источника
    (за вычетом уже принятых по нему решений) переводит задачу в `needs_decision`, и она не
@@ -56,7 +55,6 @@ worktree с собственным origin пользователя. Устано
    внутри текущего прогона: нарушения приёмки идут обычным `--outcome failed` и на последнем прогоне.
 6. После всех task reviews создаётся draft PR. GitHub Codex должен завершить review именно
    текущего HEAD. Повторные запросы на тот же head идемпотентны и не опрашиваются бесконечно.
-   CodeRabbit необязателен, но существенные полученные findings разбираются.
 
 Недоступный обязательный reviewer/auth/model/quota — `blocked`/`unavailable`, а не pass.
 Исключение только для подтверждённого Fable quota: сама Fable-попытка остаётся
@@ -260,7 +258,7 @@ Manifest без `role_models` (1.2.x, 1.3.x) оценивается по вст�
   `--outcome pass` для этого источника нет.
 - Маркер первого внешнего пакета — ключ задачи `external_review` (`{role, head, recorded_at}`):
   его пишет первый `task-result` роли `cross_provider_reviewer`, `second_reviewer`,
-  `github_codex_review` или `coderabbit` с любым статусом. Он переживает `resume` и новый HEAD
+  `github_codex_review` с любым статусом. Он переживает `resume` и новый HEAD
   после фикса: до конца прогона внутренний источник закрыт, находки идут под внешним источником
   или `tester`. У manifest 1.2.2 маркера нет — тогда то же читается из `session_roles` и
   `fix_sources` задачи. Маркером становится ПЕРВАЯ такая запись, какой бы роли она ни была: запись
@@ -284,7 +282,7 @@ manifest: `state.py init` 1.2.4 писал `review_policy.version: "1.2.4"`, с 
 
 - **Внутреннее ревью — до первого внешнего пакета, на его HEAD.** Первый внешний пакет задачи —
   первая запись `task-result` ЛЮБОЙ роли из `cross_provider_reviewer`, `second_reviewer`,
-  `github_codex_review`, `coderabbit` при любом статусе (включая `unavailable`): после неё
+  `github_codex_review` при любом статусе (включая `unavailable`): после неё
   внутреннее ревью в этом прогоне не засчитывается. Факт «пакет уже был» `state.py` и гейт берут
   одним правилом (`external_review_started`) по свидетелям, которые переживают `resume` и лежат в
   сыром manifest: маркер `external_review`, история сессий `session_roles`, счётчики источников
@@ -293,7 +291,7 @@ manifest: `state.py init` 1.2.4 писал `review_policy.version: "1.2.4"`, с 
   ничего не открывает заново, а следующая внешняя запись маркер не пересоздаёт (HEAD первого пакета
   неизвестен — до конца прогона «новый прогон»); `external_review: null` (`state.py` его никогда не
   пишет) — malformed manifest, закрытый отказ. Остаток (manifest не подписан): если первым пакетом
-  была запись `github_codex_review` или `coderabbit` (в `review_history` они не пишутся), после
+  была запись `github_codex_review` (в `review_history` она не пишется), после
   `resume` её результата нет, маркер и `session_roles` стёрты руками, а по этому источнику не было
   ни круга `fix-loop`, ни `--defer`/`--accept`, — свидетелей не остаётся, и такую правку правило не
   отличит от прогона без внешнего ревью. И обратное: ошибочный `fix-loop --outcome failed` под
@@ -353,9 +351,9 @@ manifest: `state.py init` 1.2.4 писал `review_policy.version: "1.2.4"`, с 
     `cross_provider_reviewer`, `second_reviewer`, `internal_reviewer`; каждый `fix-loop`
     (`--outcome failed`/`pass`, `--defer`, `--accept`, `--decision`); `task-risk`, меняющий
     эффективный риск задачи (повтор того же риска или уровня прогона — не изменение). Переживает
-    `resume`. НЕ растёт на `github_codex_review` и `coderabbit` (PR-гейт в сравнение не входит:
-    CodeRabbit приходит после снятия draft, то есть после сверки; его находки идут через
-    `fix-loop`, который растит счётчик сам), на `architect`, `triage`, `investigator`
+    `resume`. НЕ растёт на `github_codex_review` (PR-гейт в сравнение не входит: он приходит
+    после снятия draft, то есть после сверки; его находки идут через `fix-loop`, который растит
+    счётчик сам), на `architect`, `triage`, `investigator`
     (информационные роли: не меняют ни готовность, ни шаг) и на самой `final_check`. Сверка с
     другим `after_epoch` или без него не засчитывается (совместимых живых записей нет — поле
     появилось в той же волне, что и правило; запись без него — правка руками). Это общий страж: он
@@ -374,7 +372,7 @@ manifest: `state.py init` 1.2.4 писал `review_policy.version: "1.2.4"`, с 
   `fix-loop --outcome pass`, новый HEAD, `--defer`/`--accept` и запись роли (coder, tester, ревью,
   PR-гейт), после которых все требуемые роли pass или покрыты. Закрывает круг запись ЛЮБОЙ такой
   роли, не обязательно источника, открывшего круг (#98 п.1, поведение 1.2.0, сохранено); в том числе
-  запись PR-гейта (`github_codex_review` или `coderabbit`, любой статус) в `needs_fix`, когда все
+  запись PR-гейта (`github_codex_review`, любой статус) в `needs_fix`, когда все
   требуемые роли уже pass или покрыты, закрывает круг тем же правилом `update_task_status` (#98 п.2)
   (`fix_cycle_closable`: сверка в этот
   вопрос не входит — она обязана ИДТИ ПОСЛЕ закрытия, а на high под `1.2.4` сверка, записанная до
@@ -415,10 +413,15 @@ mirroring what `resume` itself preserves.
 
 Record a role with `task-result --task <id> --role <role> --status <status> --session-id <id> --head <sha>`.
 The only valid roles are `coder`, `tester`, `cross_provider_reviewer`, `second_reviewer`
-(manifest version 2 only), `github_codex_review`, `coderabbit`, and the subagent roles
+(manifest version 2 only), `github_codex_review`, and the subagent roles
 `architect`, `internal_reviewer`, `triage`, `investigator`, `final_check` (manifest version 2 only,
 always with `--model` not weaker than the role policy, 1.4.0); valid statuses are `pass`, `findings`,
 `incomplete`, `error`, and `unavailable`.
+The role `coderabbit` was removed in 1.7.0 (CodeRabbit is no review channel): `task-result --role
+coderabbit` and `fix-loop --source coderabbit` are refused with that reason. A manifest written before
+1.7.0 keeps its `coderabbit` results, sessions and deferrals; `state.py` and the wave gate read them
+without failing and judge them by nobody (no disposition, no readiness, no gate problem, no line in
+`where`).
 Cross-provider `pass` must contain matching `--reviewed-head <sha>` and `--packet-hash`: either
 `sha256:<64 lowercase hex>` (the report field `state_packet_hash` of `review.py run`) or the bare
 64 lowercase hex that `review.py` writes in the envelope; state always stores `sha256:<hex>`, and
@@ -432,14 +435,13 @@ The script rejects a session ID used by another task or role anywhere in the run
 until `resume`. A task becomes `ready_for_pr_review` only when current coder, tester and
 cross-provider reviewer results all pass (a high-risk task of a version 2 manifest also needs
 coder and tester models not weaker than the role policy and the `second_reviewer`, see above); a reviewer `findings` result counts as passed only
-through a `fix-loop --defer` bound to exactly that result (its digest and head). GitHub Codex review remains a separate PR gate;
-CodeRabbit cannot satisfy either gate. `fix-loop --outcome failed --source <source>` persists each
+through a `fix-loop --defer` bound to exactly that result (its digest and head). GitHub Codex review remains a separate PR gate.
+`fix-loop --outcome failed --source <source>` persists each
 failed round and increments both the task-wide `fix_cycles` and the per-source `fix_sources[source]`
 counter; `--source` is required with `--outcome failed`, rejected with `--outcome pass`, and must be
 one of `cross_provider_reviewer` (the decisive task reviewer), `second_reviewer` (the second
 decisive task reviewer of a high-risk task), `github_codex_review` (the PR
-gate), `coderabbit` (advisory: its findings are triaged, but two rounds from it also force a
-decision) or `tester`; `internal_reviewer` is a separate source with its own counter and none of
+gate) or `tester`; `internal_reviewer` is a separate source with its own counter and none of
 these increments (see above). The third failed round still makes the task permanently `blocked` in v1,
 unchanged from before. Two-round-per-source limit: when, after the increment, a source's own count
 minus the decisions already recorded for it reaches 2 and the task is not already `blocked`, status
@@ -458,7 +460,7 @@ role results. Legacy manifests without `fix_sources`/`decisions`/`decision_requi
 defaulted via `setdefault` on first touch. `fix-loop --defer --source <source> --note <text>`
 (mutually exclusive with `--outcome`/`--decision`) records a deferral of low/P3-only findings into the
 remainder of the next wave/task: `--source` must be `cross_provider_reviewer`, `second_reviewer`,
-`github_codex_review` or `coderabbit` (never `tester`), the task must hold a `findings` result of that role on the current
+or `github_codex_review` (never `tester`), the task must hold a `findings` result of that role on the current
 head and tree, `--note` follows the `--decision` rules, and the task must not be `blocked` or
 `needs_decision`. It appends `{source, note, head, result_recorded_at, recorded_at}` to `deferrals`
 (not to `decisions`) and leaves `fix_cycles`, `fix_sources` and `decision_required_for` untouched.

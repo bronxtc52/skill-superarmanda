@@ -30,10 +30,18 @@ ROLES = {
     "tester",
     "cross_provider_reviewer",
     "github_codex_review",
-    "coderabbit",
     "second_reviewer",
     *FABLE_ROLES,
 }
+# Roles a manifest written before 1.7.0 may still carry (results, session_roles, deferrals): read
+# without failing and judged by nobody — no disposition, no readiness, no gate problem, no line in
+# `where`. A new record of such a role (task-result, fix-loop --source) is refused.
+LEGACY_ROLES = {"coderabbit"}
+LEGACY_ROLE_REMOVED = (
+    "{role} was removed in 1.7.0: the PR review gate is github_codex_review; "
+    "an old manifest keeps its {role} records, a new one is never written; "
+    "a decision pending on {role} is recorded by fix-loop --decision without --source"
+)
 STATUSES = {"pass", "findings", "incomplete", "error", "unavailable"}
 # The internal Fable review as a fix-loop source: its rounds spend no fix cycle and are counted
 # apart (`internal_rounds` of the task), at most MAX_INTERNAL_ROUNDS, and only before the first
@@ -41,14 +49,14 @@ STATUSES = {"pass", "findings", "incomplete", "error", "unavailable"}
 INTERNAL_SOURCE = "internal_reviewer"
 MAX_INTERNAL_ROUNDS = 3
 FIX_SOURCES = {
-    "cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit", "tester",
+    "cross_provider_reviewer", "second_reviewer", "github_codex_review", "tester",
     INTERNAL_SOURCE,
 }
 DECISIONS = {"invariant", "cut_surface", "accept_limitation"}
 # Reviewer channels whose low/P3-only findings may be deferred to the remainder
 # of the next wave/task without spending the fix cap (#36). Tester is excluded:
 # a failed check is never a nit.
-DEFER_SOURCES = {"cross_provider_reviewer", "second_reviewer", "github_codex_review", "coderabbit"}
+DEFER_SOURCES = {"cross_provider_reviewer", "second_reviewer", "github_codex_review"}
 # The roles of an external review: the first task-result of any of them (at any status) is the
 # first external packet of the task and closes the internal fix-loop source for the run.
 EXTERNAL_REVIEW_ROLES = DEFER_SOURCES
@@ -955,7 +963,7 @@ def session_owners(data):
             roles.setdefault(result["session_id"], role)
             pairs.append((result["session_id"], role))
         for session_id, role in pairs:
-            if not isinstance(session_id, str) or role not in ROLES:
+            if not isinstance(session_id, str) or role not in ROLES | LEGACY_ROLES:
                 fail("malformed task session history")
             owner = (name, role)
             previous = owners.setdefault(session_id, owner)
@@ -1388,10 +1396,10 @@ def fix_cycles_closed(entry):
 
 # The roles whose result changes what the final check has to judge (task_epoch): the results of the
 # readiness rules (coder, tester, both task reviews, the internal review). Not the PR gate
-# (github_codex_review, coderabbit: no part of the comparison — CodeRabbit comes after the draft is
-# lifted, i.e. after the final check; its findings go through fix-loop, which raises the epoch
-# itself), not the informational Fable roles (architect, triage, investigator: they change neither
-# readiness nor the step), not the final check itself.
+# (github_codex_review: no part of the comparison — it comes after the draft is lifted, i.e. after
+# the final check; its findings go through fix-loop, which raises the epoch itself), not the
+# informational Fable roles (architect, triage, investigator: they change neither readiness nor
+# the step), not the final check itself.
 EPOCH_ROLES = ("coder", "tester") + REVIEW_ROLES + (INTERNAL_SOURCE,)
 
 
@@ -1425,7 +1433,7 @@ def final_check_gap(entry, results, models):
     --defer/--accept or a role result out of needs_fix, on the same tree) asks for a new one too —
     a final check recorded during the cycle or before it is no check of the fixed task. A record
     without `after_fix_cycles` (written before 1.2.4 knew the field) counts only while the task
-    closed no cycle. The PR reviews (github_codex_review, coderabbit) are no part of the
+    closed no cycle. The PR review (github_codex_review) is no part of the
     after_reviews comparison. Behind these specific reasons the general guard: `after_epoch` is
     the task_epoch at the record, and every later change the final check has to judge (a result of
     a role in EPOCH_ROLES, any fix-loop, a change of the effective risk) raised it, so a mismatch —
@@ -2037,6 +2045,8 @@ def resume(args):
 
 
 def result(args):
+    if args.role in LEGACY_ROLES:
+        fail(LEGACY_ROLE_REMOVED.format(role=args.role))
     if args.role not in ROLES or args.status not in STATUSES:
         fail("invalid role or status")
     path = Path(args.manifest)
@@ -2519,6 +2529,8 @@ def show_role_model(args):
 
 
 def fix_loop(args):
+    if args.source in LEGACY_ROLES:
+        fail(LEGACY_ROLE_REMOVED.format(role=args.source))
     path = Path(args.manifest)
     data = read(path)
     location = repo(data["repo"])
@@ -2739,7 +2751,7 @@ def external_review_started(entry):
     current results and the review history. The rule is the same for state.py and the merge
     gate, which reads the raw manifest (without the session_roles that `read` restores from the
     results), so a marker and sessions removed by hand reopen nothing while any witness is left.
-    Remainder: a first packet of github_codex_review/coderabbit leaves no review_history, so
+    Remainder: a first packet of github_codex_review leaves no review_history, so
     after `resume` (its result gone) with the marker and the sessions removed by hand no witness
     is left when that source had neither a fix-loop round nor a --defer/--accept."""
     marker = entry.get("external_review")
@@ -2866,11 +2878,13 @@ def current_verdicts(entry, head, tree):
 
 
 def current_results(entry, head, tree):
-    """The task's results recorded on the current head and tree."""
+    """The task's results recorded on the current head and tree; a legacy role (LEGACY_ROLES) is
+    never current: its record stays in the manifest and is judged by nobody."""
     return {
         role: item
         for role, item in ((entry or {}).get("results") or {}).items()
-        if item.get("head") == head and item.get("tree_fingerprint") == tree
+        if role not in LEGACY_ROLES
+        and item.get("head") == head and item.get("tree_fingerprint") == tree
     }
 
 
@@ -2998,7 +3012,7 @@ def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None, fallback=
     current_gaps of its current results: with risk high the second review is required and a
     passed role named in `gaps` is not a pass; under the policy 1.2.4 `gaps` also names the
     mandatory Fable roles (internal_reviewer after tester, final_check after the two reviews).
-    Below high the second review is optional, like CodeRabbit: only its findings need a disposition; error/unavailable/incomplete are
+    Below high the second review is optional: only its findings need a disposition; error/unavailable/incomplete are
     recorded and ignored. `fallback` is the tail of the advice for a failed second review of a
     high-risk task (second_review_fallback; the default offers codex-host-opus).
     On the last permitted run of a wave there is no new `init --from-plan`, but fix rounds
@@ -3021,10 +3035,6 @@ def derive_step(entry, verdicts, last_run=False, risk=None, gaps=None, fallback=
         for role, _step in REVIEW_ORDER
         if verdicts.get(role) == "findings"
     ]
-    # CodeRabbit is optional: only its findings need disposition; its
-    # error/unavailable/incomplete are recorded and ignored.
-    if verdicts.get("coderabbit") == "findings":
-        disposition.append("coderabbit")
     if disposition and last_run and disposition[0] != "tester":
         return (
             6,
@@ -3335,7 +3345,9 @@ def parser():
     outcome_or_decision.add_argument("--defer", action="store_true")
     outcome_or_decision.add_argument("--accept", action="store_true")
     q.add_argument("--severity", choices=sorted(RISKS))
-    q.add_argument("--source", choices=sorted(FIX_SOURCES))
+    # a legacy role passes the parser only to be refused by fix_loop with its own reason
+    q.add_argument("--source", choices=sorted(FIX_SOURCES | LEGACY_ROLES),
+                   metavar="{" + ",".join(sorted(FIX_SOURCES)) + "}")
     q.add_argument("--note")
     q.set_defaults(func=fix_loop)
     q = sub.add_parser("mark", parents=[common])
