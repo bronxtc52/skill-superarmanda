@@ -653,7 +653,7 @@ def check(args):
 
     def codex_only(snap):
         # Stability is judged on the evidence evaluate reads: another author editing the PR
-        # (a retired CodeRabbit summary, a person) does not move a Codex result.
+        # (a retired review bot's summary, a person) does not move a Codex result.
         return tuple([item for item in part if trusted(item, CODEX)] for part in snap)
 
     first = fetch_header(owner, name, args.pr)
