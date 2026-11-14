@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+# Only superseded runs for the same PR are cancelled.
+# Main and manual runs keep independent groups.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   tests:
     strategy:
